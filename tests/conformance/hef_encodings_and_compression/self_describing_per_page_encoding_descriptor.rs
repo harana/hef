@@ -34,7 +34,9 @@ fn id_values(count: usize) -> StringColumn {
 /// predicate-evaluated-on-dictionary-codes-via-the-descriptor
 #[test]
 fn predicate_evaluated_on_dictionary_codes_via_the_descriptor() {
-    let values = status_values(60);
+    // Enough rows that the dictionary form is smaller than the plain form. A much smaller page still pays for a whole
+    // 1024-value vector of packed codes, loses the encoder's plain-form size check, and is stored plain instead.
+    let values = status_values(200);
     let encoded = encode_block(&ColumnData::Strings(values.clone()), true);
     assert_eq!(encoded.pipeline.transform().unwrap(), Transform::DictionaryString);
 
