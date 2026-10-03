@@ -1,0 +1,34 @@
+schema: spec-driven
+
+context: |
+  hef is a standalone Rust crate at the root of this repository. It holds
+  the HEF columnar event file format (Harana Event File) and the HEJ
+  append-only event journal (Harana Event Journal). Pulse, the Harana
+  application, consumes the crate as a git dependency. The OpenSpec corpus
+  is the authoritative requirements baseline for the crate; the quality
+  gate for spec work is `openspec validate --all --strict` passing.
+
+  Layout and authority:
+  - The corpus lives in openspec/specs/ (one hef-* capability per
+    directory; each holds spec.md plus companion files).
+  - Requirements that Pulse's query engine or services implement are
+    specified in the harana/pulse repository under the same capability
+    name, as is the whole hef-aggregation-metadata capability. A change
+    that spans both repositories keeps the same change name in each.
+  - Caution at archive time: `openspec archive` applies only requirement
+    blocks from spec.md deltas. For a change that ADDs a new capability it
+    generates a placeholder TBD Purpose and does not copy companion files;
+    restore the real Purpose and copy companions manually after archiving.
+
+rules:
+  proposal:
+    - Name capabilities in kebab-case with the hef- prefix, consistent with the existing corpus (e.g. hef-write-path, hef-file-layout).
+  specs:
+    - Specs must be self-contained; embed all normative content. Cross-references to other capability specs (in this repository or in harana/pulse) and named INV-* invariants are allowed.
+    - Open every spec's `## Purpose` with a plain-English, specific summary a non-expert can follow (who uses it, what it does, what it produces). Keep real architectural terms but phrase them plainly; no jargon openers.
+    - Put large schemas, registries, byte layouts, and example data in companion files inside the capability directory (e.g. file-layout.md, encodings.md); keep requirements in spec.md. Split a capability that grows too large into multiple capability specs.
+    - After editing, run `openspec validate --all --strict` and fix every issue. Also check for requirement text dangling after a scenario with no `### Requirement:` heading; validate does not catch that class.
+  design:
+    - Record contested choices as tension, decision, why, and implied spec edits, including rejected alternatives and open sub-tensions.
+  tasks:
+    - Group tasks by capability and end with a verification task that runs `openspec validate <change> --strict`. Once implementation starts, each coding task should name the capability and requirement it implements.

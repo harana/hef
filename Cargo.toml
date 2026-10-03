@@ -1,0 +1,61 @@
+[package]
+name = "hef"
+description = "The HEF columnar event file format and the HEJ append-only event journal: encodings, layout, indexes, integrity, and the write path."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+[features]
+write = []
+
+[dependencies]
+ahash = { version = "0.8", features = ["serde"] }
+aho-corasick = { git = "https://github.com/harana-oss/aho-corasick.git" }
+arrow-array = "59.2.0"
+arrow-buffer = "59.2.0"
+arrow-schema = "59.2.0"
+blake3 = { version = "1.8.7", features = ["rayon"] }
+bytemuck = { version = "1.25.2", features = ["extern_crate_alloc"] }
+chacha20poly1305 = "0.11"
+chrono = { version = "0.4", features = ["serde"] }
+crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
+dashmap = "6"
+fsst-rs = "0.5.11"
+getrandom = "0.4.3"
+hardware-rust-crypto = { version = "1.0.1", features = ["hazmat-explicit-nonce"] }
+hashbrown = "0.17"
+hex-simd = "0.8"
+hkdf = "0.13.0"
+k256 = { version = "0.14.0", default-features = false, features = ["ecdh", "schnorr", "std"] }
+lz4_flex = "0.13.1"
+memchr = "2"
+miniz_oxide = "0.9.1"
+multiversion = "0.8"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+simd-json = "0.17.0"
+structured-zstd = "0.0.49"
+thiserror = "2"
+type-safe-id = { version = "0.3.3", features = ["serde"] }
+uuid = "1"
+zeekstd = "0.6.2"
+zeroize = "1"
+zstd = "0.13.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"

@@ -1,0 +1,16 @@
+//! Conformance tests for the `hef-query-metadata-and-indexes` capability.
+
+mod authoritative_footer_and_granule_metadata;
+mod bounded_string_min_max_in_skip_indexes;
+mod constant_and_all_null_flags_enable_metadata_only_answers;
+mod exact_directly_intersectable_bitmap_indexes;
+mod layered_metadata_hierarchy_to_minimize_reads;
+mod learned_position_index_over_sorted_keys;
+mod manifest_summaries_mirror_footer_coverage_flags;
+mod page_granularity_skip_metadata_for_sub_granule_pruning;
+mod pruning_as_a_falsification_expression;
+mod rank_select_over_visibility_and_null_bitmaps;
+mod text_token_and_path_presence_indexes_are_produced_and_used;
+mod text_token_filter_bytes_live_in_the_data_area;
+mod uniform_skipindex_model;
+mod workload_adaptive_probabilistic_filters;

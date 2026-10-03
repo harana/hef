@@ -1,0 +1,12 @@
+//! Conformance tests for the `hef-logical-event-model` capability.
+
+mod analytical_column_families;
+mod automatic_workload_aware_column_promotion;
+mod column_families_split_by_temporal_computability;
+mod event_relationship_references_column_family;
+mod fixed_event_envelope;
+mod public_output_authorization_boundary;
+mod relationship_references_accepted_without_referential_integrity;
+mod single_canonical_payload_format_with_ingest_transcoding;
+mod thread_reconstruction_without_recursion;
+mod unit_neutral_time_and_duration;

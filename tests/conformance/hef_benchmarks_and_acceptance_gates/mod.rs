@@ -1,0 +1,18 @@
+//! Conformance tests for the `hef-benchmarks-and-acceptance-gates` capability.
+
+mod accelerator_falls_back_on_failed_parity;
+mod blackout_window_must_be_underwritten;
+mod capability_cannot_be_marked_ready_on_an_unmeasured_gate;
+mod cold_open_exceeds_the_one_request_budget;
+mod default_flush_target_requires_separate_measurement;
+mod duplicate_safety_gate;
+mod equivalence_and_benefit_are_measured_together;
+mod maintenance_pressure_breaks_live_latency;
+mod oversized_flush_unit_rejected_as_default;
+mod pruned_file_costs_near_zero_planner_metadata;
+mod query_class_not_marked_ready_on_cold_cache_miss;
+mod regressed_baseline_drops_a_capability_from_the_ready_set;
+mod regressed_publish_waf_drops_a_placement_path;
+mod rewrite_path_held_to_its_write_amplification_floor;
+mod s3_durable_cold_lookup_is_not_measured_against_the_nvme_target;
+mod stalled_worker_does_not_stall_the_watermark;

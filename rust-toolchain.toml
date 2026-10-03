@@ -1,0 +1,5 @@
+# Pinned toolchain: stable channel, exact version (D1).
+# Upgrades are ordinary reviewed changes that edit this file.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

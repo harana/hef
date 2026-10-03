@@ -1,0 +1,51 @@
+[package]
+name = "hef-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "hej_frame"
+path = "fuzz_targets/hej_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "compact_batch"
+path = "fuzz_targets/compact_batch.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "variant_value"
+path = "fuzz_targets/variant_value.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "hef_footer"
+path = "fuzz_targets/hef_footer.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "hef_file"
+path = "fuzz_targets/hef_file.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "column_block"
+path = "fuzz_targets/column_block.rs"
+test = false
+doc = false
+
+[dependencies]
+hef = { path = "..", features = ["write"] }
+libfuzzer-sys = "0.4"

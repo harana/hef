@@ -1,0 +1,8 @@
+//! Conformance tests for the `hef-hardware-deployment` capability.
+
+mod accelerators_never_change_correctness;
+mod default_io_uring_backend_with_explicit_durability;
+mod nvme_character_device_deployment_constraint;
+mod nvme_data_placement_is_a_hint_layer;
+mod nvme_passthrough_operation_set_is_provided_behind_the_synchronous_interface;
+mod rebuildable_hybrid_local_hef_cache;

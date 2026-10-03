@@ -1,0 +1,9 @@
+//! Conformance tests for the `hef-physical-artifacts` capability.
+
+mod acknowledge_only_after_hej_durability;
+mod autonomous_per_worker_commit_discipline;
+mod deterministic_hej_to_liveoverlay_conversion;
+mod explicit_watermark_model;
+mod hef_is_the_immutable_self_describing_query_file;
+mod hej_is_the_durable_event_replay_source;
+mod liveoverlay_serves_fresh_durable_ranges_and_is_reconstructable;

@@ -1,0 +1,10 @@
+//! Conformance tests for the `hef-write-path` capability.
+
+mod compaction_folds_sidecar_files_into_the_base;
+mod file_roll_boundary_owned_by_publish_policy;
+mod hef_publish_boundary_gates_visibility;
+mod hef_publish_side_effect_transaction_discipline;
+mod hef_rewrite_preserves_one_format_and_correctness;
+mod idempotent_hef_publication;
+mod ingest_to_acknowledgement_pipeline;
+mod single_protected_payload_record_with_safe_retry;

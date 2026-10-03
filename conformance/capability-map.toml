@@ -1,0 +1,22 @@
+# Capability ownership map: every capability in openspec/specs/ names exactly one owning crate and module path.
+# Module paths are how ownership is split inside the crate; modules may land after their capability's first
+# implementation change, but the owner is fixed here first.
+
+[capabilities]
+hef-apis = { crate = "hef", module = "hef", required_evidence = "spec" }
+hef-benchmarks-and-acceptance-gates = { crate = "hef", module = "benchmarks", required_evidence = "spec" }
+hef-column-design = { crate = "hef", module = "columns", required_evidence = "spec" }
+hef-core-invariants = { crate = "hef", module = "invariants", required_evidence = "spec" }
+hef-deletes-and-corrections = { crate = "hef", module = "deletes", required_evidence = "spec" }
+hef-encodings-and-compression = { crate = "hef", module = "encoding", required_evidence = "spec" }
+hef-file-layout = { crate = "hef", module = "layout", required_evidence = "spec" }
+hef-file-lifecycle = { crate = "hef", module = "lifecycle", required_evidence = "spec" }
+hef-hardware-deployment = { crate = "hef", module = "hardware", required_evidence = "spec" }
+hef-layout-and-clustering = { crate = "hef", module = "clustering", required_evidence = "spec" }
+hef-logical-event-model = { crate = "hef", module = "events", required_evidence = "spec" }
+hef-manifest-integration = { crate = "hef", module = "manifest", required_evidence = "spec" }
+hef-physical-artifacts = { crate = "hef", module = "artifacts", required_evidence = "spec" }
+hef-query-metadata-and-indexes = { crate = "hef", module = "indexes", required_evidence = "spec" }
+hef-reader-compatibility = { crate = "hef", module = "compat", required_evidence = "spec" }
+hef-security-and-isolation = { crate = "hef", module = "security", required_evidence = "spec" }
+hef-write-path = { crate = "hef", module = "writer", required_evidence = "spec" }
