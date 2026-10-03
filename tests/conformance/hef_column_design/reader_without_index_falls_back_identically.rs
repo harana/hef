@@ -2,7 +2,7 @@
 //! carries, decodes the whole granule block instead, and returns byte-identical values — for both a declared free-text
 //! column and an internal embedding/vector column.
 
-use super::file_with_stored_vectors;
+use super::{commit_trailing_gap, file_with_stored_vectors};
 use crate::support;
 use hef::columns::{FreetextDeclaration, column_ids};
 use hef::events::variant::VariantValue;
@@ -125,14 +125,16 @@ fn with_and_without_embedding_index(built: &BuiltHef, row_bytes: &[Vec<u8>]) -> 
         offsets_len: offsets_block.len() as u64,
         offsets_offset: extra_offset - stripe.file_offset,
     }];
+    let mut data_area = built.bytes[..stripe_region_end].to_vec();
+    data_area.extend_from_slice(&offsets_block);
+    data_area.extend_from_slice(&bytes_block);
+    commit_trailing_gap(&mut with_flag, &data_area);
     let mut without_flag = with_flag.clone();
     without_flag.optional_feature_flags &= !optional_features::TYPED_COLUMN_ROW_OFFSETS;
 
     let splice = |footer: &Footer| {
         let footer_blob = encode_footer(footer);
-        let mut spliced = built.bytes[..stripe_region_end].to_vec();
-        spliced.extend_from_slice(&offsets_block);
-        spliced.extend_from_slice(&bytes_block);
+        let mut spliced = data_area.clone();
         spliced.extend_from_slice(&footer_blob);
         spliced.extend_from_slice(&(footer_blob.len() as u64).to_le_bytes());
         spliced.extend_from_slice(b"HEF1");

@@ -3,7 +3,8 @@
 use crate::support;
 use hef::columns::column_ids;
 use hef::encoding::ColumnData;
-use hef::layout::footer::ColumnKind;
+use hef::file::integrity::hash_tree;
+use hef::layout::footer::{ColumnKind, Footer, IntegrityGapEntry};
 use hef::writer::build::{AnalyticalColumn, BuiltHef, HefRow, build_hef_file};
 
 mod context_projection_columns_avoid_raw_payload_scans;
@@ -39,4 +40,22 @@ pub fn file_with_stored_vectors(vectors: &[String]) -> BuiltHef {
     let built = build_hef_file(rows, &config).unwrap();
     assert_eq!(built.footer.granules.len(), 1, "test needs every row in one granule");
     built
+}
+
+/// Declares the bytes a test appended after the last stripe as the data area's trailing integrity gap, so the footer's
+/// stripes and gaps still cover every byte up to the footer exactly once. `bytes_before_footer` is the spliced file up
+/// to where its new footer will start.
+pub fn commit_trailing_gap(footer: &mut Footer, bytes_before_footer: &[u8]) {
+    let tail_start = footer
+        .stripes
+        .iter()
+        .map(|stripe| stripe.file_offset + stripe.byte_len)
+        .max()
+        .expect("a built file has stripes");
+    footer.integrity_gaps.retain(|gap| gap.file_offset < tail_start);
+    footer.integrity_gaps.push(IntegrityGapEntry {
+        blake3: *hash_tree(&bytes_before_footer[tail_start as usize..]).as_bytes(),
+        byte_len: bytes_before_footer.len() as u64 - tail_start,
+        file_offset: tail_start,
+    });
 }
