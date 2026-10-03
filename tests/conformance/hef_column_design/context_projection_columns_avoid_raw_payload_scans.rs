@@ -12,9 +12,9 @@ use hef::writer::build::{AnalyticalColumn, HefRow, build_hef_file};
 #[test]
 fn evidence_card_from_context_columns() {
     // Context projection columns (context_title, context_summary, etc.) carry data-class labels and are public-safe
-    // when the caller is authorized. They are NOT in the default public-blocked list — access flows through the
-    // data-class authorization layer, not through the blanket prefix block that covers embedding_ and internal_
-    // columns.
+    // only when the caller is authorized. The scan boundary allow-lists public output, so a bare public caller does not
+    // receive them by default; the owner service that assembles the evidence card reads them below the API boundary,
+    // where the data-class authorization is applied.
     for col in [
         "context_title",
         "context_summary",
@@ -28,8 +28,12 @@ fn evidence_card_from_context_columns() {
         "context_lineage_ref",
     ] {
         assert!(
-            column_allowed(col, Caller::Public),
-            "{col} must be public-safe (authorized via data-class labels, not blocked by default)"
+            !column_allowed(col, Caller::Public),
+            "{col} is public-safe only when authorized, so an unauthorized public caller must not receive it"
+        );
+        assert!(
+            column_allowed(col, Caller::Internal),
+            "{col} must be readable by the owner service that assembles the evidence card"
         );
     }
 
@@ -57,8 +61,8 @@ fn evidence_card_from_context_columns() {
     }];
     let built = build_hef_file(rows, &config).unwrap();
 
-    // The context column is present in the file's column directory and is explicitly not internal-only — public callers
-    // can read it directly.
+    // The context column is present in the file's column directory and is explicitly not internal-only, so it stays
+    // eligible for authorized public output.
     let context_col = built
         .footer
         .columns

@@ -175,6 +175,34 @@ fn byte_stream_split_deflate_page_supports_single_granule_range_decode() {
     assert_eq!(decoded, ColumnData::F64(values[start..end].to_vec()));
 }
 
+/// A plain block stored as a deflate page reads any row range by inflating only the granules holding it, and the
+/// result matches slicing a full decode: inside one granule, across a granule edge, from the first granule (whose row
+/// count header is checked), and past the last row.
+#[test]
+fn plain_deflate_page_range_decode_matches_full_decode() {
+    let values: Vec<u64> = (0..2000u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+    let mut body = (values.len() as u32).to_le_bytes().to_vec();
+    for value in &values {
+        body.extend_from_slice(&value.to_le_bytes());
+    }
+    let pipeline = PipelineId::new(Transform::PlainU64, Compression::Deflate, ValueKind::U64);
+    let page = deflate::compress(&body);
+    assert!(pipeline.supports_byte_range_extraction().unwrap());
+    assert_eq!(decode_block(pipeline, &page).unwrap(), ColumnData::U64(values.clone()));
+    for (start, end) in [(0, 1), (0, 600), (511, 513), (1000, 1600), (1990, 5000), (3000, 4000)] {
+        let expected = values.get(start..end.min(values.len())).unwrap_or(&[]).to_vec();
+        assert_eq!(
+            decode_block_range(pipeline, &page, start, end).unwrap(),
+            ColumnData::U64(expected),
+            "rows {start}..{end}"
+        );
+    }
+
+    let mut forged = body;
+    forged[..4].copy_from_slice(&1u32.to_le_bytes());
+    assert!(decode_block_range(pipeline, &deflate::compress(&forged), 0, 1).is_err());
+}
+
 /// Builds a forged ALP block body (`[exponent][exception count = 0][bitpack count][bitpack width]`, no packed words)
 /// so a test can drive the bitpack header past its valid range without a real encoder.
 fn forged_alp_block(exponent_index: u8, count: u32, width: u8) -> Vec<u8> {

@@ -9,14 +9,16 @@ use hef::encoding::{
     decode_block, decode_block_range, encode_block, encode_block_with_strategy,
 };
 
-/// An f64 metric column that is mostly ALP-encodable (exact halves) with an exact-bits exception every `stride` rows
-/// (multiples of pi never survive decimal scaling, so each becomes an entry in ALP's exception side stream).
+/// An f64 metric column that is mostly ALP-encodable (exact halves) with an exact-bits exception every `stride` rows.
+/// Each exception is a multiple of pi times 1e19: already past ALP's 9e18 scaled-integer limit before any power of ten
+/// is applied, so no exponent can absorb it and each one becomes an entry in ALP's exception side stream. (Smaller
+/// multiples of pi round-trip at a high exponent, which would trade the exceptions for near-64-bit scaled integers.)
 fn alp_column_with_exceptions(rows: usize, stride: usize) -> ColumnData {
     ColumnData::F64(
         (0..rows)
             .map(|i| {
                 if i % stride == 0 {
-                    std::f64::consts::PI * (i + 1) as f64
+                    std::f64::consts::PI * 1e19 * (i + 1) as f64
                 } else {
                     i as f64 * 0.5
                 }

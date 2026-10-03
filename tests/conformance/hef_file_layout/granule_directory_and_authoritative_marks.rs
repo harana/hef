@@ -14,12 +14,8 @@ fn random_access_via_marks() {
     let file = HefFile::open(built.bytes, None).unwrap();
     let granule = file.footer().granules.last().copied().unwrap();
     let mark = file
-        .footer()
-        .marks
-        .iter()
-        .find(|mark| {
-            mark.column_id == column_ids::SEQUENCE && mark.projection_id == 0 && mark.granule_id == granule.granule_id
-        })
+        .mark(column_ids::SEQUENCE, 0, granule.granule_id)
+        .unwrap()
         .expect("mark exists for (column, projection, granule)");
     // The mark offset is stripe-relative: it is measured from the base offset of its own stripe
     // (`StripeEntry.file_offset`), not the file start. Resolving `stripe_base + relative` lands the block past the 4 KiB

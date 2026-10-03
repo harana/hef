@@ -28,15 +28,17 @@ fn hot_path_shredded_into_a_typed_column() {
     let read = file.read_column(amount.column_id, granule).unwrap();
     assert!(!read.presence.is_empty());
     let mark = file
-        .footer()
-        .marks
-        .iter()
-        .find(|mark| mark.column_id == amount.column_id && mark.granule_id == granule)
-        .unwrap();
-    assert_eq!(
-        mark.codec_pipeline_id.compression().unwrap(),
-        Compression::None,
-        "shredded scan-path columns preserve random access in compressed form"
+        .mark(amount.column_id, 0, granule)
+        .unwrap()
+        .expect("the shredded column has a mark in the granule");
+    // No whole-block codec: the block is stored either uncompressed or in independently decompressible seekable
+    // Zstandard frames that a row range can be sliced from without decoding the whole block.
+    let pipeline = mark.codec_pipeline_id;
+    let compression = pipeline.compression().unwrap();
+    assert!(
+        compression == Compression::None
+            || (compression == Compression::SeekableZstd && pipeline.supports_byte_range_extraction().unwrap()),
+        "shredded scan-path columns preserve random access in compressed form (got {compression:?})"
     );
     // The shredded path is gone from the residual but the merge restores the complete payload.
     let PayloadRead::Value(value) = file.payload(0).unwrap() else {

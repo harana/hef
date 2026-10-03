@@ -2,7 +2,7 @@
 //! rather than decoding the whole vector block, that the fetch returns the same bytes the whole-block decode would,
 //! and that the approximate ANN retrieval path — which reads the granule's vector block whole, the same block the
 //! index sits beside — is unaffected by the index's presence.
-use super::file_with_stored_vectors;
+use super::{commit_trailing_gap, file_with_stored_vectors};
 use hef::columns::column_ids;
 use hef::encoding::ColumnData;
 use hef::layout::footer::{EmbeddingRowOffsets, encode_footer};
@@ -12,7 +12,8 @@ use hef::writer::build::BuiltHef;
 
 /// Splices a per-row byte-offset index for the embedding column into a built file's footer. The index's raw bytes are
 /// appended after the stripe region — never inside it — so the existing stripe checksums stay valid; row `i`'s index
-/// entry points at `row_bytes[i]`, independent of whatever the granule's own vector block holds for that row.
+/// entry points at `row_bytes[i]`, independent of whatever the granule's own vector block holds for that row. The
+/// appended bytes are declared as the data area's trailing integrity gap.
 fn with_embedding_row_index(built: &BuiltHef, row_bytes: &[Vec<u8>]) -> Vec<u8> {
     let granule = built.footer.granules[0];
     let stripe = built
@@ -48,11 +49,12 @@ fn with_embedding_row_index(built: &BuiltHef, row_bytes: &[Vec<u8>]) -> Vec<u8> 
         offsets_len: offsets_block.len() as u64,
         offsets_offset: extra_offset - stripe.file_offset,
     }];
-    let new_footer_blob = encode_footer(&footer);
 
     let mut spliced = built.bytes[..stripe_region_end].to_vec();
     spliced.extend_from_slice(&offsets_block);
     spliced.extend_from_slice(&bytes_block);
+    commit_trailing_gap(&mut footer, &spliced);
+    let new_footer_blob = encode_footer(&footer);
     spliced.extend_from_slice(&new_footer_blob);
     spliced.extend_from_slice(&(new_footer_blob.len() as u64).to_le_bytes());
     spliced.extend_from_slice(b"HEF1");

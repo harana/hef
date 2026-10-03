@@ -341,13 +341,16 @@ impl PipelineId {
     }
 
     /// True when this pipeline's stored bytes can be sliced to a row range without decoding the whole block —
-    /// either because the transform itself is [`Transform::is_per_value_addressable`], or because it is one of the
-    /// plain transforms wrapped in the seekable Zstandard family ([`Transform::supports_framed_range`]).
+    /// either because the transform itself is [`Transform::is_per_value_addressable`], because it is one of the
+    /// plain transforms wrapped in the seekable Zstandard family ([`Transform::supports_framed_range`]), or because
+    /// it is a plain u64/f64 body stored as a deflate page, whose granules inflate independently.
     /// [`decode_block_range`] consults this instead of re-deriving the invariant inline.
     pub fn supports_byte_range_extraction(self) -> Result<bool, FormatError> {
         let transform = self.transform()?;
+        let compression = self.compression()?;
         Ok(transform.is_per_value_addressable()
-            || (transform.supports_framed_range() && self.compression()? == Compression::SeekableZstd))
+            || (transform.supports_framed_range() && compression == Compression::SeekableZstd)
+            || (matches!(transform, Transform::PlainU64 | Transform::PlainF64) && compression == Compression::Deflate))
     }
 }
 
@@ -4516,24 +4519,70 @@ fn decode_plain_framed_range(
     }
     let effective_end = end.min(count);
     if effective_end <= start {
-        return Ok(match kind {
-            ValueKind::F64 => ColumnData::F64(Vec::new()),
-            ValueKind::I64 => ColumnData::I64(Vec::new()),
-            _ => ColumnData::U64(Vec::new()),
-        });
+        return Ok(plain_rows(kind, &[]));
     }
     let byte_start = 4 + start * 8;
     let row_bytes = window.read(byte_start, (effective_end - start) * 8)?;
+    Ok(plain_rows(kind, &row_bytes))
+}
+
+/// Decodes rows `[start, end)` from a plain u64/i64/f64 block stored as a deflate page by inflating only the granules
+/// whose bytes hold those rows, located through the page's recorded per-granule offsets: the mechanism behind
+/// "Single-granule random access on a deflate page". Row `i` of the plain body sits at byte offset `4 + i * 8`.
+///
+/// The row count comes from the page's declared plain length, so a range that starts past the first granule never
+/// inflates it just to read the body's leading count header; when the range does include the first granule, the
+/// header is checked against that count.
+fn decode_plain_deflate_range(
+    kind: ValueKind,
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+) -> Result<ColumnData, FormatError> {
+    let page = deflate::Page::open(bytes)?;
+    let count = page
+        .plain_len()
+        .checked_sub(4)
+        .filter(|body| body % 8 == 0)
+        .map(|body| body / 8)
+        .ok_or(FormatError::Structural {
+            rule: "deflate plain body is not a row-count header plus whole rows",
+        })?;
+    let effective_end = end.min(count);
+    if effective_end <= start {
+        return Ok(plain_rows(kind, &[]));
+    }
+    let byte_start = 4 + start * 8;
+    let byte_end = 4 + effective_end * 8;
+    let first = byte_start / deflate::GRANULE_BYTES;
+    let plain = page.decompress_granules(first, (byte_end - 1) / deflate::GRANULE_BYTES)?;
+    if first == 0
+        && plain
+            .get(..4)
+            .map(|header| u32::from_le_bytes(header.try_into().unwrap_or([0; 4])) as usize)
+            != Some(count)
+    {
+        return Err(FormatError::Structural {
+            rule: "deflate plain body length disagrees with its row-count header",
+        });
+    }
+    let offset = first * deflate::GRANULE_BYTES;
+    let row_bytes = slice(&plain, byte_start - offset, byte_end - byte_start, "deflate row range")?;
+    Ok(plain_rows(kind, row_bytes))
+}
+
+/// Turns plain-body row bytes (8 little-endian bytes per row) into column values of `kind`.
+fn plain_rows(kind: ValueKind, row_bytes: &[u8]) -> ColumnData {
     let values: Vec<u64> = row_bytes
         .chunks_exact(8)
         .map(|word| u64::from_le_bytes(word.try_into().unwrap_or([0; 8])))
         .collect();
-    Ok(match kind {
+    match kind {
         ValueKind::F64 => ColumnData::F64(values.into_iter().map(f64::from_bits).collect()),
         // I64 values ride the u64 transforms zigzag-mapped, exactly as in `decode_block`; undo it here too.
         ValueKind::I64 => ColumnData::I64(values.into_iter().map(unzigzag).collect()),
         _ => ColumnData::U64(values),
-    })
+    }
 }
 
 /// Decodes rows `[start, end)` from a framed byte-stream-split block by decompressing, for each of the 8 byte planes,
@@ -4647,6 +4696,10 @@ pub fn decode_block_range_shared(
             )?)),
             _ => decode_plain_framed_range(pipeline.value_kind()?, bytes, start, end),
         };
+    }
+    if matches!(transform, Transform::PlainU64 | Transform::PlainF64) && pipeline.compression()? == Compression::Deflate
+    {
+        return decode_plain_deflate_range(pipeline.value_kind()?, bytes, start, end);
     }
     let body = remove_trailing(pipeline.compression()?, bytes)?;
     match (pipeline.value_kind()?, transform) {

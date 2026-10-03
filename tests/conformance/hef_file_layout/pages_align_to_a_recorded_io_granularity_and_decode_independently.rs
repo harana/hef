@@ -1,9 +1,11 @@
 //! Checks that column block boundaries are aligned to the IO granularity recorded in the footer, and that each block decodes independently using only its own bytes — no neighbouring blocks required.
 
 use crate::support;
+use hef::columns::column_ids;
 use hef::encoding::decode_block;
-use hef::layout::optional_features;
+use hef::file::bytes::Reader;
 use hef::layout::reader::HefFile;
+use hef::layout::{decode_presence_frame, optional_features, required_features};
 use hef::writer::build::{HefBuildConfig, HefRow, build_hef_file};
 
 /// conformance: hef-file-layout/pages-align-to-a-recorded-io-granularity-and-decode-independently/aligned-fetch-of-surviving-pages
@@ -48,12 +50,29 @@ fn aligned_fetch_of_surviving_pages() {
         );
     }
 
-    // Pruning leaves three non-adjacent surviving pages: pick the first, middle, and last column blocks for column 0.
-    let col0_marks: Vec<_> = built.footer.marks.iter().filter(|m| m.column_id == 0).collect();
-    assert!(col0_marks.len() >= 3, "need at least 3 granules for non-adjacent pages");
+    // Pruning leaves three non-adjacent surviving pages: pick the first, middle, and last SEQUENCE blocks. Every row
+    // here shares one epoch, so the epoch column's blocks are elided (zero stored bytes); sequence numbers differ per
+    // row, so every SEQUENCE block stores real bytes to fetch.
+    let sequence_marks: Vec<_> = built
+        .footer
+        .marks
+        .iter()
+        .filter(|m| m.column_id == column_ids::SEQUENCE)
+        .collect();
+    assert!(
+        sequence_marks.len() >= 3,
+        "need at least 3 granules for non-adjacent pages"
+    );
 
-    let stride = (col0_marks.len() - 1) / 2;
-    let survivors = [col0_marks[0], col0_marks[stride], col0_marks[col0_marks.len() - 1]];
+    let stride = (sequence_marks.len() - 1) / 2;
+    let survivors = [
+        sequence_marks[0],
+        sequence_marks[stride],
+        sequence_marks[sequence_marks.len() - 1],
+    ];
+
+    // The presence frame's layout depends on whether the file declares compressed presence streams.
+    let compressed_presence = built.footer.required_feature_flags & required_features::COMPRESSED_PRESENCE != 0;
 
     // Reference reader over the full file — used only to verify the result, not to supply bytes for decoding.
     let reader = HefFile::open(built.bytes.clone(), None).unwrap();
@@ -79,9 +98,10 @@ fn aligned_fetch_of_surviving_pages() {
         let end = start + mark.compressed_size as usize;
         let page_bytes = &built.bytes[start..end];
 
-        // Parse the 4-byte presence prefix, then decode the block body independently — no neighbouring page bytes required.
-        let presence_len = u32::from_le_bytes(page_bytes[..4].try_into().unwrap()) as usize;
-        let body = &page_bytes[4 + presence_len..];
+        // Strip the presence frame, then decode the block body independently — no neighbouring page bytes required.
+        let mut frame = Reader::new(page_bytes);
+        decode_presence_frame(&mut frame, mark.row_count, compressed_presence).unwrap();
+        let body = frame.take(frame.remaining(), "block body").unwrap();
         let isolated = decode_block(mark.codec_pipeline_id, body).unwrap();
 
         // The isolated decode must produce data identical to a full column read through the reader, proving independent decodability.
