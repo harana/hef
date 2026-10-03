@@ -31,7 +31,7 @@ fn scan_path_uses_file_dek_columns_only() {
 
     // Analytical scan-path columns (dimensions, timestamps, measures) are not internal_only — they travel under the
     // file DEK and are readable by authorized public callers through the normal scan boundary.
-    for analytical_col in ["occurred_at", "event_type_id", "source", "entity_type"] {
+    for analytical_col in ["occurred_at", "event_type_id", "source_id", "entity_type_id"] {
         assert!(
             column_allowed(analytical_col, Caller::Public),
             "{analytical_col} is a file-DEK column and must be readable at the scan boundary"
