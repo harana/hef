@@ -43,16 +43,14 @@ fn read_one_page_without_the_rest_of_the_granule() {
     // The page directory entry must point to exactly the same byte range as the column mark (single-page granule: page
     // bytes == block bytes).
     let page_entry = file
-        .footer()
-        .page_directory
-        .iter()
-        .find(|e| e.column_id == column_ids::SEQUENCE && e.granule_id == granule.granule_id && e.page_index == 0)
+        .page_directory_for(column_ids::SEQUENCE, 0, granule.granule_id)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.page_index == 0)
         .expect("page directory entry must exist");
     let mark = file
-        .footer()
-        .marks
-        .iter()
-        .find(|m| m.column_id == column_ids::SEQUENCE && m.granule_id == granule.granule_id)
+        .mark(column_ids::SEQUENCE, 0, granule.granule_id)
+        .unwrap()
         .expect("column mark must exist");
 
     assert_eq!(page_entry.compressed_offset, mark.compressed_offset);
