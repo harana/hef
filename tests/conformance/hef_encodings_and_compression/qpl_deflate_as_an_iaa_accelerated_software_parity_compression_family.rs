@@ -3,7 +3,9 @@
 //! host decodes without Intel IAA, and a reader can decode one granule of a page without inflating the rest.
 
 use hef::encoding::deflate::{self, GRANULE_BYTES, granule_byte_range};
-use hef::encoding::{ColumnData, Compression, PipelineId, Transform, decode_block, encode_block, remove_trailing};
+use hef::encoding::{
+    ColumnData, Compression, PipelineId, Transform, decode_block, decode_block_range, encode_block, remove_trailing,
+};
 
 /// A handful of widely-spread `u64` constants, repeated in a fixed cycle. Cycling through such different-looking
 /// values defeats FastLanes FOR/DELTA (their deltas span nearly the full 64-bit range, just like the plain baseline)
@@ -128,13 +130,6 @@ fn single_granule_random_access_on_a_deflate_page() {
         }
     }
 
-    // The reader finds the target granule through the page's recorded offsets and inflates it alone, then reads the
-    // rows out of that granule's slice of the plain body.
-    let granule = deflate::decompress_granule(&corrupted, target_granule).unwrap();
-    let first_byte = 4 + start * 8 - target_granule * GRANULE_BYTES;
-    let decoded: Vec<u64> = granule[first_byte..first_byte + (end - start) * 8]
-        .chunks_exact(8)
-        .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
-        .collect();
-    assert_eq!(decoded, values[start..end]);
+    let decoded = decode_block_range(pipeline, &corrupted, start, end).unwrap();
+    assert_eq!(decoded, ColumnData::U64(values[start..end].to_vec()));
 }

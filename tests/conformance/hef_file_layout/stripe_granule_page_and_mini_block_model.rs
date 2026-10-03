@@ -6,7 +6,6 @@ use hef::error::FormatError;
 use hef::layout::footer::{Footer, decode_footer, encode_footer};
 use hef::layout::reader::HefFile;
 use hef::layout::{MAX_PAGE_BYTES, required_features};
-use hef::writer::build::BuiltHef;
 
 /// conformance: hef-file-layout/stripe-granule-page-and-mini-block-model/stripe-exceeds-maximum
 #[test]
@@ -55,7 +54,7 @@ fn oversized_page_on_read() {
 
     for (footer, checked_at_open) in [(row_oriented, true), (columnar, false)] {
         // Control: the re-encoded footer alone is accepted, so a rejection below is caused by the oversized page.
-        HefFile::open(with_footer(&built, &footer), None)
+        HefFile::open(with_footer(&built.bytes, &footer), None)
             .and_then(|file| file.read_column(column_id, granule_id))
             .expect("the untampered re-encoded file opens and reads");
         let mut tampered = footer.clone();
@@ -63,7 +62,7 @@ fn oversized_page_on_read() {
         // Sanity: the tampered footer still parses standalone...
         decode_footer(&encode_footer(&tampered)).unwrap();
         // ...but the reader rejects the file for the oversized page.
-        let opened = HefFile::open(with_footer(&built, &tampered), None);
+        let opened = HefFile::open(with_footer(&built.bytes, &tampered), None);
         if checked_at_open {
             assert!(
                 opened.is_err(),
@@ -79,17 +78,17 @@ fn oversized_page_on_read() {
     }
 }
 
-/// The built file's bytes with its footer replaced by `footer`, re-encoded into the file tail.
-fn with_footer(built: &BuiltHef, footer: &Footer) -> Vec<u8> {
+/// A copy of the file `bytes` with its footer replaced by `footer`, re-encoded into the file tail.
+fn with_footer(bytes: &[u8], footer: &Footer) -> Vec<u8> {
     let blob = encode_footer(footer);
     let original_blob_len = {
-        let tail = &built.bytes[built.bytes.len() - 12..built.bytes.len() - 4];
+        let tail = &bytes[bytes.len() - 12..bytes.len() - 4];
         u64::from_le_bytes(tail.try_into().unwrap()) as usize
     };
-    let data_end = built.bytes.len() - 12 - original_blob_len;
-    let mut bytes = built.bytes[..data_end].to_vec();
-    bytes.extend_from_slice(&blob);
-    bytes.extend_from_slice(&(blob.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(b"HEF1");
-    bytes
+    let data_end = bytes.len() - 12 - original_blob_len;
+    let mut out = bytes[..data_end].to_vec();
+    out.extend_from_slice(&blob);
+    out.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+    out.extend_from_slice(b"HEF1");
+    out
 }
