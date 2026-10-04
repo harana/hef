@@ -5,10 +5,12 @@
 //! the footer it holds to the manifest seal. Every later read of a marks page, column block, or payload slot fetches
 //! just the stripe range it touches, widened to the outboard proof leaves that cover it, and proves those bytes
 //! against the stripe's authenticated root before serving any of them. A stripe pruning never reaches is never
-//! fetched. Fetched ranges are held for the reader's lifetime, so later reads inside them cost no request.
+//! fetched. Fetched ranges are held for the reader's lifetime, so later reads inside them cost no request, and are
+//! shared with an optional [`BlockCache`] so other readers on the node reuse them.
 //!
 //! See: hef-file-layout/spec.md
 
+use super::cache::{BlockCache, BlockKey, BlockKind};
 use super::constant::HELD_RANGE_BUCKETS;
 use super::footer::{Footer, StripeEntry};
 use super::reader::{DECODED_CACHE_BUDGET_BYTES, HeaderCommitment, HefFile, HefFooter, VerifiedStripeRead};
@@ -31,7 +33,7 @@ pub(super) enum FileBytes {
 }
 
 impl FileBytes {
-    /// The same bytes for a new reader: the shared buffer of a local file, or a remote file's source and
+    /// The same bytes for a new reader: the shared buffer of a local file, or a remote file's source, cache, and
     /// authenticated footer with none of this reader's fetched ranges.
     pub(super) fn fresh(&self) -> Self {
         match self {
@@ -43,6 +45,7 @@ impl FileBytes {
 
 /// A file in remote storage, read a verified range at a time.
 pub(super) struct RemoteFile {
+    cache: Option<Arc<BlockCache>>,
     file_id: u128,
     footer: Arc<HefFooter>,
     held: HeldRanges,
@@ -76,7 +79,8 @@ impl HefFile {
     ///
     /// `header` is the [`HeaderCommitment`] the publisher recorded beside the seal; with it the footer is bound to
     /// `entry.file_seal` without ever reading the front of the object. `footer_dek` opens a sealed footer, as in
-    /// [`Self::open_with_keys`].
+    /// [`Self::open_with_keys`]. Pass a shared `cache` to serve pieces other readers on the node already fetched; a
+    /// cached piece is proven again before use, and one that fails is dropped and fetched afresh.
     ///
     /// Every byte served is first proven against the authenticated stripe root, through the outboard proof tree when
     /// the object carries one and by hashing the whole stripe otherwise. The fixed header block is never read, so
@@ -85,6 +89,7 @@ impl HefFile {
     /// one, because only the front-of-file block records them.
     pub fn open_remote(
         source: Arc<dyn RangeSource>,
+        cache: Option<Arc<BlockCache>>,
         entry: &HefFileEntry,
         header: &HeaderCommitment,
         footer_dek: Option<&[u8; 32]>,
@@ -94,10 +99,11 @@ impl HefFile {
                 rule: "header commitment names a different file than the manifest entry",
             });
         }
-        let (tail_start, tail, opened) = open_tail(source.as_ref(), entry, header, footer_dek)?;
+        let (tail_start, tail, opened) = open_tail(source.as_ref(), cache.as_deref(), entry, header, footer_dek)?;
         let footer = opened.footer().clone();
         let usable_optional_features = opened.usable_optional_features();
         let remote = RemoteFile {
+            cache,
             file_id: entry.file_id,
             held: HeldRanges::new(),
             marks_extents: Arc::new(marks_extents(&footer)),
@@ -119,14 +125,33 @@ impl HefFile {
     }
 }
 
-/// Fetches and authenticates the object's tail. Returns the tail's file offset, its bytes, and the opened footer.
+/// Fetches and authenticates the object's tail, from the cache when it holds a tail that still passes the seal.
+/// Returns the tail's file offset, its bytes, and the opened footer.
 fn open_tail(
     source: &dyn RangeSource,
+    cache: Option<&BlockCache>,
     entry: &HefFileEntry,
     header: &HeaderCommitment,
     footer_dek: Option<&[u8; 32]>,
 ) -> Result<(u64, Arc<[u8]>, HefFooter), FormatError> {
     let range = entry.tail_range();
+    let open =
+        |tail: &[u8]| HefFooter::open_authenticated_tail(tail, entry.size_bytes, &entry.file_seal, header, footer_dek);
+    let key = |offset: u64, len: u64| BlockKey {
+        file_id: entry.file_id,
+        kind: BlockKind::Footer,
+        len,
+        offset,
+        tenant_id: entry.tenant_id,
+    };
+    if let Some(cache) = cache
+        && let Some(tail) = cache.get(&key(range.start, range.len))
+    {
+        match open(&*tail) {
+            Ok(footer) => return Ok((range.start, tail, footer)),
+            Err(_) => cache.remove(&key(range.start, range.len)),
+        }
+    }
     let mut start = range.start;
     let mut tail = fetch_exact(source, entry.file_id, start, range.len)?;
     if !range.exact
@@ -136,8 +161,12 @@ fn open_tail(
         start = entry.size_bytes - exact_len;
         tail = fetch_exact(source, entry.file_id, start, exact_len)?;
     }
-    let footer = HefFooter::open_authenticated_tail(&tail, entry.size_bytes, &entry.file_seal, header, footer_dek)?;
-    Ok((start, tail.into(), footer))
+    let footer = open(&*tail)?;
+    let tail: Arc<[u8]> = tail.into();
+    if let Some(cache) = cache {
+        cache.insert(key(start, tail.len() as u64), Arc::clone(&tail));
+    }
+    Ok((start, tail, footer))
 }
 
 /// Asks `source` for one range and refuses a reply of the wrong length.
@@ -238,6 +267,7 @@ fn remote_header(footer: &Footer, entry: &HefFileEntry, commitment: &HeaderCommi
 impl RemoteFile {
     fn fresh(&self) -> Self {
         Self {
+            cache: self.cache.clone(),
             file_id: self.file_id,
             footer: Arc::clone(&self.footer),
             held: HeldRanges::new(),
@@ -251,7 +281,7 @@ impl RemoteFile {
     }
 
     /// The `len` file bytes at `position`, proven before they are served. Answered from a range this reader already
-    /// fetched when one covers it; otherwise fetches the stripe range around it.
+    /// fetched when one covers it; otherwise fetches the stripe range around it (from the cache or the source).
     pub(super) fn read(&self, position: u64, len: usize, what: &'static str) -> Result<&[u8], FormatError> {
         if len == 0 {
             return Ok(&[]);
@@ -322,18 +352,37 @@ impl RemoteFile {
         })
     }
 
-    /// The bytes `read` plans, fetched from the source and proven against the stripe root; `None` when they do not
-    /// prove.
+    /// The bytes `read` plans, proven against the stripe root: from the cache when it holds a copy that still proves,
+    /// otherwise from the source, admitted to the cache once proven. `None` when the source's bytes do not prove.
     fn fetch_verified(&self, read: &VerifiedStripeRead) -> Result<Option<Arc<[u8]>>, FormatError> {
-        let bytes = fetch_exact(self.source.as_ref(), self.file_id, read.file_offset, read.length)?;
-        if self
-            .footer
-            .verify_stripe_range_in(read, &bytes, read.file_offset)
-            .is_err()
+        let proves = |bytes: &[u8]| {
+            self.footer
+                .verify_stripe_range_in(read, bytes, read.file_offset)
+                .is_ok()
+        };
+        let key = BlockKey {
+            file_id: self.file_id,
+            kind: BlockKind::Stripe,
+            len: read.length,
+            offset: read.file_offset,
+            tenant_id: self.tenant_id,
+        };
+        if let Some(cache) = &self.cache
+            && let Some(bytes) = cache.get(&key)
         {
+            if proves(&*bytes) {
+                return Ok(Some(bytes));
+            }
+            cache.remove(&key);
+        }
+        let bytes: Arc<[u8]> = fetch_exact(self.source.as_ref(), self.file_id, read.file_offset, read.length)?.into();
+        if !proves(&*bytes) {
             return Ok(None);
         }
-        Ok(Some(bytes.into()))
+        if let Some(cache) = &self.cache {
+            cache.insert(key, Arc::clone(&bytes));
+        }
+        Ok(Some(bytes))
     }
 }
 

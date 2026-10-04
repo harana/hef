@@ -12,6 +12,7 @@ use constant::HEF_MAGIC;
 use std::borrow::Cow;
 use uuid::Uuid;
 
+pub mod cache;
 pub mod clustering;
 pub mod constant;
 pub mod footer;

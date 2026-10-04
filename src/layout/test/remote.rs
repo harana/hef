@@ -4,12 +4,13 @@ use crate::columns::{FreetextDeclaration, PromotionPlan, column_ids};
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, SequenceRange, StreamId, TimestampValue};
 use crate::file::constant::CHUNK_GROUP_BYTES;
+use crate::layout::cache::CacheStore;
 use crate::layout::reader::PayloadRead;
 use crate::layout::{HEADER_BLOCK_LEN, LayoutTargets, required_features};
 use crate::lifecycle::{FileType, PartState};
 use crate::typed_id::TypedIdTestExt;
 use crate::writer::build::{BuildLifecycle, BuiltHef, HefBuildConfig, HefRow, build_hef_file};
-use std::collections::BTreeMap as StdBTreeMap;
+use std::collections::{BTreeMap as StdBTreeMap, HashMap as StdHashMap};
 use std::sync::Mutex;
 
 const TENANT: u128 = 3;
@@ -41,6 +42,28 @@ impl RangeSource for CountingSource {
             .get(offset as usize..end as usize)
             .map(<[u8]>::to_vec)
             .ok_or(FileError::OutOfBounds)
+    }
+}
+
+/// An application-backed disk tier held in memory, so a test can read and corrupt what the cache stored.
+#[derive(Default)]
+struct DiskDouble {
+    entries: Mutex<StdHashMap<BlockKey, Vec<u8>>>,
+}
+
+impl CacheStore for DiskDouble {
+    fn get(&self, key: &BlockKey) -> Result<Option<Vec<u8>>, FileError> {
+        Ok(self.entries.lock().unwrap().get(key).cloned())
+    }
+
+    fn put(&self, key: &BlockKey, bytes: &[u8]) -> Result<(), FileError> {
+        self.entries.lock().unwrap().insert(*key, bytes.to_vec());
+        Ok(())
+    }
+
+    fn remove(&self, key: &BlockKey) -> Result<(), FileError> {
+        self.entries.lock().unwrap().remove(key);
+        Ok(())
     }
 }
 
@@ -190,10 +213,15 @@ fn entry(built: &BuiltHef) -> HefFileEntry {
     }
 }
 
-fn open(source: &Arc<CountingSource>, built: &BuiltHef, footer_dek: Option<&[u8; 32]>) -> HefFile {
+fn open(
+    source: &Arc<CountingSource>,
+    cache: Option<&Arc<BlockCache>>,
+    built: &BuiltHef,
+    footer_dek: Option<&[u8; 32]>,
+) -> HefFile {
     let source: Arc<dyn RangeSource> = source.clone();
     let header = HeaderCommitment::from_header_block(&built.bytes[..HEADER_BLOCK_LEN]).unwrap();
-    HefFile::open_remote(source, &entry(built), &header, footer_dek).unwrap()
+    HefFile::open_remote(source, cache.cloned(), &entry(built), &header, footer_dek).unwrap()
 }
 
 fn local(built: &BuiltHef, footer_dek: Option<&[u8; 32]>) -> HefFile {
@@ -210,7 +238,7 @@ fn intersects((offset, len): (u64, u64), start: u64, end: u64) -> bool {
 fn a_cold_point_read_costs_at_most_two_requests_once_the_footer_length_is_known() {
     let built = large_file();
     let source = CountingSource::new(&built.bytes);
-    let file = open(&source, &built, None);
+    let file = open(&source, None, &built, None);
     assert_eq!(source.requests().len(), 1, "an exact tail open is a single request");
 
     let granule = built.footer.granules[0].granule_id;
@@ -234,7 +262,7 @@ fn a_cold_point_read_costs_at_most_two_requests_once_the_footer_length_is_known(
 fn a_pruned_stripe_is_never_fetched() {
     let built = multi_stripe_file(None);
     let source = CountingSource::new(&built.bytes);
-    let file = open(&source, &built, None);
+    let file = open(&source, None, &built, None);
     let surviving = built.footer.granules[0];
     file.read_column(column_ids::SEQUENCE, surviving.granule_id).unwrap();
 
@@ -277,7 +305,7 @@ fn a_cold_single_row_payload_read_fetches_only_that_rows_residual_slot() {
     let residual_end = residual_start + payload.residual_len;
 
     let source = CountingSource::new(&built.bytes);
-    let file = open(&source, &built, None);
+    let file = open(&source, None, &built, None);
     let read = file.payload(1).unwrap();
     assert!(matches!(read, PayloadRead::Value(_)));
     assert_eq!(read, local(&built, None).payload(1).unwrap());
@@ -290,12 +318,132 @@ fn a_cold_single_row_payload_read_fetches_only_that_rows_residual_slot() {
     );
 }
 
+/// A second reader of the same file sharing the cache opens and reads with no request at all.
+#[test]
+fn a_second_open_through_a_shared_cache_issues_no_requests() {
+    let built = large_file();
+    let source = CountingSource::new(&built.bytes);
+    let cache = Arc::new(BlockCache::new(64 << 20, None));
+    let granule = built.footer.granules[0].granule_id;
+
+    let first = open(&source, Some(&cache), &built, None);
+    let first_column = first.read_column(column_ids::SEQUENCE, granule).unwrap();
+    let first_payload = first.payload(1).unwrap();
+    let after_first = source.requests().len();
+
+    let second = open(&source, Some(&cache), &built, None);
+    let second_column = second.read_column(column_ids::SEQUENCE, granule).unwrap();
+    assert_eq!(second.payload(1).unwrap(), first_payload);
+    assert_eq!(second_column.data, first_column.data);
+    assert_eq!(
+        source.requests().len(),
+        after_first,
+        "the second open was served from the cache"
+    );
+}
+
+/// A cached piece that no longer proves (here a flipped byte on the disk tier) is dropped, fetched again from the
+/// source, and replaced; the read still returns the right answer.
+#[test]
+fn a_corrupted_cached_piece_is_rejected_and_fetched_again() {
+    let built = multi_stripe_file(None);
+    let source = CountingSource::new(&built.bytes);
+    let disk = Arc::new(DiskDouble::default());
+    // A zero memory budget keeps every piece on the disk tier, where the test can reach it.
+    let cache = Arc::new(BlockCache::new(0, Some(disk.clone())));
+    let granule = built.footer.granules[0].granule_id;
+
+    let expected = open(&source, Some(&cache), &built, None)
+        .read_column(column_ids::SEQUENCE, granule)
+        .unwrap();
+    let kinds: Vec<BlockKind> = disk.entries.lock().unwrap().keys().map(|key| key.kind).collect();
+    assert!(kinds.contains(&BlockKind::Footer) && kinds.contains(&BlockKind::Stripe));
+    for bytes in disk.entries.lock().unwrap().values_mut() {
+        bytes[0] ^= 0xFF;
+    }
+    let before = source.requests().len();
+
+    let read = open(&source, Some(&cache), &built, None)
+        .read_column(column_ids::SEQUENCE, granule)
+        .unwrap();
+    assert_eq!(read.data, expected.data);
+    assert!(
+        source.requests().len() >= before + 2,
+        "both the tail and the stripe piece were fetched again"
+    );
+    for (key, bytes) in disk.entries.lock().unwrap().iter() {
+        assert_eq!(
+            bytes.as_slice(),
+            &built.bytes[key.offset as usize..][..key.len as usize],
+            "the corrupt copy was replaced by the stored bytes"
+        );
+    }
+}
+
+/// Reads through a cache too small to hold the file return exactly what the in-memory reader returns, and the cache
+/// stays within its budget.
+#[test]
+fn eviction_never_changes_results() {
+    let built = multi_stripe_file(None);
+    let source = CountingSource::new(&built.bytes);
+    let budget = 4096;
+    let cache = Arc::new(BlockCache::new(budget, None));
+    let expected = local(&built, None);
+
+    for _ in 0..2 {
+        let file = open(&source, Some(&cache), &built, None);
+        for granule in &built.footer.granules {
+            assert_eq!(
+                file.read_column(column_ids::SEQUENCE, granule.granule_id).unwrap().data,
+                expected
+                    .read_column(column_ids::SEQUENCE, granule.granule_id)
+                    .unwrap()
+                    .data
+            );
+        }
+        for row in 0..built.footer.exact_counts.row_count {
+            assert_eq!(file.payload(row).unwrap(), expected.payload(row).unwrap(), "row {row}");
+        }
+        assert!(cache.memory_bytes() <= budget);
+    }
+}
+
+/// A file whose footer is sealed opens remotely with its key, and the cache only ever holds the object's stored
+/// bytes: the sealed footer stays ciphertext there.
+#[test]
+fn a_sealed_footer_is_cached_only_in_its_stored_form() {
+    let dek = [7u8; 32];
+    let built = multi_stripe_file(Some(dek));
+    let source = CountingSource::new(&built.bytes);
+    let disk = Arc::new(DiskDouble::default());
+    let cache = Arc::new(BlockCache::new(1 << 20, Some(disk.clone())));
+
+    let file = open(&source, Some(&cache), &built, Some(&dek));
+    assert_eq!(file.payload(0).unwrap(), local(&built, Some(&dek)).payload(0).unwrap());
+
+    let plaintext_footer = crate::layout::footer::encode_footer(&built.footer);
+    let entries = disk.entries.lock().unwrap();
+    assert!(entries.keys().any(|key| key.kind == BlockKind::Footer));
+    for (key, bytes) in entries.iter() {
+        assert_eq!(
+            bytes.as_slice(),
+            &built.bytes[key.offset as usize..][..key.len as usize]
+        );
+        assert!(
+            !bytes
+                .windows(plaintext_footer.len().min(64))
+                .any(|window| window == &plaintext_footer[..plaintext_footer.len().min(64)]),
+            "no plaintext footer bytes may reach the cache"
+        );
+    }
+}
+
 /// A fresh reader made from a remote one reads the same values without the first reader's fetched ranges.
 #[test]
 fn a_fresh_reader_of_a_remote_file_reads_the_same_values() {
     let built = multi_stripe_file(None);
     let source = CountingSource::new(&built.bytes);
-    let file = open(&source, &built, None);
+    let file = open(&source, None, &built, None);
     let first = file.payload(5).unwrap();
     let fresh = file.fresh_reader().unwrap();
     assert_eq!(fresh.payload(5).unwrap(), first);
