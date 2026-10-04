@@ -706,7 +706,6 @@ dependencies = [
  "miniz_oxide",
  "multiversion",
  "rayon",
- "rustix",
  "serde",
  "serde_json",
  "sha2",
