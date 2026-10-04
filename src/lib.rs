@@ -13,7 +13,8 @@
 //! Module layout follows `conformance/capability-map.toml`: one module per `hef-*` capability. The storage core
 //! implements `events`, `invariants`, `columns`, `encoding`, `layout`, `artifacts`, `writer`, `lifecycle`, and
 //! `compat`; `indexes` adds the query metadata and skip-index structures; `introspection` exposes public-safe system
-//! tables; `file` is the shared byte codec, integrity checks, and block interface everything above sits on.
+//! tables; `cache` keeps recently read file bytes in RAM and on local NVMe; `file` is the shared byte codec, integrity
+//! checks, and block interface everything above sits on.
 //!
 //! Reading these files back as a query (planning, columnar Arrow execution, and the SQL frontend) is **not** here: that
 //! is the query engine of the application that embeds HEF. Durable homes for keys, objects, and jobs (a relational
@@ -23,6 +24,7 @@
 
 pub mod artifacts;
 pub mod benchmarks;
+pub mod cache;
 pub mod clock;
 pub mod columns;
 pub mod compat;
