@@ -14,6 +14,8 @@ use uuid::Uuid;
 
 pub mod clustering;
 pub mod constant;
+pub mod entity_scan;
+pub mod event;
 pub mod footer;
 pub mod mirror;
 pub mod reader;

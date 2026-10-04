@@ -9,6 +9,10 @@
 [scenarios]
 "hef-apis/bulk-egress-reader-path/migration-re-extraction-uses-bulk-egress" = { status = "covered", test = "conformance::hef_apis::bulk_egress_reader_path::migration_re_extraction_uses_bulk_egress", evidence = "model" }
 "hef-apis/context-evidence-and-introspection-apis-stay-public-safe/system-table-withholds-secrets" = { status = "covered", test = "conformance::hef_apis::context_evidence_and_introspection_apis_stay_public_safe::system_table_withholds_secrets", evidence = "model" }
+"hef-apis/entity-event-scan/backwards-scan-with-a-limit" = { status = "unimplemented" }
+"hef-apis/entity-event-scan/deleted-row-skipped" = { status = "unimplemented" }
+"hef-apis/entity-event-scan/replacement-correction-returned-instead-of-the-original" = { status = "unimplemented" }
+"hef-apis/entity-event-scan/scan-spans-files-and-overlay" = { status = "unimplemented" }
 "hef-apis/zero-copy-string-column-scans/uncovered-blocks-fall-back-identically" = { status = "covered", test = "conformance::hef_apis::zero_copy_string_column_scans::uncovered_blocks_fall_back_identically", evidence = "model" }
 "hef-apis/zero-copy-string-column-scans/view-read-matches-the-materializing-read" = { status = "covered", test = "conformance::hef_apis::zero_copy_string_column_scans::view_read_matches_the_materializing_read", evidence = "model" }
 "hef-benchmarks-and-acceptance-gates/accelerator-enablement-gates/accelerator-falls-back-on-failed-parity" = { status = "covered", test = "conformance::hef_benchmarks_and_acceptance_gates::accelerator_falls_back_on_failed_parity::accelerator_falls_back_on_failed_parity", evidence = "model" }
