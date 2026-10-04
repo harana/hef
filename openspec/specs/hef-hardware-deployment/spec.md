@@ -57,6 +57,20 @@ Journal and local-cache write amplification MAY be reduced with device-level dat
 ### Requirement: Rebuildable hybrid local HEF cache
 The local HEF granule/footer cache SHALL be a foyer-style hybrid cache (in-memory tier plus local NVMe disk tier) keyed by `(file_id, block kind, block range)`. It SHALL be rebuildable acceleration state with object storage plus the manifest authoritative; cached blocks SHALL be verified by their HEF block checksums on admission; tenant isolation and data-class labels SHALL apply to cache keys and eviction; and single-subject encrypted blocks SHALL be cached only in encrypted form so crypto-shredding remains effective. The disk tier MAY use FDP placement, but placement SHALL NOT be required. An operator MAY additionally place the disk tier's filesystem — or any node-local cache-tier volume — on an operator-managed persistent block cache underneath it (a device-mapper target such as dm-pcache, Linux 6.18+). That substrate is deployment infrastructure, not an in-process accelerator: the platform SHALL NOT probe for it, configure it, or behave differently because of it, and the cache contract SHALL be identical with or without it — the cache remains rebuildable acceleration state with object storage plus the manifest authoritative, and admission verification, tenant isolation, data-class labels, encrypted-form caching, and eviction are unchanged. A lost, degraded, or removed substrate SHALL lose nothing that cannot be rebuilt from object storage plus the manifest.
 
+The cache SHALL sit between a remote reader's range source and the decoder and SHALL be keyed by `(tenant, file_id, block kind, offset, length)`, where block kind distinguishes a file's tail (footer region plus proof appendix) from a proof-aligned stripe range. A piece SHALL be admitted only after it is proven (a tail against the manifest seal, a stripe range against its authenticated stripe root), SHALL be proven again every time it is served from either tier, and a piece that fails SHALL be dropped from both tiers and fetched again from object storage. The cache SHALL hold only the object's stored bytes, never a decrypted form. The memory tier SHALL be byte-budgeted with least-recently-used eviction; the disk tier SHALL be an interface the deploying application backs, and a disk-tier failure SHALL be a cache miss, never a read failure. When a node loads a generation's footer mirror, it SHALL seed the cache with every mirrored tail first, so opening those files issues no tail request of their own.
+
+#### Scenario: Second open is served from the cache
+- **WHEN** a second reader on the node opens and reads a file another reader already read through the same cache
+- **THEN** it issues no range request to object storage and returns the same results
+
+#### Scenario: Corrupted cached piece is rejected and refetched
+- **WHEN** a cached tail or stripe range no longer proves against the seal or its stripe root
+- **THEN** the reader drops it from both tiers, fetches it again from object storage, serves the proven bytes, and re-admits them
+
+#### Scenario: Eviction never changes results
+- **WHEN** reads run through a cache whose memory budget is smaller than the file
+- **THEN** every result equals the in-memory reader's and the memory tier stays within its budget
+
 #### Scenario: Encrypted block stays encrypted in cache
 - **WHEN** a single-subject encrypted block is admitted to the local HEF cache
 - **THEN** it is cached only in encrypted form so destroying the subject's content key still renders it unrecoverable

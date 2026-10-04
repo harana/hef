@@ -28,6 +28,10 @@ pub enum FormatError {
     Structural { rule: &'static str },
     #[error("truncated input while reading {what}")]
     Truncated { what: &'static str },
+    /// The bytes never arrived: the remote source a file is read through failed to return a range. Not a verdict on
+    /// the file itself, so a retry may succeed.
+    #[error("file bytes unavailable: {detail}")]
+    Unavailable { detail: String },
     #[error("unknown required feature flags {bits:#x}: refusing")]
     UnknownRequiredFeature { bits: u64 },
     #[error("unsupported version {found} in {field}")]
@@ -59,18 +63,28 @@ pub enum IntrospectionError {
 /// event's authorship cannot be proven, so it must not be written and must not be presented as authentic.
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum ProvenanceError {
+    #[error("recomputed content hash does not match the hash the event carries")]
+    ContentHashMismatch,
     #[error("recomputed protocol event id does not match the stored one")]
     EventIdMismatch,
+    #[error("stored event cannot be rebuilt into the protocol's canonical form: {rule}")]
+    MalformedEvent { rule: &'static str },
     #[error("hex field is not lowercase hex of the expected length")]
     MalformedHex,
     #[error("author public key is not a valid signing key")]
     MalformedKey,
     #[error("signature bytes are not a valid signature")]
     MalformedSignature,
+    #[error("stored signer signature is not `<scheme> <signer> <key id> <key hex> <signature hex>`")]
+    MalformedSignerSignature,
+    #[error("a multi-signer event must carry at least one signature")]
+    NoSignatures,
     #[error("payload does not carry `{field}` in the shape the protocol serializes")]
     PayloadShape { field: &'static str },
     #[error("signature does not verify against the author public key")]
     SignatureRejected,
+    #[error("protocol version is not one this engine can re-verify")]
+    UnknownProtocolVersion,
 }
 
 /// Why a declared event relationship was refused before storage. Only the declaration's own shape is checked — its
@@ -88,6 +102,16 @@ pub enum RelationshipError {
     UnknownSpace,
     #[error("target length does not match its identifier space")]
     WrongTargetLength,
+}
+
+/// Why the cross-file external-id index could not record a file or answer a lookup: either the file's stored ids
+/// could not be read, or the durable store behind the index failed.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum ExternalIdIndexError {
+    #[error("reading a file's external ids failed: {0}")]
+    Format(#[from] FormatError),
+    #[error("external-id store failed: {0}")]
+    Storage(#[from] StorageError),
 }
 
 /// A storage-interface failure (I/O error, injected fault, crash point). Distinct from `FormatError`: bytes that
@@ -141,4 +165,35 @@ pub enum PublishError {
     UnknownGeneration,
     #[error("publish verification failed: {rule}")]
     VerificationFailed { rule: &'static str },
+}
+
+/// Why a data subject's payload could not be sealed or opened. An erased subject is not an error on read: its payload
+/// reads back as a tombstone.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum SubjectPayloadError {
+    #[error(transparent)]
+    Format(FormatError),
+    /// The application's subject key store failed to answer.
+    #[error(transparent)]
+    KeyStore(StorageError),
+    /// The subject's sealing key has spent the epoch range it was checked out with; check out a fresh one and retry.
+    #[error("the subject's sealing key has no epochs left in its reserved range")]
+    SealRefused,
+    /// The subject's key has been destroyed, so no new payload is ever written for an erased subject.
+    #[error("the subject has been erased; refusing to seal a new payload for it")]
+    SubjectErased,
+}
+
+/// Why reading one entity's events back failed: a stored file or overlay batch was malformed, the application's store
+/// of deletes and corrections could not answer, or a correction names an event the scan was not given.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum EntityScanError {
+    /// The correcting event lives in none of the files or overlay segments the scan was handed, so neither the
+    /// superseded event nor its correction can be served.
+    #[error("correcting event at epoch {epoch} sequence {sequence} is in none of the scanned files or the overlay")]
+    CorrectionNotFound { epoch: u64, sequence: u64 },
+    #[error(transparent)]
+    Format(#[from] FormatError),
+    #[error("deletes and corrections store failed: {detail}")]
+    Store { detail: String },
 }

@@ -123,6 +123,7 @@ fn covering_manifest(segment: &LiveOverlaySegment) -> ManifestGeneration {
         footer_mirror: None,
         generation: 1,
         index_artifacts: Vec::new(),
+        retirements: Vec::new(),
     }
 }
 

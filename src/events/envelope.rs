@@ -79,7 +79,7 @@ impl PartialOrd for SequencePoint {
 }
 
 /// A contiguous internal sequence range within one epoch (inclusive).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SequenceRange {
     pub epoch: u64,
     pub first_sequence: u64,

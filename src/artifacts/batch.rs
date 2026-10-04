@@ -38,6 +38,9 @@ pub const BATCH_FLAG_RELATIONSHIPS: u32 = 2;
 /// Stored code for the BIP-340 Schnorr scheme in a provenance record.
 const SCHEME_CODE_BIP340: u32 = 1;
 
+/// Stored code for the Ed25519 scheme in a provenance record.
+const SCHEME_CODE_ED25519: u32 = 2;
+
 /// Byte width of one stored offset entry in a string table or the variant dictionary's key table: each offset is a
 /// plain `u32`.
 const OFFSET_ENTRY_LEN: usize = 4;
@@ -58,12 +61,14 @@ const SIGNATURE_LEN: usize = 64;
 fn scheme_code(scheme: SignatureScheme) -> u32 {
     match scheme {
         SignatureScheme::Bip340SchnorrSecp256k1 => SCHEME_CODE_BIP340,
+        SignatureScheme::Ed25519 => SCHEME_CODE_ED25519,
     }
 }
 
 fn scheme_from_code(code: u32) -> Result<SignatureScheme, FormatError> {
     match code {
         SCHEME_CODE_BIP340 => Ok(SignatureScheme::Bip340SchnorrSecp256k1),
+        SCHEME_CODE_ED25519 => Ok(SignatureScheme::Ed25519),
         _ => Err(FormatError::Structural {
             rule: "unknown signature scheme code in a provenance record",
         }),
@@ -72,8 +77,10 @@ fn scheme_from_code(code: u32) -> Result<SignatureScheme, FormatError> {
 
 fn relationship_kind_code(kind: RelationshipKind) -> u32 {
     match kind {
+        RelationshipKind::Auth => 5,
         RelationshipKind::Link => 1,
         RelationshipKind::Parent => 2,
+        RelationshipKind::Prev => 6,
         RelationshipKind::Related => 3,
         RelationshipKind::Root => 4,
     }
@@ -85,6 +92,8 @@ fn relationship_kind_from_code(code: u32) -> Result<RelationshipKind, FormatErro
         2 => Ok(RelationshipKind::Parent),
         3 => Ok(RelationshipKind::Related),
         4 => Ok(RelationshipKind::Root),
+        5 => Ok(RelationshipKind::Auth),
+        6 => Ok(RelationshipKind::Prev),
         _ => Err(FormatError::Structural {
             rule: "unknown relationship kind code in a relationship record",
         }),
@@ -94,6 +103,7 @@ fn relationship_kind_from_code(code: u32) -> Result<RelationshipKind, FormatErro
 fn target_space_code(space: TargetIdSpace) -> u32 {
     match space {
         TargetIdSpace::EventId => 1,
+        TargetIdSpace::ExternalId => 3,
         TargetIdSpace::ProtocolEventId => 2,
     }
 }
@@ -102,6 +112,7 @@ fn target_space_from_code(code: u32) -> Result<TargetIdSpace, FormatError> {
     match code {
         1 => Ok(TargetIdSpace::EventId),
         2 => Ok(TargetIdSpace::ProtocolEventId),
+        3 => Ok(TargetIdSpace::ExternalId),
         _ => Err(FormatError::Structural {
             rule: "unknown target identifier space code in a relationship record",
         }),
@@ -496,6 +507,10 @@ pub fn build_batch(
                 for reference in relationships.refs() {
                     relationship_table.put_u32(relationship_kind_code(reference.kind));
                     relationship_table.put_u32(target_space_code(reference.space));
+                    // A variable-length space records its target's length ahead of the bytes.
+                    if reference.space.fixed_len().is_none() {
+                        relationship_table.put_u32(reference.target_ref.len() as u32);
+                    }
                     relationship_table.put_slice(&reference.target_ref);
                 }
             }
@@ -1185,7 +1200,11 @@ fn decode_relationships(
     for _ in 0..ref_count {
         let kind = relationship_kind_from_code(reader.u32("relationship kind")?)?;
         let space = target_space_from_code(reader.u32("relationship target space")?)?;
-        let target_ref = reader.take(space.target_len(), "relationship target")?.to_vec();
+        let target_len = match space.fixed_len() {
+            Some(len) => len,
+            None => reader.u32("relationship target length")? as usize,
+        };
+        let target_ref = reader.take(target_len, "relationship target")?.to_vec();
         refs.push(
             RelationshipRef::new(kind, space, target_ref).map_err(|_| FormatError::Structural {
                 rule: "relationship target length must match its identifier space",

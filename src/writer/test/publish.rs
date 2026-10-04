@@ -1,7 +1,7 @@
 use super::super::build::BuildLifecycle;
 use super::super::pipeline::{FlushReason, RouteDependency, WorkerCommitPipeline};
 use super::super::reserve::SequenceAllocator;
-use super::super::retry::SafeRetryStore;
+use super::super::sim::SimSafeRetryStore;
 use super::*;
 use crate::artifacts::batch::{EventInput, PayloadInput};
 use crate::artifacts::overlay::LiveOverlayStore;
@@ -12,6 +12,7 @@ use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TenantId, Time
 use crate::invariants::sim::{SerialEncodeExecutor, SimClock, SimJournalStorage, SimulatedPublishedSet};
 use crate::layout::LayoutTargets;
 use crate::layout::reader::HefFile;
+use crate::object_store::sim::{ObjectFault, SimObjectStore};
 use crate::typed_id::TypedIdTestExt;
 
 fn event(i: u64) -> EventInput {
@@ -70,7 +71,8 @@ fn build_config() -> HefBuildConfig {
 struct World {
     allocator: SequenceAllocator,
     clock: SimClock,
-    retry: SafeRetryStore,
+    overlay: LiveOverlayStore,
+    retry: SimSafeRetryStore,
     storage: SimJournalStorage,
     watermarks: WatermarkTracker,
     worker: WorkerCommitPipeline,
@@ -81,7 +83,8 @@ fn ingest(count: u64) -> (World, SequenceRange) {
     let mut storage = SimJournalStorage::new();
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = WorkerCommitPipeline::new(
         1,
         ShardId(0),
@@ -90,7 +93,7 @@ fn ingest(count: u64) -> (World, SequenceRange) {
         1 << 20,
     );
     for i in 0..count {
-        worker.submit(event(i), 1, &clock).unwrap();
+        worker.submit(event(i), 1, &mut retry, &clock).unwrap();
     }
     let result = worker
         .flush(
@@ -99,6 +102,7 @@ fn ingest(count: u64) -> (World, SequenceRange) {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap();
@@ -109,6 +113,7 @@ fn ingest(count: u64) -> (World, SequenceRange) {
             storage,
             allocator,
             watermarks,
+            overlay,
             retry,
             worker,
         },
@@ -133,6 +138,7 @@ fn publish_boundary_end_to_end() {
             range,
             &build_config(),
             &mut published_set,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -200,6 +206,7 @@ fn republish_same_range_is_idempotent_with_an_encrypted_footer() {
             range,
             &config,
             published_set,
+            &SimObjectStore::new(),
             observer,
             notices,
             &world.clock,
@@ -234,6 +241,7 @@ fn republish_same_range_is_idempotent() {
             range,
             &config,
             &mut published_set,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -250,6 +258,7 @@ fn republish_same_range_is_idempotent() {
             range,
             &config,
             &mut published_set,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -287,6 +296,7 @@ fn republish_with_changed_build_config_conflicts_instead_of_pairing_mismatched_b
             range,
             &first_config,
             &mut published_set,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -305,6 +315,7 @@ fn republish_with_changed_build_config_conflicts_instead_of_pairing_mismatched_b
         range,
         &second_config,
         &mut published_set,
+        &SimObjectStore::new(),
         &mut observer,
         &mut notices,
         &world.clock,
@@ -370,6 +381,7 @@ fn a_covering_entry_of_another_tenant_or_a_retired_entry_does_not_short_circuit(
             range,
             &build_config(),
             &mut published_set,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -455,6 +467,7 @@ fn lost_cas_rebases_and_retries_never_overwrites() {
             range,
             &build_config(),
             &mut racing,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -488,6 +501,7 @@ fn failed_publish_leaks_nothing() {
             range,
             &build_config(),
             &mut published_set,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -555,10 +569,14 @@ fn publish_skips_voids_but_requires_contiguity() {
             &mut world.allocator,
             &mut world.storage,
             &mut world.watermarks,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();
-    world.worker.submit(event(10), 1, &world.clock).unwrap();
+    world
+        .worker
+        .submit(event(10), 1, &mut world.retry, &world.clock)
+        .unwrap();
     let tail = world
         .worker
         .flush(
@@ -567,6 +585,7 @@ fn publish_skips_voids_but_requires_contiguity() {
             &mut world.storage,
             &mut world.watermarks,
             &mut world.retry,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();
@@ -590,6 +609,7 @@ fn publish_skips_voids_but_requires_contiguity() {
             full,
             &build_config(),
             &mut published_set,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -619,6 +639,7 @@ fn retention_advances_over_a_range_that_holds_only_voids() {
             &mut world.allocator,
             &mut world.storage,
             &mut world.watermarks,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();
@@ -638,6 +659,7 @@ fn retention_advances_over_a_range_that_holds_only_voids() {
             void_range,
             &build_config(),
             &mut published_set,
+            &SimObjectStore::new(),
             &mut RecordingObserver::default(),
             &mut NoopPeerNotices::default(),
             &world.clock,
@@ -737,6 +759,7 @@ fn publish_rejects_replayed_chain_that_does_not_match_recorded_anchor() {
             range,
             &build_config(),
             &mut published_set,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -762,6 +785,7 @@ fn publish_rejects_replayed_chain_that_does_not_match_recorded_anchor() {
         range,
         &build_config(),
         &mut published_set,
+        &SimObjectStore::new(),
         &mut observer,
         &mut notices,
         &world.clock,
@@ -818,6 +842,7 @@ fn publish_is_not_short_circuited_by_another_tenants_covering_entry() {
             range,
             &build_config(),
             &mut published_set,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -887,6 +912,7 @@ fn interrupted_publish_with_changed_content_is_refused_not_adopted() {
         range,
         &build_config(),
         &mut published_set,
+        &SimObjectStore::new(),
         &mut observer,
         &mut notices,
         &world.clock,
@@ -923,6 +949,7 @@ fn interrupted_publish_of_identical_content_completes_by_advancing_the_head() {
             range,
             &config,
             &mut scratch,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -950,6 +977,7 @@ fn interrupted_publish_of_identical_content_completes_by_advancing_the_head() {
             range,
             &config,
             &mut published_set,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -987,6 +1015,7 @@ fn a_collided_generation_holding_only_a_retired_entry_is_not_adopted() {
             range,
             &config,
             &mut scratch,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -1018,6 +1047,7 @@ fn a_collided_generation_holding_only_a_retired_entry_is_not_adopted() {
             range,
             &config,
             &mut published_set,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -1067,6 +1097,7 @@ fn orphaned_generation_for_another_range_does_not_wedge_the_publish() {
             range,
             &build_config(),
             &mut published_set,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -1147,6 +1178,7 @@ fn a_winning_generation_the_head_was_advanced_over_is_completed_not_rolled_back(
             range,
             &build_config(),
             &mut stolen,
+            &SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,
@@ -1273,6 +1305,7 @@ fn publish_frames(frames: &[Vec<u8>], range: SequenceRange) -> Result<Published,
         range,
         &build_config(),
         &mut SimulatedPublishedSet::new(),
+        &SimObjectStore::new(),
         &mut RecordingObserver::default(),
         &mut NoopPeerNotices::default(),
         &clock,
@@ -1315,4 +1348,137 @@ fn another_tenants_overlapping_frame_neither_blocks_publication_nor_joins_its_co
         publish_frames(&[frame_for(42, 1, 3)], range),
         Err(PublishFailure::RangeNotDurable)
     ));
+}
+
+#[test]
+fn a_failed_upload_never_reaches_put_generation() {
+    let (world, range) = ingest(4);
+    let mut publisher = HefPublisher::new();
+    let mut published_set = SimulatedPublishedSet::new();
+    let objects = SimObjectStore::new();
+    objects.inject(ObjectFault::FailPutIfAbsent);
+    let mut observer = RecordingObserver::default();
+    let mut notices = NoopPeerNotices::default();
+
+    let result = publisher.publish_range(
+        &world.storage,
+        ShardId(0),
+        1,
+        1,
+        None,
+        range,
+        &build_config(),
+        &mut published_set,
+        &objects,
+        &mut observer,
+        &mut notices,
+        &world.clock,
+        &SerialEncodeExecutor,
+    );
+
+    assert!(matches!(result, Err(PublishFailure::Storage(_))));
+    assert_eq!(
+        published_set.generation(1),
+        Err(PublishError::UnknownGeneration),
+        "no generation was written"
+    );
+    assert_eq!(published_set.head().unwrap().0, 0);
+    assert_eq!(observer.rolled_back, vec![1]);
+    assert!(notices.published.is_empty());
+    assert!(objects.keys().is_empty());
+}
+
+#[test]
+fn a_published_file_is_uploaded_under_its_object_key() {
+    let (world, range) = ingest(4);
+    let mut publisher = HefPublisher::new();
+    let mut published_set = SimulatedPublishedSet::new();
+    let objects = SimObjectStore::new();
+    let published = publisher
+        .publish_range(
+            &world.storage,
+            ShardId(0),
+            1,
+            1,
+            None,
+            range,
+            &build_config(),
+            &mut published_set,
+            &objects,
+            &mut RecordingObserver::default(),
+            &mut NoopPeerNotices::default(),
+            &world.clock,
+            &SerialEncodeExecutor,
+        )
+        .unwrap();
+
+    let key = hef_object_key(TenantId::new_test_id(9), published.entry.file_id);
+    assert_eq!(objects.object(&key).unwrap(), published.file_bytes);
+}
+
+/// A `PublishedSet` where a rival publishes a different file over the same range between the caller's head read and
+/// its own generation write, so the caller loses after it has already uploaded.
+struct RivalCoversSet {
+    inner: SimulatedPublishedSet,
+    rival: Option<ManifestGeneration>,
+}
+
+impl PublishedSet for RivalCoversSet {
+    fn head(&self) -> Result<(u64, ManifestGeneration), PublishError> {
+        self.inner.head()
+    }
+    fn put_generation(&mut self, generation: ManifestGeneration) -> Result<(), PublishError> {
+        if let Some(rival) = self.rival.take() {
+            let rival_id = rival.generation;
+            self.inner.put_generation(rival)?;
+            self.inner.advance_head(rival_id - 1, rival_id)?;
+        }
+        self.inner.put_generation(generation)
+    }
+    fn advance_head(&mut self, expected: u64, next: u64) -> Result<(), PublishError> {
+        self.inner.advance_head(expected, next)
+    }
+    fn generation(&self, id: u64) -> Result<ManifestGeneration, PublishError> {
+        self.inner.generation(id)
+    }
+}
+
+#[test]
+fn a_lost_race_after_upload_leaves_the_object_unreferenced() {
+    let (world, range) = ingest(4);
+    let tenant = TenantId::new_test_id(9);
+    let mut publisher = HefPublisher::new();
+    let mut racing = RivalCoversSet {
+        inner: SimulatedPublishedSet::new(),
+        rival: Some(manifest_covering(range, tenant)),
+    };
+    let objects = SimObjectStore::new();
+    let mut observer = RecordingObserver::default();
+    let mut notices = NoopPeerNotices::default();
+
+    let result = publisher.publish_range(
+        &world.storage,
+        ShardId(0),
+        1,
+        1,
+        None,
+        range,
+        &build_config(),
+        &mut racing,
+        &objects,
+        &mut observer,
+        &mut notices,
+        &world.clock,
+        &SerialEncodeExecutor,
+    );
+
+    assert!(matches!(result, Err(PublishFailure::Verification(_))));
+    // The upload happened and is left in place; the catalogue only names the rival's file.
+    let keys = objects.keys();
+    assert_eq!(keys.len(), 1, "the uploaded object is kept, not deleted");
+    let (_, head) = racing.inner.head().unwrap();
+    assert_eq!(head.files.len(), 1);
+    assert_ne!(keys[0], hef_object_key(tenant, head.files[0].file_id));
+    assert_eq!(observer.rolled_back, vec![1]);
+    assert!(notices.published.is_empty());
 }

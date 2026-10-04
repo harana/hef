@@ -5,6 +5,7 @@ use crate::support;
 use hef::artifacts::segment::replay_segment;
 use hef::invariants::Clock;
 use hef::writer::retry::SafeRetryStore;
+use hef::writer::sim::SimSafeRetryStore;
 
 /// conformance: hef-write-path/single-protected-payload-record-with-safe-retry/replay-within-guard-window
 #[test]
@@ -20,7 +21,7 @@ fn replay_within_guard_window() {
     assert!(!world.retry.duplicate_within_guard(support::tenant(), (9_999, 7), now));
     // Reconstruction from HEJ replay reproduces the same guard decisions.
     let replay = replay_segment(&world.storage, support::SHARD, 1, 1).unwrap();
-    let mut rebuilt = SafeRetryStore::new();
+    let mut rebuilt = SimSafeRetryStore::new();
     rebuilt.reconstruct_from_replay(&replay.frames, support::SHARD, now + 1);
     assert!(rebuilt.duplicate_within_guard(support::tenant(), (1_000, 7), now));
 }

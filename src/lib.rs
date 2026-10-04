@@ -45,6 +45,7 @@ pub mod introspection;
 pub mod invariants;
 pub mod layout;
 pub mod lifecycle;
+pub mod object_store;
 pub mod security;
 pub mod typed_id;
 

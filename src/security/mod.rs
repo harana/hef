@@ -23,6 +23,11 @@ use std::fmt;
 use std::mem::size_of;
 use std::sync::{Arc, Mutex, PoisonError};
 
+pub use subject_payload::*;
+
+mod constant;
+mod subject_payload;
+
 /// HKDF-SHA256 label binding a wrapping key derived from a master key to its one job: wrapping per-tenant DEKs.
 const MASTER_KEY_TENANT_DEK_INFO: &[u8] = b"harana/hef/master-key/tenant-dek/aes-256-gcm/v1";
 

@@ -58,6 +58,11 @@ pub mod column_ids {
     pub const PROTOCOL_EVENT_ID: u32 = PROVENANCE_BASE + 3;
     pub const PROTOCOL_KIND: u32 = PROVENANCE_BASE + 4;
     pub const CLAIMED_AT: u32 = PROVENANCE_BASE + 5;
+    /// The Matrix room version a multi-signer event was signed under. Part of [`super::SOURCE_FORM_COLUMNS`].
+    pub const MATRIX_ROOM_VERSION: u32 = PROVENANCE_BASE + 6;
+    /// Every signature of a multi-signer event, one `<scheme> <signer> <key id> <key hex> <signature hex>` line each.
+    /// Part of [`super::SOURCE_FORM_COLUMNS`].
+    pub const SIGNER_SIGNATURES: u32 = PROVENANCE_BASE + 7;
 
     /// Relationship-reference columns are allocated from here. Materialized only for streams whose events declare
     /// relationships to other events.
@@ -67,6 +72,16 @@ pub mod column_ids {
     pub const ROOT_REF: u32 = RELATIONSHIP_BASE + 1;
     pub const LINKED_REFS: u32 = RELATIONSHIP_BASE + 2;
     pub const RELATED_REFS: u32 = RELATIONSHIP_BASE + 3;
+    pub const PREV_REFS: u32 = RELATIONSHIP_BASE + 4;
+    pub const AUTH_REFS: u32 = RELATIONSHIP_BASE + 5;
+
+    /// Columns keeping an event's original form (its raw payload bytes and its external protocol id) are allocated
+    /// from here. Each is materialized only in files whose rows carry it.
+    pub const SOURCE_FORM_BASE: u32 = 8000;
+
+    pub const RAW_PAYLOAD: u32 = SOURCE_FORM_BASE;
+    /// Stored as the id's lowercase hex, so any byte string up to 255 bytes fits a text column.
+    pub const EXTERNAL_ID: u32 = SOURCE_FORM_BASE + 1;
 }
 
 /// One column's static description.
@@ -340,6 +355,59 @@ pub const RELATIONSHIP_COLUMNS: &[ColumnSpec] = &[
         kind: ColumnKind::String,
         nullable: true,
         internal_only: true,
+    },
+    ColumnSpec {
+        column_id: column_ids::PREV_REFS,
+        name: "prev_refs",
+        kind: ColumnKind::String,
+        nullable: true,
+        internal_only: true,
+    },
+    ColumnSpec {
+        column_id: column_ids::AUTH_REFS,
+        name: "auth_refs",
+        kind: ColumnKind::String,
+        nullable: true,
+        internal_only: true,
+    },
+];
+
+/// The optional columns that keep an event's original form next to its canonical one: the exact payload bytes it
+/// arrived as, its external protocol id, and the room version and signatures that let a multi-signer protocol's event
+/// re-verify. Each column is present only in files where some row carries its value, so a stream that opts into none
+/// of them pays nothing.
+///
+/// The raw payload is internal-only, like the payload reference: callers read payloads through the reader, never as
+/// a column. The external id and the signatures are exactly as visible as the event they belong to, like the
+/// provenance family.
+pub const SOURCE_FORM_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec {
+        column_id: column_ids::MATRIX_ROOM_VERSION,
+        name: "matrix_room_version",
+        kind: ColumnKind::String,
+        nullable: true,
+        internal_only: false,
+    },
+    ColumnSpec {
+        column_id: column_ids::SIGNER_SIGNATURES,
+        name: "signer_signatures",
+        kind: ColumnKind::String,
+        nullable: true,
+        internal_only: false,
+    },
+    ColumnSpec {
+        column_id: column_ids::RAW_PAYLOAD,
+        name: "raw_payload",
+        kind: ColumnKind::String,
+        nullable: true,
+        internal_only: true,
+    },
+    ColumnSpec {
+        column_id: column_ids::EXTERNAL_ID,
+        name: "external_id",
+        kind: ColumnKind::String,
+        nullable: true,
+        internal_only: false,
     },
 ];
 

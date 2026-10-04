@@ -17,7 +17,10 @@ fn fault_injection_requires_no_production_code_changes() {
     let run = |seed: u64| -> (usize, bool) {
         let mut world = support::World::new(seed);
         world.ingest(2);
-        world.worker.submit(support::event(7), 1, &world.clock).unwrap();
+        world
+            .worker
+            .submit(support::event(7), 1, &mut world.retry, &world.clock)
+            .unwrap();
         world.storage.inject(Fault::TornTail {
             shard: support::SHARD,
             keep_bytes: 64,
@@ -29,6 +32,7 @@ fn fault_injection_requires_no_production_code_changes() {
             &mut world.storage,
             &mut world.watermarks,
             &mut world.retry,
+            &mut world.overlay,
             &world.clock,
         );
         world.storage.crash();

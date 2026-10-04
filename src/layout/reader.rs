@@ -21,6 +21,7 @@ use super::footer::{
     PageStats, PayloadGranule, ResidualCompression, StripeEntry, TextTokenOffsetsEntry, decode_footer,
     decode_marks_page, decode_marks_page_directory, decode_marks_page_extents,
 };
+use super::remote::FileBytes;
 use super::{EMPTY_VALUE_ROW_OFFSET, HEADER_BLOCK_LEN, HefHeader, decode_header, optional_features, required_features};
 use crate::artifacts::batch::decode_variant_dictionary;
 use crate::columns::column_ids;
@@ -565,6 +566,10 @@ pub struct StripeRange {
 
 /// The result of opening from a speculative tail whose exact length was not known before the fetch.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the footer variant is the common outcome and is moved out at once; boxing it would cost an allocation per open"
+)]
 pub enum SpeculativeTail {
     /// The speculative fetch was shorter than the footer. Re-fetch exactly the last `tail_len` bytes of the object and
     /// call [`HefFooter::open`] on them — the one exact retry.
@@ -1606,7 +1611,7 @@ enum Marks {
 /// stripe, in stripe-directory order, holding whether the stripe matched. Readers made by [`HefFile::fresh_reader`]
 /// share it, so a stripe is hashed once per file rather than once per reader.
 #[derive(Debug)]
-struct StripeVerification {
+pub(super) struct StripeVerification {
     verified: Vec<OnceLock<bool>>,
 }
 
@@ -1665,9 +1670,10 @@ pub struct HefFile {
     /// Encoded column-block and page fetches since open. Never feeds a read result; it exists so tests can observe
     /// that a scan answered from metadata (a constant block filled from its exact stats) skipped the block's bytes.
     block_reads: AtomicU64,
-    /// Shared with every reader [`Self::fresh_reader`] made from this one, so a benchmark's per-iteration readers
-    /// need no copy of the file.
-    bytes: Arc<Vec<u8>>,
+    /// The whole file in memory, shared with every reader [`Self::fresh_reader`] made from this one so a benchmark's
+    /// per-iteration readers need no copy of it; or, for [`Self::open_remote`], the remote object read a verified
+    /// range at a time.
+    bytes: FileBytes,
     /// Monotonic access tick shared by the decoded-block caches; each hit or insert stamps the slot it touched, so
     /// eviction can drop the least-recently-used slot deterministically.
     cache_access_counter: AtomicU64,
@@ -1915,7 +1921,7 @@ impl HefFile {
             None
         };
         Self::assemble(
-            Arc::new(bytes),
+            FileBytes::Local(Arc::new(bytes)),
             header,
             footer,
             usable_optional_features,
@@ -1930,7 +1936,7 @@ impl HefFile {
     /// keeps checking the rest as it reads them.
     pub fn fresh_reader(&self) -> Result<Self, FormatError> {
         Self::assemble(
-            Arc::clone(&self.bytes),
+            self.bytes.fresh(),
             self.header.clone(),
             self.footer.clone(),
             self.usable_optional_features,
@@ -1941,8 +1947,8 @@ impl HefFile {
 
     /// Checks the structure the footer declares and builds the reader's lookup indexes over it. Everything after the
     /// stripe hashing of an open, so a reader made from an already-verified template starts here.
-    fn assemble(
-        bytes: Arc<Vec<u8>>,
+    pub(super) fn assemble(
+        bytes: FileBytes,
         header: HefHeader,
         footer: Footer,
         usable_optional_features: u64,
@@ -2161,7 +2167,11 @@ impl HefFile {
     /// time any of its bytes are read. Bytes outside every stripe — the header, the footer, and the alignment gaps —
     /// were verified at open.
     fn data(&self, position: usize, len: usize, what: &'static str) -> Result<&[u8], FormatError> {
-        let bytes = slice(&self.bytes, position, len, what)?;
+        let file = match &self.bytes {
+            FileBytes::Local(file) => file,
+            FileBytes::Remote(remote) => return remote.read(position as u64, len, what),
+        };
+        let bytes = slice(file, position, len, what)?;
         if let Some(verification) = &self.lazy_stripes {
             let end = position + len;
             for (index, (stripe, checksum)) in self
@@ -2173,7 +2183,7 @@ impl HefFile {
             {
                 let stripe_end = stripe.file_offset.saturating_add(stripe.byte_len) as usize;
                 if (stripe.file_offset as usize) < end && position < stripe_end {
-                    verification.ensure_verified(index, stripe, checksum, &self.bytes)?;
+                    verification.ensure_verified(index, stripe, checksum, file)?;
                 }
             }
         }
@@ -2989,10 +2999,18 @@ impl HefFile {
     ) -> Result<ResidualBytes<'_>, FormatError> {
         match payload.residual_compression {
             ResidualCompression::None => {
-                let residual = self.residual_block(payload)?;
-                Ok(ResidualBytes::InFile(slice(
-                    residual,
-                    offset as usize,
+                // Only the row's own slot is read, so a remote reader fetches that slot rather than the whole arena.
+                if offset.checked_add(len).is_none_or(|end| end > payload.residual_len) {
+                    return Err(FormatError::Truncated { what: "residual value" });
+                }
+                let position = self
+                    .file_position(payload.granule_id, payload.residual_offset)?
+                    .checked_add(offset as usize)
+                    .ok_or(FormatError::RefOutOfRange {
+                        what: "offset beyond file range",
+                    })?;
+                Ok(ResidualBytes::InFile(self.data(
+                    position,
                     len as usize,
                     "residual value",
                 )?))
@@ -3914,12 +3932,7 @@ impl HefFile {
         space: TargetIdSpace,
         target_ref: &[u8],
     ) -> Result<Vec<u64>, FormatError> {
-        let column_id = match kind {
-            RelationshipKind::Link => column_ids::LINKED_REFS,
-            RelationshipKind::Parent => column_ids::PARENT_REF,
-            RelationshipKind::Related => column_ids::RELATED_REFS,
-            RelationshipKind::Root => column_ids::ROOT_REF,
-        };
+        let column_id = kind.column_id();
         if !self.footer.columns.iter().any(|column| column.column_id == column_id) {
             return Ok(Vec::new());
         }
@@ -3929,6 +3942,10 @@ impl HefFile {
         let finder = memmem::Finder::new(needle.as_bytes());
         let mut rows = Vec::new();
         for granule in &self.footer.granules {
+            // The granule's reference filter rules it out without reading its block.
+            if !super::source_form::reference_may_be_in(&self.footer, column_id, granule.granule_id, &needle)? {
+                continue;
+            }
             let read = self.read_column(column_id, granule.granule_id)?;
             for_each_present_string(&read, granule.row_count as usize, |row, text| {
                 // `link`/`related` store several space-separated references; `parent`/`root` store exactly one, so a
@@ -3979,6 +3996,7 @@ impl HefFile {
                 }
                 Ok(rows)
             }
+            TargetIdSpace::ExternalId => self.rows_with_external_id(&reference.target_ref),
             TargetIdSpace::ProtocolEventId => {
                 // The protocol id is a stored provenance column; a file without signed events has no such column and
                 // so cannot hold the target.

@@ -4,6 +4,7 @@
 //! The builder is deterministic: the same rows and configuration produce byte-identical files, which is what makes
 //! publication idempotent (the file identity is derived from its content).
 
+use super::source_form::{self, SourceFormIndexes};
 use crate::artifacts::batch::{
     EncodedPayload, EventInput, PAYLOAD_FLAG_EXTERNAL_REF, PayloadInput, encode_variant_dictionary,
 };
@@ -11,11 +12,13 @@ use crate::columns::{
     FreetextDeclaration, PROVENANCE_COLUMNS, PathStatistics, PromotionPlan, RELATIONSHIP_COLUMNS, REQUIRED_COLUMNS,
     SHARED_DICTIONARY_MAX_VALUES, column_ids, promoted_present, validate_promotion_plan,
 };
+use crate::deletes::SubjectId;
 use crate::encoding::{
     BlockStats, CascadeStrategy, ColumnData, FsstTable, ReplayCapture, SideStream, StringColumn, ValueKind,
     count_set_bits, encode_block_replayed, encode_block_with_shared_dictionary, seekable_zstd,
 };
 use crate::error::FormatError;
+use crate::events::matrix::MatrixProvenance;
 use crate::events::provenance::{SignedEventProvenance, hex_lower_into};
 use crate::events::relationships::{EventRelationships, RelationshipKind};
 use crate::events::variant::{
@@ -43,6 +46,7 @@ use crate::layout::{
     optional_features, required_features,
 };
 use crate::security::{AeadScheme, FooterEncryption};
+use crate::writer::projection::{RowKey, RowOrder};
 use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -240,12 +244,27 @@ pub struct BuildEnvelope {
 pub struct BuildRow {
     pub envelope: BuildEnvelope,
     pub epoch: u64,
+    /// The event's own protocol id (a Matrix `$...` id, say), 1 to 255 bytes, for streams whose tenant declares one.
+    /// Indexed so `HefFile::row_by_external_id` finds the row without a scan.
+    pub external_id: Option<Vec<u8>>,
+    /// Signatures and room version of an event a multi-signer protocol (Matrix federation) delivered. Boxed for the
+    /// same reason as `provenance`.
+    pub matrix_provenance: Option<Box<MatrixProvenance>>,
     pub payload: BuildPayload,
     /// Boxed because it is a couple of hundred bytes that only a signed event carries, and every pass over the rows
     /// streams the whole row.
     pub provenance: Option<Box<SignedEventProvenance>>,
+    /// The payload exactly as it arrived (UTF-8 text such as JSON), kept beside the canonical payload so signed bytes
+    /// can be returned byte for byte. Opt-in: `None` stores nothing.
+    pub raw_payload: Option<Vec<u8>>,
     pub relationships: Option<EventRelationships>,
     pub sequence: u64,
+    /// The data subject whose content key seals this row's payload, or `None` for a payload stored in the clear. The
+    /// caller picks the granularity: one subject per sender erases a person's events with one key, one subject per
+    /// event erases exactly one event at one stored key per event. A row naming a subject goes through
+    /// [`seal_subject_rows`](crate::writer::subject_seal::seal_subject_rows) before the build, which refuses it
+    /// otherwise.
+    pub subject: Option<SubjectId>,
 }
 
 /// A row shape a build takes: [`BuildRow`] as it is, or [`HefRow`] converted on the way in.
@@ -343,6 +362,9 @@ impl SharedStrings {
                 trace_id_hash_low: envelope.trace_id_hash_low,
             },
             epoch,
+            // The journal does not carry an event's original form; a producer that keeps it builds `BuildRow`s.
+            external_id: None,
+            matrix_provenance: None,
             payload: match payload {
                 PayloadInput::Encoded(encoded) => BuildPayload::Encoded(encoded),
                 PayloadInput::ExternalRef(reference) => BuildPayload::ExternalRef(reference),
@@ -350,8 +372,10 @@ impl SharedStrings {
                 PayloadInput::Variant(value) => self.build_payload(value),
             },
             provenance: provenance.map(Box::new),
+            raw_payload: None,
             relationships,
             sequence,
+            subject: None,
         }
     }
 
@@ -2140,7 +2164,10 @@ fn plan_update_reuse_from<'a, 'b>(
             && before.sequence == after.sequence
             && normalized_envelope == after.envelope
             && before.provenance == after.provenance
-            && before.relationships == after.relationships;
+            && before.relationships == after.relationships
+            && before.external_id == after.external_id
+            && before.matrix_provenance == after.matrix_provenance
+            && before.raw_payload == after.raw_payload;
         if !only_payload_and_dedupe {
             mark_all_columns(source, changed);
             changed_payload_granules.insert(granule_id);
@@ -2326,14 +2353,18 @@ fn plan_source_update<'a>(
                     trace_id_hash_low: 0,
                 },
                 epoch: granule.first_epoch,
+                external_id: None,
+                matrix_provenance: None,
                 payload: match payload {
                     PayloadRead::External(reference) => BuildPayload::ExternalRef(reference),
                     PayloadRead::None => BuildPayload::None,
                     PayloadRead::Value(value) => shared.build_payload(value),
                 },
                 provenance: None,
+                raw_payload: None,
                 relationships: None,
                 sequence,
+                subject: None,
             });
         }
     }
@@ -2493,21 +2524,28 @@ pub fn update_hef_file_from_source_changes_profiled_with_executor<R: BuildInput>
     Ok((built, profile))
 }
 
-/// The first and last `(epoch, sequence)` of `rows` once they prove strictly ordered and all of `tenant_id` — `None`
+/// The first and last sort keys of `rows` in `order` once they prove strictly ordered and all of `tenant_id` - `None`
 /// for no rows — or the rule the first row to break one breaks.
-fn check_rows(rows: &[BuildRow], tenant_id: TenantId) -> Result<Option<((u64, u64), (u64, u64))>, &'static str> {
-    let mut previous: Option<(u64, u64)> = None;
+fn check_rows(
+    rows: &[BuildRow],
+    tenant_id: TenantId,
+    order: RowOrder,
+) -> Result<Option<(RowKey, RowKey)>, &'static str> {
+    let mut previous: Option<RowKey> = None;
     for row in rows {
-        let key = (row.epoch, row.sequence);
+        let key = order.key(row);
         if previous.is_some_and(|previous| previous >= key) {
-            return Err("rows must be strictly (epoch, sequence) ordered");
+            return Err(order.rule());
         }
         previous = Some(key);
         if row.envelope.tenant_id != tenant_id {
             return Err("a HEF file carries one tenant");
         }
+        if row.subject.is_some() {
+            return Err("a row naming a subject is sealed with seal_subject_rows before the build");
+        }
     }
-    Ok(rows.first().map(|row| (row.epoch, row.sequence)).zip(previous))
+    Ok(rows.first().map(|row| order.key(row)).zip(previous))
 }
 
 /// Abandons a sparse update whose rebuilt granules no longer reproduce the source's granule or stripe geometry and
@@ -2610,12 +2648,35 @@ pub fn build_hef_file_streamed_profiled<R: BuildInput>(
 }
 
 fn build_hef_file_sealed(
+    rows: Vec<BuildRow>,
+    config: &HefBuildConfig,
+    encode: &dyn EncodeExecutor,
+    sink: Option<&mut dyn FnMut(u64, Vec<u8>)>,
+    profile: Option<&mut BuildProfile>,
+    update_reuse: Option<&UpdateReuse<'_>>,
+) -> Result<BuiltHef, FormatError> {
+    build_hef_file_sealed_in_order(rows, config, encode, sink, profile, update_reuse, RowOrder::Sequence)
+}
+
+/// Builds one file from rows already sorted in `order`: the primary `(epoch, sequence)` order, or the entity order
+/// only the entity projection is built in.
+pub(crate) fn build_hef_file_in_order(
+    rows: Vec<BuildRow>,
+    config: &HefBuildConfig,
+    encode: &dyn EncodeExecutor,
+    order: RowOrder,
+) -> Result<BuiltHef, FormatError> {
+    build_hef_file_sealed_in_order(rows, config, encode, None, None, None, order)
+}
+
+fn build_hef_file_sealed_in_order(
     mut rows: Vec<BuildRow>,
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
     mut sink: Option<&mut dyn FnMut(u64, Vec<u8>)>,
     profile: Option<&mut BuildProfile>,
     update_reuse: Option<&UpdateReuse<'_>>,
+    order: RowOrder,
 ) -> Result<BuiltHef, FormatError> {
     let mut phase_clock = PhaseClock::new(profile, BuildPhase::Normalization);
     let profile_workers = phase_clock.enabled();
@@ -2644,24 +2705,30 @@ fn build_hef_file_sealed(
                     rule: "a HEF file must carry at least one row",
                 });
             };
-            (rows.len(), (first.epoch, first.sequence), (last.epoch, last.sequence))
+            match order {
+                RowOrder::Entity => {
+                    let points = rows.iter().map(|row| (row.epoch, row.sequence));
+                    let first = points.clone().min().unwrap_or((first.epoch, first.sequence));
+                    let last = points.max().unwrap_or((last.epoch, last.sequence));
+                    (rows.len(), first, last)
+                }
+                RowOrder::Sequence => (rows.len(), (first.epoch, first.sequence), (last.epoch, last.sequence)),
+            }
         }
     };
     // A row is a few hundred bytes, so a pass over a file's worth of them streams tens of megabytes: the order and
     // tenant checks make one pass, on the worker pool, and only the chunk boundaries are compared in sequence.
-    let checked: Vec<Result<Option<((u64, u64), (u64, u64))>, &'static str>> = rows
+    let checked: Vec<Result<Option<(RowKey, RowKey)>, &'static str>> = rows
         .par_chunks(NORMALIZE_BATCH_ROWS)
-        .map(|chunk| check_rows(chunk, config.tenant_id))
+        .map(|chunk| check_rows(chunk, config.tenant_id, order))
         .collect();
-    let mut previous: Option<(u64, u64)> = None;
+    let mut previous: Option<RowKey> = None;
     for chunk in checked {
         let Some((first, last)) = chunk.map_err(|rule| FormatError::Structural { rule })? else {
             continue;
         };
         if previous.is_some_and(|previous| previous >= first) {
-            return Err(FormatError::Structural {
-                rule: "rows must be strictly (epoch, sequence) ordered",
-            });
+            return Err(FormatError::Structural { rule: order.rule() });
         }
         previous = Some(last);
     }
@@ -2988,6 +3055,15 @@ fn build_hef_file_sealed(
             });
         }
     }
+    // The original-form columns follow the same absence rule, column by column.
+    let source_form_columns = source_form::carried_columns(source.map(|source| &source.footer), &rows);
+    columns.extend(source_form_columns.iter().map(|spec| ColumnDescriptor {
+        column_id: spec.column_id,
+        name: spec.name.to_owned(),
+        kind: spec.kind,
+        nullable: spec.nullable,
+        internal_only: spec.internal_only,
+    }));
     let freetext_entries: Vec<FreetextEntry> = config
         .freetext
         .fields
@@ -3068,6 +3144,12 @@ fn build_hef_file_sealed(
     if sparse.is_none() && start < rows.len() {
         granule_row_ranges.push((start, rows.len()));
     }
+    // The original-form blocks and indexes, from the rows before granule construction takes their strings. A sparse
+    // update changes none of them, so it borrows the source's blocks and keeps its indexes.
+    let (source_form_blocks, source_form_indexes) = match source {
+        Some(source) => (Vec::new(), SourceFormIndexes::from_footer(&source.footer)),
+        None => source_form::build(&rows, &granule_row_ranges, &source_form_columns)?,
+    };
 
     // Build per-granule pieces, one job per granule fanned out through the injected executor. The ranges partition the
     // rows, so peeling each granule's slice off the front hands every job a disjoint view no other job can see, and a
@@ -3165,6 +3247,17 @@ fn build_hef_file_sealed(
                 .expect("the executor runs every job")?,
         );
     }
+    for (granule, blocks) in granules.iter_mut().zip(source_form_blocks) {
+        granule
+            .blocks
+            .extend(blocks.into_iter().map(|(column_id, presence, data)| PendingBlock {
+                column_id,
+                data,
+                presence,
+                // Raw payloads and ids are point-read a row at a time, like free text.
+                random_access: true,
+            }));
+    }
 
     phase_clock.transition(BuildPhase::BlockEncoding);
 
@@ -3189,6 +3282,7 @@ fn build_hef_file_sealed(
                 .into_iter()
                 .flatten(),
         )
+        .chain(source_form_columns.iter().map(|spec| spec.column_id))
         .collect();
     // The values each source block holds, for the stripe estimate of a block a sparse update did not build.
     let source_block_values: HashMap<(u32, u32), usize> = source
@@ -4133,7 +4227,7 @@ fn build_hef_file_sealed(
     // executor. The results are held until layout/footer assembly consumes them.
     let hot_columns = column_ids::PROMOTED_BASE..column_ids::PROMOTED_BASE + config.promotion.columns.len() as u32;
     phase_clock.transition(BuildPhase::FooterConstruction);
-    let scheduled_metadata = match source {
+    let mut scheduled_metadata = match source {
         Some(source) => borrow_footer_metadata(source)?,
         None => build_scheduled_footer_metadata(
             &granules,
@@ -4144,6 +4238,11 @@ fn build_hef_file_sealed(
             profile_workers,
         ),
     };
+    if order == RowOrder::Entity {
+        for entry in &mut scheduled_metadata.clustering {
+            entry.sortedness_proof = Some(order.sortedness_proof());
+        }
+    }
     phase_clock.transition(BuildPhase::Layout);
 
     // The filters' bytes go into the data area inside each granule's owning stripe (below, beside the payload
@@ -4813,6 +4912,7 @@ fn build_hef_file_sealed(
         // hatch.
         escape_hatches: Vec::new(),
         exact_counts,
+        external_ids: source_form_indexes.external_ids,
         format_version: (1, 0),
         freetext: freetext_entries,
         freetext_row_offsets,
@@ -4834,6 +4934,7 @@ fn build_hef_file_sealed(
         page_stats,
         payload_granules,
         presence: presence_entries,
+        reference_filters: source_form_indexes.reference_filters,
         required_feature_flags: required_features::ALL,
         schema_fingerprint: *schema_hash.finalize().as_bytes(),
         shared_dictionaries,
@@ -5027,19 +5128,23 @@ fn build_hef_file_sealed(
 }
 
 /// The kind each relationship column stores, in [`RELATIONSHIP_COLUMN_IDS`] order.
-const RELATIONSHIP_KIND_COLUMNS: [RelationshipKind; 4] = [
+const RELATIONSHIP_KIND_COLUMNS: [RelationshipKind; 6] = [
     RelationshipKind::Parent,
     RelationshipKind::Root,
     RelationshipKind::Link,
     RelationshipKind::Related,
+    RelationshipKind::Prev,
+    RelationshipKind::Auth,
 ];
 
 /// The relationship column ids in `RELATIONSHIP_COLUMNS` declaration order.
-const RELATIONSHIP_COLUMN_IDS: [u32; 4] = [
+const RELATIONSHIP_COLUMN_IDS: [u32; 6] = [
     column_ids::PARENT_REF,
     column_ids::ROOT_REF,
     column_ids::LINKED_REFS,
     column_ids::RELATED_REFS,
+    column_ids::PREV_REFS,
+    column_ids::AUTH_REFS,
 ];
 
 /// Encodes one granule's payload arena: the key dictionary over every residual key, then each row's residual value —
@@ -5145,15 +5250,19 @@ fn build_granule(
     let wants = |column_id: u32| wanted.is_none_or(|columns| columns.contains(&column_id));
     // The granule's own `(epoch, sequence)` bounds, taken by value up front: from the row loop on, the rows are on
     // loan to the borrowed residual and column values and cannot be looked at again.
+    // The lowest and highest rather than the first and last row: the same thing for the primary `(epoch, sequence)`
+    // order, and the true sequence bounds for the entity projection, whose granule rows interleave across entities.
     let (first_epoch, first_sequence) =
-        rows.first()
+        rows.iter()
             .map(|row| (row.epoch, row.sequence))
+            .min()
             .ok_or(FormatError::Structural {
                 rule: "granules are non-empty",
             })?;
     let (last_epoch, last_sequence) =
-        rows.last()
+        rows.iter()
             .map(|row| (row.epoch, row.sequence))
+            .max()
             .ok_or(FormatError::Structural {
                 rule: "granules are non-empty",
             })?;
@@ -5241,7 +5350,7 @@ fn build_granule(
 
     // Relationship references: one column per kind, each with its own presence bitmap — an event may declare a parent
     // without a root or vice versa. Values are the canonical `<space>:<hex>` text an equality filter compares.
-    let mut relationship_columns: [(Vec<u8>, StringColumn); 4] =
+    let mut relationship_columns: [(Vec<u8>, StringColumn); 6] =
         std::array::from_fn(|_| (vec![0u8; row_count.div_ceil(8)], StringColumn::new()));
 
     // Residual values after moves, borrowed from the rows rather than copied out of them: the fields that stayed go

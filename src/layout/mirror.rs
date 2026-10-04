@@ -8,11 +8,13 @@
 //! to that file's own authoritative tail read ([`super::reader::tail_range`]) on any mismatch, a missing section, or
 //! a missing mirror.
 
+use super::cache::{BlockCache, BlockKey, BlockKind};
 use super::reader::{HefFooter, TailRange};
 use crate::error::FormatError;
 use crate::file::bytes::{Reader, Writer};
 use crate::lifecycle::HefFileEntry;
 use hashbrown::HashMap;
+use std::sync::Arc;
 
 /// Fixed per-section overhead a capacity estimate accounts for ahead of a section's tail bytes: the `u128` file_id
 /// (16), `u64` generation (8), and BLAKE3 checksum (32). The trailing `u64` tail-length word adds another 8 bytes
@@ -83,6 +85,30 @@ impl FooterMirror {
         Ok(Self { sections })
     }
 
+    /// Loads the mirrored tail of every entry in `entries` into `cache`, as the first thing a node does for a new
+    /// generation, so [`super::reader::HefFile::open_remote`] then opens those files from the cache with no tail
+    /// request of their own. Only an entry with exact tail geometry (`footer_len` recorded) whose mirrored tail has
+    /// exactly that length is loaded; every other entry keeps its per-file tail read. A loaded tail is still bound
+    /// to the manifest seal when the file opens, and one that fails is dropped and fetched from the file itself.
+    pub fn seed_cache(&self, cache: &BlockCache, generation: u64, entries: &[HefFileEntry]) {
+        for entry in entries {
+            let range = entry.tail_range();
+            if let Some(tail_bytes) = self.tail_bytes(entry.file_id, generation)
+                && range.exact
+                && tail_bytes.len() as u64 == range.len
+            {
+                let key = BlockKey {
+                    file_id: entry.file_id,
+                    kind: BlockKind::Footer,
+                    len: range.len,
+                    offset: range.start,
+                    tenant_id: entry.tenant_id,
+                };
+                cache.insert(key, Arc::from(tail_bytes));
+            }
+        }
+    }
+
     /// The tail bytes mirrored for `file_id` at `generation`, or `None` when no section matches both — the single
     /// signal [`open_footer`] needs to decide whether to use the mirror or fall back to a per-file tail read (a
     /// section whose BLAKE3 failed to verify was already dropped by [`FooterMirror::open`]).
@@ -111,6 +137,10 @@ fn section_checksum(file_id: u128, generation: u64, tail_bytes: &[u8]) -> [u8; 3
 /// Where a planner should open `entry`'s footer from: the mirror, when it holds a valid section, or the per-file
 /// tail geometry ([`super::reader::tail_range`]) otherwise.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the footer variant is the common outcome and is moved out at once; boxing it would cost an allocation per open"
+)]
 pub enum FooterSource {
     /// The mirror held a valid section; the footer is already open.
     Mirror(HefFooter),

@@ -8,6 +8,7 @@
 
 use super::build::{BuiltHef, HefBuildConfig, HefRow, build_hef_file_with_executor};
 use super::reserve::arbitrate_coverage;
+use super::upload::upload_hef;
 use crate::artifacts::batch::{decode_batch, envelope_of};
 use crate::artifacts::frame::decode_frame;
 use crate::artifacts::segment::{ReplayOutcome, ReplayedFrame, SegmentDescriptor, replay_segment, verify_chain_anchor};
@@ -16,6 +17,7 @@ use crate::events::{SequenceRange, TenantId};
 use crate::invariants::{EncodeExecutor, JournalStorage, MonotonicClock, PublishedSet, ShardId};
 use crate::layout::{MAX_PAGE_BYTES, required_features};
 use crate::lifecycle::{FileType, HefFileEntry, ManifestGeneration, PartState};
+use crate::object_store::{ObjectStore, constant::MIN_MULTIPART_PART_BYTES, hef_object_key};
 
 /// The byte length of a BLAKE3 hash, as stored in a schema fingerprint or a segment chain anchor.
 const BLAKE3_HASH_BYTES: usize = 32;
@@ -28,7 +30,7 @@ const DEFAULT_ROLL_BYTE_TARGET: u64 = 1 << 30;
 const DEFAULT_ROLL_TIME_WINDOW_NANOS: u64 = 300 * 1_000_000_000;
 
 /// How many times [`HefPublisher::publish_range`] rebases and retries the manifest CAS before giving up.
-const MAX_REBASE_ATTEMPTS: u32 = 16;
+pub(super) const MAX_REBASE_ATTEMPTS: u32 = 16;
 
 /// The byte length of each upload segment for a built HEF, cut so that every stripe begins on a segment boundary. The
 /// leading segment is the header (and anything before the first stripe); each following segment runs from one stripe's
@@ -98,6 +100,9 @@ pub struct OpenFileState {
 }
 
 /// The dual trigger, whichever fires first.
+///
+/// Nothing in HEF calls this: the application checks it on its open file after each flush and publishes the range with
+/// [`HefPublisher::publish_range`] when it fires. See [`crate::writer::retire`] for the whole call pattern.
 pub fn should_roll(state: &OpenFileState, policy: &RollPolicy, clock: &dyn MonotonicClock) -> Option<RollTrigger> {
     if state.compressed_bytes >= policy.byte_target {
         return Some(RollTrigger::ByteTarget);
@@ -261,7 +266,7 @@ impl HefPublisher {
     }
 
     /// Staged-verification rules: size/quota, schema, BLAKE3, tenant, range, feature directory.
-    fn verify_staged(
+    pub(super) fn verify_staged(
         &self,
         built: &BuiltHef,
         config: &HefBuildConfig,
@@ -316,6 +321,12 @@ impl HefPublisher {
 
     /// The complete publish boundary for one contiguous durable range.
     ///
+    /// The built file is uploaded to `objects` under [`hef_object_key`] and its stored size and CRC-64/NVME checked
+    /// before any generation is written, so a catalogue entry never names an object that is missing or wrong; a failed
+    /// upload is aborted and the attempt rolled back. Once uploaded, the object is never deleted here: an attempt that
+    /// then loses the range to a different file leaves it unreferenced, for the application's sweep of unreferenced
+    /// keys, rather than deleting bytes a stalled generation might still name.
+    ///
     /// Idempotent: re-publishing an already-covered range returns the existing entry paired with the freshly rebuilt
     /// bytes, but only once those bytes are confirmed to match the existing entry's file id and BLAKE3 (same content
     /// ⇒ same content-derived file identity). If the existing file covering the range does not match — rebuilt under
@@ -340,6 +351,7 @@ impl HefPublisher {
         range: SequenceRange,
         config: &HefBuildConfig,
         published: &mut dyn PublishedSet,
+        objects: &dyn ObjectStore,
         observer: &mut dyn PublishObserver,
         notices: &mut dyn PeerNotices,
         _clock: &dyn MonotonicClock,
@@ -398,6 +410,12 @@ impl HefPublisher {
 
         // 6. Verify everything before any visibility.
         if let Err(failure) = self.verify_staged(&built, config, &range) {
+            observer.rollback(attempt_id);
+            return Err(failure);
+        }
+        // Upload and check the object before any generation can name it.
+        let object_key = hef_object_key(config.tenant_id, built.file_id);
+        if let Err(failure) = upload_hef(objects, &object_key, &built, MIN_MULTIPART_PART_BYTES) {
             observer.rollback(attempt_id);
             return Err(failure);
         }
@@ -460,6 +478,7 @@ impl HefPublisher {
             let mut next = ManifestGeneration {
                 generation: head_id + 1,
                 files: head.files.clone(),
+                retirements: head.retirements.clone(),
                 ..Default::default()
             };
             next.files.push(entry.clone());

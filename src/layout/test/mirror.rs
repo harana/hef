@@ -4,10 +4,13 @@ use crate::columns::{FreetextDeclaration, PromotionPlan};
 use crate::encoding::deflate;
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, SequenceRange, StreamId, TenantId, TimestampValue};
-use crate::layout::LayoutTargets;
+use crate::file::{FileError, RangeSource};
+use crate::layout::reader::{HeaderCommitment, HefFile};
+use crate::layout::{HEADER_BLOCK_LEN, LayoutTargets};
 use crate::lifecycle::{FileType, PartState};
 use crate::typed_id::TypedIdTestExt;
 use crate::writer::build::{BuildLifecycle, HefBuildConfig, HefRow, build_hef_file};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn config(tenant: u128) -> HefBuildConfig {
     HefBuildConfig {
@@ -217,4 +220,53 @@ fn a_section_moved_to_another_generation_fails_its_checksum() {
         FooterSource::PerFileTail(range) => assert_eq!(range, entry.tail_range()),
         FooterSource::Mirror(_) => panic!("a section moved between generations must not verify"),
     }
+}
+
+/// A remote object that counts the ranges asked of it.
+struct CountingSource {
+    bytes: Vec<u8>,
+    requests: AtomicUsize,
+}
+
+impl RangeSource for CountingSource {
+    fn read_range(&self, _object: u128, offset: u64, len: u64) -> Result<Vec<u8>, FileError> {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        let end = offset.checked_add(len).ok_or(FileError::OutOfBounds)?;
+        self.bytes
+            .get(offset as usize..end as usize)
+            .map(<[u8]>::to_vec)
+            .ok_or(FileError::OutOfBounds)
+    }
+}
+
+#[test]
+fn seeding_the_cache_from_the_mirror_opens_its_files_with_no_tail_request() {
+    let (file_id, tail, entry) = built_tail(21);
+    let built = build_hef_file(vec![one_row(21)], &config(21)).unwrap();
+    assert_eq!(built.file_id, file_id, "the build is deterministic");
+    let generation = 4;
+    let mirror = FooterMirror::open(&FooterMirror::build(generation, &[(file_id, tail)])).unwrap();
+    let cache = Arc::new(BlockCache::new(1 << 20, None));
+    mirror.seed_cache(&cache, generation, std::slice::from_ref(&entry));
+
+    let source = Arc::new(CountingSource {
+        bytes: built.bytes.clone(),
+        requests: AtomicUsize::new(0),
+    });
+    let header = HeaderCommitment::from_header_block(&built.bytes[..HEADER_BLOCK_LEN]).unwrap();
+    let file = HefFile::open_remote(source.clone(), Some(cache), &entry, &header, None).unwrap();
+    assert_eq!(
+        source.requests.load(Ordering::Relaxed),
+        0,
+        "the tail came from the seeded cache"
+    );
+    assert_eq!(file.header().row_count, 1);
+
+    // An entry without exact tail geometry keeps its own tail read, and a different generation seeds nothing.
+    let mut legacy = entry.clone();
+    legacy.footer_len = None;
+    let untouched = BlockCache::new(1 << 20, None);
+    mirror.seed_cache(&untouched, generation, &[legacy]);
+    mirror.seed_cache(&untouched, generation + 1, &[entry]);
+    assert_eq!(untouched.memory_bytes(), 0);
 }

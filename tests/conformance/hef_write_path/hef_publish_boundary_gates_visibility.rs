@@ -28,6 +28,7 @@ fn failed_publish_leaks_nothing() {
             range,
             &support::build_config(),
             &mut set,
+            &hef::object_store::sim::SimObjectStore::new(),
             &mut observer,
             &mut notices,
             &world.clock,

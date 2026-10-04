@@ -36,11 +36,17 @@ The writer SHALL be able to promote common event attributes into typed columns a
 - **THEN** the writer promotes it to a typed column while preserving its data-class labels and field-level authorization
 
 ### Requirement: Single canonical payload format with ingest transcoding
-There SHALL be exactly one payload format, `harana_variant_v1` — a Parquet-Variant-based binary value encoding whose field ids resolve against an external shared dictionary and which supports offset-based single-path navigation that never touches sibling fields. Ingest routes SHALL transcode every accepted source body (JSON, Protobuf, Avro, MessagePack, raw bytes) into `harana_variant_v1` before HEJ append; source bytes SHALL NOT be stored, and the canonical `harana_variant_v1` value SHALL be the stored payload. QueryEngine SHALL NOT read payload values unless the query needs paths unavailable as authorized promoted or shredded payload columns, and payload reads SHALL be late-materialized: prune via metadata, read envelope/promoted/shredded columns, apply authorization/filters/deletion-vectors/corrections, then read residual variant values only for final matching rows, extract only the requested paths, then redact per the caller's authorization.
+There SHALL be exactly one payload format, `harana_variant_v1` — a Parquet-Variant-based binary value encoding whose field ids resolve against an external shared dictionary and which supports offset-based single-path navigation that never touches sibling fields. Ingest routes SHALL transcode every accepted source body (JSON, Protobuf, Avro, MessagePack, raw bytes) into `harana_variant_v1` before HEJ append; source bytes SHALL NOT be stored unless the stream opts into the raw-payload column, and the canonical `harana_variant_v1` value SHALL be the stored payload. A stream that must return signed bodies byte-exact MAY opt into an optional `raw_payload` column holding each event's original UTF-8 body beside the canonical payload, compressed by the ordinary string-column encodings; shredding, promotion, and free-text extraction SHALL keep working off the canonical payload, the column SHALL be internal-only, and deletion vectors SHALL apply to it as to the payload while any field-level redaction of a row SHALL withhold that row's whole raw payload. QueryEngine SHALL NOT read payload values unless the query needs paths unavailable as authorized promoted or shredded payload columns, and payload reads SHALL be late-materialized: prune via metadata, read envelope/promoted/shredded columns, apply authorization/filters/deletion-vectors/corrections, then read residual variant values only for final matching rows, extract only the requested paths, then redact per the caller's authorization.
 
 #### Scenario: Source body transcoded, source bytes discarded
 - **WHEN** a Protobuf or JSON event body is ingested
 - **THEN** it is transcoded into a canonical `harana_variant_v1` value before HEJ append, the original source bytes are not stored, and any source-format lineage is recorded only as internal `source_schema_ref`
+
+#### Scenario: Opted-in raw payload returns byte-exact
+- **WHEN** a stream that opted into the raw-payload column writes canonical-JSON Matrix events, including integers
+  near 2^53 and unicode escapes, and a reader asks for one event's raw payload from the sealed file
+- **THEN** the bytes come back identical to the bytes that arrived, while the canonical payload still reads as the
+  transcoded variant
 
 #### Scenario: Query satisfiable from promoted columns
 - **WHEN** a query references only authorized promoted columns and envelope fields
@@ -79,11 +85,15 @@ The QueryEngine provider and owner services SHALL enforce public-output safety b
 The logical event model SHALL define an optional Tier A relationship-references
 column family carrying the references an event declares about other events.
 Each reference SHALL carry `relationship_kind` (a registry-controlled tag;
-initially `parent`, `root`, `link`, and `related`, extended only by registry),
+initially `parent`, `root`, `link`, and `related`, extended only by registry;
+the registry now also holds `prev` and `auth` for a federated protocol's
+`prev_events` and `auth_events`),
 `target_ref` (the declared target identifier bytes), and `target_id_space` (a
 registry-controlled tag naming the identifier space of `target_ref`; initially
 `event_id` for envelope identity and `protocol_event_id` for a signed
-protocol's own identifier space). References SHALL be declared by the
+protocol's own identifier space, plus `external_id` for a 1-to-255-byte
+external protocol id matching the event external-id column). Only `parent` and
+`root` are limited to one per event; every other kind repeats freely. References SHALL be declared by the
 referencing event at ingest and SHALL be immutable with it; a sealed target
 SHALL never be rewritten to record later referrers. The family SHALL be
 absent — materializing no columns — for streams that declare no relationships;
@@ -95,7 +105,11 @@ authorization — and equality predicates on `(relationship_kind, target_ref)`
 SHALL be pushdown-eligible and served by the standard metadata and filter
 machinery, so reverse lookups such as "events whose `parent` reference names X"
 prune files and granules without any graph engine, new index kind, or new file
-shape. A relationship reference SHALL assert structure only — reply, grouping,
+shape. Every file that carries relationship columns SHALL carry, per
+(relationship column, granule) holding any reference, a no-false-negative
+membership filter over the stored references, so a reverse lookup reads only
+the granules whose filter admits the target; a granule holding no reference of
+a kind SHALL be skipped for that kind. A relationship reference SHALL assert structure only — reply, grouping,
 or reference — and SHALL NOT assert that one event caused another
 (INV-EVENTSTREAM-NON-CAUSAL); it is disjoint from the relational entity
 relationship graph, which remains derived, rebuildable, entity-level state.
@@ -111,6 +125,12 @@ relationship graph, which remains derived, rebuildable, entity-level state.
   `(relationship_kind = parent, target_ref = X)` pruned by the standard
   metadata and filter machinery, and X's own stored bytes are not modified or
   required
+
+#### Scenario: Federated predecessors and authorisers round-trip
+- **WHEN** a Matrix event declaring 20 `prev` and 10 `auth` references, including a room version 1 target
+  `$abc:example.org` in the `external_id` space, is written and read back
+- **THEN** every reference comes back in declaration order, and a reverse lookup on `auth` naming one target
+  reads only the granules whose reference filter admits it
 
 #### Scenario: Relationship never licenses causal claims
 - **WHEN** two events are connected by a `link` or `related` reference
@@ -166,7 +186,12 @@ family for events originating from a signed protocol, carrying at minimum:
 bytes), `signature_scheme` (a registry-controlled tag; BIP-340 Schnorr over
 secp256k1 for Nostr), `protocol_event_id` (the protocol's own content-derived
 event identifier), `protocol_kind` (the protocol's event-kind integer), and
-`claimed_at` (the author-claimed timestamp as a `TimestampValue`). The family
+`claimed_at` (the author-claimed timestamp as a `TimestampValue`). The
+signature-scheme registry SHALL also hold Ed25519 (signing the canonical bytes
+themselves). Events of a protocol that several parties sign (Matrix federation)
+SHALL instead carry `matrix_room_version` and `signer_signatures`: one
+`(scheme, signer, key_id, public key, signature)` entry per signature, so each
+re-verifies from the stored key alone. The family
 SHALL be absent — materializing no columns — for streams whose events carry no
 signatures; its presence SHALL NOT alter the fixed envelope, and `sequence`
 assignment, pruning, and ordering SHALL remain governed by the envelope alone,
@@ -214,6 +239,13 @@ the stored bytes.
   recomputed `protocol_event_id` matches the stored column, and the signature
   verifies against `author_pubkey` offline
 
+#### Scenario: Federated event re-verifies with several server signatures
+- **WHEN** a Matrix event signed by two servers is read back from a sealed file together with its raw payload,
+  external id, room version, and stored signatures
+- **THEN** the content hash recomputes from the canonical JSON, both signatures verify over the redacted canonical
+  form, and in room version 3 and later the recomputed reference hash, as `$` and unpadded base64 (URL-safe from
+  version 4), equals the stored external id
+
 #### Scenario: No stored verdict to drift
 - **WHEN** an implementation proposes persisting a `verified` flag alongside
   the provenance family
@@ -221,3 +253,24 @@ the stored bytes.
   journal implies ingest-time verification, and any later check recomputes
   from the stored bytes
 
+
+### Requirement: Events findable by external protocol id
+A stream whose tenant declares external ids SHALL store each event's external
+protocol id (1 to 255 bytes, a Matrix `$...` id say) in an optional
+`external_id` column, absent for streams that carry none. Each file carrying
+the column SHALL index it in its footer, as `(id hash, row ordinal)` pairs
+sorted for binary search, so a reader finds an event's row without scanning a
+granule and confirms every hit against the stored id. Across files, a
+cross-file index from `(tenant, external id)` to `(file, generation, row
+ordinal)` SHALL be persisted through an interface the embedding application
+backs with durable storage, and when an id is recorded from several files the
+newest generation SHALL win.
+
+#### Scenario: Lookup hits and misses without a scan
+- **WHEN** a reader asks a file for the row of an external id, including one longer than 32 bytes
+- **THEN** a present id resolves to its row reading at most the one granule block that confirms it, and an absent
+  id resolves to nothing without reading any block
+
+#### Scenario: Duplicate id across files
+- **WHEN** the same external id is recorded from files of two generations, in either order
+- **THEN** the cross-file index points at the row in the newer generation's file

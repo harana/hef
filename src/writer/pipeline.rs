@@ -1,6 +1,7 @@
 //! One worker's path from accepting an event to acknowledging it, all the way through making it durable.
 //!
-//! The stages are: validate → serialize into the worker's lock-free queue (READY) → reach the flush target (16 KiB
+//! The stages are: validate (a retry already committed inside the replay-guard window is answered with its original
+//! receipt and goes no further) → serialize into the worker's lock-free queue (READY) → reach the flush target (16 KiB
 //! default; 4 KiB force-commit) → claim and reserve a contiguous `(epoch, sequence)` range → submit an aligned HEJ
 //! frame → verify CRC-64/NVME + BLAKE3 → HARDENED → record safe-retry metadata → COMMITTED (append-only: immediately;
 //! no GSN/RFA/barrier machinery) → decode into LiveOverlay → acknowledge per the route contract.
@@ -12,8 +13,9 @@ use super::error::{FlushError, LeaseError, QueueError};
 use super::queue::{CommitQueue, PendingRecord, peek_steal};
 use super::reserve::{FORCE_COMMIT_IDLE_NANOS, SequenceAllocator};
 use super::retry::{RetryReceipt, SafeRetryStore, StatusClass};
-use crate::artifacts::batch::{EventInput, build_batch};
-use crate::artifacts::frame::{FLAG_VOID_RECORD, FrameBuildInput, build_frame};
+use crate::artifacts::batch::{EventInput, build_batch, decode_batch};
+use crate::artifacts::frame::{FLAG_VOID_RECORD, FrameBuildInput, build_frame, decode_frame};
+use crate::artifacts::overlay::{LiveOverlayStore, convert_frame};
 use crate::artifacts::watermark::WatermarkTracker;
 use crate::error::FormatError;
 use crate::events::{SequencePoint, SequenceRange, TenantId};
@@ -63,6 +65,18 @@ pub enum FlushReason {
     ForceCommit,
     /// Pending bytes reached the flush target.
     Target,
+}
+
+/// What happened to one submitted event.
+///
+/// See: hef-write-path/spec.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Submission {
+    /// The same tenant already committed an event with this dedupe identity inside the replay-guard window, so nothing
+    /// was queued. Carries the original commit's receipt, to answer the retry with.
+    Duplicate(RetryReceipt),
+    /// Validated and queued (READY); not yet durable.
+    Ready,
 }
 
 /// The outcome of one committed frame.
@@ -128,16 +142,21 @@ impl WorkerCommitPipeline {
         &mut self.queue
     }
 
-    /// READY: validates and serializes the event into the worker queue. No durability, no visibility, no final sequence
-    /// yet.
+    /// Queues one event (READY): no durability, no visibility, no final sequence yet. A retry of an event this tenant
+    /// already committed inside the replay-guard window (same dedupe identity) is not queued again; you get
+    /// `Submission::Duplicate` with the original receipt to answer the client with.
     pub fn submit(
         &mut self,
         event: EventInput,
         epoch: u64,
+        retry: &mut dyn SafeRetryStore,
         clock: &dyn MonotonicClock,
-    ) -> Result<CommitState, QueueError> {
+    ) -> Result<Submission, QueueError> {
         if event.envelope.tenant_id != self.tenant_id {
             return Err(QueueError::TenantMismatch);
+        }
+        if let Some(receipt) = self.committed_duplicate(&event, retry, clock) {
+            return Ok(Submission::Duplicate(receipt));
         }
         self.queue.push(&PendingRecord {
             tenant_id: self.tenant_id,
@@ -145,31 +164,45 @@ impl WorkerCommitPipeline {
             event,
         })?;
         self.last_activity_monotonic = clock.monotonic_nanos();
-        Ok(CommitState::Ready)
+        Ok(Submission::Ready)
     }
 
-    /// READY for a whole caller batch, or nothing: validates every event and queues the batch only when the queue can
+    /// Queues a whole caller batch, or nothing: validates every event and queues the batch only when the queue can
     /// hold all of it. A refused batch leaves nothing queued and the queue's cursors untouched, so the caller retries
     /// the same batch as one unit once there is room — never a duplicated prefix, never a lost suffix. Admitted events
     /// keep their submission order, so the flush that claims them commits one contiguous sequence sub-range with one
     /// receipt per event.
+    ///
+    /// Returns one `Submission` per event, in order. Events this tenant already committed inside the replay-guard
+    /// window come back as `Submission::Duplicate` with their original receipt and are left out of the batch.
     pub fn submit_batch(
         &mut self,
         events: Vec<EventInput>,
         epoch: u64,
+        retry: &mut dyn SafeRetryStore,
         clock: &dyn MonotonicClock,
-    ) -> Result<CommitState, QueueError> {
+    ) -> Result<Vec<Submission>, QueueError> {
         if events.iter().any(|event| event.envelope.tenant_id != self.tenant_id) {
             return Err(QueueError::TenantMismatch);
         }
-        let records: Vec<PendingRecord> = events
-            .into_iter()
-            .map(|event| PendingRecord {
-                tenant_id: self.tenant_id,
-                epoch,
-                event,
-            })
-            .collect();
+        let mut submissions = Vec::with_capacity(events.len());
+        let mut records = Vec::with_capacity(events.len());
+        for event in events {
+            match self.committed_duplicate(&event, retry, clock) {
+                Some(receipt) => submissions.push(Submission::Duplicate(receipt)),
+                None => {
+                    submissions.push(Submission::Ready);
+                    records.push(PendingRecord {
+                        tenant_id: self.tenant_id,
+                        epoch,
+                        event,
+                    });
+                }
+            }
+        }
+        if records.is_empty() {
+            return Ok(submissions);
+        }
         // Reclaim storage peers have stolen before measuring room, as `push` does, so a drained queue is not refused
         // on stale accounting.
         self.queue.release_hardened();
@@ -178,7 +211,19 @@ impl WorkerCommitPipeline {
         };
         self.queue.push_admitted(&admission)?;
         self.last_activity_monotonic = clock.monotonic_nanos();
-        Ok(CommitState::Ready)
+        Ok(submissions)
+    }
+
+    /// The original receipt when this tenant already committed an event with `event`'s dedupe identity inside the
+    /// replay-guard window.
+    fn committed_duplicate(
+        &self,
+        event: &EventInput,
+        retry: &mut dyn SafeRetryStore,
+        clock: &dyn MonotonicClock,
+    ) -> Option<RetryReceipt> {
+        let dedupe = (event.envelope.dedupe_hash_low, event.envelope.dedupe_hash_high);
+        retry.acknowledged_within_guard(self.tenant_id, dedupe, clock.now_nanos())
     }
 
     /// Steals same-tenant/same-epoch pending records from a topology-local peer queue into this worker's queue. The peer
@@ -235,13 +280,21 @@ impl WorkerCommitPipeline {
     /// one contiguous sequence range, writes one aligned HEJ frame, reads it back to verify what landed on media, and
     /// records durability plus safe-retry receipts. Append-only routes are COMMITTED on durability; transactional
     /// routes stay HARDENED for the dependency hook.
+    ///
+    /// A COMMITTED frame is also published to `overlay` before this returns, so its events are readable through
+    /// `LiveOverlayStore::fresh_read` as soon as the flush succeeds.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a flush wires every store it commits into exactly once"
+    )]
     pub fn flush(
         &mut self,
         reason: FlushReason,
         allocator: &mut SequenceAllocator,
         storage: &mut dyn JournalStorage,
         watermarks: &mut WatermarkTracker,
-        retry: &mut SafeRetryStore,
+        retry: &mut dyn SafeRetryStore,
+        overlay: &mut LiveOverlayStore,
         clock: &dyn MonotonicClock,
     ) -> Result<FlushResult, FlushError> {
         let epoch = allocator.epoch();
@@ -343,6 +396,9 @@ impl WorkerCommitPipeline {
             RouteDependency::AppendOnly => CommitState::Committed,
             RouteDependency::Transactional => CommitState::Hardened,
         };
+        if state == CommitState::Committed {
+            self.publish_to_overlay(&frame_bytes, overlay)?;
+        }
         Ok(FlushResult {
             range,
             frame_offset,
@@ -364,7 +420,7 @@ impl WorkerCommitPipeline {
         frame_offset: u64,
         now: i64,
         status_class: StatusClass,
-        retry: &mut SafeRetryStore,
+        retry: &mut dyn SafeRetryStore,
     ) -> Vec<RetryReceipt> {
         let mut receipts = Vec::with_capacity(events.len());
         for (row, event) in events.iter().enumerate() {
@@ -388,6 +444,20 @@ impl WorkerCommitPipeline {
         // already passed even when no replay ever consults them.
         retry.evict_expired(now);
         receipts
+    }
+
+    /// Decodes a just-committed frame and publishes its events to `overlay`. The segment names this worker's shard as
+    /// its source and carries no segment chain anchor: the chain is a property of a replayed journal segment, and a
+    /// replay rebuild recomputes it. A frame this writer just built is never covered by a published file yet.
+    fn publish_to_overlay(&self, frame_bytes: &[u8], overlay: &mut LiveOverlayStore) -> Result<(), FlushError> {
+        let (header, payload) = decode_frame(frame_bytes).map_err(FlushError::Format)?;
+        let decoded = decode_batch(payload, header.event_count).map_err(FlushError::Format)?;
+        let segment = convert_frame(&header, &decoded, u64::from(self.shard.0), 0, None, |_, _| false)
+            .map_err(FlushError::Format)?;
+        if let Some(segment) = segment {
+            overlay.publish(segment);
+        }
+        Ok(())
     }
 
     /// Builds the batch payload and HEJ frame for `events` under the leased `range`, then appends and syncs it.
@@ -456,12 +526,14 @@ impl WorkerCommitPipeline {
     /// Closes expired reservation leases with internal void records: zero events, the void flag, the abandoned range;
     /// in the hash chain like any frame, never a user event or public output. A lease is retired only after its void
     /// record is durable, so a failed append or sync leaves that lease and every later one still outstanding for a
-    /// subsequent pass to close rather than dropping their ranges uncovered. Returns the ranges durably voided.
+    /// subsequent pass to close rather than dropping their ranges uncovered. Each durable void is also recorded in
+    /// `overlay`, so a fresh read passes over its sequences. Returns the ranges durably voided.
     pub fn commit_voids(
         &mut self,
         allocator: &mut SequenceAllocator,
         storage: &mut dyn JournalStorage,
         watermarks: &mut WatermarkTracker,
+        overlay: &mut LiveOverlayStore,
         clock: &dyn MonotonicClock,
     ) -> Result<Vec<SequenceRange>, FlushError> {
         let now = clock.now_nanos();
@@ -498,6 +570,7 @@ impl WorkerCommitPipeline {
             // Voided sequences are permanently skipped: durable and visible coverage advance (they publish zero rows).
             watermarks.record_durable(range);
             watermarks.record_visible(range);
+            overlay.publish_void(self.tenant_id, range);
             voided.push(range);
         }
         Ok(voided)

@@ -9,10 +9,14 @@ use super::events::{SequenceRange, TenantId};
 use hashbrown::HashMap;
 
 /// The role a stored file plays in the published catalogue.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FileType {
     /// Model outputs or promotion-backfill projections, row-aligned ordinal-for-ordinal to a base HEF file.
     DerivedColumns,
+    /// The same rows as the base event files covering its range, re-sorted by entity so one entity's history reads
+    /// from a few neighbouring granules. A read alternative to those files, never extra data: a query reads one or the
+    /// other for a range, and compaction never merges it back into the base files.
+    EntityProjection,
     /// One fragment of a multi-part SuperHEF compaction generation.
     GenerationPart,
     /// A committed base event file.
@@ -22,7 +26,7 @@ pub enum FileType {
 
 /// Where a stored file is in its life, from being written to deleted. A file only ever advances: `OpenTmp → Sealed →
 /// Active → Outdated → DeleteOnDestroy → Deleted`. `Ord` follows that progression; see `rank()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum PartState {
     /// Manifest references the file and coverage. Queryable.
     Active,
@@ -84,7 +88,7 @@ impl PartialOrd for PartState {
 
 /// One stored file as recorded in the published catalogue. Its mere existence on storage means nothing; this entry is
 /// what makes it visible to queries and records the journal range it covers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HefFileEntry {
     /// The contiguous journal range this file covers.
     pub coverage: SequenceRange,
@@ -186,6 +190,11 @@ pub struct CompactionJob {
 /// `min_output_over_largest` times the largest input, or the roll target — so a trickle tenant's newest small file is
 /// never rewritten at every cycle just because it has one small neighbour. At most `max_jobs_per_cycle` jobs are
 /// returned; everything else waits. Scheduling is deterministic: the same generation always plans the same jobs.
+///
+/// Nothing in HEF calls this: the application calls it each compaction cycle on the head generation, builds each job's
+/// merged file, and publishes it with `HefPublisher::publish_compaction`, then periodically runs
+/// `sweep_retired_files` to delete the replaced inputs (both in the `writer::retire` module, behind the `write`
+/// feature).
 pub fn plan_compaction_cycle(
     policy: &CompactionPolicy,
     generation: &ManifestGeneration,
@@ -244,7 +253,7 @@ pub fn plan_compaction_cycle(
 
 /// One published version of the file catalogue: the set of stored files and their states that queries see at this
 /// generation. Publishing a new version produces the next generation.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ManifestGeneration {
     pub files: Vec<HefFileEntry>,
     /// This generation's footer-mirror object, when one has been built (see
@@ -256,11 +265,29 @@ pub struct ManifestGeneration {
     /// file set. Dropping an artifact is omitting it from the next generation; the sweeper retires its object only
     /// after the safety window, once no live generation references it (see [`retired_artifact_keys`]).
     pub index_artifacts: Vec<IndexArtifactRef>,
+    /// When each `Outdated` or `DeleteOnDestroy` file entered that state, so the sweeper can tell how long it has
+    /// waited. One record per retired file; it leaves with the file.
+    pub retirements: Vec<Retirement>,
+}
+
+/// When, and in which generation, a retired file entered its current state (`Outdated` or `DeleteOnDestroy`).
+///
+/// The sweeper reads it to decide whether a file has waited out the in-flight-query horizon or the safety window, and
+/// whether every query still running opened its snapshot after the file stopped being selectable.
+///
+/// See: hef-file-lifecycle/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Retirement {
+    pub file_id: u128,
+    /// The generation that moved the file into its current state.
+    pub generation: u64,
+    /// Wall-clock nanoseconds since the Unix epoch (read through [`crate::clock::Clock`]) when that generation was built.
+    pub since_nanos: i64,
 }
 
 /// Where one generation's footer-mirror object is stored: its object key, the BLAKE3 checksum of its bytes, and its
 /// size, so a reader can fetch and verify the mirror without trusting the store.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FooterMirrorObject {
     /// Authoritative BLAKE3 of the object bytes.
     pub blake3: [u8; 32],
@@ -270,7 +297,7 @@ pub struct FooterMirrorObject {
 }
 
 /// One manifest-referenced index artifact: enough to fetch, verify, and judge the object without opening it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IndexArtifactRef {
     pub artifact_blake3: [u8; 32],
     pub column_id: u32,

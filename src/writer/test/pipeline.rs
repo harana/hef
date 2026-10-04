@@ -1,11 +1,13 @@
 use super::*;
 use crate::artifacts::batch::PayloadInput;
+use crate::artifacts::overlay::FreshRead;
 use crate::artifacts::segment::{ReplayTail, replay_segment};
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TimestampValue};
 use crate::invariants::Clock;
 use crate::invariants::sim::{Fault, SimClock, SimJournalStorage};
 use crate::typed_id::TypedIdTestExt;
+use crate::writer::sim::SimSafeRetryStore;
 
 fn event(i: u64) -> EventInput {
     EventInput {
@@ -58,10 +60,14 @@ fn append_only_flush_commits_after_durability() {
     let mut storage = SimJournalStorage::new();
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
     for i in 0..3 {
-        assert_eq!(worker.submit(event(i), 1, &clock).unwrap(), CommitState::Ready);
+        assert_eq!(
+            worker.submit(event(i), 1, &mut retry, &clock).unwrap(),
+            Submission::Ready
+        );
     }
     let result = worker
         .flush(
@@ -70,6 +76,7 @@ fn append_only_flush_commits_after_durability() {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap();
@@ -92,11 +99,12 @@ fn append_only_flush_commits_after_durability() {
 #[test]
 fn submit_rejects_an_event_whose_tenant_does_not_match_the_worker() {
     let clock = SimClock::new(42);
+    let mut retry = SimSafeRetryStore::new();
     let mut worker = pipeline();
     let mut foreign = event(0);
     foreign.envelope.tenant_id = TenantId::new_test_id(42);
     assert_eq!(
-        worker.submit(foreign, 1, &clock),
+        worker.submit(foreign, 1, &mut retry, &clock),
         Err(QueueError::TenantMismatch),
         "a cross-tenant event is diagnosed as a tenant mismatch, not a codec failure"
     );
@@ -116,10 +124,11 @@ fn a_zeroed_preallocated_tail_is_never_replayed_or_acknowledged() {
     let mut storage = SimJournalStorage::new();
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
     for i in 0..3 {
-        worker.submit(event(i), 1, &clock).unwrap();
+        worker.submit(event(i), 1, &mut retry, &clock).unwrap();
     }
     worker
         .flush(
@@ -128,6 +137,7 @@ fn a_zeroed_preallocated_tail_is_never_replayed_or_acknowledged() {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap();
@@ -154,8 +164,9 @@ fn a_zeroed_preallocated_tail_is_never_replayed_or_acknowledged() {
 #[test]
 fn force_commit_fires_on_idle_not_immediately() {
     let clock = SimClock::new(7);
+    let mut retry = SimSafeRetryStore::new();
     let mut worker = pipeline();
-    worker.submit(event(0), 1, &clock).unwrap();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
     // Fresh submission: under the idle target, no flush.
     assert_eq!(worker.should_flush(&clock), None);
     // Past the (jittered) idle target, the force commit fires.
@@ -169,9 +180,10 @@ fn force_commit_produces_minimum_frame() {
     let mut storage = SimJournalStorage::new();
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
-    worker.submit(event(0), 1, &clock).unwrap();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
     clock.advance(FORCE_COMMIT_IDLE_NANOS * 2);
     let result = worker
         .flush(
@@ -180,6 +192,7 @@ fn force_commit_produces_minimum_frame() {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap();
@@ -192,6 +205,7 @@ fn expired_lease_closed_by_void_record() {
     let mut storage = SimJournalStorage::new();
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
     // A reservation is taken but never hardened (stalled worker).
     let lease = allocator.reserve(5, clock.monotonic_nanos());
@@ -200,7 +214,7 @@ fn expired_lease_closed_by_void_record() {
     // The stale worker may not harden under the expired lease.
     assert_eq!(allocator.reserve(1, clock.monotonic_nanos()).range.first_sequence, 6);
     let voided = worker
-        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &clock)
+        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &mut overlay, &clock)
         .unwrap();
     assert_eq!(
         voided,
@@ -268,9 +282,10 @@ fn durability_barrier_outlasting_the_lease_deadline_does_not_void_the_durable_fr
     };
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
-    worker.submit(event(0), 1, &clock).unwrap();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
 
     // `sync` inside `build_and_persist` advances the clock past the lease deadline before `harden` is ever called.
     let result = worker
@@ -280,6 +295,7 @@ fn durability_barrier_outlasting_the_lease_deadline_does_not_void_the_durable_fr
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .expect("a frame made durable before its lease deadline check must not be rejected");
@@ -288,7 +304,7 @@ fn durability_barrier_outlasting_the_lease_deadline_does_not_void_the_durable_fr
     // The lease was consumed despite the expired deadline, so no outstanding lease is left for `commit_voids` to close.
     assert_eq!(allocator.outstanding_leases(), 0);
     let voided = worker
-        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &clock)
+        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &mut overlay, &clock)
         .unwrap();
     assert!(
         voided.is_empty(),
@@ -307,9 +323,10 @@ fn durability_barrier_outlasting_the_lease_deadline_does_not_void_the_durable_fr
 #[test]
 fn steal_claim_failure_discards_copied_bytes() {
     let clock = SimClock::new(3);
+    let mut retry = SimSafeRetryStore::new();
     let mut owner = pipeline();
-    owner.submit(event(0), 1, &clock).unwrap();
-    owner.submit(event(1), 1, &clock).unwrap();
+    owner.submit(event(0), 1, &mut retry, &clock).unwrap();
+    owner.submit(event(1), 1, &mut retry, &clock).unwrap();
     // The stealer copies, then the owner claims first: the stale claim must fail and the stolen copy is discarded.
     let (region, copied) = owner.queue().copy_pending().unwrap();
     assert_eq!(copied.len(), 2);
@@ -322,8 +339,9 @@ fn steal_claim_failure_discards_copied_bytes() {
 #[test]
 fn steal_rules_tenant_epoch_and_group() {
     let clock = SimClock::new(3);
+    let mut retry = SimSafeRetryStore::new();
     let mut owner = pipeline();
-    owner.submit(event(0), 1, &clock).unwrap();
+    owner.submit(event(0), 1, &mut retry, &clock).unwrap();
     let mut thief = pipeline();
     // Outside the steal group: refused.
     assert_eq!(thief.steal_from(owner.queue_mut(), 1, false).unwrap(), 0);
@@ -340,9 +358,10 @@ fn steal_into_a_full_thief_claims_nothing_and_loses_no_records() {
     // Regression: the source region must be claimed only after the thief confirms it has room. A thief that cannot
     // admit the records claims nothing, so every record stays with the source rather than vanishing between the queues.
     let clock = SimClock::new(3);
+    let mut retry = SimSafeRetryStore::new();
     let mut owner = pipeline();
     for i in 0..40 {
-        owner.submit(event(i), 1, &clock).unwrap();
+        owner.submit(event(i), 1, &mut retry, &clock).unwrap();
     }
     let before = owner.queue().pending_bytes();
     // A minimal-capacity thief cannot hold all forty records.
@@ -364,6 +383,7 @@ fn steal_lets_the_source_reclaim_its_storage() {
     // drained. Sixty-four single-record rounds through a queue that holds only a few records at once proves the space
     // is reclaimed after each steal.
     let clock = SimClock::new(3);
+    let mut retry = SimSafeRetryStore::new();
     let mut owner = WorkerCommitPipeline::new(
         3,
         ShardId(0),
@@ -373,7 +393,7 @@ fn steal_lets_the_source_reclaim_its_storage() {
     );
     let mut thief = pipeline();
     for i in 0..64 {
-        owner.submit(event(i), 1, &clock).unwrap();
+        owner.submit(event(i), 1, &mut retry, &clock).unwrap();
         assert_eq!(thief.steal_from(owner.queue_mut(), 1, true).unwrap(), 1);
         assert_eq!(owner.queue().pending_bytes(), 0);
     }
@@ -385,9 +405,10 @@ fn crash_loses_unsynced_frame_and_replay_is_idempotent() {
     let mut storage = SimJournalStorage::new();
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
-    worker.submit(event(0), 1, &clock).unwrap();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
     // The sync barrier fails (injected): flush errors, nothing durable.
     storage.inject(Fault::FailSync { shard: ShardId(0) });
     let error = worker
@@ -397,6 +418,7 @@ fn crash_loses_unsynced_frame_and_replay_is_idempotent() {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap_err();
@@ -416,9 +438,10 @@ fn torn_tail_truncates_and_safe_retry_rebuilds_from_hej() {
     let mut storage = SimJournalStorage::new();
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
-    worker.submit(event(0), 1, &clock).unwrap();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
     worker
         .flush(
             FlushReason::Target,
@@ -426,11 +449,12 @@ fn torn_tail_truncates_and_safe_retry_rebuilds_from_hej() {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap();
     // Second frame tears at the crash: only 100 bytes reach media.
-    worker.submit(event(1), 1, &clock).unwrap();
+    worker.submit(event(1), 1, &mut retry, &clock).unwrap();
     storage.inject(Fault::TornTail {
         shard: ShardId(0),
         keep_bytes: 100,
@@ -442,6 +466,7 @@ fn torn_tail_truncates_and_safe_retry_rebuilds_from_hej() {
         &mut storage,
         &mut watermarks,
         &mut retry,
+        &mut overlay,
         &clock,
     );
     storage.crash();
@@ -449,7 +474,7 @@ fn torn_tail_truncates_and_safe_retry_rebuilds_from_hej() {
     assert_eq!(replay.frames.len(), 1);
     assert!(matches!(replay.tail, ReplayTail::Truncated { .. }));
     // Safe-retry rows rebuilt from HEJ coverage agree with the journal.
-    let mut rebuilt = SafeRetryStore::new();
+    let mut rebuilt = SimSafeRetryStore::new();
     rebuilt.reconstruct_from_replay(&replay.frames, ShardId(0), clock.now_nanos() + 1);
     assert_eq!(rebuilt.len(), 1);
     let receipt = rebuilt.lookup(TenantId::new_test_id(9), (5000, 1)).unwrap();
@@ -475,7 +500,7 @@ fn safe_retry_receipts_do_not_collide_across_tenants() {
         status_class: StatusClass::Acknowledged,
         tenant_id: tenant,
     };
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
     retry.record(receipt(tenant_a, 1));
     retry.record(receipt(tenant_b, 2));
     // Both rows coexist; each tenant reads its own commit position rather than the other's.
@@ -542,6 +567,7 @@ fn a_failed_void_write_keeps_later_expired_ranges_outstanding() {
     };
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
     allocator.reserve(1, clock.monotonic_nanos());
     allocator.reserve(1, clock.monotonic_nanos());
@@ -550,7 +576,7 @@ fn a_failed_void_write_keeps_later_expired_ranges_outstanding() {
 
     // The second void append fails; the pass errors after durably voiding only the first range.
     let error = worker
-        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &clock)
+        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &mut overlay, &clock)
         .unwrap_err();
     assert!(matches!(error, FlushError::Storage(_)));
     assert_eq!(
@@ -561,7 +587,13 @@ fn a_failed_void_write_keeps_later_expired_ranges_outstanding() {
 
     // A later pass with storage healthy closes the two ranges that were left outstanding.
     let voided = worker
-        .commit_voids(&mut allocator, &mut storage.inner, &mut watermarks, &clock)
+        .commit_voids(
+            &mut allocator,
+            &mut storage.inner,
+            &mut watermarks,
+            &mut overlay,
+            &clock,
+        )
         .unwrap();
     assert_eq!(voided.len(), 2);
     assert_eq!(allocator.outstanding_leases(), 0);
@@ -578,9 +610,10 @@ fn a_sync_failure_after_a_successful_append_is_not_closed_by_a_void() {
     let mut storage = SimJournalStorage::new();
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
-    worker.submit(event(0), 1, &clock).unwrap();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
 
     storage.inject(Fault::FailSync { shard: ShardId(0) });
     let error = worker
@@ -590,6 +623,7 @@ fn a_sync_failure_after_a_successful_append_is_not_closed_by_a_void() {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap_err();
@@ -603,7 +637,7 @@ fn a_sync_failure_after_a_successful_append_is_not_closed_by_a_void() {
     // Even past the lease deadline, no void record covers the range.
     clock.advance(super::super::reserve::LEASE_NANOS + 1);
     let voided = worker
-        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &clock)
+        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &mut overlay, &clock)
         .unwrap();
     assert!(
         voided.is_empty(),
@@ -668,9 +702,10 @@ fn an_unreadable_offset_after_a_failed_sync_is_not_treated_as_proof_the_append_i
     };
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
-    worker.submit(event(0), 1, &clock).unwrap();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
 
     let error = worker
         .flush(
@@ -679,6 +714,7 @@ fn an_unreadable_offset_after_a_failed_sync_is_not_treated_as_proof_the_append_i
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap_err();
@@ -690,7 +726,7 @@ fn an_unreadable_offset_after_a_failed_sync_is_not_treated_as_proof_the_append_i
     );
     clock.advance(super::super::reserve::LEASE_NANOS + 1);
     let voided = worker
-        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &clock)
+        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &mut overlay, &clock)
         .unwrap();
     assert!(
         voided.is_empty(),
@@ -706,11 +742,12 @@ fn a_mixed_epoch_flush_commits_the_matching_prefix_and_drops_nothing() {
     let mut storage = SimJournalStorage::new();
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
-    worker.submit(event(0), 1, &clock).unwrap();
-    worker.submit(event(1), 1, &clock).unwrap();
-    worker.submit(event(2), 2, &clock).unwrap();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
+    worker.submit(event(1), 1, &mut retry, &clock).unwrap();
+    worker.submit(event(2), 2, &mut retry, &clock).unwrap();
 
     let result = worker
         .flush(
@@ -719,6 +756,7 @@ fn a_mixed_epoch_flush_commits_the_matching_prefix_and_drops_nothing() {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap();
@@ -738,6 +776,7 @@ fn a_mixed_epoch_flush_commits_the_matching_prefix_and_drops_nothing() {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap();
@@ -752,10 +791,11 @@ fn a_flush_whose_queue_front_mismatches_claims_and_drops_nothing() {
     let mut storage = SimJournalStorage::new();
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
     // An epoch-2 record at the queue front while the allocator is still at epoch 1.
-    worker.submit(event(0), 2, &clock).unwrap();
+    worker.submit(event(0), 2, &mut retry, &clock).unwrap();
 
     let error = worker
         .flush(
@@ -764,6 +804,7 @@ fn a_flush_whose_queue_front_mismatches_claims_and_drops_nothing() {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap_err();
@@ -827,9 +868,10 @@ fn post_sync_verification_reads_back_the_stored_bytes() {
     };
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
-    worker.submit(event(0), 1, &clock).unwrap();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
 
     let error = worker
         .flush(
@@ -838,6 +880,7 @@ fn post_sync_verification_reads_back_the_stored_bytes() {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap_err();
@@ -862,7 +905,7 @@ fn post_sync_verification_reads_back_the_stored_bytes() {
     assert_eq!(allocator.outstanding_leases(), 0);
     clock.advance(super::super::reserve::LEASE_NANOS + 1);
     let voided = worker
-        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &clock)
+        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &mut overlay, &clock)
         .unwrap();
     assert!(voided.is_empty());
 }
@@ -957,9 +1000,10 @@ fn a_sync_failure_over_bytes_that_never_landed_leaves_its_range_to_be_voided() {
     };
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
-    worker.submit(event(0), 1, &clock).unwrap();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
 
     let error = worker
         .flush(
@@ -968,6 +1012,7 @@ fn a_sync_failure_over_bytes_that_never_landed_leaves_its_range_to_be_voided() {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap_err();
@@ -982,7 +1027,13 @@ fn a_sync_failure_over_bytes_that_never_landed_leaves_its_range_to_be_voided() {
     // A later pass over healthy storage closes the range with a void record: no permanent sequence hole.
     clock.advance(super::super::reserve::LEASE_NANOS + 1);
     let voided = worker
-        .commit_voids(&mut allocator, &mut storage.inner, &mut watermarks, &clock)
+        .commit_voids(
+            &mut allocator,
+            &mut storage.inner,
+            &mut watermarks,
+            &mut overlay,
+            &clock,
+        )
         .unwrap();
     assert_eq!(voided.len(), 1);
     assert_eq!(allocator.outstanding_leases(), 0);
@@ -997,7 +1048,8 @@ fn a_sync_failure_over_appended_bytes_leaves_an_indeterminate_receipt_to_guard_a
     let mut storage = SimJournalStorage::new();
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
     let submitted = event(0);
     let delivery = (
@@ -1005,7 +1057,7 @@ fn a_sync_failure_over_appended_bytes_leaves_an_indeterminate_receipt_to_guard_a
         submitted.connector_delivery_hash_high,
     );
     let dedupe = (submitted.envelope.dedupe_hash_low, submitted.envelope.dedupe_hash_high);
-    worker.submit(submitted, 1, &clock).unwrap();
+    worker.submit(submitted, 1, &mut retry, &clock).unwrap();
 
     storage.inject(Fault::FailSync { shard: ShardId(0) });
     assert!(matches!(
@@ -1016,6 +1068,7 @@ fn a_sync_failure_over_appended_bytes_leaves_an_indeterminate_receipt_to_guard_a
                 &mut storage,
                 &mut watermarks,
                 &mut retry,
+                &mut overlay,
                 &clock,
             )
             .unwrap_err(),
@@ -1084,9 +1137,10 @@ fn post_sync_verification_rejects_a_different_valid_frame_read_back() {
         let mut worker = pipeline();
         let mut allocator = SequenceAllocator::new(1);
         let mut watermarks = WatermarkTracker::new();
-        let mut retry = SafeRetryStore::new();
+        let mut retry = SimSafeRetryStore::new();
+        let mut overlay = LiveOverlayStore::new();
         let mut storage = SimJournalStorage::new();
-        worker.submit(event(41), 1, &clock).unwrap();
+        worker.submit(event(41), 1, &mut retry, &clock).unwrap();
         let result = worker
             .flush(
                 FlushReason::Target,
@@ -1094,6 +1148,7 @@ fn post_sync_verification_rejects_a_different_valid_frame_read_back() {
                 &mut storage,
                 &mut watermarks,
                 &mut retry,
+                &mut overlay,
                 &clock,
             )
             .unwrap();
@@ -1106,9 +1161,10 @@ fn post_sync_verification_rejects_a_different_valid_frame_read_back() {
     };
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = pipeline();
-    worker.submit(event(0), 1, &clock).unwrap();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
 
     let error = worker
         .flush(
@@ -1117,6 +1173,7 @@ fn post_sync_verification_rejects_a_different_valid_frame_read_back() {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap_err();
@@ -1133,5 +1190,212 @@ fn post_sync_verification_rejects_a_different_valid_frame_read_back() {
         watermarks.commit_watermark(),
         None,
         "durability is not recorded for a frame that could not be verified"
+    );
+}
+
+#[test]
+fn a_committed_event_is_readable_through_fresh_read_as_soon_as_flush_returns() {
+    let clock = SimClock::new(37);
+    let mut storage = SimJournalStorage::new();
+    let mut allocator = SequenceAllocator::new(1);
+    let mut watermarks = WatermarkTracker::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
+    let mut worker = pipeline();
+    for i in 0..3 {
+        worker.submit(event(i), 1, &mut retry, &clock).unwrap();
+    }
+
+    let result = worker
+        .flush(
+            FlushReason::Target,
+            &mut allocator,
+            &mut storage,
+            &mut watermarks,
+            &mut retry,
+            &mut overlay,
+            &clock,
+        )
+        .unwrap();
+
+    let FreshRead::Ready(segments) = overlay.fresh_read(worker.tenant_id, result.range) else {
+        panic!("a committed frame must be in the overlay when flush returns");
+    };
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].range(), result.range);
+    assert_eq!(segments[0].batch.num_rows(), 3);
+}
+
+#[test]
+fn a_hardened_transactional_frame_is_not_published_to_the_overlay() {
+    let clock = SimClock::new(41);
+    let mut storage = SimJournalStorage::new();
+    let mut allocator = SequenceAllocator::new(1);
+    let mut watermarks = WatermarkTracker::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
+    let mut worker = WorkerCommitPipeline::new(
+        3,
+        ShardId(0),
+        TenantId::new_test_id(9),
+        RouteDependency::Transactional,
+        1 << 20,
+    );
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
+
+    let result = worker
+        .flush(
+            FlushReason::Target,
+            &mut allocator,
+            &mut storage,
+            &mut watermarks,
+            &mut retry,
+            &mut overlay,
+            &clock,
+        )
+        .unwrap();
+    assert_eq!(result.state, CommitState::Hardened);
+    assert_eq!(overlay.segment_count(), 0, "only COMMITTED frames become visible");
+}
+
+#[test]
+fn a_committed_void_is_passed_over_by_fresh_read() {
+    let clock = SimClock::new(43);
+    let mut storage = SimJournalStorage::new();
+    let mut allocator = SequenceAllocator::new(1);
+    let mut watermarks = WatermarkTracker::new();
+    let mut overlay = LiveOverlayStore::new();
+    let mut worker = pipeline();
+    allocator.reserve(2, clock.monotonic_nanos());
+    clock.advance(super::super::reserve::LEASE_NANOS + 1);
+
+    let voided = worker
+        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &mut overlay, &clock)
+        .unwrap();
+    assert_eq!(voided.len(), 1);
+    assert!(matches!(
+        overlay.fresh_read(worker.tenant_id, voided[0]),
+        FreshRead::Ready(segments) if segments.is_empty()
+    ));
+}
+
+#[test]
+fn a_retry_inside_the_guard_window_commits_once_and_returns_the_original_receipt() {
+    let clock = SimClock::new(47);
+    let mut storage = SimJournalStorage::new();
+    let mut allocator = SequenceAllocator::new(1);
+    let mut watermarks = WatermarkTracker::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
+    let mut worker = pipeline();
+    assert_eq!(
+        worker.submit(event(0), 1, &mut retry, &clock).unwrap(),
+        Submission::Ready
+    );
+    let first = worker
+        .flush(
+            FlushReason::Target,
+            &mut allocator,
+            &mut storage,
+            &mut watermarks,
+            &mut retry,
+            &mut overlay,
+            &clock,
+        )
+        .unwrap();
+    let original = first.receipts[0].clone();
+
+    assert_eq!(
+        worker.submit(event(0), 1, &mut retry, &clock).unwrap(),
+        Submission::Duplicate(original),
+        "the retry is answered with the first commit's receipt"
+    );
+    assert_eq!(worker.queue().pending_bytes(), 0, "the retry is not queued");
+    assert!(matches!(
+        worker.flush(
+            FlushReason::Target,
+            &mut allocator,
+            &mut storage,
+            &mut watermarks,
+            &mut retry,
+            &mut overlay,
+            &clock,
+        ),
+        Err(FlushError::NothingToFlush)
+    ));
+    let replay = replay_segment(&storage, ShardId(0), 1, 1).unwrap();
+    assert_eq!(replay.frames.len(), 1, "the event is stored once");
+}
+
+#[test]
+fn a_batch_retry_skips_only_the_events_already_committed() {
+    let clock = SimClock::new(53);
+    let mut storage = SimJournalStorage::new();
+    let mut allocator = SequenceAllocator::new(1);
+    let mut watermarks = WatermarkTracker::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
+    let mut worker = pipeline();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
+    let first = worker
+        .flush(
+            FlushReason::Target,
+            &mut allocator,
+            &mut storage,
+            &mut watermarks,
+            &mut retry,
+            &mut overlay,
+            &clock,
+        )
+        .unwrap();
+
+    let submissions = worker
+        .submit_batch(vec![event(0), event(1)], 1, &mut retry, &clock)
+        .unwrap();
+    assert_eq!(
+        submissions,
+        vec![Submission::Duplicate(first.receipts[0].clone()), Submission::Ready]
+    );
+    let second = worker
+        .flush(
+            FlushReason::Target,
+            &mut allocator,
+            &mut storage,
+            &mut watermarks,
+            &mut retry,
+            &mut overlay,
+            &clock,
+        )
+        .unwrap();
+    assert_eq!(second.receipts.len(), 1, "only the new event commits");
+    assert_eq!(second.receipts[0].dedupe, (1001, 7));
+}
+
+#[test]
+fn a_retry_after_the_guard_window_is_queued_again() {
+    let clock = SimClock::new(59);
+    let mut storage = SimJournalStorage::new();
+    let mut allocator = SequenceAllocator::new(1);
+    let mut watermarks = WatermarkTracker::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
+    let mut worker = pipeline();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
+    worker
+        .flush(
+            FlushReason::Target,
+            &mut allocator,
+            &mut storage,
+            &mut watermarks,
+            &mut retry,
+            &mut overlay,
+            &clock,
+        )
+        .unwrap();
+
+    clock.advance(ACK_REPLAY_GUARD_NANOS as u64 + 1);
+    assert_eq!(
+        worker.submit(event(0), 1, &mut retry, &clock).unwrap(),
+        Submission::Ready
     );
 }

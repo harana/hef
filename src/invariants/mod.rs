@@ -78,11 +78,17 @@ pub trait EncodeExecutor: Sync {
 }
 
 /// How a new version of the file catalogue is published, modelled on object-store conditional writes — create-only
-/// generation objects plus an If-Match compare-and-swap on the head pointer. This is the interface that
-/// `hef-manifest-integration` later implements over the real object store; in the meantime the in-memory version
-/// exercises the same rebase-and-retry, never-overwrite discipline honestly.
+/// generation objects plus an If-Match compare-and-swap on the head pointer.
+///
+/// Production uses [`crate::object_store::LivePublishedSet`] over the application's object store; tests use the
+/// in-memory [`sim::SimulatedPublishedSet`], which keeps the same rebase-and-retry, never-overwrite discipline.
+///
+/// Generation ids are plain numbers, but a real store compares the head pointer by its ETag, not by the id it holds.
+/// An implementation may therefore remember the ETag it read in `head` and use it for the next `advance_head`; it must
+/// then fail that `advance_head` with `CasLost` whenever the pointer changed since that read, even if the caller's
+/// `expected` id is right, and never fall back to an unconditional write.
 pub trait PublishedSet {
-    /// Current head generation id and its manifest contents.
+    /// Current head generation id and its manifest contents. May remember the pointer's ETag for `advance_head`.
     fn head(&self) -> Result<(u64, ManifestGeneration), PublishError>;
     /// Create-only write of a new generation object. Fails with `GenerationExists` when the id was already written by
     /// anyone.

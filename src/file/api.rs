@@ -11,7 +11,7 @@
 //! and the in-memory simulation owns none.
 
 use super::error::FileError;
-use super::model::{Atomicity, BlockTarget};
+use super::model::{Atomicity, BlockTarget, ByteRange};
 
 /// How a backend appends to, reads from, and flushes append-only files, one target at a time.
 ///
@@ -64,6 +64,27 @@ pub trait BlockStore {
     /// The target's current untorn-write guarantee: what the startup probe found, unless this target's writes have
     /// since fallen back to the ordinary path, in which case the conservative no-capability answer.
     fn atomicity(&self, target: BlockTarget) -> Result<Atomicity, FileError>;
+}
+
+/// How a reader fetches pieces of a stored file it does not hold in memory, such as a file in object storage. The
+/// deploying application implements it over its own object store.
+///
+/// Synchronous by design, like [`BlockStore`]: the application owns any asynchronous edge internally. `object` is the
+/// file id the manifest names; the application maps it to its own object key. The bytes are untrusted here; the
+/// reader proves every byte it serves against the file's authenticated checksums.
+pub trait RangeSource: Send + Sync {
+    /// Returns exactly `len` bytes of `object` starting at byte `offset`. A range that runs past the end of the object
+    /// is an error, never a short read.
+    fn read_range(&self, object: u128, offset: u64, len: u64) -> Result<Vec<u8>, FileError>;
+
+    /// Returns every range in `ranges` of `object`, in the order given, so a caller can hand over several at once and
+    /// the application can merge neighbours or fetch them in parallel. The default reads them one at a time.
+    fn read_ranges(&self, object: u128, ranges: &[ByteRange]) -> Result<Vec<Vec<u8>>, FileError> {
+        ranges
+            .iter()
+            .map(|range| self.read_range(object, range.offset, range.len))
+            .collect()
+    }
 }
 
 /// Confirms a whole buffer is the bytes the owner committed: its length matches and its authoritative BLAKE3 matches.
