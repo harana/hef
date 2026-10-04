@@ -172,6 +172,9 @@
 "hef-hardware-deployment/rebuildable-hybrid-local-hef-cache/cache-contract-is-identical-on-an-operator-managed-block-cache-substrate" = { status = "unimplemented" }
 "hef-hardware-deployment/rebuildable-hybrid-local-hef-cache/encrypted-block-stays-encrypted-in-cache" = { status = "covered", test = "conformance::hef_hardware_deployment::rebuildable_hybrid_local_hef_cache::encrypted_block_stays_encrypted_in_cache", evidence = "spec" }
 "hef-layout-and-clustering/default-primary-projection/clustering-preserves-sequence-coverage" = { status = "covered", test = "conformance::hef_layout_and_clustering::default_primary_projection::clustering_preserves_sequence_coverage_test", evidence = "model" }
+"hef-layout-and-clustering/entity-projection/entity-min-max-skips-other-granules" = { status = "unimplemented" }
+"hef-layout-and-clustering/entity-projection/primary-build-refuses-entity-order" = { status = "unimplemented" }
+"hef-layout-and-clustering/entity-projection/short-entity-range-reads-at-most-two-granules" = { status = "unimplemented" }
 "hef-logical-event-model/analytical-column-families/internal-embedding-column-requested-publicly" = { status = "covered", test = "conformance::hef_logical_event_model::analytical_column_families::internal_embedding_column_requested_publicly", evidence = "model" }
 "hef-logical-event-model/automatic-workload-aware-column-promotion/frequently-filtered-field-is-promoted" = { status = "covered", test = "conformance::hef_logical_event_model::automatic_workload_aware_column_promotion::frequently_filtered_field_is_promoted", evidence = "model" }
 "hef-logical-event-model/column-families-split-by-temporal-computability/anomaly-score-arrives-days-after-seal" = { status = "covered", test = "conformance::hef_logical_event_model::column_families_split_by_temporal_computability::anomaly_score_arrives_days_after_seal", evidence = "model" }

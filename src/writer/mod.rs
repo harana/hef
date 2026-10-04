@@ -8,6 +8,7 @@ pub mod build;
 pub mod compaction;
 pub mod error;
 pub mod pipeline;
+pub mod projection;
 pub mod publish;
 pub mod queue;
 pub mod reserve;

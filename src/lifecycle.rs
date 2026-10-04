@@ -13,6 +13,10 @@ use hashbrown::HashMap;
 pub enum FileType {
     /// Model outputs or promotion-backfill projections, row-aligned ordinal-for-ordinal to a base HEF file.
     DerivedColumns,
+    /// The same rows as the base event files covering its range, re-sorted by entity so one entity's history reads
+    /// from a few neighbouring granules. A read alternative to those files, never extra data: a query reads one or the
+    /// other for a range, and compaction never merges it back into the base files.
+    EntityProjection,
     /// One fragment of a multi-part SuperHEF compaction generation.
     GenerationPart,
     /// A committed base event file.
