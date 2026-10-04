@@ -95,7 +95,7 @@ impl ExternalPayloadRef {
             }
             let raw = reader.take(len, "external payload uri")?;
             Some(
-                std::str::from_utf8(raw)
+                simdutf8::basic::from_utf8(raw)
                     .map_err(|_| FormatError::Structural {
                         rule: "external payload uri is not UTF-8",
                     })?

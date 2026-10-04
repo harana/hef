@@ -66,7 +66,7 @@ fn read_optional_string(reader: &mut Reader<'_>) -> Result<Option<String>, Forma
         return Ok(None);
     }
     let bytes = reader.take(len as usize, "optional string")?;
-    let text = std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
+    let text = simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
         what: "pending record string",
     })?;
     Ok(Some(text.to_owned()))

@@ -363,7 +363,7 @@ pub fn decode_variant_dictionary(bytes: &[u8]) -> Result<KeyDictionary, FormatEr
             });
         }
         let bytes = slice(data, start, end - start, "dictionary key")?;
-        let key = std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "dictionary key" })?;
+        let key = simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "dictionary key" })?;
         keys.push(key.to_owned());
     }
     KeyDictionary::from_sorted_unique(keys)
@@ -400,7 +400,7 @@ fn decode_string_table(bytes: &[u8]) -> Result<Vec<&str>, FormatError> {
             });
         }
         let bytes = slice(data, start, end - start, "string")?;
-        let value = std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
+        let value = simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
             what: "string table entry",
         })?;
         strings.push(value);
@@ -1065,7 +1065,7 @@ pub fn decode_batch(payload: &[u8], expected_event_count: u32) -> Result<Decoded
             )?;
             if variable.payload_flags & PAYLOAD_FLAG_EXTERNAL_REF != 0 {
                 // External references must be UTF-8; they are internal-only.
-                std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
+                simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
                     what: "external payload reference",
                 })?;
             } else {

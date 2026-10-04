@@ -804,6 +804,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "simd-json",
+ "simdutf8",
  "structured-zstd",
  "tempfile",
  "thiserror",
