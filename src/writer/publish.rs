@@ -233,7 +233,7 @@ impl HefPublisher {
                     Some(bytes)
                         if event.variable.payload_flags & crate::artifacts::batch::PAYLOAD_FLAG_EXTERNAL_REF != 0 =>
                     {
-                        let reference = std::str::from_utf8(bytes).map_err(|_| {
+                        let reference = simdutf8::basic::from_utf8(bytes).map_err(|_| {
                             PublishFailure::Format(FormatError::InvalidUtf8 {
                                 what: "external payload reference",
                             })

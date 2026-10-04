@@ -586,7 +586,7 @@ fn put_string(out: &mut Writer, value: &str) {
 fn read_string(reader: &mut Reader<'_>) -> Result<String, FormatError> {
     let len = reader.u32("string length")? as usize;
     let bytes = reader.take(len, "string")?;
-    std::str::from_utf8(bytes)
+    simdutf8::basic::from_utf8(bytes)
         .map(str::to_owned)
         .map_err(|_| FormatError::InvalidUtf8 { what: "footer string" })
 }
@@ -1837,7 +1837,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
             for _ in 0..value_count {
                 let len = r.u16("shared dictionary value length")? as usize;
                 values.push(
-                    std::str::from_utf8(r.take(len, "shared dictionary value")?)
+                    simdutf8::basic::from_utf8(r.take(len, "shared dictionary value")?)
                         .map_err(|_| FormatError::InvalidUtf8 {
                             what: "shared dictionary value",
                         })?
@@ -1866,7 +1866,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         for _ in 0..count {
             let column_id = r.u32("sparse key column")?;
             let len = r.u16("sparse key path length")? as usize;
-            let path = std::str::from_utf8(r.take(len, "sparse key path")?)
+            let path = simdutf8::basic::from_utf8(r.take(len, "sparse key path")?)
                 .map_err(|_| FormatError::InvalidUtf8 {
                     what: "sparse key path",
                 })?

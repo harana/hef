@@ -957,7 +957,8 @@ impl<'a> VariantRef<'a> {
             BASIC_SHORT_STRING => {
                 let len = header as usize;
                 let bytes = slice(self.bytes, 1, len, "short string")?;
-                let text = std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "short string" })?;
+                let text =
+                    simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "short string" })?;
                 if self.bytes.len() != 1 + len {
                     return Err(FormatError::Structural {
                         rule: "short string has trailing bytes",
@@ -1052,7 +1053,8 @@ impl<'a> VariantRef<'a> {
             PRIM_STRING => {
                 let len = reader.u32("string length")? as usize;
                 let bytes = reader.take(len, "string")?;
-                let text = std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "string" })?;
+                let text =
+                    simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "string" })?;
                 VariantValue::String(text.to_owned())
             }
             PRIM_TIMESTAMP_NANOS_UTC => {
@@ -1095,7 +1097,7 @@ impl<'a> VariantRef<'a> {
             BASIC_SHORT_STRING => {
                 let len = header as usize;
                 let bytes = slice(self.bytes, 1, len, "short string")?;
-                std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "short string" })?;
+                simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "short string" })?;
                 if self.bytes.len() != 1 + len {
                     return Err(FormatError::Structural {
                         rule: "short string has trailing bytes",
@@ -1206,7 +1208,7 @@ impl<'a> VariantRef<'a> {
             PRIM_STRING => {
                 let len = reader.u32("string length")? as usize;
                 let bytes = reader.take(len, "string")?;
-                std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "string" })?;
+                simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "string" })?;
             }
             PRIM_TIMESTAMP_NANOS_UTC => {
                 reader.take(8, "timestamp")?;

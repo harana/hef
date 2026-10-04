@@ -2315,7 +2315,7 @@ fn read_dictionary_values(
         }
         let bytes = slice(data, start, end - start, "dictionary entry")?;
         dictionary.push(
-            std::str::from_utf8(bytes)
+            simdutf8::basic::from_utf8(bytes)
                 .map_err(|_| FormatError::InvalidUtf8 {
                     what: "dictionary entry",
                 })?
@@ -2429,7 +2429,7 @@ fn fsst_decompress_arena(
 ) -> Result<FsstArena, FormatError> {
     with_arena_buffer(|buffer| {
         let bounds = fsst_decompress_values_with_table(table, data, offsets, what, rule, buffer)?;
-        let text = std::str::from_utf8(buffer.as_slice())
+        let text = simdutf8::basic::from_utf8(buffer.as_slice())
             .map_err(|_| FormatError::InvalidUtf8 { what })?
             .to_owned();
         Ok(FsstArena { bounds, text })
@@ -2823,7 +2823,7 @@ fn decode_raw_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatErro
             });
         }
         let bytes = slice(data, start, end - start, "raw string")?;
-        present.push(std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "raw string" })?);
+        present.push(simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "raw string" })?);
     }
     merge_nulls(&nulls, &present)
 }
@@ -2952,7 +2952,7 @@ fn decode_string_block_views_with_body(
                             });
                         }
                         let bytes = slice(data, start, end - start, "dictionary entry")?;
-                        entries.push(std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
+                        entries.push(simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
                             what: "dictionary entry",
                         })?);
                     }
@@ -3028,7 +3028,7 @@ fn string_views_by_row(
     bounds: &[usize],
     what: &'static str,
 ) -> Result<Vec<u128>, FormatError> {
-    let text = std::str::from_utf8(arena).map_err(|_| FormatError::InvalidUtf8 { what })?;
+    let text = simdutf8::basic::from_utf8(arena).map_err(|_| FormatError::InvalidUtf8 { what })?;
     check_value_bounds(text, bounds)?;
     let views = bounds.windows(2).map(|pair| {
         let &[start, end] = pair else { return 0 };
@@ -4185,7 +4185,7 @@ fn decode_dictionary_string_range(
                     });
                 }
                 let bytes = slice(data, lo, hi - lo, "dictionary entry")?;
-                entries.push(std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
+                entries.push(simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
                     what: "dictionary entry",
                 })?);
             }
@@ -4411,7 +4411,7 @@ fn raw_string_values<'a>(data: &'a [u8], offsets: &[usize]) -> Result<Vec<&'a st
                     rule: "raw string offsets must be non-decreasing",
                 });
             }
-            std::str::from_utf8(slice(data, start, end - start, "raw string")?)
+            simdutf8::basic::from_utf8(slice(data, start, end - start, "raw string")?)
                 .map_err(|_| FormatError::InvalidUtf8 { what: "raw string" })
         })
         .collect()

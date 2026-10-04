@@ -426,7 +426,7 @@ fn append_all_present_bits(dst: &mut Vec<u8>, dst_start_bit: usize, len: usize) 
 
 /// Validates `bytes` as UTF-8 and hands back an owned `String`.
 fn owned_utf8(bytes: &[u8], what: &'static str) -> Result<String, FormatError> {
-    std::str::from_utf8(bytes)
+    simdutf8::basic::from_utf8(bytes)
         .map(str::to_owned)
         .map_err(|_| FormatError::InvalidUtf8 { what })
 }
@@ -3282,7 +3282,7 @@ impl HefFile {
                 return Ok(None);
             };
             let bytes = self.freetext_row_bytes(entry, offset, len)?;
-            let text = std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
+            let text = simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
                 what: "freetext row value",
             })?;
             return Ok(Some(VariantValue::String(text.to_owned())));
@@ -3722,7 +3722,7 @@ impl HefFile {
                 return Ok(None);
             };
             let bytes = self.freetext_row_bytes(entry, offset, len)?;
-            let text = std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
+            let text = simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
                 what: "freetext row value",
             })?;
             return Ok(Some(VariantValue::String(text.to_owned())));

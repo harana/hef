@@ -63,7 +63,7 @@ impl LivePublishedSet {
                 generation: 0,
             },
             Some(object) => HeadRead {
-                generation: std::str::from_utf8(&object.bytes)
+                generation: simdutf8::basic::from_utf8(&object.bytes)
                     .ok()
                     .and_then(|text| text.parse().ok())
                     .ok_or_else(|| PublishError::Io {

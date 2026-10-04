@@ -599,7 +599,7 @@ fn filter_dictionary(body: &[u8], side: SideStream, predicate: &StringPredicate)
                 });
             }
             let entry = slice(data, *start, end - start, "dictionary entry")?;
-            dictionary.push(std::str::from_utf8(entry).map_err(|_| FormatError::InvalidUtf8 {
+            dictionary.push(simdutf8::basic::from_utf8(entry).map_err(|_| FormatError::InvalidUtf8 {
                 what: "dictionary entry",
             })?);
         }
@@ -1023,7 +1023,7 @@ fn range_verdicts(predicate: &StringPredicate, text: &[u8], bounds: &[usize]) ->
         .map(|(start, end)| {
             let value = text
                 .get(start..end)
-                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .and_then(|bytes| simdutf8::basic::from_utf8(bytes).ok())
                 .ok_or(FormatError::InvalidUtf8 { what: "fsst value" })?;
             Ok(predicate.matches_value(Some(value)))
         })

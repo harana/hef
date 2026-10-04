@@ -116,7 +116,7 @@ fn stored_text(row: &BuildRow, column_id: u32) -> Result<Option<Cow<'_, str>>, F
             .map(|provenance| Cow::Owned(SignerSignature::join(provenance.signatures()))),
         column_ids::RAW_PAYLOAD => match &row.raw_payload {
             Some(bytes) => Some(Cow::Borrowed(
-                std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "raw payload" })?,
+                simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "raw payload" })?,
             )),
             None => None,
         },
