@@ -1,9 +1,10 @@
 //! Keeps everything needed to prove, years later, who wrote an event that arrived over a signed protocol.
 //!
-//! An event that reaches the platform over a signed wire protocol (Nostr today) carries the author's public key, the
-//! signature, and the protocol's own content-derived identifier. Those travel with the event into storage and stay
-//! byte-exact, so a reader holding nothing but the stored form can rebuild the exact bytes the author signed, recompute
-//! the identifier, and check the signature — without the original wire message and without trusting this store.
+//! An event that reaches the platform over a signed wire protocol (Nostr, or Matrix federation) carries the signers'
+//! public keys, their signatures, and the protocol's own content-derived identifier. Those travel with the event into
+//! storage and stay byte-exact, so a reader holding nothing but the stored form can rebuild the exact bytes the author
+//! signed, recompute the identifier, and check the signature — without the original wire message and without trusting
+//! this store.
 //!
 //! There is deliberately no stored "verified" flag: verification is a precondition of writing the event, and any later
 //! check recomputes it from the bytes.
@@ -17,6 +18,7 @@ use crate::error::ProvenanceError;
 use k256::schnorr::signature::hazmat::PrehashVerifier;
 use k256::schnorr::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::fmt::Write as _;
 
 /// Payload field holding the protocol's message text.
@@ -31,6 +33,8 @@ pub const TAGS_FIELD: &str = "tags";
 pub enum SignatureScheme {
     /// BIP-340 Schnorr over secp256k1, with the NIP-01 canonical serialization — the Nostr contract.
     Bip340SchnorrSecp256k1,
+    /// Ed25519 over the canonical bytes themselves (no pre-hash) - the Matrix federation contract.
+    Ed25519,
 }
 
 impl SignatureScheme {
@@ -38,6 +42,7 @@ impl SignatureScheme {
     pub const fn as_str(self) -> &'static str {
         match self {
             SignatureScheme::Bip340SchnorrSecp256k1 => "bip340-schnorr-secp256k1",
+            SignatureScheme::Ed25519 => "ed25519",
         }
     }
 
@@ -45,6 +50,7 @@ impl SignatureScheme {
     pub fn from_str(tag: &str) -> Option<Self> {
         match tag {
             "bip340-schnorr-secp256k1" => Some(SignatureScheme::Bip340SchnorrSecp256k1),
+            "ed25519" => Some(SignatureScheme::Ed25519),
             _ => None,
         }
     }
@@ -122,6 +128,8 @@ impl SignedEventProvenance {
             SignatureScheme::Bip340SchnorrSecp256k1 => {
                 verify_bip340_prehash(&self.author_pubkey, &recomputed, &self.signature)
             }
+            // Ed25519 signs the message itself, so it checks the canonical bytes rather than their hash.
+            SignatureScheme::Ed25519 => verify_ed25519(&self.author_pubkey, &canonical, &self.signature),
         }
     }
 }
@@ -140,6 +148,122 @@ pub fn verify_bip340_prehash(
     let signature = Signature::try_from(signature.as_slice()).map_err(|_| ProvenanceError::MalformedSignature)?;
     key.verify_prehash(prehash, &signature)
         .map_err(|_| ProvenanceError::SignatureRejected)
+}
+
+/// Checks an Ed25519 signature over `message`, rejecting the weak keys and non-canonical signatures the strict rules
+/// refuse, so a signature that verifies here verifies the same way in every other strict implementation.
+pub fn verify_ed25519(
+    public_key: &[u8; PROTOCOL_ID_BYTES],
+    message: &[u8],
+    signature: &[u8; SIGNATURE_BYTES],
+) -> Result<(), ProvenanceError> {
+    let key = ed25519_dalek::VerifyingKey::from_bytes(public_key).map_err(|_| ProvenanceError::MalformedKey)?;
+    let signature = ed25519_dalek::Signature::from_bytes(signature);
+    key.verify_strict(message, &signature)
+        .map_err(|_| ProvenanceError::SignatureRejected)
+}
+
+/// One party's signature over an event: who signed (a server name, say), which of their keys signed, that key's
+/// public bytes, and the signature itself.
+///
+/// An event a protocol lets several parties sign carries one of these per signature, so every signature re-verifies
+/// offline from the stored key alone, years after the signer rotated or retired that key. `signer` and `key_id` are
+/// non-empty and hold no whitespace, which is what lets their stored text form be split back apart.
+///
+/// See: hef-logical-event-model/spec.md
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SignerSignature {
+    pub key_id: String,
+    pub public_key: [u8; PROTOCOL_ID_BYTES],
+    pub scheme: SignatureScheme,
+    pub signature: [u8; SIGNATURE_BYTES],
+    pub signer: String,
+}
+
+impl SignerSignature {
+    /// A signature entry, or [`ProvenanceError::MalformedSignerSignature`] when the signer or key id is empty or holds
+    /// whitespace.
+    pub fn new(
+        signer: &str,
+        key_id: &str,
+        scheme: SignatureScheme,
+        public_key: [u8; PROTOCOL_ID_BYTES],
+        signature: [u8; SIGNATURE_BYTES],
+    ) -> Result<Self, ProvenanceError> {
+        if !is_token(signer) || !is_token(key_id) {
+            return Err(ProvenanceError::MalformedSignerSignature);
+        }
+        Ok(Self {
+            key_id: key_id.to_owned(),
+            public_key,
+            scheme,
+            signature,
+            signer: signer.to_owned(),
+        })
+    }
+
+    /// Checks this signature over `message`, the exact bytes the protocol says the signer signed. A BIP-340 signer
+    /// signs the SHA-256 of those bytes; an Ed25519 signer signs the bytes themselves.
+    pub fn verify(&self, message: &[u8]) -> Result<(), ProvenanceError> {
+        match self.scheme {
+            SignatureScheme::Bip340SchnorrSecp256k1 => {
+                verify_bip340_prehash(&self.public_key, &sha256_digest(message), &self.signature)
+            }
+            SignatureScheme::Ed25519 => verify_ed25519(&self.public_key, message, &self.signature),
+        }
+    }
+
+    /// Reads one stored entry back: `<scheme> <signer> <key id> <public key hex> <signature hex>`, as
+    /// [`Display`](fmt::Display) writes it.
+    pub fn parse(text: &str) -> Result<Self, ProvenanceError> {
+        let mut parts = text.split(' ');
+        let (Some(scheme), Some(signer), Some(key_id), Some(public_key), Some(signature), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return Err(ProvenanceError::MalformedSignerSignature);
+        };
+        let scheme = SignatureScheme::from_str(scheme).ok_or(ProvenanceError::MalformedSignerSignature)?;
+        Self::new(signer, key_id, scheme, hex_bytes(public_key)?, hex_bytes(signature)?)
+    }
+
+    /// The stored text of several signatures: one entry per line, in the given order.
+    pub fn join(signatures: &[SignerSignature]) -> String {
+        signatures
+            .iter()
+            .map(SignerSignature::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Reads [`join`](Self::join)'s text back into its signatures.
+    pub fn split(text: &str) -> Result<Vec<SignerSignature>, ProvenanceError> {
+        text.split('\n').map(SignerSignature::parse).collect()
+    }
+}
+
+impl fmt::Display for SignerSignature {
+    /// The stored text form: `<scheme> <signer> <key id> <public key hex> <signature hex>`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} {} {} {} {}",
+            self.scheme.as_str(),
+            self.signer,
+            self.key_id,
+            hex_lower(&self.public_key),
+            hex_lower(&self.signature)
+        )
+    }
+}
+
+/// Whether `text` can stand as one space-separated field of a stored signature entry.
+fn is_token(text: &str) -> bool {
+    !text.is_empty() && !text.chars().any(char::is_whitespace)
 }
 
 /// The SHA-256 digest of `preimage` — the hash a caller of [`verify_bip340_prehash`] signs when what it is signing is
@@ -229,7 +353,7 @@ fn push_tags(out: &mut String, tags: &[Vec<&str>]) {
 /// backslash, carriage return, tab, backspace, and form feed get their short escapes, every other control character
 /// gets `\uXXXX`, and nothing else — in particular no escaping of non-ASCII — so the bytes match what the author
 /// hashed.
-fn push_json_string(out: &mut String, value: &str) {
+pub(crate) fn push_json_string(out: &mut String, value: &str) {
     out.push('"');
     // Copies each run of characters that needs no escaping in one push_str instead of one push per character; only
     // an escape boundary flushes the run so far.
