@@ -19,7 +19,10 @@ fn a_worker_batches_frames_without_a_global_commit_thread() {
         let mut world = support::World::new(seed);
         // Submit three events; the worker batches them into a single frame.
         for i in 0..3 {
-            world.worker.submit(support::event(i), 1, &world.clock).unwrap();
+            world
+                .worker
+                .submit(support::event(i), 1, &mut world.retry, &world.clock)
+                .unwrap();
         }
         let result = world
             .worker
@@ -29,6 +32,7 @@ fn a_worker_batches_frames_without_a_global_commit_thread() {
                 &mut world.storage,
                 &mut world.watermarks,
                 &mut world.retry,
+                &mut world.overlay,
                 &world.clock,
             )
             .unwrap();

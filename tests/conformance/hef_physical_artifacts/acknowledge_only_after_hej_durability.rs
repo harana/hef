@@ -12,7 +12,10 @@ fn strict_read_after_ack_visibility() {
     // Under the strict contract, acknowledgement waits until the event is included in visibility_watermark;
     // acknowledged-but-not-yet-visible events are never silently omitted (the gate reports not-ready).
     let mut world = support::World::new(71);
-    world.worker.submit(support::event(0), 1, &world.clock).unwrap();
+    world
+        .worker
+        .submit(support::event(0), 1, &mut world.retry, &world.clock)
+        .unwrap();
     let result = world
         .worker
         .flush(
@@ -21,6 +24,7 @@ fn strict_read_after_ack_visibility() {
             &mut world.storage,
             &mut world.watermarks,
             &mut world.retry,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();

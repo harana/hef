@@ -73,13 +73,17 @@ fn unsupported_host_keeps_the_reactive_path() {
         keep_bytes: 64,
     });
     world.storage.inject(Fault::FailSync { shard: support::SHARD });
-    world.worker.submit(support::event(77), 1, &world.clock).ok();
+    world
+        .worker
+        .submit(support::event(77), 1, &mut world.retry, &world.clock)
+        .ok();
     let _ = world.worker.flush(
         FlushReason::Target,
         &mut world.allocator,
         &mut world.storage,
         &mut world.watermarks,
         &mut world.retry,
+        &mut world.overlay,
         &world.clock,
     );
     world.storage.crash(); // torn tail lands on media

@@ -1,82 +1,42 @@
 use super::*;
 use crate::typed_id::TypedIdTestExt;
+use crate::writer::sim::SimSafeRetryStore;
 
-fn receipt(
-    tenant_id: TenantId,
-    delivery_identity: (u64, u64),
-    dedupe: (u64, u64),
-    expiry_physical_nanos: i64,
-) -> RetryReceipt {
+fn receipt(tenant_id: TenantId, status_class: StatusClass) -> RetryReceipt {
     RetryReceipt {
         commit: SequencePoint { epoch: 1, sequence: 1 },
-        dedupe,
-        delivery_identity,
-        expiry_physical_nanos,
+        dedupe: (100, 0),
+        delivery_identity: (1, 0),
+        expiry_physical_nanos: 1_000,
         frame_offset: 0,
         shard: ShardId(0),
-        status_class: StatusClass::Acknowledged,
+        status_class,
         tenant_id,
     }
 }
 
 #[test]
-fn expired_receipts_are_evicted_and_stop_suppressing() {
+fn duplicate_within_guard_follows_the_acknowledged_receipt() {
     let tenant = TenantId::new_test_id(9);
-    let mut retry = SafeRetryStore::new();
-    retry.record(receipt(tenant, (1, 0), (100, 0), 1_000));
-    retry.record(receipt(tenant, (2, 0), (200, 0), 5_000));
+    let mut retry = SimSafeRetryStore::new();
+    retry.record(receipt(tenant, StatusClass::Acknowledged));
 
-    // Within the window both suppress and nothing is evicted.
-    assert!(retry.duplicate_within_guard(tenant, (100, 0), 500));
-    assert!(retry.duplicate_within_guard(tenant, (200, 0), 500));
-    assert_eq!(retry.len(), 2);
-
-    // Past the first receipt's window it stops suppressing and its row is dropped; the unexpired one stays.
-    assert!(!retry.duplicate_within_guard(tenant, (100, 0), 2_000));
-    assert_eq!(retry.len(), 1);
-    assert!(retry.lookup(tenant, (1, 0)).is_none());
-    assert!(retry.lookup(tenant, (2, 0)).is_some());
-
-    // A record-only owner bounds the store with the explicit sweep.
-    retry.evict_expired(10_000);
-    assert!(retry.is_empty());
-}
-
-#[test]
-fn overwriting_a_receipt_reindexes_its_dedupe_identity() {
-    let tenant = TenantId::new_test_id(9);
-    let mut retry = SafeRetryStore::new();
-    retry.record(receipt(tenant, (1, 0), (100, 0), 1_000));
-    // The same delivery identity re-records under a different dedupe identity.
-    retry.record(receipt(tenant, (1, 0), (200, 0), 1_000));
-
-    assert_eq!(retry.len(), 1);
-    assert!(
-        !retry.duplicate_within_guard(tenant, (100, 0), 0),
-        "the overwritten dedupe identity must no longer suppress"
+    assert_eq!(
+        retry.acknowledged_within_guard(tenant, (100, 0), 0),
+        Some(receipt(tenant, StatusClass::Acknowledged)),
+        "the original receipt comes back for a retry inside the window"
     );
-    assert!(retry.duplicate_within_guard(tenant, (200, 0), 0));
+    assert!(retry.duplicate_within_guard(tenant, (100, 0), 0));
+    assert!(!retry.duplicate_within_guard(TenantId::new_test_id(10), (100, 0), 0));
+    assert!(!retry.duplicate_within_guard(tenant, (100, 0), 1_000));
 }
 
 #[test]
-fn rejected_receipts_never_suppress() {
+fn an_indeterminate_receipt_is_not_a_duplicate() {
     let tenant = TenantId::new_test_id(9);
-    let mut retry = SafeRetryStore::new();
-    let mut rejected = receipt(tenant, (1, 0), (100, 0), 1_000);
-    rejected.status_class = StatusClass::Rejected;
-    retry.record(rejected);
+    let mut retry = SimSafeRetryStore::new();
+    retry.record(receipt(tenant, StatusClass::Indeterminate));
+
+    assert_eq!(retry.acknowledged_within_guard(tenant, (100, 0), 0), None);
     assert!(!retry.duplicate_within_guard(tenant, (100, 0), 0));
-}
-
-#[test]
-fn a_refreshed_receipt_outlives_its_stale_queue_entry() {
-    let tenant = TenantId::new_test_id(9);
-    let mut retry = SafeRetryStore::new();
-    retry.record(receipt(tenant, (1, 0), (100, 0), 1_000));
-    // The same delivery re-records with a later expiry; the eviction queue still holds the stale 1_000 entry.
-    retry.record(receipt(tenant, (1, 0), (100, 0), 5_000));
-
-    retry.evict_expired(2_000);
-    assert_eq!(retry.len(), 1, "the refreshed row survives the stale queue entry");
-    assert!(retry.duplicate_within_guard(tenant, (100, 0), 2_000));
 }

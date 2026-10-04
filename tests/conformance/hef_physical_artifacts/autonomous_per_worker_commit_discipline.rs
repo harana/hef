@@ -15,8 +15,14 @@ fn log_steal_cas_fails() {
     // The stealer copies clean..dirty bytes, then loses the clean-cursor CAS to the owner: the copied bytes are
     // discarded and never framed.
     let mut world = support::World::new(61);
-    world.worker.submit(support::event(0), 1, &world.clock).unwrap();
-    world.worker.submit(support::event(1), 1, &world.clock).unwrap();
+    world
+        .worker
+        .submit(support::event(0), 1, &mut world.retry, &world.clock)
+        .unwrap();
+    world
+        .worker
+        .submit(support::event(1), 1, &mut world.retry, &world.clock)
+        .unwrap();
     let (region, copied) = world.worker.queue().copy_pending().unwrap();
     assert_eq!(copied.len(), 2);
     assert!(world.worker.queue_mut().commit_claim(region), "owner claims first");
@@ -49,6 +55,7 @@ fn abandoned_reservation_closed_by_void_record() {
             &mut world.allocator,
             &mut world.storage,
             &mut world.watermarks,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();
@@ -74,7 +81,10 @@ fn low_load_force_commit() {
     // KiB-aligned frame.
     use hef::writer::reserve::FORCE_COMMIT_IDLE_NANOS;
     let mut world = support::World::new(65);
-    world.worker.submit(support::event(0), 1, &world.clock).unwrap();
+    world
+        .worker
+        .submit(support::event(0), 1, &mut world.retry, &world.clock)
+        .unwrap();
     assert_eq!(world.worker.should_flush(&world.clock), None);
     world.clock.advance(FORCE_COMMIT_IDLE_NANOS * 2);
     assert_eq!(world.worker.should_flush(&world.clock), Some(FlushReason::ForceCommit));
@@ -86,6 +96,7 @@ fn low_load_force_commit() {
             &mut world.storage,
             &mut world.watermarks,
             &mut world.retry,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();

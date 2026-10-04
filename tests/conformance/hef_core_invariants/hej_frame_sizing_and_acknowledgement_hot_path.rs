@@ -13,7 +13,10 @@ fn append_only_ingest_avoids_dependency_machinery() {
     // An ordinary append-only event is acknowledged via the worker's own autonomous flush: COMMITTED directly on
     // durability, no GSN/RFA/ barrier step, and the frame is one of the exact normal sizes.
     let mut world = support::World::new(31);
-    world.worker.submit(support::event(0), 1, &world.clock).unwrap();
+    world
+        .worker
+        .submit(support::event(0), 1, &mut world.retry, &world.clock)
+        .unwrap();
     let result = world
         .worker
         .flush(
@@ -22,6 +25,7 @@ fn append_only_ingest_avoids_dependency_machinery() {
             &mut world.storage,
             &mut world.watermarks,
             &mut world.retry,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();

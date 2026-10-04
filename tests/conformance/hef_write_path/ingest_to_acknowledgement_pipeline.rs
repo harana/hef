@@ -3,7 +3,8 @@
 //! the write succeeded.
 
 use crate::support;
-use hef::writer::pipeline::{CommitState, FlushReason};
+use hef::writer::pipeline::{CommitState, FlushReason, Submission};
+use hef::writer::retry::SafeRetryStore;
 
 /// conformance: hef-write-path/ingest-to-acknowledgement-pipeline/append-only-commit
 #[test]
@@ -12,8 +13,11 @@ fn append_only_commit() {
     // append-only ingest and the client may be acknowledged.
     let mut world = support::World::new(91);
     assert_eq!(
-        world.worker.submit(support::event(0), 1, &world.clock).unwrap(),
-        CommitState::Ready
+        world
+            .worker
+            .submit(support::event(0), 1, &mut world.retry, &world.clock)
+            .unwrap(),
+        Submission::Ready
     );
     let result = world
         .worker
@@ -23,6 +27,7 @@ fn append_only_commit() {
             &mut world.storage,
             &mut world.watermarks,
             &mut world.retry,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();

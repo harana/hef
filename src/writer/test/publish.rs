@@ -1,7 +1,7 @@
 use super::super::build::BuildLifecycle;
 use super::super::pipeline::{FlushReason, RouteDependency, WorkerCommitPipeline};
 use super::super::reserve::SequenceAllocator;
-use super::super::retry::SafeRetryStore;
+use super::super::sim::SimSafeRetryStore;
 use super::*;
 use crate::artifacts::batch::{EventInput, PayloadInput};
 use crate::artifacts::overlay::LiveOverlayStore;
@@ -71,7 +71,8 @@ fn build_config() -> HefBuildConfig {
 struct World {
     allocator: SequenceAllocator,
     clock: SimClock,
-    retry: SafeRetryStore,
+    overlay: LiveOverlayStore,
+    retry: SimSafeRetryStore,
     storage: SimJournalStorage,
     watermarks: WatermarkTracker,
     worker: WorkerCommitPipeline,
@@ -82,7 +83,8 @@ fn ingest(count: u64) -> (World, SequenceRange) {
     let mut storage = SimJournalStorage::new();
     let mut allocator = SequenceAllocator::new(1);
     let mut watermarks = WatermarkTracker::new();
-    let mut retry = SafeRetryStore::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
     let mut worker = WorkerCommitPipeline::new(
         1,
         ShardId(0),
@@ -91,7 +93,7 @@ fn ingest(count: u64) -> (World, SequenceRange) {
         1 << 20,
     );
     for i in 0..count {
-        worker.submit(event(i), 1, &clock).unwrap();
+        worker.submit(event(i), 1, &mut retry, &clock).unwrap();
     }
     let result = worker
         .flush(
@@ -100,6 +102,7 @@ fn ingest(count: u64) -> (World, SequenceRange) {
             &mut storage,
             &mut watermarks,
             &mut retry,
+            &mut overlay,
             &clock,
         )
         .unwrap();
@@ -110,6 +113,7 @@ fn ingest(count: u64) -> (World, SequenceRange) {
             storage,
             allocator,
             watermarks,
+            overlay,
             retry,
             worker,
         },
@@ -565,10 +569,14 @@ fn publish_skips_voids_but_requires_contiguity() {
             &mut world.allocator,
             &mut world.storage,
             &mut world.watermarks,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();
-    world.worker.submit(event(10), 1, &world.clock).unwrap();
+    world
+        .worker
+        .submit(event(10), 1, &mut world.retry, &world.clock)
+        .unwrap();
     let tail = world
         .worker
         .flush(
@@ -577,6 +585,7 @@ fn publish_skips_voids_but_requires_contiguity() {
             &mut world.storage,
             &mut world.watermarks,
             &mut world.retry,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();
@@ -630,6 +639,7 @@ fn retention_advances_over_a_range_that_holds_only_voids() {
             &mut world.allocator,
             &mut world.storage,
             &mut world.watermarks,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();
