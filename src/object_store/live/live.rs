@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 /// Each generation is its own create-only object (`If-None-Match: *`), so a racing publisher can never overwrite one. A
 /// small pointer object names the current generation and moves only by compare-and-swap: `head` remembers the
 /// pointer's ETag, and `advance_head` writes with `If-Match` on it, so a publisher that read a head which has since
-/// moved loses with `CasLost` and must rebase. Generations are stored log-structured — a full checkpoint every
-/// `CHECKPOINT_INTERVAL` generations and, in between, only the changes since that checkpoint — so publishing costs the
+/// moved loses with `CasLost` and must rebase. Generations are stored log-structured - a full checkpoint every
+/// `CHECKPOINT_INTERVAL` generations and, in between, only the changes since that checkpoint - so publishing costs the
 /// same however many files the catalogue holds. A store with no pointer object yet reads as the empty generation 0.
 ///
 /// The store must offer conditional writes; see [`ObjectStore`] for the degraded mode when it does not.

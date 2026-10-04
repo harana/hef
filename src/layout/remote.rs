@@ -147,7 +147,7 @@ fn open_tail(
     if let Some(cache) = cache
         && let Some(tail) = cache.get(&key(range.start, range.len))
     {
-        match open(&*tail) {
+        match open(&tail) {
             Ok(footer) => return Ok((range.start, tail, footer)),
             Err(_) => cache.remove(&key(range.start, range.len)),
         }
@@ -161,7 +161,7 @@ fn open_tail(
         start = entry.size_bytes - exact_len;
         tail = fetch_exact(source, entry.file_id, start, exact_len)?;
     }
-    let footer = open(&*tail)?;
+    let footer = open(&tail)?;
     let tail: Arc<[u8]> = tail.into();
     if let Some(cache) = cache {
         cache.insert(key(start, tail.len() as u64), Arc::clone(&tail));
@@ -370,13 +370,13 @@ impl RemoteFile {
         if let Some(cache) = &self.cache
             && let Some(bytes) = cache.get(&key)
         {
-            if proves(&*bytes) {
+            if proves(&bytes) {
                 return Ok(Some(bytes));
             }
             cache.remove(&key);
         }
         let bytes: Arc<[u8]> = fetch_exact(self.source.as_ref(), self.file_id, read.file_offset, read.length)?.into();
-        if !proves(&*bytes) {
+        if !proves(&bytes) {
             return Ok(None);
         }
         if let Some(cache) = &self.cache {
@@ -426,10 +426,13 @@ impl HeldRanges {
     }
 }
 
+/// One bucket of [`HeldSlots`]: a fixed run of slots, each set at most once.
+type HeldBucket = Box<[OnceLock<Arc<[u8]>>]>;
+
 /// An append-only list of byte buffers that hands out borrows living as long as the list: slots are never moved or
 /// emptied once set. Slot `i` sits in bucket `log2(i + 1)`, and bucket `b` is allocated on first use with `2^b` slots.
 struct HeldSlots {
-    buckets: [OnceLock<Box<[OnceLock<Arc<[u8]>>]>>; HELD_RANGE_BUCKETS],
+    buckets: [OnceLock<HeldBucket>; HELD_RANGE_BUCKETS],
     next: AtomicUsize,
 }
 

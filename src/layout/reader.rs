@@ -566,6 +566,10 @@ pub struct StripeRange {
 
 /// The result of opening from a speculative tail whose exact length was not known before the fetch.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the footer variant is the common outcome and is moved out at once; boxing it would cost an allocation per open"
+)]
 pub enum SpeculativeTail {
     /// The speculative fetch was shorter than the footer. Re-fetch exactly the last `tail_len` bytes of the object and
     /// call [`HefFooter::open`] on them — the one exact retry.
@@ -1607,7 +1611,7 @@ enum Marks {
 /// stripe, in stripe-directory order, holding whether the stripe matched. Readers made by [`HefFile::fresh_reader`]
 /// share it, so a stripe is hashed once per file rather than once per reader.
 #[derive(Debug)]
-struct StripeVerification {
+pub(super) struct StripeVerification {
     verified: Vec<OnceLock<bool>>,
 }
 

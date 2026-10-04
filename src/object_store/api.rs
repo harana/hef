@@ -15,7 +15,7 @@ use crate::events::TenantId;
 /// it is [`PutOutcome::PreconditionFailed`].
 ///
 /// A store without conditional writes cannot implement `put_if_absent` and `put_if_match` honestly. Such a deployment
-/// needs an external commit lock serialising catalogue publication — the documented degraded mode — and must not
+/// needs an external commit lock serialising catalogue publication - the documented degraded mode - and must not
 /// pretend the conditions hold.
 ///
 /// See: hef-manifest-integration/spec.md

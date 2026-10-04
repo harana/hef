@@ -9,7 +9,7 @@
 //!    [`plan_compaction_cycle`](crate::lifecycle::plan_compaction_cycle) for each tenant. For every job, build one file
 //!    from the rows of the job's input files and hand it to [`HefPublisher::publish_compaction`], which publishes one
 //!    generation where the output is `Active` and every input is `Outdated`.
-//! 3. Periodically — not continuously — call [`sweep_retired_files`] with the oldest generation any running query
+//! 3. Periodically - not continuously - call [`sweep_retired_files`] with the oldest generation any running query
 //!    still reads. It moves `Outdated` files no query can still select to `DeleteOnDestroy`, and deletes the objects
 //!    of `DeleteOnDestroy` files that have waited out the safety window, dropping them from the catalogue.
 //!
@@ -45,16 +45,16 @@ pub struct SweepPolicy {
 /// What one sweep did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepReport {
-    /// Files whose objects were deleted and whose entries left the catalogue (`DeleteOnDestroy → Deleted`).
+    /// Files whose objects were deleted and whose entries left the catalogue (`DeleteOnDestroy -> Deleted`).
     pub deleted: Vec<u128>,
     /// The generation the sweep published, or `None` when nothing was due.
     pub generation: Option<u64>,
-    /// Files no live query can still read, moved `Outdated → DeleteOnDestroy`.
+    /// Files no live query can still read, moved `Outdated -> DeleteOnDestroy`.
     pub unreferenced: Vec<u128>,
 }
 
 impl HefPublisher {
-    /// Publishes `built` — one file merged from the files named in `inputs` — as a single new generation in which the
+    /// Publishes `built` - one file merged from the files named in `inputs` - as a single new generation in which the
     /// output is `Active` and every input is `Outdated`, so new queries read the output while queries already reading
     /// the inputs can finish.
     ///
@@ -159,7 +159,7 @@ impl HefPublisher {
 ///
 /// `oldest_live_snapshot` is the oldest catalogue generation any running query opened its snapshot at (the head
 /// generation when no query is running); the application tracks it. An `Outdated` file becomes `DeleteOnDestroy` only
-/// when every live snapshot was opened at or after the generation that outdated it — so no running query selected it —
+/// when every live snapshot was opened at or after the generation that outdated it - so no running query selected it -
 /// and it has been `Outdated` for at least the in-flight-query horizon. A `DeleteOnDestroy` file is deleted from
 /// `objects` once it has waited the safety window, and its entry then leaves the catalogue. A file whose object key is
 /// still named by an `Active` or `Outdated` entry is never deleted.
@@ -297,8 +297,8 @@ fn merged_coverage(
 }
 
 /// Writes `next` and moves the head to it from `head_id`. `Ok(true)` when this call published it; `Ok(false)` when the
-/// head moved first and the caller must rebase. A generation id someone else already wrote — a crashed publisher's
-/// stalled generation — is helped onto the head first, so it can never wedge this caller.
+/// head moved first and the caller must rebase. A generation id someone else already wrote - a crashed publisher's
+/// stalled generation - is helped onto the head first, so it can never wedge this caller.
 fn commit(published: &mut dyn PublishedSet, head_id: u64, next: ManifestGeneration) -> Result<bool, PublishFailure> {
     let next_id = next.generation;
     match published.put_generation(next) {

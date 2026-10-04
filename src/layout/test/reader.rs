@@ -102,7 +102,7 @@ fn file_with_mark(mark: ColumnMark, bytes: Vec<u8>, usable_optional_features: u6
         aliased_extent_cache_bytes: AtomicU64::new(0),
         aliased_extents: DashSet::default(),
         block_reads: AtomicU64::new(0),
-        bytes: Arc::new(bytes),
+        bytes: FileBytes::Local(Arc::new(bytes)),
         cache_access_counter: AtomicU64::new(0),
         column_cache: DashMap::default(),
         column_cache_bytes: AtomicU64::new(0),
@@ -2482,7 +2482,7 @@ fn cold_footer_locates_the_same_blocks_as_the_whole_file_reader() {
                 let range = cold.block_range(&mark).unwrap();
                 let via_range = &bytes[(stripe.file_offset + range.stripe_offset) as usize..][..range.length as usize];
                 let position = file.file_position(granule.granule_id, mark.compressed_offset).unwrap();
-                assert_eq!(via_range, &file.bytes[position..][..mark.compressed_size as usize]);
+                assert_eq!(via_range, &bytes[position..][..mark.compressed_size as usize]);
             }
         }
     }

@@ -137,6 +137,10 @@ fn section_checksum(file_id: u128, generation: u64, tail_bytes: &[u8]) -> [u8; 3
 /// Where a planner should open `entry`'s footer from: the mirror, when it holds a valid section, or the per-file
 /// tail geometry ([`super::reader::tail_range`]) otherwise.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the footer variant is the common outcome and is moved out at once; boxing it would cost an allocation per open"
+)]
 pub enum FooterSource {
     /// The mirror held a valid section; the footer is already open.
     Mirror(HefFooter),

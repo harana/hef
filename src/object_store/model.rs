@@ -28,8 +28,8 @@ pub struct ObjectStat {
 /// What a conditional write did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PutOutcome {
-    /// The condition did not hold — the key was already taken for a create-only write, or the ETag had moved for an
-    /// If-Match write — so nothing was written.
+    /// The condition did not hold - the key was already taken for a create-only write, or the ETag had moved for an
+    /// If-Match write - so nothing was written.
     PreconditionFailed,
     /// The object was written and now carries `etag`.
     Written { etag: ETag },

@@ -47,7 +47,7 @@ pub(crate) fn upload_hef(
 }
 
 /// Groups stripe-aligned upload segments (see [`hef_upload_segments`]) into multipart parts of at least
-/// `min_part_bytes`, cutting only where a segment ends — that is, where a stripe begins. The last part may be smaller,
+/// `min_part_bytes`, cutting only where a segment ends - that is, where a stripe begins. The last part may be smaller,
 /// as object stores allow. The parts tile the whole file in order.
 pub(crate) fn upload_parts(segments: &[u64], min_part_bytes: u64) -> Vec<Range<u64>> {
     let mut parts = Vec::new();

@@ -72,6 +72,9 @@ pub fn event(i: u64) -> EventInput {
 pub struct World {
     pub allocator: SequenceAllocator,
     pub clock: SimClock,
+    /// Index of the next event `ingest` submits, so every ingested event is distinct and none is deduplicated as a
+    /// retry.
+    pub next_event: u64,
     pub overlay: LiveOverlayStore,
     pub retry: SimSafeRetryStore,
     pub storage: SimJournalStorage,
@@ -85,6 +88,7 @@ impl World {
             clock: SimClock::new(seed),
             storage: SimJournalStorage::new(),
             allocator: SequenceAllocator::new(1),
+            next_event: 0,
             watermarks: WatermarkTracker::new(),
             overlay: LiveOverlayStore::new(),
             retry: SimSafeRetryStore::new(),
@@ -94,9 +98,10 @@ impl World {
 
     /// Submits and flushes `count` events as one frame; returns its range.
     pub fn ingest(&mut self, count: u64) -> SequenceRange {
-        for i in 0..count {
+        for i in self.next_event..self.next_event + count {
             self.worker.submit(event(i), 1, &mut self.retry, &self.clock).unwrap();
         }
+        self.next_event += count;
         self.worker
             .flush(
                 FlushReason::Target,
