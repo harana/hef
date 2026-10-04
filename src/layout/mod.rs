@@ -12,11 +12,13 @@ use constant::HEF_MAGIC;
 use std::borrow::Cow;
 use uuid::Uuid;
 
+pub mod cache;
 pub mod clustering;
 pub mod constant;
 pub mod footer;
 pub mod mirror;
 pub mod reader;
+mod remote;
 
 /// The fixed file header occupies the first 4 KiB block.
 pub const HEADER_BLOCK_LEN: usize = 4096;

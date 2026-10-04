@@ -21,6 +21,7 @@ use super::footer::{
     PageStats, PayloadGranule, ResidualCompression, StripeEntry, TextTokenOffsetsEntry, decode_footer,
     decode_marks_page, decode_marks_page_directory, decode_marks_page_extents,
 };
+use super::remote::FileBytes;
 use super::{EMPTY_VALUE_ROW_OFFSET, HEADER_BLOCK_LEN, HefHeader, decode_header, optional_features, required_features};
 use crate::artifacts::batch::decode_variant_dictionary;
 use crate::columns::column_ids;
@@ -1665,9 +1666,10 @@ pub struct HefFile {
     /// Encoded column-block and page fetches since open. Never feeds a read result; it exists so tests can observe
     /// that a scan answered from metadata (a constant block filled from its exact stats) skipped the block's bytes.
     block_reads: AtomicU64,
-    /// Shared with every reader [`Self::fresh_reader`] made from this one, so a benchmark's per-iteration readers
-    /// need no copy of the file.
-    bytes: Arc<Vec<u8>>,
+    /// The whole file in memory, shared with every reader [`Self::fresh_reader`] made from this one so a benchmark's
+    /// per-iteration readers need no copy of it; or, for [`Self::open_remote`], the remote object read a verified
+    /// range at a time.
+    bytes: FileBytes,
     /// Monotonic access tick shared by the decoded-block caches; each hit or insert stamps the slot it touched, so
     /// eviction can drop the least-recently-used slot deterministically.
     cache_access_counter: AtomicU64,
@@ -1915,7 +1917,7 @@ impl HefFile {
             None
         };
         Self::assemble(
-            Arc::new(bytes),
+            FileBytes::Local(Arc::new(bytes)),
             header,
             footer,
             usable_optional_features,
@@ -1930,7 +1932,7 @@ impl HefFile {
     /// keeps checking the rest as it reads them.
     pub fn fresh_reader(&self) -> Result<Self, FormatError> {
         Self::assemble(
-            Arc::clone(&self.bytes),
+            self.bytes.fresh(),
             self.header.clone(),
             self.footer.clone(),
             self.usable_optional_features,
@@ -1941,8 +1943,8 @@ impl HefFile {
 
     /// Checks the structure the footer declares and builds the reader's lookup indexes over it. Everything after the
     /// stripe hashing of an open, so a reader made from an already-verified template starts here.
-    fn assemble(
-        bytes: Arc<Vec<u8>>,
+    pub(super) fn assemble(
+        bytes: FileBytes,
         header: HefHeader,
         footer: Footer,
         usable_optional_features: u64,
@@ -2161,7 +2163,11 @@ impl HefFile {
     /// time any of its bytes are read. Bytes outside every stripe — the header, the footer, and the alignment gaps —
     /// were verified at open.
     fn data(&self, position: usize, len: usize, what: &'static str) -> Result<&[u8], FormatError> {
-        let bytes = slice(&self.bytes, position, len, what)?;
+        let file = match &self.bytes {
+            FileBytes::Local(file) => file,
+            FileBytes::Remote(remote) => return remote.read(position as u64, len, what),
+        };
+        let bytes = slice(file, position, len, what)?;
         if let Some(verification) = &self.lazy_stripes {
             let end = position + len;
             for (index, (stripe, checksum)) in self
@@ -2173,7 +2179,7 @@ impl HefFile {
             {
                 let stripe_end = stripe.file_offset.saturating_add(stripe.byte_len) as usize;
                 if (stripe.file_offset as usize) < end && position < stripe_end {
-                    verification.ensure_verified(index, stripe, checksum, &self.bytes)?;
+                    verification.ensure_verified(index, stripe, checksum, file)?;
                 }
             }
         }
@@ -2989,10 +2995,18 @@ impl HefFile {
     ) -> Result<ResidualBytes<'_>, FormatError> {
         match payload.residual_compression {
             ResidualCompression::None => {
-                let residual = self.residual_block(payload)?;
-                Ok(ResidualBytes::InFile(slice(
-                    residual,
-                    offset as usize,
+                // Only the row's own slot is read, so a remote reader fetches that slot rather than the whole arena.
+                if offset.checked_add(len).is_none_or(|end| end > payload.residual_len) {
+                    return Err(FormatError::Truncated { what: "residual value" });
+                }
+                let position = self
+                    .file_position(payload.granule_id, payload.residual_offset)?
+                    .checked_add(offset as usize)
+                    .ok_or(FormatError::RefOutOfRange {
+                        what: "offset beyond file range",
+                    })?;
+                Ok(ResidualBytes::InFile(self.data(
+                    position,
                     len as usize,
                     "residual value",
                 )?))

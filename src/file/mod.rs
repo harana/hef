@@ -19,6 +19,6 @@ pub mod integrity;
 pub mod model;
 pub mod sim;
 
-pub use api::BlockStore;
+pub use api::{BlockStore, RangeSource};
 pub use error::{CodecError, FileError};
-pub use model::{Atomicity, BlockTarget, DurabilityMode, IoCapabilities};
+pub use model::{Atomicity, BlockTarget, ByteRange, DurabilityMode, IoCapabilities};
