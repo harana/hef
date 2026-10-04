@@ -1,4 +1,5 @@
-//! The references an event declares about other events — its parent, its thread root, and anything it links to.
+//! The references an event declares about other events — its parent, its thread root, anything it links to, and the
+//! earlier events a federated protocol's event names as its predecessors and authorisers.
 //!
 //! A reference is declared by the *later* event about the *earlier* one: a reply names its parent and its thread root,
 //! a follow-up names the original. The referenced event is sealed and immutable, so it is never rewritten to learn of
@@ -10,7 +11,9 @@
 //!
 //! See: hef-logical-event-model/spec.md
 
+use super::constant::EXTERNAL_ID_MAX_BYTES;
 use super::provenance::hex_lower_into;
+use crate::columns::column_ids;
 use crate::error::RelationshipError;
 
 /// Byte length of a target in the `event_id` space (the 128-bit envelope identity).
@@ -23,10 +26,14 @@ pub const PROTOCOL_TARGET_LEN: usize = 32;
 /// a stored tag outside the registry never decodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RelationshipKind {
+    /// An earlier event whose state authorises this one (Matrix `auth_events`). Repeatable.
+    Auth,
     /// An explicit link to another event, with no reply or thread meaning.
     Link,
     /// The event this one directly replies to or continues. At most one per event.
     Parent,
+    /// An event this one directly follows in its room's history (Matrix `prev_events`). Repeatable.
+    Prev,
     /// A loose association, weaker than a link. Never a causal claim.
     Related,
     /// The first event of the thread this one belongs to, denormalized so a whole conversation is one equality
@@ -36,9 +43,11 @@ pub enum RelationshipKind {
 
 impl RelationshipKind {
     /// Every kind, for iterating over the registry.
-    pub const ALL: [RelationshipKind; 4] = [
+    pub const ALL: [RelationshipKind; 6] = [
+        RelationshipKind::Auth,
         RelationshipKind::Link,
         RelationshipKind::Parent,
+        RelationshipKind::Prev,
         RelationshipKind::Related,
         RelationshipKind::Root,
     ];
@@ -46,8 +55,10 @@ impl RelationshipKind {
     /// The stored tag for this kind.
     pub const fn as_str(self) -> &'static str {
         match self {
+            RelationshipKind::Auth => "auth",
             RelationshipKind::Link => "link",
             RelationshipKind::Parent => "parent",
+            RelationshipKind::Prev => "prev",
             RelationshipKind::Related => "related",
             RelationshipKind::Root => "root",
         }
@@ -56,11 +67,25 @@ impl RelationshipKind {
     /// The kind a stored tag names, or `None` when the tag is not in the registry.
     pub fn from_str(tag: &str) -> Option<Self> {
         match tag {
+            "auth" => Some(RelationshipKind::Auth),
             "link" => Some(RelationshipKind::Link),
             "parent" => Some(RelationshipKind::Parent),
+            "prev" => Some(RelationshipKind::Prev),
             "related" => Some(RelationshipKind::Related),
             "root" => Some(RelationshipKind::Root),
             _ => None,
+        }
+    }
+
+    /// The file column that stores this kind's references.
+    pub const fn column_id(self) -> u32 {
+        match self {
+            RelationshipKind::Auth => column_ids::AUTH_REFS,
+            RelationshipKind::Link => column_ids::LINKED_REFS,
+            RelationshipKind::Parent => column_ids::PARENT_REF,
+            RelationshipKind::Prev => column_ids::PREV_REFS,
+            RelationshipKind::Related => column_ids::RELATED_REFS,
+            RelationshipKind::Root => column_ids::ROOT_REF,
         }
     }
 }
@@ -74,6 +99,9 @@ impl RelationshipKind {
 pub enum TargetIdSpace {
     /// The envelope's 128-bit `event_id`. Internal identity: never raw public output.
     EventId,
+    /// An external protocol's own event id as the event's external-id column stores it (a Matrix `$...` id, say):
+    /// 1 to 255 bytes.
+    ExternalId,
     /// A signed protocol's own content-derived event identifier (32 bytes today).
     ProtocolEventId,
 }
@@ -83,6 +111,7 @@ impl TargetIdSpace {
     pub const fn as_str(self) -> &'static str {
         match self {
             TargetIdSpace::EventId => "event_id",
+            TargetIdSpace::ExternalId => "external_id",
             TargetIdSpace::ProtocolEventId => "protocol_event_id",
         }
     }
@@ -91,16 +120,27 @@ impl TargetIdSpace {
     pub fn from_str(tag: &str) -> Option<Self> {
         match tag {
             "event_id" => Some(TargetIdSpace::EventId),
+            "external_id" => Some(TargetIdSpace::ExternalId),
             "protocol_event_id" => Some(TargetIdSpace::ProtocolEventId),
             _ => None,
         }
     }
 
-    /// The exact byte length a target in this space must have.
-    pub const fn target_len(self) -> usize {
+    /// The exact byte length every target in this space has, or `None` for the variable-length external-id space.
+    pub const fn fixed_len(self) -> Option<usize> {
         match self {
-            TargetIdSpace::EventId => EVENT_ID_TARGET_LEN,
-            TargetIdSpace::ProtocolEventId => PROTOCOL_TARGET_LEN,
+            TargetIdSpace::EventId => Some(EVENT_ID_TARGET_LEN),
+            TargetIdSpace::ExternalId => None,
+            TargetIdSpace::ProtocolEventId => Some(PROTOCOL_TARGET_LEN),
+        }
+    }
+
+    /// Whether a target of `len` bytes can name an event in this space: exactly the fixed width, or 1 to 255 bytes for
+    /// external ids.
+    pub const fn accepts_len(self, len: usize) -> bool {
+        match self.fixed_len() {
+            Some(fixed) => len == fixed,
+            None => len >= 1 && len <= EXTERNAL_ID_MAX_BYTES,
         }
     }
 }
@@ -118,7 +158,7 @@ impl RelationshipRef {
     /// A reference whose target length matches its space, or an error — a target of the wrong width could never
     /// equal any stored identifier, so storing it would be a reference that lies about resolving.
     pub fn new(kind: RelationshipKind, space: TargetIdSpace, target_ref: Vec<u8>) -> Result<Self, RelationshipError> {
-        if target_ref.len() != space.target_len() {
+        if !space.accepts_len(target_ref.len()) {
             return Err(RelationshipError::WrongTargetLength);
         }
         Ok(Self {
@@ -135,6 +175,12 @@ impl RelationshipRef {
             space: TargetIdSpace::EventId,
             target_ref: event_id.to_be_bytes().to_vec(),
         }
+    }
+
+    /// A reference to an event by its external protocol id (a Matrix `$...` id, say), or
+    /// [`RelationshipError::WrongTargetLength`] for an empty id or one longer than 255 bytes.
+    pub fn to_external(kind: RelationshipKind, external_id: &[u8]) -> Result<Self, RelationshipError> {
+        Self::new(kind, TargetIdSpace::ExternalId, external_id.to_vec())
     }
 
     /// A reference to a signed protocol event by the protocol's own identifier.
@@ -166,7 +212,10 @@ impl RelationshipRef {
     pub fn parse_column_value(kind: RelationshipKind, value: &str) -> Result<Self, RelationshipError> {
         let (space_tag, hex) = value.split_once(':').ok_or(RelationshipError::MalformedColumnValue)?;
         let space = TargetIdSpace::from_str(space_tag).ok_or(RelationshipError::UnknownSpace)?;
-        if hex.len() != space.target_len() * 2 || hex.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        if !hex.len().is_multiple_of(2)
+            || !space.accepts_len(hex.len() / 2)
+            || hex.bytes().any(|byte| byte.is_ascii_uppercase())
+        {
             return Err(RelationshipError::MalformedColumnValue);
         }
         let target_ref = hex_simd::decode_to_vec(hex).map_err(|_| RelationshipError::MalformedColumnValue)?;
@@ -178,7 +227,7 @@ impl RelationshipRef {
 /// declares no relationships materializes no relationship columns at all.
 ///
 /// At most one `parent` and at most one `root` are allowed, because those two kinds are what thread reconstruction
-/// filters on; `link` and `related` may repeat freely.
+/// filters on; `link`, `related`, `prev`, and `auth` may repeat freely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventRelationships {
     refs: Vec<RelationshipRef>,
