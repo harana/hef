@@ -19,6 +19,21 @@ Each HEF file SHALL begin with a fixed-size aligned header (`HEFHeader`) carryin
 - **WHEN** a remote reader opens a HEF from object storage
 - **THEN** it sizes the tail range from the manifest's `file_size`, `footer_len`, and `tree_len` and never issues a front-of-file header read or reads `footer_pointer_hint`
 
+### Requirement: Remote reads fetch only the ranges a read needs
+A reader SHALL be able to open and read a HEF that lives in object storage without holding the whole object. The byte source SHALL be a synchronous range-source interface the embedding application implements (`read_range(object, offset, len)`, plus a batched form that returns several ranges in one call so the application can merge neighbours or fetch them in parallel); the application owns any asynchronous edge. A remote open SHALL issue one request for the tail, sized exactly from the manifest entry's `size_bytes`, `footer_len`, and `tree_len` (a speculative tail plus at most one exact retry when `footer_len` is absent), and SHALL bind the footer to the manifest seal through the publisher's recorded header commitment, never by reading the front-of-file header. After the open, every marks page, column block, and payload slot a read touches SHALL be fetched as the stripe range covering it, widened only to the outboard proof leaves that verify it (the whole stripe when the stripe has no proof tree or its tree is unusable), and no byte SHALL be served before it is proven against the authenticated stripe root. A stripe's co-located marks pages SHALL be fetched as their one contiguous extent. A single-row payload read from an uncompressed residual arena SHALL fetch that row's residual slot, not the whole arena. A stripe that pruning never reaches SHALL never be fetched.
+
+#### Scenario: Cold point read after an exact tail open
+- **WHEN** a reader opens a remote HEF whose manifest entry records `footer_len` and reads one column block of one granule
+- **THEN** the open is one request and the block read issues at most two more (the stripe's marks extent, then the block), none of them the whole stripe of a stripe that carries a proof tree
+
+#### Scenario: Pruned stripe is never fetched remotely
+- **WHEN** a remote reader reads granules of one stripe only
+- **THEN** no request touches any byte of any other stripe, its marks pages included
+
+#### Scenario: Single-row payload fetches its slot
+- **WHEN** a remote reader reconstructs one row's payload from a granule whose uncompressed residual arena spans several proof leaves
+- **THEN** it fetches the proof leaves around that row's residual slot and never the whole arena, and returns the same value an in-memory reader returns
+
 ### Requirement: Stripe, granule, page, and mini-block model
 HEF SHALL preserve row-group semantics through sequence-ordered stripes and granules and SHALL NOT adopt an arbitrary self-describing layout tree. Stripes SHALL target ~256 MiB uncompressed (min 64 MiB, max 512 MiB); granules SHALL be `min(index_granularity rows=8192, rows fitting index_granularity_bytes=10 MiB compressed)` and contain a contiguous sequence-ordered row range within one stripe with shared row positions across envelope columns. A writer SHALL close the file before any stripe exceeds the maximum stripe size as a pure safety backstop — the stripe clamp SHALL NOT be the primary file-roll trigger, which is owned by publish policy (the dual byte/time roll trigger in the write path) — and a reader SHALL reject a file whose stripe/page exceeds the maximum unless a supported future feature flag is declared.
 

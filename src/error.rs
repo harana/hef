@@ -28,6 +28,10 @@ pub enum FormatError {
     Structural { rule: &'static str },
     #[error("truncated input while reading {what}")]
     Truncated { what: &'static str },
+    /// The bytes never arrived: the remote source a file is read through failed to return a range. Not a verdict on
+    /// the file itself, so a retry may succeed.
+    #[error("file bytes unavailable: {detail}")]
+    Unavailable { detail: String },
     #[error("unknown required feature flags {bits:#x}: refusing")]
     UnknownRequiredFeature { bits: u64 },
     #[error("unsupported version {found} in {field}")]

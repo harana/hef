@@ -20,3 +20,7 @@ pub const HEF_MAGIC: [u8; 4] = *b"HEF1";
 /// 32 MiB the default benchmark file (100,000 rows, 56 MiB estimated over every column) scans as two windows with a
 /// measured 22 MB peak of live decoded blocks, while a day-scale file streams through in fixed-size steps.
 pub const SCAN_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+
+/// How many doubling buckets hold the verified ranges a remote reader has fetched: bucket `b` holds `2^b` ranges, so
+/// this bounds one reader at `2^48 - 1` fetches, far past anything a single file can need.
+pub const HELD_RANGE_BUCKETS: usize = 48;

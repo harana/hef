@@ -10,6 +10,14 @@ use super::constant::FRAME_ALIGNMENT;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockTarget(pub u64);
 
+/// One contiguous run of bytes in a stored object, as a [`crate::file::api::RangeSource`] is asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteRange {
+    pub len: u64,
+    /// Measured from the first byte of the object.
+    pub offset: u64,
+}
+
 /// How a backend turns a write into a durable write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityMode {
