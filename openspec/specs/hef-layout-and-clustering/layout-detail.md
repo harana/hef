@@ -20,8 +20,12 @@ time_major
   optimized for dashboards, counts, period comparisons, and time buckets.
 
 entity_major
-  sort by entity_id_hash, occurred_at, epoch, sequence;
-  optimized for entity/account/customer/opportunity timelines.
+  sort by entity_id_hash (low, then high), epoch, sequence;
+  optimized for entity/account/customer/opportunity timelines;
+  built by compaction from ingest files and published as an EntityProjection
+  manifest entry; per-granule entity min/max comes from the entity hash
+  columns' block statistics, and each granule keeps exact (epoch, sequence)
+  bounds.
 
 source_type_major
   sort by source_id, event_type_id, occurred_at, epoch, sequence;

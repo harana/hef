@@ -34,3 +34,22 @@ The `EventContextReader` API (`plan_context_scan`, `read_context_packets`) and i
 - **WHEN** an operator queries `system.hef_files`
 - **THEN** results enforce tenant/admin authorization and omit object-store credentials, local paths, payload bytes, and embedding values
 
+### Requirement: Entity event scan
+The reader SHALL read any stored row back as its event (the full envelope and the payload) from a published HEF file and from a LiveOverlay segment alike. It SHALL expose an entity scan that takes a tenant, an entity's identity hashes, an inclusive `(epoch, sequence)` range, a direction, and an optional limit, runs over a set of HEF files plus the LiveOverlay, and returns that entity's events in sequence order. Where the same sequence point appears more than once, the copy from the newest file generation SHALL be served, and a published copy SHALL win over the LiveOverlay. The scan SHALL skip rows a deletion vector deletes and SHALL serve each corrected event as its latest correction in the original's place: a replacement serves the correcting event, an amendment serves the original with the amendment's payload fields laid over its own, and a retraction drops the event; a correcting event SHALL NOT also be served at its own place. Deletion vectors and corrections SHALL be read through an interface the embedding application backs with its durable storage, never held by the scan itself. A correction whose correcting event is in none of the scanned sources SHALL be refused rather than serving the superseded original.
+
+#### Scenario: Scan spans files and overlay
+- **WHEN** one entity's events are spread over two published files and the LiveOverlay
+- **THEN** the scan returns all of them, and only them, in sequence order, each with the envelope and payload it was written with
+
+#### Scenario: Backwards scan with a limit
+- **WHEN** a scan reads backwards with a limit
+- **THEN** it returns the newest events first, crossing from the LiveOverlay into the files, and stops at the limit
+
+#### Scenario: Deleted row skipped
+- **WHEN** a deletion vector deletes one of the entity's rows
+- **THEN** the scan never serves that row and still serves its neighbours
+
+#### Scenario: Replacement correction returned instead of the original
+- **WHEN** one of the entity's events has a replacement correction
+- **THEN** the scan serves the correcting event in the original's place, never the original, and does not serve the correcting event a second time
+

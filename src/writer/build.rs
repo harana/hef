@@ -44,6 +44,7 @@ use crate::layout::{
     optional_features, required_features,
 };
 use crate::security::{AeadScheme, FooterEncryption};
+use crate::writer::projection::{RowKey, RowOrder};
 use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -2502,14 +2503,18 @@ pub fn update_hef_file_from_source_changes_profiled_with_executor<R: BuildInput>
     Ok((built, profile))
 }
 
-/// The first and last `(epoch, sequence)` of `rows` once they prove strictly ordered and all of `tenant_id` — `None`
+/// The first and last sort keys of `rows` in `order` once they prove strictly ordered and all of `tenant_id` - `None`
 /// for no rows — or the rule the first row to break one breaks.
-fn check_rows(rows: &[BuildRow], tenant_id: TenantId) -> Result<Option<((u64, u64), (u64, u64))>, &'static str> {
-    let mut previous: Option<(u64, u64)> = None;
+fn check_rows(
+    rows: &[BuildRow],
+    tenant_id: TenantId,
+    order: RowOrder,
+) -> Result<Option<(RowKey, RowKey)>, &'static str> {
+    let mut previous: Option<RowKey> = None;
     for row in rows {
-        let key = (row.epoch, row.sequence);
+        let key = order.key(row);
         if previous.is_some_and(|previous| previous >= key) {
-            return Err("rows must be strictly (epoch, sequence) ordered");
+            return Err(order.rule());
         }
         previous = Some(key);
         if row.envelope.tenant_id != tenant_id {
@@ -2519,7 +2524,7 @@ fn check_rows(rows: &[BuildRow], tenant_id: TenantId) -> Result<Option<((u64, u6
             return Err("a row naming a subject is sealed with seal_subject_rows before the build");
         }
     }
-    Ok(rows.first().map(|row| (row.epoch, row.sequence)).zip(previous))
+    Ok(rows.first().map(|row| order.key(row)).zip(previous))
 }
 
 /// Abandons a sparse update whose rebuilt granules no longer reproduce the source's granule or stripe geometry and
@@ -2622,12 +2627,35 @@ pub fn build_hef_file_streamed_profiled<R: BuildInput>(
 }
 
 fn build_hef_file_sealed(
+    rows: Vec<BuildRow>,
+    config: &HefBuildConfig,
+    encode: &dyn EncodeExecutor,
+    sink: Option<&mut dyn FnMut(u64, Vec<u8>)>,
+    profile: Option<&mut BuildProfile>,
+    update_reuse: Option<&UpdateReuse<'_>>,
+) -> Result<BuiltHef, FormatError> {
+    build_hef_file_sealed_in_order(rows, config, encode, sink, profile, update_reuse, RowOrder::Sequence)
+}
+
+/// Builds one file from rows already sorted in `order`: the primary `(epoch, sequence)` order, or the entity order
+/// only the entity projection is built in.
+pub(crate) fn build_hef_file_in_order(
+    rows: Vec<BuildRow>,
+    config: &HefBuildConfig,
+    encode: &dyn EncodeExecutor,
+    order: RowOrder,
+) -> Result<BuiltHef, FormatError> {
+    build_hef_file_sealed_in_order(rows, config, encode, None, None, None, order)
+}
+
+fn build_hef_file_sealed_in_order(
     mut rows: Vec<BuildRow>,
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
     mut sink: Option<&mut dyn FnMut(u64, Vec<u8>)>,
     profile: Option<&mut BuildProfile>,
     update_reuse: Option<&UpdateReuse<'_>>,
+    order: RowOrder,
 ) -> Result<BuiltHef, FormatError> {
     let mut phase_clock = PhaseClock::new(profile, BuildPhase::Normalization);
     let profile_workers = phase_clock.enabled();
@@ -2656,24 +2684,30 @@ fn build_hef_file_sealed(
                     rule: "a HEF file must carry at least one row",
                 });
             };
-            (rows.len(), (first.epoch, first.sequence), (last.epoch, last.sequence))
+            match order {
+                RowOrder::Entity => {
+                    let points = rows.iter().map(|row| (row.epoch, row.sequence));
+                    let first = points.clone().min().unwrap_or((first.epoch, first.sequence));
+                    let last = points.max().unwrap_or((last.epoch, last.sequence));
+                    (rows.len(), first, last)
+                }
+                RowOrder::Sequence => (rows.len(), (first.epoch, first.sequence), (last.epoch, last.sequence)),
+            }
         }
     };
     // A row is a few hundred bytes, so a pass over a file's worth of them streams tens of megabytes: the order and
     // tenant checks make one pass, on the worker pool, and only the chunk boundaries are compared in sequence.
-    let checked: Vec<Result<Option<((u64, u64), (u64, u64))>, &'static str>> = rows
+    let checked: Vec<Result<Option<(RowKey, RowKey)>, &'static str>> = rows
         .par_chunks(NORMALIZE_BATCH_ROWS)
-        .map(|chunk| check_rows(chunk, config.tenant_id))
+        .map(|chunk| check_rows(chunk, config.tenant_id, order))
         .collect();
-    let mut previous: Option<(u64, u64)> = None;
+    let mut previous: Option<RowKey> = None;
     for chunk in checked {
         let Some((first, last)) = chunk.map_err(|rule| FormatError::Structural { rule })? else {
             continue;
         };
         if previous.is_some_and(|previous| previous >= first) {
-            return Err(FormatError::Structural {
-                rule: "rows must be strictly (epoch, sequence) ordered",
-            });
+            return Err(FormatError::Structural { rule: order.rule() });
         }
         previous = Some(last);
     }
@@ -4145,7 +4179,7 @@ fn build_hef_file_sealed(
     // executor. The results are held until layout/footer assembly consumes them.
     let hot_columns = column_ids::PROMOTED_BASE..column_ids::PROMOTED_BASE + config.promotion.columns.len() as u32;
     phase_clock.transition(BuildPhase::FooterConstruction);
-    let scheduled_metadata = match source {
+    let mut scheduled_metadata = match source {
         Some(source) => borrow_footer_metadata(source)?,
         None => build_scheduled_footer_metadata(
             &granules,
@@ -4156,6 +4190,11 @@ fn build_hef_file_sealed(
             profile_workers,
         ),
     };
+    if order == RowOrder::Entity {
+        for entry in &mut scheduled_metadata.clustering {
+            entry.sortedness_proof = Some(order.sortedness_proof());
+        }
+    }
     phase_clock.transition(BuildPhase::Layout);
 
     // The filters' bytes go into the data area inside each granule's owning stripe (below, beside the payload
@@ -5157,15 +5196,19 @@ fn build_granule(
     let wants = |column_id: u32| wanted.is_none_or(|columns| columns.contains(&column_id));
     // The granule's own `(epoch, sequence)` bounds, taken by value up front: from the row loop on, the rows are on
     // loan to the borrowed residual and column values and cannot be looked at again.
+    // The lowest and highest rather than the first and last row: the same thing for the primary `(epoch, sequence)`
+    // order, and the true sequence bounds for the entity projection, whose granule rows interleave across entities.
     let (first_epoch, first_sequence) =
-        rows.first()
+        rows.iter()
             .map(|row| (row.epoch, row.sequence))
+            .min()
             .ok_or(FormatError::Structural {
                 rule: "granules are non-empty",
             })?;
     let (last_epoch, last_sequence) =
-        rows.last()
+        rows.iter()
             .map(|row| (row.epoch, row.sequence))
+            .max()
             .ok_or(FormatError::Structural {
                 rule: "granules are non-empty",
             })?;

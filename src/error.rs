@@ -163,3 +163,17 @@ pub enum SubjectPayloadError {
     #[error("the subject has been erased; refusing to seal a new payload for it")]
     SubjectErased,
 }
+
+/// Why reading one entity's events back failed: a stored file or overlay batch was malformed, the application's store
+/// of deletes and corrections could not answer, or a correction names an event the scan was not given.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum EntityScanError {
+    /// The correcting event lives in none of the files or overlay segments the scan was handed, so neither the
+    /// superseded event nor its correction can be served.
+    #[error("correcting event at epoch {epoch} sequence {sequence} is in none of the scanned files or the overlay")]
+    CorrectionNotFound { epoch: u64, sequence: u64 },
+    #[error(transparent)]
+    Format(#[from] FormatError),
+    #[error("deletes and corrections store failed: {detail}")]
+    Store { detail: String },
+}
