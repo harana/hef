@@ -63,6 +63,14 @@ A HEF SHALL NOT be visible until the complete publish boundary succeeds (HefPubl
 - **WHEN** a HEF publish attempt fails a checksum or loses the commit race
 - **THEN** no peer frame is sent, staged side effects are discarded, and no public read observes the attempt
 
+#### Scenario: Object uploaded and verified before the manifest names it
+- **WHEN** a publish attempt uploads its HEF object to the application's object store
+- **THEN** the stored size and CRC-64/NVME are checked against the build before any manifest generation is written, a failed upload aborts any multipart upload and writes no generation, and multipart parts begin only on stripe boundaries
+
+#### Scenario: Lost race after upload
+- **WHEN** an attempt loses the range to a different file after its object was uploaded
+- **THEN** the object is left in place, unreferenced by any generation, for the application's sweep of unreferenced keys
+
 ### Requirement: HEF-publish side-effect transaction discipline
 When a service mutates derived state while observing rows during HEF publication, it SHALL record staged changes (or a rollback point) under the publish attempt id, promote staged state only at `after_hef_publish_before_peer_notice` if the manifest publication wins, otherwise roll back or rebuild from the last checkpoint plus UnifiedEvents, and SHALL finish rollback/rebuild before answering reads, emitting outputs, or accepting more publish-side mutations.
 

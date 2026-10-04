@@ -8,6 +8,7 @@
 
 use super::build::{BuiltHef, HefBuildConfig, HefRow, build_hef_file_with_executor};
 use super::reserve::arbitrate_coverage;
+use super::upload::upload_hef;
 use crate::artifacts::batch::{decode_batch, envelope_of};
 use crate::artifacts::frame::decode_frame;
 use crate::artifacts::segment::{ReplayOutcome, ReplayedFrame, SegmentDescriptor, replay_segment, verify_chain_anchor};
@@ -16,6 +17,7 @@ use crate::events::{SequenceRange, TenantId};
 use crate::invariants::{EncodeExecutor, JournalStorage, MonotonicClock, PublishedSet, ShardId};
 use crate::layout::{MAX_PAGE_BYTES, required_features};
 use crate::lifecycle::{FileType, HefFileEntry, ManifestGeneration, PartState};
+use crate::object_store::{ObjectStore, constant::MIN_MULTIPART_PART_BYTES, hef_object_key};
 
 /// The byte length of a BLAKE3 hash, as stored in a schema fingerprint or a segment chain anchor.
 const BLAKE3_HASH_BYTES: usize = 32;
@@ -316,6 +318,12 @@ impl HefPublisher {
 
     /// The complete publish boundary for one contiguous durable range.
     ///
+    /// The built file is uploaded to `objects` under [`hef_object_key`] and its stored size and CRC-64/NVME checked
+    /// before any generation is written, so a catalogue entry never names an object that is missing or wrong; a failed
+    /// upload is aborted and the attempt rolled back. Once uploaded, the object is never deleted here: an attempt that
+    /// then loses the range to a different file leaves it unreferenced, for the application's sweep of unreferenced
+    /// keys, rather than deleting bytes a stalled generation might still name.
+    ///
     /// Idempotent: re-publishing an already-covered range returns the existing entry paired with the freshly rebuilt
     /// bytes, but only once those bytes are confirmed to match the existing entry's file id and BLAKE3 (same content
     /// ⇒ same content-derived file identity). If the existing file covering the range does not match — rebuilt under
@@ -340,6 +348,7 @@ impl HefPublisher {
         range: SequenceRange,
         config: &HefBuildConfig,
         published: &mut dyn PublishedSet,
+        objects: &dyn ObjectStore,
         observer: &mut dyn PublishObserver,
         notices: &mut dyn PeerNotices,
         _clock: &dyn MonotonicClock,
@@ -398,6 +407,12 @@ impl HefPublisher {
 
         // 6. Verify everything before any visibility.
         if let Err(failure) = self.verify_staged(&built, config, &range) {
+            observer.rollback(attempt_id);
+            return Err(failure);
+        }
+        // Upload and check the object before any generation can name it.
+        let object_key = hef_object_key(config.tenant_id, built.file_id);
+        if let Err(failure) = upload_hef(objects, &object_key, &built, MIN_MULTIPART_PART_BYTES) {
             observer.rollback(attempt_id);
             return Err(failure);
         }
