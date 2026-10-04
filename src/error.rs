@@ -142,3 +142,20 @@ pub enum PublishError {
     #[error("publish verification failed: {rule}")]
     VerificationFailed { rule: &'static str },
 }
+
+/// Why a data subject's payload could not be sealed or opened. An erased subject is not an error on read: its payload
+/// reads back as a tombstone.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum SubjectPayloadError {
+    #[error(transparent)]
+    Format(FormatError),
+    /// The application's subject key store failed to answer.
+    #[error(transparent)]
+    KeyStore(StorageError),
+    /// The subject's sealing key has spent the epoch range it was checked out with; check out a fresh one and retry.
+    #[error("the subject's sealing key has no epochs left in its reserved range")]
+    SealRefused,
+    /// The subject's key has been destroyed, so no new payload is ever written for an erased subject.
+    #[error("the subject has been erased; refusing to seal a new payload for it")]
+    SubjectErased,
+}
