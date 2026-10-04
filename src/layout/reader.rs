@@ -3928,12 +3928,7 @@ impl HefFile {
         space: TargetIdSpace,
         target_ref: &[u8],
     ) -> Result<Vec<u64>, FormatError> {
-        let column_id = match kind {
-            RelationshipKind::Link => column_ids::LINKED_REFS,
-            RelationshipKind::Parent => column_ids::PARENT_REF,
-            RelationshipKind::Related => column_ids::RELATED_REFS,
-            RelationshipKind::Root => column_ids::ROOT_REF,
-        };
+        let column_id = kind.column_id();
         if !self.footer.columns.iter().any(|column| column.column_id == column_id) {
             return Ok(Vec::new());
         }
@@ -3943,6 +3938,10 @@ impl HefFile {
         let finder = memmem::Finder::new(needle.as_bytes());
         let mut rows = Vec::new();
         for granule in &self.footer.granules {
+            // The granule's reference filter rules it out without reading its block.
+            if !super::source_form::reference_may_be_in(&self.footer, column_id, granule.granule_id, &needle)? {
+                continue;
+            }
             let read = self.read_column(column_id, granule.granule_id)?;
             for_each_present_string(&read, granule.row_count as usize, |row, text| {
                 // `link`/`related` store several space-separated references; `parent`/`root` store exactly one, so a
@@ -3993,6 +3992,7 @@ impl HefFile {
                 }
                 Ok(rows)
             }
+            TargetIdSpace::ExternalId => self.rows_with_external_id(&reference.target_ref),
             TargetIdSpace::ProtocolEventId => {
                 // The protocol id is a stored provenance column; a file without signed events has no such column and
                 // so cannot hold the target.

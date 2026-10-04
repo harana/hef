@@ -344,3 +344,24 @@ fn an_unsigned_batch_carries_no_provenance_bytes_at_all() {
     assert_eq!(decoded.header.provenance_table_offset, 0);
     assert!(decoded.events.iter().all(|event| event.provenance.is_none()));
 }
+
+#[test]
+fn prev_and_auth_references_to_external_ids_survive_the_journal() {
+    let mut refs: Vec<RelationshipRef> = (0..20)
+        .map(|i| RelationshipRef::to_external(RelationshipKind::Prev, format!("$prev-{i}").as_bytes()).unwrap())
+        .collect();
+    refs.extend(
+        (0..10).map(|i| RelationshipRef::to_external(RelationshipKind::Auth, format!("$auth-{i}").as_bytes()).unwrap()),
+    );
+    refs.push(RelationshipRef::to_external(RelationshipKind::Prev, b"$abc:example.org").unwrap());
+    refs.push(RelationshipRef::to_event(RelationshipKind::Parent, 7));
+    let relationships = EventRelationships::new(refs).unwrap();
+    let mut events = sample_events(2);
+    events[1].relationships = Some(relationships.clone());
+    let encoded = build_batch(&events, 1, 0).expect("batch builds");
+    let decoded = decode_batch(&encoded, 2).expect("batch decodes");
+    assert_eq!(
+        decoded.events.get(1).and_then(|event| event.relationships.clone()),
+        Some(relationships)
+    );
+}

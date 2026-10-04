@@ -21,6 +21,7 @@ pub mod footer;
 pub mod mirror;
 pub mod reader;
 mod remote;
+pub mod source_form;
 
 /// The fixed file header occupies the first 4 KiB block.
 pub const HEADER_BLOCK_LEN: usize = 4096;

@@ -4,6 +4,7 @@
 //! The builder is deterministic: the same rows and configuration produce byte-identical files, which is what makes
 //! publication idempotent (the file identity is derived from its content).
 
+use super::source_form::{self, SourceFormIndexes};
 use crate::artifacts::batch::{
     EncodedPayload, EventInput, PAYLOAD_FLAG_EXTERNAL_REF, PayloadInput, encode_variant_dictionary,
 };
@@ -17,6 +18,7 @@ use crate::encoding::{
     count_set_bits, encode_block_replayed, encode_block_with_shared_dictionary, seekable_zstd,
 };
 use crate::error::FormatError;
+use crate::events::matrix::MatrixProvenance;
 use crate::events::provenance::{SignedEventProvenance, hex_lower_into};
 use crate::events::relationships::{EventRelationships, RelationshipKind};
 use crate::events::variant::{
@@ -242,10 +244,19 @@ pub struct BuildEnvelope {
 pub struct BuildRow {
     pub envelope: BuildEnvelope,
     pub epoch: u64,
+    /// The event's own protocol id (a Matrix `$...` id, say), 1 to 255 bytes, for streams whose tenant declares one.
+    /// Indexed so `HefFile::row_by_external_id` finds the row without a scan.
+    pub external_id: Option<Vec<u8>>,
+    /// Signatures and room version of an event a multi-signer protocol (Matrix federation) delivered. Boxed for the
+    /// same reason as `provenance`.
+    pub matrix_provenance: Option<Box<MatrixProvenance>>,
     pub payload: BuildPayload,
     /// Boxed because it is a couple of hundred bytes that only a signed event carries, and every pass over the rows
     /// streams the whole row.
     pub provenance: Option<Box<SignedEventProvenance>>,
+    /// The payload exactly as it arrived (UTF-8 text such as JSON), kept beside the canonical payload so signed bytes
+    /// can be returned byte for byte. Opt-in: `None` stores nothing.
+    pub raw_payload: Option<Vec<u8>>,
     pub relationships: Option<EventRelationships>,
     pub sequence: u64,
     /// The data subject whose content key seals this row's payload, or `None` for a payload stored in the clear. The
@@ -351,6 +362,9 @@ impl SharedStrings {
                 trace_id_hash_low: envelope.trace_id_hash_low,
             },
             epoch,
+            // The journal does not carry an event's original form; a producer that keeps it builds `BuildRow`s.
+            external_id: None,
+            matrix_provenance: None,
             payload: match payload {
                 PayloadInput::Encoded(encoded) => BuildPayload::Encoded(encoded),
                 PayloadInput::ExternalRef(reference) => BuildPayload::ExternalRef(reference),
@@ -358,6 +372,7 @@ impl SharedStrings {
                 PayloadInput::Variant(value) => self.build_payload(value),
             },
             provenance: provenance.map(Box::new),
+            raw_payload: None,
             relationships,
             sequence,
             subject: None,
@@ -2149,7 +2164,10 @@ fn plan_update_reuse_from<'a, 'b>(
             && before.sequence == after.sequence
             && normalized_envelope == after.envelope
             && before.provenance == after.provenance
-            && before.relationships == after.relationships;
+            && before.relationships == after.relationships
+            && before.external_id == after.external_id
+            && before.matrix_provenance == after.matrix_provenance
+            && before.raw_payload == after.raw_payload;
         if !only_payload_and_dedupe {
             mark_all_columns(source, changed);
             changed_payload_granules.insert(granule_id);
@@ -2335,12 +2353,15 @@ fn plan_source_update<'a>(
                     trace_id_hash_low: 0,
                 },
                 epoch: granule.first_epoch,
+                external_id: None,
+                matrix_provenance: None,
                 payload: match payload {
                     PayloadRead::External(reference) => BuildPayload::ExternalRef(reference),
                     PayloadRead::None => BuildPayload::None,
                     PayloadRead::Value(value) => shared.build_payload(value),
                 },
                 provenance: None,
+                raw_payload: None,
                 relationships: None,
                 sequence,
                 subject: None,
@@ -3034,6 +3055,15 @@ fn build_hef_file_sealed_in_order(
             });
         }
     }
+    // The original-form columns follow the same absence rule, column by column.
+    let source_form_columns = source_form::carried_columns(source.map(|source| &source.footer), &rows);
+    columns.extend(source_form_columns.iter().map(|spec| ColumnDescriptor {
+        column_id: spec.column_id,
+        name: spec.name.to_owned(),
+        kind: spec.kind,
+        nullable: spec.nullable,
+        internal_only: spec.internal_only,
+    }));
     let freetext_entries: Vec<FreetextEntry> = config
         .freetext
         .fields
@@ -3114,6 +3144,12 @@ fn build_hef_file_sealed_in_order(
     if sparse.is_none() && start < rows.len() {
         granule_row_ranges.push((start, rows.len()));
     }
+    // The original-form blocks and indexes, from the rows before granule construction takes their strings. A sparse
+    // update changes none of them, so it borrows the source's blocks and keeps its indexes.
+    let (source_form_blocks, source_form_indexes) = match source {
+        Some(source) => (Vec::new(), SourceFormIndexes::from_footer(&source.footer)),
+        None => source_form::build(&rows, &granule_row_ranges, &source_form_columns)?,
+    };
 
     // Build per-granule pieces, one job per granule fanned out through the injected executor. The ranges partition the
     // rows, so peeling each granule's slice off the front hands every job a disjoint view no other job can see, and a
@@ -3211,6 +3247,17 @@ fn build_hef_file_sealed_in_order(
                 .expect("the executor runs every job")?,
         );
     }
+    for (granule, blocks) in granules.iter_mut().zip(source_form_blocks) {
+        granule
+            .blocks
+            .extend(blocks.into_iter().map(|(column_id, presence, data)| PendingBlock {
+                column_id,
+                data,
+                presence,
+                // Raw payloads and ids are point-read a row at a time, like free text.
+                random_access: true,
+            }));
+    }
 
     phase_clock.transition(BuildPhase::BlockEncoding);
 
@@ -3235,6 +3282,7 @@ fn build_hef_file_sealed_in_order(
                 .into_iter()
                 .flatten(),
         )
+        .chain(source_form_columns.iter().map(|spec| spec.column_id))
         .collect();
     // The values each source block holds, for the stripe estimate of a block a sparse update did not build.
     let source_block_values: HashMap<(u32, u32), usize> = source
@@ -4864,6 +4912,7 @@ fn build_hef_file_sealed_in_order(
         // hatch.
         escape_hatches: Vec::new(),
         exact_counts,
+        external_ids: source_form_indexes.external_ids,
         format_version: (1, 0),
         freetext: freetext_entries,
         freetext_row_offsets,
@@ -4885,6 +4934,7 @@ fn build_hef_file_sealed_in_order(
         page_stats,
         payload_granules,
         presence: presence_entries,
+        reference_filters: source_form_indexes.reference_filters,
         required_feature_flags: required_features::ALL,
         schema_fingerprint: *schema_hash.finalize().as_bytes(),
         shared_dictionaries,
@@ -5078,19 +5128,23 @@ fn build_hef_file_sealed_in_order(
 }
 
 /// The kind each relationship column stores, in [`RELATIONSHIP_COLUMN_IDS`] order.
-const RELATIONSHIP_KIND_COLUMNS: [RelationshipKind; 4] = [
+const RELATIONSHIP_KIND_COLUMNS: [RelationshipKind; 6] = [
     RelationshipKind::Parent,
     RelationshipKind::Root,
     RelationshipKind::Link,
     RelationshipKind::Related,
+    RelationshipKind::Prev,
+    RelationshipKind::Auth,
 ];
 
 /// The relationship column ids in `RELATIONSHIP_COLUMNS` declaration order.
-const RELATIONSHIP_COLUMN_IDS: [u32; 4] = [
+const RELATIONSHIP_COLUMN_IDS: [u32; 6] = [
     column_ids::PARENT_REF,
     column_ids::ROOT_REF,
     column_ids::LINKED_REFS,
     column_ids::RELATED_REFS,
+    column_ids::PREV_REFS,
+    column_ids::AUTH_REFS,
 ];
 
 /// Encodes one granule's payload arena: the key dictionary over every residual key, then each row's residual value —
@@ -5296,7 +5350,7 @@ fn build_granule(
 
     // Relationship references: one column per kind, each with its own presence bitmap — an event may declare a parent
     // without a root or vice versa. Values are the canonical `<space>:<hex>` text an equality filter compares.
-    let mut relationship_columns: [(Vec<u8>, StringColumn); 4] =
+    let mut relationship_columns: [(Vec<u8>, StringColumn); 6] =
         std::array::from_fn(|_| (vec![0u8; row_count.div_ceil(8)], StringColumn::new()));
 
     // Residual values after moves, borrowed from the rows rather than copied out of them: the fields that stayed go

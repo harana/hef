@@ -63,18 +63,28 @@ pub enum IntrospectionError {
 /// event's authorship cannot be proven, so it must not be written and must not be presented as authentic.
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum ProvenanceError {
+    #[error("recomputed content hash does not match the hash the event carries")]
+    ContentHashMismatch,
     #[error("recomputed protocol event id does not match the stored one")]
     EventIdMismatch,
+    #[error("stored event cannot be rebuilt into the protocol's canonical form: {rule}")]
+    MalformedEvent { rule: &'static str },
     #[error("hex field is not lowercase hex of the expected length")]
     MalformedHex,
     #[error("author public key is not a valid signing key")]
     MalformedKey,
     #[error("signature bytes are not a valid signature")]
     MalformedSignature,
+    #[error("stored signer signature is not `<scheme> <signer> <key id> <key hex> <signature hex>`")]
+    MalformedSignerSignature,
+    #[error("a multi-signer event must carry at least one signature")]
+    NoSignatures,
     #[error("payload does not carry `{field}` in the shape the protocol serializes")]
     PayloadShape { field: &'static str },
     #[error("signature does not verify against the author public key")]
     SignatureRejected,
+    #[error("protocol version is not one this engine can re-verify")]
+    UnknownProtocolVersion,
 }
 
 /// Why a declared event relationship was refused before storage. Only the declaration's own shape is checked — its
@@ -92,6 +102,16 @@ pub enum RelationshipError {
     UnknownSpace,
     #[error("target length does not match its identifier space")]
     WrongTargetLength,
+}
+
+/// Why the cross-file external-id index could not record a file or answer a lookup: either the file's stored ids
+/// could not be read, or the durable store behind the index failed.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum ExternalIdIndexError {
+    #[error("reading a file's external ids failed: {0}")]
+    Format(#[from] FormatError),
+    #[error("external-id store failed: {0}")]
+    Storage(#[from] StorageError),
 }
 
 /// A storage-interface failure (I/O error, injected fault, crash point). Distinct from `FormatError`: bytes that

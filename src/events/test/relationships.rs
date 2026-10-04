@@ -85,3 +85,63 @@ fn registry_tags_round_trip_and_unknown_tags_refuse() {
         Err(RelationshipError::MalformedColumnValue)
     );
 }
+
+#[test]
+fn prev_and_auth_references_repeat_and_round_trip() {
+    let mut refs: Vec<RelationshipRef> = (0..20u8)
+        .map(|i| RelationshipRef::to_external(RelationshipKind::Prev, format!("$prev{i}").as_bytes()).unwrap())
+        .collect();
+    refs.extend(
+        (0..10u8)
+            .map(|i| RelationshipRef::to_external(RelationshipKind::Auth, format!("$auth{i}").as_bytes()).unwrap()),
+    );
+    let relationships = EventRelationships::new(refs.clone()).expect("prev and auth repeat freely");
+    for kind in [RelationshipKind::Prev, RelationshipKind::Auth] {
+        let text = relationships.column_text(kind).expect("declared");
+        let parsed = EventRelationships::parse_column_text(kind, &text).expect("round-trips");
+        let declared: Vec<RelationshipRef> = refs.iter().filter(|r| r.kind == kind).cloned().collect();
+        assert_eq!(parsed, declared);
+    }
+    assert_eq!(
+        relationships
+            .column_text(RelationshipKind::Prev)
+            .map(|text| text.split(' ').count()),
+        Some(20)
+    );
+    assert_eq!(
+        relationships
+            .column_text(RelationshipKind::Auth)
+            .map(|text| text.split(' ').count()),
+        Some(10)
+    );
+}
+
+#[test]
+fn a_room_version_one_event_id_is_an_accepted_external_target() {
+    let reference = RelationshipRef::to_external(RelationshipKind::Prev, b"$abc:example.org").expect("fits the space");
+    assert_eq!(reference.space, TargetIdSpace::ExternalId);
+    let value = reference.column_value();
+    assert!(value.starts_with("external_id:"), "{value}");
+    assert_eq!(
+        RelationshipRef::parse_column_value(RelationshipKind::Prev, &value),
+        Ok(reference)
+    );
+}
+
+#[test]
+fn external_targets_are_one_to_255_bytes() {
+    assert!(RelationshipRef::to_external(RelationshipKind::Auth, &[b'x'; 255]).is_ok());
+    assert_eq!(
+        RelationshipRef::to_external(RelationshipKind::Auth, &[b'x'; 256]),
+        Err(RelationshipError::WrongTargetLength)
+    );
+    assert_eq!(
+        RelationshipRef::to_external(RelationshipKind::Auth, b""),
+        Err(RelationshipError::WrongTargetLength)
+    );
+    assert_eq!(
+        RelationshipRef::parse_column_value(RelationshipKind::Auth, "external_id:abc"),
+        Err(RelationshipError::MalformedColumnValue),
+        "an odd hex length is not a whole byte string"
+    );
+}

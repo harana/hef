@@ -6,6 +6,7 @@
 
 pub mod build;
 pub mod compaction;
+pub mod constant;
 pub mod error;
 pub mod pipeline;
 pub mod projection;
@@ -16,5 +17,6 @@ pub mod retire;
 pub mod retry;
 pub mod rewrite;
 pub mod sim;
+pub(crate) mod source_form;
 pub mod subject_seal;
 pub mod upload;

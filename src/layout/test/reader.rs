@@ -47,6 +47,7 @@ fn minimal_footer(mark: ColumnMark) -> Footer {
             row_count: 1,
             ..ExactCounts::default()
         },
+        external_ids: Vec::new(),
         format_version: (1, 0),
         freetext: Vec::new(),
         freetext_row_offsets: Vec::new(),
@@ -77,6 +78,7 @@ fn minimal_footer(mark: ColumnMark) -> Footer {
         page_stats: Vec::new(),
         payload_granules: Vec::new(),
         presence: Vec::new(),
+        reference_filters: None,
         // The current writer's full feature set: these fixtures hand-craft current-format blocks, so the footer
         // must declare the framing the blocks actually use (compressed presence in particular).
         required_feature_flags: required_features::ALL,

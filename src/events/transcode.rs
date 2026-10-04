@@ -1,9 +1,10 @@
 //! Translates an incoming event body from its source format into the one canonical payload format the engine stores.
 //!
 //! Every accepted body is converted to the canonical value before it is written to the journal; the original source
-//! bytes are not kept. This change wires up the JSON and raw-bytes converters; the Protobuf, Avro, and MessagePack
-//! converters need registered source schemas and land with the connector-service work (design D7). The single-format
-//! rule is already enforced everywhere: the journal rejects every other payload encoding.
+//! bytes are not kept, unless the stream opts into the raw-payload column that stores them beside the canonical value.
+//! This change wires up the JSON and raw-bytes converters; the Protobuf, Avro, and MessagePack converters need
+//! registered source schemas and land with the connector-service work (design D7). The single-format rule is already
+//! enforced everywhere: the journal rejects every other payload encoding.
 
 use super::variant::{MAX_DEPTH, VariantValue};
 use crate::error::FormatError;

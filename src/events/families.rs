@@ -5,7 +5,7 @@
 //! sibling derived-columns file (same format, catalogued as `file_type = derived_columns`), lined up row-for-row with
 //! the base. A separate rule blocks raw identity, physical, and internal analytical columns from public output.
 
-use crate::columns::{PROVENANCE_COLUMNS, RELATIONSHIP_COLUMNS, REQUIRED_COLUMNS};
+use crate::columns::{PROVENANCE_COLUMNS, RELATIONSHIP_COLUMNS, REQUIRED_COLUMNS, SOURCE_FORM_COLUMNS};
 
 /// Temporal computability tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +109,7 @@ pub fn column_allowed(column: &str, caller: Caller) -> bool {
             .iter()
             .chain(PROVENANCE_COLUMNS)
             .chain(RELATIONSHIP_COLUMNS)
+            .chain(SOURCE_FORM_COLUMNS)
             .any(|spec| spec.name == column && !spec.internal_only),
     }
 }

@@ -15,12 +15,14 @@ aho-corasick = { git = "https://github.com/harana-oss/aho-corasick.git" }
 arrow-array = "59.2.0"
 arrow-buffer = "59.2.0"
 arrow-schema = "59.2.0"
+base64ct = { version = "1.8", features = ["alloc"] }
 blake3 = { version = "1.8.7", features = ["rayon"] }
 bytemuck = { version = "1.25.2", features = ["extern_crate_alloc"] }
 chacha20poly1305 = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
 crc-fast = { version = "1.10.0", default-features = false, features = ["std"] }
 dashmap = "6"
+ed25519-dalek = "2"
 fsst-rs = "0.5.11"
 getrandom = "0.4.3"
 hardware-rust-crypto = { version = "1.0.1", features = ["hazmat-explicit-nonce"] }

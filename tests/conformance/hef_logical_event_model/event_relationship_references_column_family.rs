@@ -41,7 +41,7 @@ fn unrelated_stream_pays_nothing() {
     let file = HefFile::open(built.bytes, None).unwrap();
     assert!(
         !file.footer().columns.iter().any(
-            |column| (column_ids::RELATIONSHIP_BASE..column_ids::RELATIONSHIP_BASE + 4).contains(&column.column_id)
+            |column| (column_ids::RELATIONSHIP_BASE..column_ids::RELATIONSHIP_BASE + 6).contains(&column.column_id)
         ),
         "a stream without relationships materializes no relationship columns"
     );
@@ -104,7 +104,7 @@ fn relationship_never_licenses_causal_claims() {
     // stored relationship can ever read back as "X caused Y" — causal phrasing stays licensed solely by the Revenue
     // Intelligence corroboration paths.
     let structural: Vec<&str> = RelationshipKind::ALL.iter().map(|kind| kind.as_str()).collect();
-    assert_eq!(structural, vec!["link", "parent", "related", "root"]);
+    assert_eq!(structural, vec!["auth", "link", "parent", "prev", "related", "root"]);
     for causal in ["caused_by", "causes", "driver_of"] {
         assert_eq!(
             RelationshipKind::from_str(causal),
