@@ -1,7 +1,6 @@
 use super::*;
 use crate::encoding::Compression;
 use std::sync::Arc;
-use structured_zstd::encoding::CompressionLevel;
 
 /// A decompressor that delegates to the software one but reports a different backend label — stands in for a
 /// hardware-backed decompressor in tests without needing a device. Because it returns exactly the software bytes,
@@ -25,7 +24,7 @@ fn lz4_block(raw: &[u8]) -> Vec<u8> {
 
 fn zstd_block(raw: &[u8]) -> Vec<u8> {
     // Mirror the HEF zstd framing: a little-endian u32 uncompressed length, then the raw zstd body.
-    let body = structured_zstd::encoding::compress_slice_to_vec(raw, CompressionLevel::Fastest);
+    let body = zstd::bulk::compress(raw, 1).unwrap();
     let mut framed = (raw.len() as u32).to_le_bytes().to_vec();
     framed.extend_from_slice(&body);
     framed
@@ -103,7 +102,7 @@ fn a_reused_zstd_context_encodes_exactly_as_a_fresh_one() {
         for level in [1, 3, 1] {
             assert_eq!(
                 crate::encoding::compress_zstd(raw, level),
-                structured_zstd::encoding::compress_slice_to_vec(raw, CompressionLevel::from_level(level)),
+                zstd::bulk::compress(raw, level).unwrap(),
                 "block {index} at level {level}"
             );
         }
@@ -132,7 +131,7 @@ fn blocks_written_by_the_c_zstd_library_still_decode() {
 /// the decoder, so a tiny compressed body can't force a multi-gigabyte allocation.
 #[test]
 fn software_rejects_forged_zstd_uncompressed_length() {
-    let body = structured_zstd::encoding::compress_slice_to_vec(b"tiny", CompressionLevel::Fastest);
+    let body = zstd::bulk::compress(b"tiny", 1).unwrap();
     let mut framed = u32::MAX.to_le_bytes().to_vec();
     framed.extend_from_slice(&body);
 
@@ -289,7 +288,7 @@ fn software_rejects_a_truncated_zstd_body_on_both_paths() {
 /// bomb cannot pin a huge allocation to the thread that met it.
 #[test]
 fn a_forged_zstd_length_never_grows_the_reused_buffer() {
-    let body = structured_zstd::encoding::compress_slice_to_vec(b"tiny", CompressionLevel::Fastest);
+    let body = zstd::bulk::compress(b"tiny", 1).unwrap();
     let mut framed = u32::MAX.to_le_bytes().to_vec();
     framed.extend_from_slice(&body);
 
