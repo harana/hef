@@ -30,6 +30,9 @@ pub mod sections {
     pub const ENTITY_HASH_FILTERS: u32 = 27;
     pub const ESCAPE_HATCHES: u32 = 13;
     pub const EXACT_COUNTS: u32 = 7;
+    /// Optional: the file's external-id index, sorted `(id hash, row ordinal)` pairs. Absent in files whose rows carry
+    /// no external id.
+    pub const EXTERNAL_IDS: u32 = 28;
     pub const FREETEXT: u32 = 11;
     /// Optional: per-row byte-offset index for declared free-text columns. Absent in files that do not declare
     /// `TYPED_COLUMN_ROW_OFFSETS`.
@@ -48,6 +51,10 @@ pub mod sections {
     pub const PAGE_STATS: u32 = 6;
     pub const PAYLOAD_GRANULES: u32 = 8;
     pub const PRESENCE: u32 = 9;
+    /// Optional: per-(relationship column, granule) membership filters over the stored references. Present in every
+    /// file that carries relationship columns written since the filters existed; absent otherwise, and a reader then
+    /// scans every granule.
+    pub const REFERENCE_FILTERS: u32 = 29;
     pub const SHREDDED: u32 = 10;
     /// Optional: one file-scope dictionary alphabet per string column that shares it, under the
     /// `shared_dictionaries` required feature — blocks recording the file dictionary scope resolve their codes here.
@@ -237,6 +244,32 @@ pub struct EntityHashFilterEntry {
     pub granule_id: u32,
     pub index_len: u64,
     pub index_offset: u64,
+}
+
+/// One row's entry in the file's external-id index: a stable hash of the id and the row that carries it. The footer
+/// keeps the entries sorted by `(id_hash, row_ordinal)`, so finding an id is a binary search; two ids can share a
+/// hash, so a reader confirms every hit against the stored id before answering.
+///
+/// See: hef-query-metadata-and-indexes/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalIdEntry {
+    /// [`stable_hash`](crate::indexes::stable_hash) of the id's bytes.
+    pub id_hash: u64,
+    pub row_ordinal: u64,
+}
+
+/// A small filter that says whether one granule might hold a given reference in one relationship column, so a "who
+/// points at X" lookup reads only the granules that could answer. The filter is a
+/// [`SplitBlockBloomFilter`](crate::indexes::probabilistic::SplitBlockBloomFilter) over the
+/// [`stable_hash`](crate::indexes::stable_hash) of each stored reference's `<space>:<hex>` text. A granule that holds no
+/// reference of the column's kind has no entry at all. Entries are sorted by `(column_id, granule_id)`.
+///
+/// See: hef-query-metadata-and-indexes/spec.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceFilterEntry {
+    pub column_id: u32,
+    pub filter: Vec<u8>,
+    pub granule_id: u32,
 }
 
 /// One string page's token-membership filter: the encoded [`TextTokenIndex`](crate::indexes::text_token::TextTokenIndex)
@@ -448,6 +481,8 @@ pub struct Footer {
     /// decoder the fleet trusts.
     pub escape_hatches: Vec<EscapeHatch>,
     pub exact_counts: ExactCounts,
+    /// The external-id index, sorted by `(id_hash, row_ordinal)`. Empty in files whose rows carry no external id.
+    pub external_ids: Vec<ExternalIdEntry>,
     pub format_version: (u16, u16),
     pub freetext: Vec<FreetextEntry>,
     /// Per-row byte-offset index for declared free-text columns. Present when `TYPED_COLUMN_ROW_OFFSETS` is declared;
@@ -482,6 +517,9 @@ pub struct Footer {
     pub page_stats: Vec<PageStats>,
     pub payload_granules: Vec<PayloadGranule>,
     pub presence: Vec<PresenceEntry>,
+    /// Per-(relationship column, granule) reference filters. `None` when the file predates them or carries no
+    /// relationship columns, in which case a lookup scans every granule.
+    pub reference_filters: Option<Vec<ReferenceFilterEntry>>,
     pub required_feature_flags: u64,
     pub schema_fingerprint: [u8; 32],
     pub shared_dictionaries: Vec<SharedDictionaryEntry>,
@@ -1019,6 +1057,31 @@ fn encode_sections(footer: &Footer) -> SectionArea {
                 out.put_u32(entry.granule_id);
                 out.put_u64(entry.index_offset);
                 out.put_u64(entry.index_len);
+            }
+        });
+    }
+
+    // The external-id index: optional, emitted only when some row carries an external id.
+    if !footer.external_ids.is_empty() {
+        sections.push(sections::EXTERNAL_IDS, |out| {
+            out.put_u32(footer.external_ids.len() as u32);
+            for entry in &footer.external_ids {
+                out.put_u64(entry.id_hash);
+                out.put_u64(entry.row_ordinal);
+            }
+        });
+    }
+
+    // Reference filters: emitted, possibly empty, whenever the file carries relationship columns, so a reader can
+    // tell "no granule holds this kind" from "this file has no filters".
+    if let Some(filters) = &footer.reference_filters {
+        sections.push(sections::REFERENCE_FILTERS, |out| {
+            out.put_u32(filters.len() as u32);
+            for entry in filters {
+                out.put_u32(entry.column_id);
+                out.put_u32(entry.granule_id);
+                out.put_u32(entry.filter.len() as u32);
+                out.put_slice(&entry.filter);
             }
         });
     }
@@ -1700,6 +1763,41 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         }
     }
 
+    // The external-id index: optional. Fixed entry size: 8 (id hash) + 8 (row ordinal) = 16 bytes.
+    let mut external_ids = Vec::new();
+    if let Some(index_bytes) = decode_section(&directory, section_area, sections::EXTERNAL_IDS)? {
+        let mut r = Reader::new(index_bytes);
+        let count = r.u32("external id count")? as usize;
+        let count = bounded_count(count, 16, &r, "external id count exceeds input")?;
+        external_ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id_hash = r.u64("external id hash")?;
+            let row_ordinal = r.u64("external id row")?;
+            external_ids.push(ExternalIdEntry { id_hash, row_ordinal });
+        }
+    }
+
+    // Reference filters: optional. Minimum entry size: 4+4 (ids) + 4 (filter length) = 12 bytes.
+    let mut reference_filters = None;
+    if let Some(filter_bytes) = decode_section(&directory, section_area, sections::REFERENCE_FILTERS)? {
+        let mut r = Reader::new(filter_bytes);
+        let count = r.u32("reference filter count")? as usize;
+        let count = bounded_count(count, 12, &r, "reference filter count exceeds input")?;
+        let mut filters = Vec::with_capacity(count);
+        for _ in 0..count {
+            let column_id = r.u32("reference filter column")?;
+            let granule_id = r.u32("reference filter granule")?;
+            let len = r.u32("reference filter length")? as usize;
+            let filter = r.take(len, "reference filter bytes")?.to_vec();
+            filters.push(ReferenceFilterEntry {
+                column_id,
+                filter,
+                granule_id,
+            });
+        }
+        reference_filters = Some(filters);
+    }
+
     // Per-(promoted column, stripe) distinct counts: optional planner statistics. Fixed entry size: 4+4 (ids) + 8
     // (count) + 1 (exact flag) = 17 bytes.
     let mut stripe_ndv = Vec::new();
@@ -1785,6 +1883,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         entity_hash_filters,
         escape_hatches,
         exact_counts,
+        external_ids,
         format_version,
         freetext,
         freetext_row_offsets,
@@ -1801,6 +1900,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         page_stats,
         payload_granules,
         presence,
+        reference_filters,
         required_feature_flags,
         schema_fingerprint,
         shared_dictionaries,

@@ -163,6 +163,13 @@ impl FieldDeletionVector {
         self.affected_ordinals.contains(&ordinal) && self.redacted_columns.iter().any(|c| c == column)
     }
 
+    /// Returns true if the event's raw payload must be withheld at `ordinal`: whenever any of its fields is redacted.
+    /// The raw bytes are kept byte-exact for signature checks, so a redacted field cannot be cut out of them; the
+    /// whole raw payload is withheld instead, while the redacted canonical payload still serves.
+    pub fn withholds_raw_payload(&self, ordinal: u64) -> bool {
+        self.affected_ordinals.contains(&ordinal)
+    }
+
     /// The list of columns being redacted.
     pub fn redacted_columns(&self) -> &[String] {
         &self.redacted_columns

@@ -8,6 +8,14 @@ use std::collections::BTreeSet;
 
 const FILE_ID: u128 = 0xF11E_D00D;
 
+#[test]
+fn a_field_redaction_withholds_the_whole_raw_payload_of_its_row_only() {
+    let mut redaction = FieldDeletionVector::new(vec!["payload.body".to_owned()]);
+    redaction.mark_affected(4);
+    assert!(redaction.withholds_raw_payload(4));
+    assert!(!redaction.withholds_raw_payload(5));
+}
+
 fn correction_of(event_id: EventId) -> CorrectionMetadata {
     CorrectionMetadata {
         correction_epoch: 1,

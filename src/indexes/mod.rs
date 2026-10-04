@@ -16,6 +16,7 @@
 pub mod artifact;
 pub mod bitmap;
 pub mod constant_flags;
+pub mod external_id;
 pub mod learned_position;
 pub mod minmax;
 pub mod model;

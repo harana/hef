@@ -18,6 +18,7 @@ fn minimal_footer() -> Footer {
             row_count: 1,
             ..ExactCounts::default()
         },
+        external_ids: Vec::new(),
         format_version: (1, 0),
         freetext: Vec::new(),
         freetext_row_offsets: Vec::new(),
@@ -48,6 +49,7 @@ fn minimal_footer() -> Footer {
         page_stats: Vec::new(),
         payload_granules: Vec::new(),
         presence: Vec::new(),
+        reference_filters: None,
         required_feature_flags: 0,
         schema_fingerprint: [0u8; 32],
         shared_dictionaries: Vec::new(),
@@ -171,6 +173,37 @@ fn absent_entity_hash_filter_section_decodes_to_empty() {
     let bytes = encode_footer(&footer);
     let decoded = decode_footer(&bytes).expect("footer decodes without error");
     assert!(decoded.entity_hash_filters.is_empty());
+}
+
+#[test]
+fn external_id_index_and_reference_filters_round_trip_through_encode_decode() {
+    let mut footer = minimal_footer();
+    footer.external_ids = vec![
+        ExternalIdEntry {
+            id_hash: 3,
+            row_ordinal: 0,
+        },
+        ExternalIdEntry {
+            id_hash: 9,
+            row_ordinal: 4,
+        },
+    ];
+    footer.reference_filters = Some(vec![ReferenceFilterEntry {
+        column_id: 7005,
+        filter: vec![1, 2, 3],
+        granule_id: 0,
+    }]);
+    let decoded = decode_footer(&encode_footer(&footer)).expect("footer decodes without error");
+    assert_eq!(decoded.external_ids, footer.external_ids);
+    assert_eq!(decoded.reference_filters, footer.reference_filters);
+
+    // An empty filter list still says "this file has filters", unlike an absent section.
+    footer.reference_filters = Some(Vec::new());
+    let decoded = decode_footer(&encode_footer(&footer)).expect("footer decodes without error");
+    assert_eq!(decoded.reference_filters, Some(Vec::new()));
+    let decoded = decode_footer(&encode_footer(&minimal_footer())).expect("footer decodes without error");
+    assert_eq!(decoded.reference_filters, None);
+    assert!(decoded.external_ids.is_empty());
 }
 
 #[test]
