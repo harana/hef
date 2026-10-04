@@ -38,7 +38,7 @@ const BLOOM_FALLBACK_FALSE_POSITIVE_PPM: u32 = 1_000;
 
 /// The index families an artifact may carry, pinned in pruning-value order by their discriminants: path presence
 /// prunes the most queries per byte, the value bitmap the fewest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ArtifactKind {
     BinaryFuse = 1,
     Bitmap = 5,

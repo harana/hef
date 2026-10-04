@@ -66,10 +66,6 @@ impl MonotonicClock for SystemClock {
     }
 }
 
-/// Production `PublishedSet` wiring: the object-store implementation belongs to `hef-manifest-integration`. Until that
-/// change lands, leader wiring uses the in-memory set behind the same trait; this alias marks the interface.
-pub type LocalPublishedSet = super::sim::SimulatedPublishedSet;
-
 /// The production executor: fans the jobs out across the process-wide rayon pool, which holds one worker per core
 /// however many builds are running. Job index is the only ordering contract, so the output of a build driven through
 /// this pool is byte-identical to the sequential simulation executor's.

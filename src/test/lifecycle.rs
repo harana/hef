@@ -29,6 +29,7 @@ fn generation(files: Vec<HefFileEntry>) -> ManifestGeneration {
         footer_mirror: None,
         generation: 1,
         index_artifacts: Vec::new(),
+        retirements: Vec::new(),
     }
 }
 
