@@ -11,6 +11,7 @@ use crate::columns::{
     FreetextDeclaration, PROVENANCE_COLUMNS, PathStatistics, PromotionPlan, RELATIONSHIP_COLUMNS, REQUIRED_COLUMNS,
     SHARED_DICTIONARY_MAX_VALUES, column_ids, promoted_present, validate_promotion_plan,
 };
+use crate::deletes::SubjectId;
 use crate::encoding::{
     BlockStats, CascadeStrategy, ColumnData, FsstTable, ReplayCapture, SideStream, StringColumn, ValueKind,
     count_set_bits, encode_block_replayed, encode_block_with_shared_dictionary, seekable_zstd,
@@ -246,6 +247,12 @@ pub struct BuildRow {
     pub provenance: Option<Box<SignedEventProvenance>>,
     pub relationships: Option<EventRelationships>,
     pub sequence: u64,
+    /// The data subject whose content key seals this row's payload, or `None` for a payload stored in the clear. The
+    /// caller picks the granularity: one subject per sender erases a person's events with one key, one subject per
+    /// event erases exactly one event at one stored key per event. A row naming a subject goes through
+    /// [`seal_subject_rows`](crate::writer::subject_seal::seal_subject_rows) before the build, which refuses it
+    /// otherwise.
+    pub subject: Option<SubjectId>,
 }
 
 /// A row shape a build takes: [`BuildRow`] as it is, or [`HefRow`] converted on the way in.
@@ -352,6 +359,7 @@ impl SharedStrings {
             provenance: provenance.map(Box::new),
             relationships,
             sequence,
+            subject: None,
         }
     }
 
@@ -2334,6 +2342,7 @@ fn plan_source_update<'a>(
                 provenance: None,
                 relationships: None,
                 sequence,
+                subject: None,
             });
         }
     }
@@ -2505,6 +2514,9 @@ fn check_rows(rows: &[BuildRow], tenant_id: TenantId) -> Result<Option<((u64, u6
         previous = Some(key);
         if row.envelope.tenant_id != tenant_id {
             return Err("a HEF file carries one tenant");
+        }
+        if row.subject.is_some() {
+            return Err("a row naming a subject is sealed with seal_subject_rows before the build");
         }
     }
     Ok(rows.first().map(|row| (row.epoch, row.sequence)).zip(previous))

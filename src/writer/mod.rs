@@ -15,4 +15,5 @@ pub mod retire;
 pub mod retry;
 pub mod rewrite;
 pub mod sim;
+pub mod subject_seal;
 pub mod upload;
