@@ -5,7 +5,7 @@
 use crate::support;
 use hef::artifacts::batch::EventInput;
 use hef::writer::error::QueueError;
-use hef::writer::pipeline::{CommitState, FlushReason, RouteDependency, WorkerCommitPipeline};
+use hef::writer::pipeline::{FlushReason, RouteDependency, Submission, WorkerCommitPipeline};
 use hef::writer::queue::PendingRecord;
 
 /// conformance: hef-apis/journal-batch-append-admits-a-caller-batch-whole-or-not-at-all/a-batch-that-does-not-fit-admits-nothing
@@ -34,7 +34,9 @@ fn a_batch_that_does_not_fit_admits_nothing() {
     // Fill with single submits until the whole batch no longer fits.
     let mut fillers = 0u64;
     while worker.queue().can_admit(&batch_records).unwrap() {
-        worker.submit(support::event(fillers), 1, &world.clock).unwrap();
+        worker
+            .submit(support::event(fillers), 1, &mut world.retry, &world.clock)
+            .unwrap();
         fillers += 1;
     }
 
@@ -43,7 +45,7 @@ fn a_batch_that_does_not_fit_admits_nothing() {
     let dirty_before = worker.queue().dirty_cursor();
     let pending_before = worker.queue().pending_bytes();
     assert_eq!(
-        worker.submit_batch(batch.clone(), 1, &world.clock),
+        worker.submit_batch(batch.clone(), 1, &mut world.retry, &world.clock),
         Err(QueueError::Full),
         "a batch the queue cannot hold whole is refused as one unit"
     );
@@ -59,13 +61,17 @@ fn a_batch_that_does_not_fit_admits_nothing() {
             &mut world.storage,
             &mut world.watermarks,
             &mut world.retry,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();
     assert_eq!(result.receipts.len(), fillers as usize);
 
     // Room now exists: the identical batch is admitted whole and flushes as one contiguous sub-range.
-    assert_eq!(worker.submit_batch(batch, 1, &world.clock).unwrap(), CommitState::Ready);
+    assert_eq!(
+        worker.submit_batch(batch, 1, &mut world.retry, &world.clock).unwrap(),
+        vec![Submission::Ready; 6]
+    );
     let result = worker
         .flush(
             FlushReason::Target,
@@ -73,6 +79,7 @@ fn a_batch_that_does_not_fit_admits_nothing() {
             &mut world.storage,
             &mut world.watermarks,
             &mut world.retry,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();
@@ -89,12 +96,21 @@ fn a_batch_that_does_not_fit_admits_nothing() {
 fn an_admitted_batch_commits_one_contiguous_sub_range_in_submission_order() {
     let mut world = support::World::new(11);
     // Two single events ahead of the batch, so the batch's sub-range starts mid-frame rather than at the frame start.
-    world.worker.submit(support::event(0), 1, &world.clock).unwrap();
-    world.worker.submit(support::event(1), 1, &world.clock).unwrap();
+    world
+        .worker
+        .submit(support::event(0), 1, &mut world.retry, &world.clock)
+        .unwrap();
+    world
+        .worker
+        .submit(support::event(1), 1, &mut world.retry, &world.clock)
+        .unwrap();
     let batch: Vec<EventInput> = (200..203).map(support::event).collect();
     assert_eq!(
-        world.worker.submit_batch(batch, 1, &world.clock).unwrap(),
-        CommitState::Ready
+        world
+            .worker
+            .submit_batch(batch, 1, &mut world.retry, &world.clock)
+            .unwrap(),
+        vec![Submission::Ready; 3]
     );
 
     let result = world
@@ -105,6 +121,7 @@ fn an_admitted_batch_commits_one_contiguous_sub_range_in_submission_order() {
             &mut world.storage,
             &mut world.watermarks,
             &mut world.retry,
+            &mut world.overlay,
             &world.clock,
         )
         .unwrap();

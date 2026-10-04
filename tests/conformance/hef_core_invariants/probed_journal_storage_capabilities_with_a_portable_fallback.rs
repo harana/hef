@@ -63,13 +63,17 @@ fn atomic_append_and_torn_tail_recovery_reach_the_same_result() {
             keep_bytes: 64,
         });
         world.storage.inject(Fault::FailSync { shard: support::SHARD });
-        world.worker.submit(support::event(50), 1, &world.clock).ok();
+        world
+            .worker
+            .submit(support::event(50), 1, &mut world.retry, &world.clock)
+            .ok();
         let _ = world.worker.flush(
             FlushReason::Target,
             &mut world.allocator,
             &mut world.storage,
             &mut world.watermarks,
             &mut world.retry,
+            &mut world.overlay,
             &world.clock,
         );
         world.storage.crash();

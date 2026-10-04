@@ -13,3 +13,4 @@ pub mod queue;
 pub mod reserve;
 pub mod retry;
 pub mod rewrite;
+pub mod sim;

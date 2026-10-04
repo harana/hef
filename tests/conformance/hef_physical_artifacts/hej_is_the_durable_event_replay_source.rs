@@ -5,6 +5,7 @@ use crate::support;
 use hef::artifacts::segment::replay_segment;
 use hef::events::SequencePoint;
 use hef::writer::retry::{RetryReceipt, SafeRetryStore, StatusClass};
+use hef::writer::sim::SimSafeRetryStore;
 
 /// conformance: hef-physical-artifacts/hej-is-the-durable-event-replay-source/safe-retry-row-disagrees-with-hej
 #[test]
@@ -13,7 +14,7 @@ fn safe_retry_row_disagrees_with_hej() {
     let mut world = support::World::new(41);
     world.ingest(2);
     let replay = replay_segment(&world.storage, support::SHARD, 1, 1).unwrap();
-    let mut store = SafeRetryStore::new();
+    let mut store = SimSafeRetryStore::new();
     store.record(RetryReceipt {
         delivery_identity: (5_000, 1),
         tenant_id: support::tenant(),
@@ -40,7 +41,7 @@ fn missing_safe_retry_row_after_recovery() {
     let mut world = support::World::new(43);
     world.ingest(3);
     let replay = replay_segment(&world.storage, support::SHARD, 1, 1).unwrap();
-    let mut store = SafeRetryStore::new();
+    let mut store = SimSafeRetryStore::new();
     assert!(store.is_empty());
     store.reconstruct_from_replay(&replay.frames, support::SHARD, i64::MAX);
     assert_eq!(store.len(), 3);

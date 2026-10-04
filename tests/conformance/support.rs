@@ -2,6 +2,7 @@
 //! the simulation interfaces, and publish/build helpers. Everything is seed-deterministic.
 
 use hef::artifacts::batch::{EventInput, PayloadInput};
+use hef::artifacts::overlay::LiveOverlayStore;
 use hef::artifacts::watermark::WatermarkTracker;
 use hef::events::variant::VariantValue;
 use hef::events::*;
@@ -12,7 +13,7 @@ use hef::typed_id::TypedIdTestExt;
 use hef::writer::build::{BuildLifecycle, BuiltHef, HefBuildConfig, HefRow, build_hef_file};
 use hef::writer::pipeline::{FlushReason, RouteDependency, WorkerCommitPipeline};
 use hef::writer::reserve::SequenceAllocator;
-use hef::writer::retry::SafeRetryStore;
+use hef::writer::sim::SimSafeRetryStore;
 use std::collections::BTreeMap;
 
 pub const SHARD: ShardId = ShardId(0);
@@ -71,7 +72,8 @@ pub fn event(i: u64) -> EventInput {
 pub struct World {
     pub allocator: SequenceAllocator,
     pub clock: SimClock,
-    pub retry: SafeRetryStore,
+    pub overlay: LiveOverlayStore,
+    pub retry: SimSafeRetryStore,
     pub storage: SimJournalStorage,
     pub watermarks: WatermarkTracker,
     pub worker: WorkerCommitPipeline,
@@ -84,7 +86,8 @@ impl World {
             storage: SimJournalStorage::new(),
             allocator: SequenceAllocator::new(1),
             watermarks: WatermarkTracker::new(),
-            retry: SafeRetryStore::new(),
+            overlay: LiveOverlayStore::new(),
+            retry: SimSafeRetryStore::new(),
             worker: WorkerCommitPipeline::new(1, SHARD, tenant(), RouteDependency::AppendOnly, 1 << 20),
         }
     }
@@ -92,7 +95,7 @@ impl World {
     /// Submits and flushes `count` events as one frame; returns its range.
     pub fn ingest(&mut self, count: u64) -> SequenceRange {
         for i in 0..count {
-            self.worker.submit(event(i), 1, &self.clock).unwrap();
+            self.worker.submit(event(i), 1, &mut self.retry, &self.clock).unwrap();
         }
         self.worker
             .flush(
@@ -101,6 +104,7 @@ impl World {
                 &mut self.storage,
                 &mut self.watermarks,
                 &mut self.retry,
+                &mut self.overlay,
                 &self.clock,
             )
             .unwrap()

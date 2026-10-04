@@ -18,7 +18,10 @@ fn buffered_fallback_waits_for_fsync() {
         durability_mode: DurabilityMode::Buffered,
         untorn_write_bytes: 0,
     });
-    world.worker.submit(support::event(1), 1, &world.clock).ok();
+    world
+        .worker
+        .submit(support::event(1), 1, &mut world.retry, &world.clock)
+        .ok();
     world.storage.inject(Fault::FailSync { shard: support::SHARD });
     let _ = world.worker.flush(
         FlushReason::Target,
@@ -26,6 +29,7 @@ fn buffered_fallback_waits_for_fsync() {
         &mut world.storage,
         &mut world.watermarks,
         &mut world.retry,
+        &mut world.overlay,
         &world.clock,
     );
     world.storage.crash();
@@ -48,7 +52,10 @@ fn consumer_ssd_without_power_loss_protection() {
         durability_mode: DurabilityMode::Buffered,
         untorn_write_bytes: 0,
     });
-    world.worker.submit(support::event(1), 1, &world.clock).ok();
+    world
+        .worker
+        .submit(support::event(1), 1, &mut world.retry, &world.clock)
+        .ok();
     world.storage.inject(Fault::FailSync { shard: support::SHARD });
     let _ = world.worker.flush(
         FlushReason::Target,
@@ -56,6 +63,7 @@ fn consumer_ssd_without_power_loss_protection() {
         &mut world.storage,
         &mut world.watermarks,
         &mut world.retry,
+        &mut world.overlay,
         &world.clock,
     );
     world.storage.crash();
@@ -72,7 +80,10 @@ fn consumer_ssd_without_power_loss_protection() {
 fn linked_chain_cancelled_on_write_failure() {
     // When the append (first link of the write → flush → sequence-watermark chain) fails, no bytes reach the shard and the sequence watermark does not advance — the chain is cancelled at the first failing link and the frame is not acknowledged.
     let mut world = support::World::new(12);
-    world.worker.submit(support::event(1), 1, &world.clock).ok();
+    world
+        .worker
+        .submit(support::event(1), 1, &mut world.retry, &world.clock)
+        .ok();
     world.storage.inject(Fault::FailAppend { shard: support::SHARD });
     let _ = world.worker.flush(
         FlushReason::Target,
@@ -80,6 +91,7 @@ fn linked_chain_cancelled_on_write_failure() {
         &mut world.storage,
         &mut world.watermarks,
         &mut world.retry,
+        &mut world.overlay,
         &world.clock,
     );
     let extent = world.storage.extent(support::SHARD).unwrap_or(0);
