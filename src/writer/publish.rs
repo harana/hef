@@ -30,7 +30,7 @@ const DEFAULT_ROLL_BYTE_TARGET: u64 = 1 << 30;
 const DEFAULT_ROLL_TIME_WINDOW_NANOS: u64 = 300 * 1_000_000_000;
 
 /// How many times [`HefPublisher::publish_range`] rebases and retries the manifest CAS before giving up.
-const MAX_REBASE_ATTEMPTS: u32 = 16;
+pub(super) const MAX_REBASE_ATTEMPTS: u32 = 16;
 
 /// The byte length of each upload segment for a built HEF, cut so that every stripe begins on a segment boundary. The
 /// leading segment is the header (and anything before the first stripe); each following segment runs from one stripe's
@@ -100,6 +100,9 @@ pub struct OpenFileState {
 }
 
 /// The dual trigger, whichever fires first.
+///
+/// Nothing in HEF calls this: the application checks it on its open file after each flush and publishes the range with
+/// [`HefPublisher::publish_range`] when it fires. See [`crate::writer::retire`] for the whole call pattern.
 pub fn should_roll(state: &OpenFileState, policy: &RollPolicy, clock: &dyn MonotonicClock) -> Option<RollTrigger> {
     if state.compressed_bytes >= policy.byte_target {
         return Some(RollTrigger::ByteTarget);
@@ -263,7 +266,7 @@ impl HefPublisher {
     }
 
     /// Staged-verification rules: size/quota, schema, BLAKE3, tenant, range, feature directory.
-    fn verify_staged(
+    pub(super) fn verify_staged(
         &self,
         built: &BuiltHef,
         config: &HefBuildConfig,
@@ -475,6 +478,7 @@ impl HefPublisher {
             let mut next = ManifestGeneration {
                 generation: head_id + 1,
                 files: head.files.clone(),
+                retirements: head.retirements.clone(),
                 ..Default::default()
             };
             next.files.push(entry.clone());

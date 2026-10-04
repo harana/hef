@@ -11,6 +11,7 @@ pub mod pipeline;
 pub mod publish;
 pub mod queue;
 pub mod reserve;
+pub mod retire;
 pub mod retry;
 pub mod rewrite;
 pub mod upload;

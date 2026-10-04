@@ -186,6 +186,11 @@ pub struct CompactionJob {
 /// `min_output_over_largest` times the largest input, or the roll target — so a trickle tenant's newest small file is
 /// never rewritten at every cycle just because it has one small neighbour. At most `max_jobs_per_cycle` jobs are
 /// returned; everything else waits. Scheduling is deterministic: the same generation always plans the same jobs.
+///
+/// Nothing in HEF calls this: the application calls it each compaction cycle on the head generation, builds each job's
+/// merged file, and publishes it with `HefPublisher::publish_compaction`, then periodically runs
+/// `sweep_retired_files` to delete the replaced inputs (both in the `writer::retire` module, behind the `write`
+/// feature).
 pub fn plan_compaction_cycle(
     policy: &CompactionPolicy,
     generation: &ManifestGeneration,
