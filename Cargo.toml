@@ -11,7 +11,7 @@ write = []
 
 [dependencies]
 ahash = { version = "0.8", features = ["serde"] }
-aho-corasick = { git = "https://github.com/harana-oss/aho-corasick.git" }
+aho-corasick = "1.1.5"
 arrow-array = "59.2.0"
 arrow-buffer = "59.2.0"
 arrow-schema = "59.2.0"
@@ -40,7 +40,6 @@ serde_json = "1"
 sha2 = "0.11"
 simd-json = "0.17.0"
 simdutf8 = "0.1.5"
-structured-zstd = "0.0.49"
 thiserror = "2"
 type-safe-id = { version = "0.3.3", features = ["serde"] }
 uuid = "1"

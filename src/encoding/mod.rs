@@ -36,7 +36,7 @@ use constant::{
 use multiversion::multiversion;
 use std::borrow::Cow;
 use std::cell::RefCell;
-use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+use zstd::{bulk::Compressor as ZstdCompressor, zstd_safe::compress_bound};
 
 pub(crate) use presence::{PresenceRank, count_present_before, count_set_bits, present_position};
 use scratch::{with_arena_buffer, with_unpack_buffer};
@@ -3359,7 +3359,7 @@ thread_local! {
     /// A context allocates its match-finder tables once, and codec selection compresses each block once or twice, so
     /// a fresh context per call cost more than compressing most blocks did. The compressed bytes are identical
     /// either way, as a context carries nothing from one frame to the next.
-    static ZSTD_ENCODER: RefCell<FrameCompressor> = RefCell::new(FrameCompressor::new(CompressionLevel::Fastest));
+    static ZSTD_ENCODER: RefCell<ZstdCompressor<'static>> = RefCell::new(ZstdCompressor::default());
 
     /// One scratch buffer per thread holding the frame [`compress_zstd_framed`] just produced, so framing a block
     /// reuses one allocation instead of taking a fresh one per block.
@@ -3368,15 +3368,23 @@ thread_local! {
 
 /// Compresses one block with Zstandard at `level` through this thread's reused encoding context, into `out` —
 /// which is overwritten, its allocation kept. The bytes are those a context used for this block alone would write.
+/// `out` is left empty if libzstd rejects the level or fails, since no real frame is ever empty.
 fn compress_zstd_into(bytes: &[u8], level: i32, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(compress_bound(bytes.len()));
     ZSTD_ENCODER.with(|slot| {
         let mut encoder = slot.borrow_mut();
-        encoder.set_compression_level(CompressionLevel::from_level(level));
-        encoder.compress_independent_frame_into(bytes, out);
+        let compressed = encoder
+            .set_compression_level(level)
+            .and_then(|()| encoder.compress_to_buffer(bytes, out));
+        if compressed.is_err() {
+            out.clear();
+        }
     });
 }
 
-/// Compresses one block with Zstandard at `level`, returning a self-contained frame.
+/// Compresses one block with Zstandard at `level`, returning a self-contained frame, or an empty `Vec` if libzstd
+/// failed.
 pub(crate) fn compress_zstd(bytes: &[u8], level: i32) -> Vec<u8> {
     let mut out = Vec::new();
     compress_zstd_into(bytes, level, &mut out);
@@ -3384,11 +3392,15 @@ pub(crate) fn compress_zstd(bytes: &[u8], level: i32) -> Vec<u8> {
 }
 
 /// [`compress_zstd`], but behind the 4-byte little-endian uncompressed-length prefix every stored Zstandard block
-/// opens with (see [`ZSTD_LENGTH_PREFIX_BYTES`]) — the block's final stored form, sized in one allocation.
+/// opens with (see [`ZSTD_LENGTH_PREFIX_BYTES`]) — the block's final stored form, sized in one allocation. Empty if
+/// libzstd failed, so callers keep the block uncompressed rather than store a bare length prefix.
 fn compress_zstd_framed(bytes: &[u8], level: i32) -> Vec<u8> {
     ZSTD_FRAME_SCRATCH.with(|cell| {
         let mut frame = cell.borrow_mut();
         compress_zstd_into(bytes, level, &mut frame);
+        if frame.is_empty() {
+            return Vec::new();
+        }
         let mut framed = Vec::with_capacity(ZSTD_LENGTH_PREFIX_BYTES + frame.len());
         framed.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         framed.extend_from_slice(&frame);
