@@ -2,6 +2,7 @@ use super::*;
 use crate::cache::disk::DiskTier;
 use crate::cache::memory::MemoryTier;
 use crate::cache::model::BlockKind;
+use crate::cache::placement::{LocalLayout, LocalVolume};
 use crate::events::TenantId;
 use crate::typed_id::TypedIdTestExt;
 use std::cell::Cell;
@@ -16,8 +17,17 @@ fn key(file_id: u128) -> BlockKey {
     }
 }
 
+fn disk(root: &std::path::Path) -> DiskTier {
+    let volume = LocalVolume {
+        id: "local".to_owned(),
+        path: root.to_string_lossy().into_owned(),
+        weight: 1,
+    };
+    DiskTier::open(1024, LocalLayout::Single, vec![volume]).unwrap()
+}
+
 fn stack(root: &std::path::Path) -> TieredCache<MemoryTier, DiskTier> {
-    TieredCache::new(MemoryTier::new(8), DiskTier::open(root, 1024))
+    TieredCache::new(MemoryTier::new(8), disk(root))
 }
 
 #[test]
@@ -62,9 +72,10 @@ fn a_failed_fetch_caches_nothing() {
 #[test]
 fn a_corrupt_disk_copy_is_refetched_from_durable_storage() {
     let root = tempfile::tempdir().unwrap();
-    let cache = TieredCache::new(MemoryTier::new(8), DiskTier::open(root.path(), 1024));
+    let cache = stack(root.path());
     cache.lower().put(&key(1), b"good");
-    std::fs::write(cache.lower().path_of(&key(1)), b"evil").unwrap();
+    let write = &cache.lower().writes_for(&key(1))[0];
+    std::fs::write(root.path().join(&write.relative_path), b"evil").unwrap();
     let served = cache.get_or_fetch(&key(1), || Ok::<_, ()>(b"good".to_vec()));
     assert_eq!(served, Ok(b"good".to_vec()));
     assert_eq!(cache.metrics().durable_reads(), 1);
