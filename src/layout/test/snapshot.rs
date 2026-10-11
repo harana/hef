@@ -97,6 +97,7 @@ fn config(index_granularity: usize) -> HefBuildConfig {
             ..LayoutTargets::default()
         },
         tenant_id: TenantId::new_test_id(TENANT),
+        time_series_bucket_nanos: None,
     }
 }
 

@@ -89,6 +89,7 @@ fn file(rows: u64, rows_per_granule: usize) -> HefFile {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(3),
+        time_series_bucket_nanos: None,
     };
     let built = build_hef_file((0..rows).map(row).collect(), &config).unwrap();
     HefFile::open(built.bytes, Some(&built.file_seal)).unwrap()

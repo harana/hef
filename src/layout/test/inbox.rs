@@ -97,6 +97,7 @@ fn build(profile: Profile) -> HefFile {
             ..LayoutTargets::default()
         },
         tenant_id: tenant(),
+        time_series_bucket_nanos: None,
     };
     let built = build_hef_file(rows(), &config).unwrap();
     HefFile::open(built.bytes, Some(&built.file_seal)).unwrap()

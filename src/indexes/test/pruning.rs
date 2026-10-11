@@ -430,6 +430,7 @@ fn indexed_config() -> HefBuildConfig {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(7),
+        time_series_bucket_nanos: None,
     }
 }
 

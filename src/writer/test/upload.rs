@@ -73,6 +73,7 @@ fn multi_stripe_file() -> BuiltHef {
             stripe_target_bytes: 512,
         },
         tenant_id: TenantId::new_test_id(9),
+        time_series_bucket_nanos: None,
     };
     let rows = (0..40)
         .map(|i| HefRow {

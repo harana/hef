@@ -8,6 +8,7 @@
 //! by the required-feature flags in the preamble, which refuse.
 
 use super::snapshot::SnapshotKeyIndex;
+use super::time_series::TimeSeriesRollups;
 use super::{Profile, required_features};
 use crate::compat::EscapeHatch;
 use crate::encoding::{ColumnData, PipelineId, decode_block, encode_block};
@@ -93,6 +94,9 @@ pub mod sections {
     /// Optional: byte ranges of per-page token-membership filters stored in the data area. Absent in files that do
     /// not declare `TEXT_TOKEN_FILTER_OFFSETS`.
     pub const TEXT_TOKEN_OFFSETS: u32 = 21;
+    /// Optional: a time-series file's rollups (see [`super::TimeSeriesRollups`]). Absent in files that do not
+    /// declare `TIME_SERIES_ROLLUPS`.
+    pub const TIME_SERIES_ROLLUPS: u32 = 39;
 }
 
 /// Logical column kind codes (stored in the column directory).
@@ -673,6 +677,9 @@ pub struct Footer {
     /// Byte ranges of per-page token-membership filters stored in the data area. Empty unless the file declares
     /// `TEXT_TOKEN_FILTER_OFFSETS`.
     pub text_token_offsets: Vec<TextTokenOffsetsEntry>,
+    /// A time-series file's rollups. `None` in every other file, and in a time-series file that does not declare
+    /// `TIME_SERIES_ROLLUPS`.
+    pub time_series_rollups: Option<TimeSeriesRollups>,
 }
 
 impl Footer {
@@ -1296,6 +1303,10 @@ fn encode_sections(footer: &Footer) -> SectionArea {
 
     if let Some(index) = &footer.snapshot_keys {
         sections.push(sections::SNAPSHOT_KEYS, |out| out.put_slice(&index.encode()));
+    }
+
+    if let Some(rollups) = &footer.time_series_rollups {
+        sections.push(sections::TIME_SERIES_ROLLUPS, |out| out.put_slice(&rollups.encode()));
     }
 
     // The sparse shredded key set: optional, emitted only when the writer stored sparse columns.
@@ -2223,6 +2234,26 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         });
     }
 
+    let time_series_rollups = decode_section(&directory, section_area, sections::TIME_SERIES_ROLLUPS)?
+        .map(TimeSeriesRollups::decode)
+        .transpose()?;
+    // Rollups ride only a time-series file, cover exactly its rows, and summarise only its float columns.
+    if let Some(rollups) = &time_series_rollups {
+        let float_column = |column_id: &u32| {
+            columns
+                .iter()
+                .any(|column| column.column_id == *column_id && column.kind == ColumnKind::F64)
+        };
+        if profile != Profile::TimeSeries
+            || rollups.row_count() != exact_counts.row_count
+            || !rollups.column_ids.iter().all(float_column)
+        {
+            return Err(FormatError::Structural {
+                rule: "time-series rollups cover a time-series file's rows and float columns",
+            });
+        }
+    }
+
     Ok(Footer {
         audit,
         clustering,
@@ -2265,6 +2296,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         stripes,
         text_token_indexes,
         text_token_offsets,
+        time_series_rollups,
     })
 }
 

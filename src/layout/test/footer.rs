@@ -66,6 +66,7 @@ fn minimal_footer() -> Footer {
         stripes: Vec::new(),
         text_token_indexes: Vec::new(),
         text_token_offsets: Vec::new(),
+        time_series_rollups: None,
     }
 }
 
@@ -1011,6 +1012,7 @@ fn every_profile_round_trips_through_the_footer() {
         Profile::Inbox,
         Profile::Log,
         Profile::Snapshot,
+        Profile::TimeSeries,
     ] {
         let mut footer = minimal_footer();
         footer.profile = profile;
@@ -1173,4 +1175,58 @@ fn a_snapshot_key_index_round_trips_only_with_one_first_key_per_granule() {
             rule: "snapshot key index must hold one first key per granule"
         }
     );
+}
+
+/// A time-series footer with one float column and rollups covering its one row.
+fn time_series_footer() -> Footer {
+    let mut footer = minimal_footer();
+    footer.profile = Profile::TimeSeries;
+    footer.columns.push(ColumnDescriptor {
+        column_id: 1000,
+        internal_only: false,
+        kind: ColumnKind::F64,
+        name: "cpu".to_owned(),
+        nullable: true,
+    });
+    let mut aggregate = crate::layout::time_series::FloatAggregate::default();
+    aggregate.add(0.25);
+    footer.time_series_rollups = Some(crate::layout::time_series::TimeSeriesRollups {
+        bucket_nanos: 60_000_000_000,
+        buckets: vec![crate::layout::time_series::RollupBucket {
+            aggregates: vec![aggregate],
+            bucket: -3,
+            first_row_ordinal: 0,
+            row_count: 1,
+        }],
+        column_ids: vec![1000],
+    });
+    footer
+}
+
+#[test]
+fn time_series_rollups_round_trip_and_ride_only_a_time_series_footer_over_its_rows_and_float_columns() {
+    let footer = time_series_footer();
+    let decoded = decode_footer(&encode_footer(&footer)).unwrap();
+    assert_eq!(decoded.time_series_rollups, footer.time_series_rollups);
+    assert!(
+        decode_footer(&encode_footer(&minimal_footer()))
+            .unwrap()
+            .time_series_rollups
+            .is_none()
+    );
+
+    let refused = FormatError::Structural {
+        rule: "time-series rollups cover a time-series file's rows and float columns",
+    };
+    let mut event = time_series_footer();
+    event.profile = Profile::Event;
+    assert_eq!(decode_footer(&encode_footer(&event)).unwrap_err(), refused);
+    let mut more_rows = time_series_footer();
+    more_rows.exact_counts.row_count = 2;
+    assert_eq!(decode_footer(&encode_footer(&more_rows)).unwrap_err(), refused);
+    let mut not_a_float = time_series_footer();
+    if let Some(rollups) = &mut not_a_float.time_series_rollups {
+        rollups.column_ids = vec![0];
+    }
+    assert_eq!(decode_footer(&encode_footer(&not_a_float)).unwrap_err(), refused);
 }

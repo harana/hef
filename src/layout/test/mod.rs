@@ -213,13 +213,14 @@ fn presence_frame_decoding_follows_the_declared_feature() {
     assert_eq!(decoded, bitmap);
 }
 
-const PROFILES: [Profile; 6] = [
+const PROFILES: [Profile; 7] = [
     Profile::Audit,
     Profile::Event,
     Profile::Graph,
     Profile::Inbox,
     Profile::Log,
     Profile::Snapshot,
+    Profile::TimeSeries,
 ];
 
 fn header_len_word(block: &[u8]) -> usize {
@@ -239,7 +240,7 @@ fn every_profile_round_trips_through_the_header() {
 #[test]
 fn profile_codes_are_explicit_and_distinct() {
     let codes: Vec<u8> = PROFILES.iter().map(|profile| profile.code()).collect();
-    assert_eq!(codes, vec![3, 0, 1, 5, 4, 2]);
+    assert_eq!(codes, vec![3, 0, 1, 5, 4, 2, 6]);
 }
 
 #[test]
@@ -270,7 +271,7 @@ fn an_unknown_header_profile_code_is_a_structural_error() {
             rule: "unknown profile"
         }
     );
-    assert!(Profile::from_u8(6).is_err());
+    assert!(Profile::from_u8(7).is_err());
 }
 
 #[test]
@@ -278,4 +279,13 @@ fn graph_bits_are_known_but_not_declared_by_every_file() {
     assert_eq!(required_features::GRAPH & required_features::ALL, 0);
     assert_eq!(required_features::GRAPH & !required_features::KNOWN, 0);
     assert_eq!(required_features::GRAPH, ((1 << 29) - 1) & !((1 << 23) - 1));
+}
+
+#[test]
+fn the_xor_float_bit_is_known_but_declared_only_by_files_that_use_it() {
+    assert_eq!(required_features::XOR_FLOAT_BLOCKS, 1 << 30);
+    assert_eq!(required_features::XOR_FLOAT_BLOCKS & required_features::ALL, 0);
+    assert_eq!(required_features::XOR_FLOAT_BLOCKS & !required_features::KNOWN, 0);
+    assert_eq!(optional_features::TIME_SERIES_ROLLUPS, 1 << 13);
+    assert_eq!(optional_features::TIME_SERIES_ROLLUPS & !optional_features::KNOWN, 0);
 }

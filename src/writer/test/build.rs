@@ -411,6 +411,7 @@ fn config() -> HefBuildConfig {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(7),
+        time_series_bucket_nanos: None,
     }
 }
 
@@ -4166,4 +4167,45 @@ fn a_snapshot_build_indexes_its_keys_and_refuses_rows_it_cannot_hold() {
     two_epochs[1].epoch = 2;
     two_epochs[1].sequence = 1;
     assert!(build_hef_file(two_epochs, &cfg).is_err());
+}
+
+/// A time-series build takes rows whose occurred_at never goes back, rolls up at the configured width (one minute by
+/// default), and refuses a width that is not positive or that is given to any other profile.
+#[test]
+fn a_time_series_build_refuses_rows_that_go_back_in_time_and_widths_it_cannot_use() {
+    let mut cfg = config();
+    cfg.profile = Profile::TimeSeries;
+    cfg.promotion.columns.push(PromotedColumn {
+        kind: ColumnKind::F64,
+        name: "load".to_owned(),
+        path: "load".to_owned(),
+        since_schema_version: 1,
+        substring_searchable: false,
+    });
+    let built = build_hef_file((0..40).map(row).collect(), &cfg).unwrap();
+    let rollups = built.footer.time_series_rollups.as_ref().unwrap();
+    assert_eq!(rollups.bucket_nanos, DEFAULT_TIME_SERIES_BUCKET_NANOS);
+    assert_eq!(rollups.column_ids, vec![column_ids::PROMOTED_BASE + 1]);
+    assert_eq!(rollups.row_count(), 40);
+
+    let mut late: Vec<HefRow> = (0..40).map(row).collect();
+    late[20].event.envelope.occurred_at = TimestampValue::from_physical_nanos(0);
+    assert_eq!(
+        build_hef_file(late, &cfg).unwrap_err(),
+        FormatError::Structural {
+            rule: "a time-series file's rows never go back in occurred_at"
+        }
+    );
+    for width in [0, -5] {
+        cfg.time_series_bucket_nanos = Some(width);
+        assert!(build_hef_file((0..4).map(row).collect(), &cfg).is_err());
+    }
+    let mut event = config();
+    event.time_series_bucket_nanos = Some(1_000);
+    assert_eq!(
+        build_hef_file((0..4).map(row).collect(), &event).unwrap_err(),
+        FormatError::Structural {
+            rule: "only a time-series file takes a rollup bucket width"
+        }
+    );
 }

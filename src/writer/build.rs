@@ -5,6 +5,7 @@
 //! publication idempotent (the file identity is derived from its content).
 
 use super::audit::{AuditSettings, audit_trail, refuse_audit_rewrite};
+use super::constant::DEFAULT_TIME_SERIES_BUCKET_NANOS;
 use super::source_form::{self, SourceFormIndexes};
 use crate::artifacts::batch::{
     EncodedPayload, EventInput, PAYLOAD_FLAG_EXTERNAL_REF, PayloadInput, encode_variant_dictionary,
@@ -15,8 +16,9 @@ use crate::columns::{
 };
 use crate::deletes::SubjectId;
 use crate::encoding::{
-    BlockStats, CascadeStrategy, ColumnData, FsstTable, ReplayCapture, SideStream, StringColumn, ValueKind,
-    count_set_bits, encode_block_replayed, encode_block_with_shared_dictionary, seekable_zstd,
+    BlockStats, CascadeStrategy, ColumnData, FsstTable, ReplayCapture, SideStream, StringColumn, Transform, ValueKind,
+    count_set_bits, encode_block_replayed, encode_block_with_shared_dictionary, encode_block_with_xor_floats,
+    seekable_zstd,
 };
 use crate::error::FormatError;
 use crate::events::matrix::MatrixProvenance;
@@ -44,6 +46,7 @@ use crate::layout::footer::{
 use crate::layout::graph::{GraphInput, encode_graph_blocks};
 use crate::layout::reader::{HefFile, PayloadRead};
 use crate::layout::snapshot::SnapshotKeyIndex;
+use crate::layout::time_series::{FloatAggregate, RollupBucket, TimeSeriesRollups};
 use crate::layout::{
     EMPTY_VALUE_ROW_OFFSET, HEADER_BLOCK_LEN, HefHeader, LayoutClass, LayoutTargets, MAX_PAGE_BYTES, Profile,
     encode_header, optional_features, required_features,
@@ -489,6 +492,9 @@ pub struct HefBuildConfig {
     pub promotion: PromotionPlan,
     pub targets: LayoutTargets,
     pub tenant_id: TenantId,
+    /// The width of a [`Profile::TimeSeries`] file's rollup buckets, in nanoseconds of `occurred_at`; `None` uses
+    /// [`DEFAULT_TIME_SERIES_BUCKET_NANOS`]. Refused with any other profile, and when not positive.
+    pub time_series_bucket_nanos: Option<i64>,
 }
 
 /// Granules per replay segment: the first granule of each segment runs full encoding selection and later granules of
@@ -632,7 +638,9 @@ fn plan_sparse_update(
                     .iter()
                     .any(|column| column.column_id == column_id && column.kind == ColumnKind::String))
     };
-    if !reuse.payload_only
+    // A time-series file's rollups are built from every row, so its updates are always whole builds.
+    if config.profile == Profile::TimeSeries
+        || !reuse.payload_only
         || reuse.path_statistics_changed
         || !config.analytical_columns.is_empty()
         || !static_routes_compatible(footer, config)
@@ -2595,6 +2603,70 @@ fn inbox_recipient_directory(rows: &[BuildRow]) -> Vec<InboxRecipientEntry> {
     directory
 }
 
+/// A time-series file's rollups over `float_columns`: one bucket per `bucket_nanos`-wide run of `occurred_at` that
+/// holds rows, with its row range and each column's aggregate. `granules` are in row order and their rows never go
+/// back in time, so every bucket is one run of rows and each aggregate adds its values in row order, exactly as a
+/// reader's scan does.
+fn time_series_rollups(
+    granules: &[GranulePieces],
+    float_columns: Vec<u32>,
+    bucket_nanos: i64,
+) -> Result<TimeSeriesRollups, FormatError> {
+    let missing = FormatError::Structural {
+        rule: "a time-series granule holds every rolled-up column",
+    };
+    let mut buckets: Vec<RollupBucket> = Vec::new();
+    for granule in granules {
+        let block = |column_id: u32| granule.blocks.iter().find(|block| block.column_id == column_id);
+        let Some(ColumnData::I64(occurred)) = block(column_ids::OCCURRED_AT).map(|block| &block.data) else {
+            return Err(missing);
+        };
+        // Each column's presence bitmap, its present values, and how many of them the rows so far have taken.
+        let mut columns = Vec::with_capacity(float_columns.len());
+        for &column_id in &float_columns {
+            let Some(PendingBlock {
+                data: ColumnData::F64(values),
+                presence,
+                ..
+            }) = block(column_id)
+            else {
+                return Err(missing);
+            };
+            columns.push((presence.as_slice(), values.as_slice(), 0usize));
+        }
+        for (row, &at) in occurred.iter().enumerate() {
+            let bucket = at.div_euclid(bucket_nanos);
+            if buckets.last().is_none_or(|last| last.bucket != bucket) {
+                buckets.push(RollupBucket {
+                    aggregates: vec![FloatAggregate::default(); float_columns.len()],
+                    bucket,
+                    first_row_ordinal: granule.entry.first_row_ordinal + row as u64,
+                    row_count: 0,
+                });
+            }
+            let Some(current) = buckets.last_mut() else {
+                continue;
+            };
+            current.row_count += 1;
+            for ((presence, values, taken), aggregate) in columns.iter_mut().zip(&mut current.aggregates) {
+                let present =
+                    presence.is_empty() || presence.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0);
+                if present {
+                    if let Some(value) = values.get(*taken) {
+                        aggregate.add(*value);
+                    }
+                    *taken += 1;
+                }
+            }
+        }
+    }
+    Ok(TimeSeriesRollups {
+        bucket_nanos,
+        buckets,
+        column_ids: float_columns,
+    })
+}
+
 /// Abandons a sparse update whose rebuilt granules no longer reproduce the source's granule or stripe geometry and
 /// builds the file the ordinary way from every row, exactly as an update without a sparse plan would. Only a build
 /// holding every row can; one holding only the touched granules' rows has nothing to fall back to.
@@ -2805,6 +2877,32 @@ fn build_hef_file_sealed_in_order(
         inbox_recipient_directory(&rows)
     } else {
         Vec::new()
+    };
+    // A time-series file's rollup buckets each cover one run of neighbouring rows, which holds because its rows never
+    // go back in occurred_at. Its updates are always whole builds (see `plan_sparse_update`), so `rows` is every row.
+    let time_series_bucket_nanos = match (config.profile, config.time_series_bucket_nanos) {
+        (Profile::TimeSeries, width) => {
+            let width = width.unwrap_or(DEFAULT_TIME_SERIES_BUCKET_NANOS);
+            if width <= 0 {
+                return Err(FormatError::Structural {
+                    rule: "a time-series bucket width is positive",
+                });
+            }
+            if rows.iter().zip(rows.iter().skip(1)).any(|(before, after)| {
+                after.envelope.occurred_at.physical_nanos() < before.envelope.occurred_at.physical_nanos()
+            }) {
+                return Err(FormatError::Structural {
+                    rule: "a time-series file's rows never go back in occurred_at",
+                });
+            }
+            Some(width)
+        }
+        (_, Some(_)) => {
+            return Err(FormatError::Structural {
+                rule: "only a time-series file takes a rollup bucket width",
+            });
+        }
+        (_, None) => None,
     };
     // The rows of each source granule as this build holds them: every granule's for a build over the whole file,
     // only the built granules' — the rest empty — for one handed just those.
@@ -3358,6 +3456,23 @@ fn build_hef_file_sealed_in_order(
                 random_access: true,
             }));
     }
+    // The rollups summarise the promoted and shredded float columns: the metrics the file's views read.
+    let time_series_rollups = match time_series_bucket_nanos {
+        Some(width) => {
+            let float_columns: Vec<u32> = columns
+                .iter()
+                .filter(|column| {
+                    column.kind == ColumnKind::F64
+                        && (column_ids::PROMOTED_BASE..column_ids::FREETEXT_BASE).contains(&column.column_id)
+                })
+                .map(|column| column.column_id)
+                .collect();
+            (!float_columns.is_empty())
+                .then(|| time_series_rollups(&granules, float_columns, width))
+                .transpose()?
+        }
+        None => None,
+    };
 
     phase_clock.transition(BuildPhase::BlockEncoding);
 
@@ -3648,7 +3763,16 @@ fn build_hef_file_sealed_in_order(
         searchable_text_columns: &HashMap<u32, bool>,
         replay: Option<&ReplayCapture>,
         shared: Option<&[String]>,
+        xor_floats: bool,
     ) -> BlockProduct<'static> {
+        // A time-series file's float blocks also try Chimp XOR floats, which never replay a capture.
+        let encode = |data: &ColumnData| {
+            if xor_floats && matches!(data, ColumnData::F64(_)) {
+                encode_block_with_xor_floats(data, block.random_access, strategy)
+            } else {
+                encode_block_replayed(data, block.random_access, strategy, replay, shared).0
+            }
+        };
         let mut text_tokens: Vec<TextTokenEntry> = Vec::new();
         let mut fsst = None;
         let granule_row_count = entry.row_count as usize;
@@ -3664,7 +3788,7 @@ fn build_hef_file_sealed_in_order(
                 let page_start = page_idx * page_size;
                 let page_len = (page_start + page_size).min(granule_row_count) - page_start;
                 let page_data = slice_column_data(&block.data, page_start, page_start + page_len);
-                let mut encoded = encode_block_replayed(&page_data, block.random_access, strategy, replay, shared).0;
+                let mut encoded = encode(&page_data);
                 if fsst.is_none() {
                     fsst = encoded.fsst.take();
                 }
@@ -3725,7 +3849,7 @@ fn build_hef_file_sealed_in_order(
                 let present_count = count_set_bits(&page_presence, page_len);
                 let page_data = slice_column_data(&block.data, value_offset, value_offset + present_count);
                 value_offset += present_count;
-                let mut encoded = encode_block_replayed(&page_data, block.random_access, strategy, replay, shared).0;
+                let mut encoded = encode(&page_data);
                 if fsst.is_none() {
                     fsst = encoded.fsst.take();
                 }
@@ -3773,7 +3897,7 @@ fn build_hef_file_sealed_in_order(
                 uncompressed_len: uncompressed_total,
             }
         } else {
-            let mut encoded = encode_block_replayed(&block.data, block.random_access, strategy, replay, shared).0;
+            let mut encoded = encode(&block.data);
             fsst = encoded.fsst.take();
             let mut prefix = Writer::with_capacity(block.presence.len() + 8);
             crate::layout::encode_presence(&block.presence, entry.row_count, &mut prefix);
@@ -4136,6 +4260,7 @@ fn build_hef_file_sealed_in_order(
                         &searchable_text_columns,
                         captures.get(&(column_id, granule_idx / REPLAY_SEGMENT_GRANULES)),
                         shared_alphabets.get(&column_id).map(Vec::as_slice),
+                        config.profile == Profile::TimeSeries,
                     )),
                     None => Err(FormatError::Structural {
                         rule: "a sparse update encodes only blocks it built",
@@ -4323,6 +4448,12 @@ fn build_hef_file_sealed_in_order(
         pieces.push(product.piece);
     }
     let encoded_blocks = pieces.len() as u64 - reused_source_blocks;
+    // Whether any block or page, built or borrowed from the source, stores Chimp XOR floats.
+    let xor_float_blocks = pieces.iter().any(|piece| {
+        std::iter::once(piece.pipeline)
+            .chain(piece.pages.iter().map(|page| page.1))
+            .any(|pipeline| pipeline.transform() == Ok(Transform::Chimp))
+    });
 
     // The promotion plan is the column-heat measurement: promoted columns are precisely the columns whose planner
     // metadata justifies the NDV pass. Once block encoding has released its scratch, build NDV sketches, exact-count
@@ -5020,6 +5151,9 @@ fn build_hef_file_sealed_in_order(
     if snapshot_keys.is_some() {
         optional_flags |= optional_features::SNAPSHOT_KEY_INDEX;
     }
+    if time_series_rollups.is_some() {
+        optional_flags |= optional_features::TIME_SERIES_ROLLUPS;
+    }
 
     // Schema fingerprint over the column directory.
     let mut schema_hash = blake3::Hasher::new();
@@ -5045,6 +5179,9 @@ fn build_hef_file_sealed_in_order(
     }
     if config.graph.is_some() {
         required_feature_flags |= required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE;
+    }
+    if xor_float_blocks {
+        required_feature_flags |= required_features::XOR_FLOAT_BLOCKS;
     }
     let footer = Footer {
         audit,
@@ -5101,6 +5238,7 @@ fn build_hef_file_sealed_in_order(
         // Filter bytes live in the data area; the footer records only their byte ranges below.
         text_token_indexes: Vec::new(),
         text_token_offsets,
+        time_series_rollups,
     };
 
     // The checksum/proof pass above produced the large-byte leaves shared by deterministic identity, the authoritative

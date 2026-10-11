@@ -38,6 +38,7 @@ pub(crate) fn source_form_config(rows_per_granule: usize) -> HefBuildConfig {
             stripe_target_bytes: 4096,
         },
         tenant_id: TenantId::new_test_id(7),
+        time_series_bucket_nanos: None,
     }
 }
 

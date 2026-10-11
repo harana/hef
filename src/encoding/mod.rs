@@ -38,11 +38,13 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use zstd::{bulk::Compressor as ZstdCompressor, zstd_safe::compress_bound};
 
+use chimp::{decode_chimp, encode_chimp};
 pub(crate) use presence::{PresenceRank, count_present_before, count_set_bits, present_position};
 use scratch::{with_arena_buffer, with_unpack_buffer};
 use sidecar::{PrefixKey, StringFingerprint};
 pub use string_column::StringColumn;
 
+mod chimp;
 mod constant;
 pub mod decompressor;
 pub mod deflate;
@@ -157,6 +159,11 @@ pub enum Transform {
     /// planes (all byte 0s, then all byte 1s, ...), so the high-order planes form long runs the trailing granular
     /// compression stage can shrink, unlike the interleaved bytes of a raw value stream.
     ByteStreamSplit = 12,
+    /// Chimp XOR floats ([`chimp`]) for slowly changing metric series: each value is XORed with the one before it and
+    /// only the changed bits are kept, so a repeated reading costs two bits. Chosen only for a time-series file's
+    /// float blocks, and only where it stores fewer bytes than adaptive selection's own choice; a file holding one
+    /// declares the `XOR_FLOAT_BLOCKS` required feature.
+    Chimp = 14,
     /// Mandatory representation for money: fixed-scale decimal128.
     Decimal128 = 7,
     /// FastLanes-style delta (zigzag) + bitpacking.
@@ -297,6 +304,7 @@ impl PipelineId {
             // 11 is the retired Vortex shredded transform: rejected below as unknown, never reassigned.
             12 => Transform::ByteStreamSplit,
             13 => Transform::AlpRd,
+            14 => Transform::Chimp,
             _ => {
                 return Err(FormatError::Structural {
                     rule: "unknown transform in pipeline id",
@@ -3590,6 +3598,23 @@ pub fn encode_block_with_shared_dictionary(
     encode_block_inner(data, random_access, strategy, None, None, None, shared)
 }
 
+/// Encodes a time-series file's block: exactly [`encode_block_with_strategy`], except that a float block is also
+/// tried as Chimp XOR floats ([`Transform::Chimp`]) and stored that way when it comes out strictly smaller than
+/// adaptive selection's own choice. Every other block kind encodes as usual. A file that stores a Chimp block must
+/// declare the `XOR_FLOAT_BLOCKS` required feature.
+pub fn encode_block_with_xor_floats(data: &ColumnData, random_access: bool, strategy: CascadeStrategy) -> EncodedBlock {
+    let selected = encode_block_inner(data, random_access, strategy, None, None, None, None);
+    if !matches!(data, ColumnData::F64(_)) {
+        return selected;
+    }
+    let xor = encode_chosen_form(data, random_access, strategy, Some(Transform::Chimp), None, None, None);
+    if xor.bytes.len() < selected.bytes.len() {
+        xor
+    } else {
+        selected
+    }
+}
+
 /// A trained FSST symbol table, kept so later blocks of the same column can compress with it instead of training
 /// their own. Wraps the crate's compressor to give it the `Debug` the structs carrying it derive.
 #[derive(Clone)]
@@ -3775,7 +3800,7 @@ pub fn encode_block_forced_for_conformance(
             | (ColumnData::U128(_), Transform::PlainU128)
             | (
                 ColumnData::F64(_),
-                Transform::Alp | Transform::AlpRd | Transform::ByteStreamSplit | Transform::PlainF64
+                Transform::Alp | Transform::AlpRd | Transform::ByteStreamSplit | Transform::Chimp | Transform::PlainF64
             )
     );
     if !mandatory && !transform_matches_kind(transform, data) {
@@ -3873,7 +3898,7 @@ fn encode_chosen_form(
             // ALP first and falls back exactly as adaptive selection does, so a forced ALP that cannot represent the
             // data still encodes correctly.
             let alp = match forced {
-                Some(Transform::AlpRd | Transform::ByteStreamSplit | Transform::PlainF64) => None,
+                Some(Transform::AlpRd | Transform::ByteStreamSplit | Transform::Chimp | Transform::PlainF64) => None,
                 _ => encode_alp(values, strategy, &mut out),
             };
             if let Some(chosen) = alp {
@@ -3883,12 +3908,18 @@ fn encode_chosen_form(
                 // Reuses the abandoned ALP attempt's allocation instead of discarding it for a fresh `Writer`.
                 out.clear();
                 let transform = match forced {
-                    Some(forced @ (Transform::AlpRd | Transform::ByteStreamSplit | Transform::PlainF64)) => forced,
+                    Some(
+                        forced @ (Transform::AlpRd
+                        | Transform::ByteStreamSplit
+                        | Transform::Chimp
+                        | Transform::PlainF64),
+                    ) => forced,
                     _ => choose_float_fallback(values),
                 };
                 match transform {
                     Transform::AlpRd => encode_alp_rd(values, &mut out),
                     Transform::ByteStreamSplit => encode_byte_stream_split(values, &mut out),
+                    Transform::Chimp => encode_chimp(values, &mut out),
                     _ => encode_plain_f64(values, &mut out),
                 }
                 (transform, ValueKind::F64)
@@ -4808,8 +4839,9 @@ pub fn decode_block_shared_with_body(
             }
             Transform::AlpRd => Ok(ColumnData::F64(decode_alp_rd(&mut reader)?)),
             Transform::ByteStreamSplit => Ok(ColumnData::F64(decode_byte_stream_split(&mut reader)?)),
+            Transform::Chimp => Ok(ColumnData::F64(decode_chimp(&mut reader)?)),
             _ => Err(FormatError::Structural {
-                rule: "f64 columns use alp, alp-rd, plain, or byte-stream-split transforms",
+                rule: "f64 columns use alp, alp-rd, plain, byte-stream-split, or chimp transforms",
             }),
         },
         ValueKind::Decimal => {

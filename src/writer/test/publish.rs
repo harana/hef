@@ -68,6 +68,7 @@ fn build_config() -> HefBuildConfig {
         promotion: PromotionPlan::default(),
         targets: LayoutTargets::default(),
         tenant_id: TenantId::new_test_id(9),
+        time_series_bucket_nanos: None,
     }
 }
 

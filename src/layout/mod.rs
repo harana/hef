@@ -30,6 +30,7 @@ pub mod reader;
 mod remote;
 pub mod snapshot;
 pub mod source_form;
+pub mod time_series;
 
 /// The fixed file header occupies the first 4 KiB block.
 pub const HEADER_BLOCK_LEN: usize = 4096;
@@ -403,6 +404,9 @@ pub enum Profile {
     Log,
     /// Whole-epoch keyed state, read by point lookup.
     Snapshot,
+    /// Metric readings in time order, with float blocks that may store only the bits that changed and per-interval
+    /// rollups that answer range aggregates without reading every row.
+    TimeSeries,
 }
 
 impl Profile {
@@ -415,6 +419,7 @@ impl Profile {
             Profile::Audit => 3,
             Profile::Log => 4,
             Profile::Inbox => 5,
+            Profile::TimeSeries => 6,
         }
     }
 
@@ -427,6 +432,7 @@ impl Profile {
             3 => Ok(Profile::Audit),
             4 => Ok(Profile::Log),
             5 => Ok(Profile::Inbox),
+            6 => Ok(Profile::TimeSeries),
             _ => Err(FormatError::Structural {
                 rule: "unknown profile",
             }),
@@ -543,14 +549,23 @@ pub mod required_features {
     /// what stops them.
     pub const AUDIT_HASH_CHAIN: u64 = 1 << 29;
 
+    /// At least one float block stores Chimp XOR floats (pipeline transform 14), which only time-series files write.
+    /// Required and refusing on purpose: a reader that predates the transform would refuse each such block only when
+    /// it came to decode it, after it had already answered from the file's other columns, and a rewriter that
+    /// predates it would copy the blocks into a file that no longer declares them. Remote readers never see the
+    /// header's profile byte and readers from before profiles ignore the footer's profile section, so this bit is
+    /// what stops them at open.
+    pub const XOR_FLOAT_BLOCKS: u64 = 1 << 30;
+
     /// Every required feature this reader implements.
-    pub const KNOWN: u64 = (1 << 30) - 1;
+    pub const KNOWN: u64 = (1 << 31) - 1;
 
     /// The full required set every v1 file declares, `COLUMNAR_MARKS` included — the writer emits the columnar,
     /// per-stripe marks form. Excludes `FOOTER_ENCRYPTED` (opt-in per build, set only when the caller requests footer
-    /// encryption), the graph bits (set only on a graph file that carries their blocks) and `AUDIT_HASH_CHAIN` (set
-    /// only on an audit file); declaring a bit before it applies would misrepresent the file.
-    pub const ALL: u64 = KNOWN & !FOOTER_ENCRYPTED & !GRAPH & !AUDIT_HASH_CHAIN;
+    /// encryption), the graph bits (set only on a graph file that carries their blocks), `AUDIT_HASH_CHAIN` (set
+    /// only on an audit file) and `XOR_FLOAT_BLOCKS` (set only on a file that stores a Chimp block); declaring a bit
+    /// before it applies would misrepresent the file.
+    pub const ALL: u64 = KNOWN & !FOOTER_ENCRYPTED & !GRAPH & !AUDIT_HASH_CHAIN & !XOR_FLOAT_BLOCKS;
 }
 
 /// Optional feature flags: unknown optional features are ignored; known ones are validated and used.
@@ -601,8 +616,14 @@ pub mod optional_features {
     /// retirement needs the directory, and a file without one is simply never retired by it.
     pub const INBOX_RECIPIENT_DIRECTORY: u64 = 1 << 12;
 
+    /// A time-series file's footer carries rollups: per fixed-width time bucket, its row range and the count, sum,
+    /// minimum and maximum of every rolled-up float column, so a range aggregate reads rows only for the buckets the
+    /// range cuts through. Droppable acceleration state: a reader that does not declare it reads every row in the
+    /// range and returns the identical answer.
+    pub const TIME_SERIES_ROLLUPS: u64 = 1 << 13;
+
     /// Optional features this reader knows how to validate and use.
-    pub const KNOWN: u64 = (1 << 13) - 1;
+    pub const KNOWN: u64 = (1 << 14) - 1;
 }
 
 /// The decoded fixed file header. A coarse rejection accelerator, not the authoritative aggregate source.

@@ -148,6 +148,7 @@ fn config(index_granularity: usize, granule_bytes: usize, stripe_target_bytes: u
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(TENANT),
+        time_series_bucket_nanos: None,
     }
 }
 

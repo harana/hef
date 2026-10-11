@@ -255,6 +255,7 @@ fn built_file() -> BuiltHef {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(3),
+        time_series_bucket_nanos: None,
     };
     build_hef_file(rows, &config).unwrap()
 }

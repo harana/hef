@@ -2869,3 +2869,123 @@ fn presence_rank_and_present_position_agree_with_a_prefix_count() {
     assert_eq!(rank.position(&bitmap, rows), None, "row past the bitmap");
     assert_eq!(present_position(&bitmap, rows), None, "row past the bitmap");
 }
+
+/// A memory-utilization gauge sampled every few seconds: used bytes over a 16 GB total, holding still for runs of
+/// samples and otherwise moving a few pages at a time. The quotient carries full double precision, as a ratio computed
+/// from two counters does.
+fn memory_utilization_series(count: usize) -> Vec<f64> {
+    let total = 16_000_000_000u64;
+    let mut used = 6_000_000_000u64;
+    (0..count as u64)
+        .map(|i| {
+            let draw = mix(i);
+            if draw % 10 >= 5 {
+                used = (used + (draw >> 8) % 513 * 4096).saturating_sub(256 * 4096);
+            }
+            used as f64 / total as f64
+        })
+        .collect()
+}
+
+/// The smallest block any encoding that predates Chimp stores `values` in, under the random access a promoted
+/// column asks for: adaptive selection's choice and every float transform forced in turn.
+fn best_existing_float_block(values: &[f64]) -> usize {
+    let data = ColumnData::F64(values.to_vec());
+    let strategy = CascadeStrategy::DecodeOptimized;
+    [
+        Transform::Alp,
+        Transform::AlpRd,
+        Transform::ByteStreamSplit,
+        Transform::PlainF64,
+    ]
+    .into_iter()
+    .map(|transform| {
+        encode_block_forced_for_conformance(&data, true, strategy, transform)
+            .unwrap()
+            .bytes
+            .len()
+    })
+    .chain([encode_block_with_strategy(&data, true, strategy).bytes.len()])
+    .min()
+    .unwrap()
+}
+
+#[test]
+fn xor_float_blocks_round_trip_bit_for_bit_through_the_pipeline() {
+    let mut values = vec![
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7FF8_0000_DEAD_BEEF),
+        f64::from_bits(0xFFF0_0000_0000_0001),
+        f64::MIN_POSITIVE,
+        f64::MAX,
+    ];
+    values.extend(memory_utilization_series(3000));
+    let block = encode_block_forced_for_conformance(
+        &ColumnData::F64(values.clone()),
+        true,
+        CascadeStrategy::DecodeOptimized,
+        Transform::Chimp,
+    )
+    .unwrap();
+    assert_eq!(block.pipeline.transform().unwrap(), Transform::Chimp);
+    let bits = |data: ColumnData| match data {
+        ColumnData::F64(values) => values.iter().map(|value| value.to_bits()).collect::<Vec<u64>>(),
+        other => panic!("expected floats, got {other:?}"),
+    };
+    let expected: Vec<u64> = values.iter().map(|value| value.to_bits()).collect();
+    assert_eq!(bits(decode_block(block.pipeline, &block.bytes).unwrap()), expected);
+    assert_eq!(
+        bits(decode_block_range(block.pipeline, &block.bytes, 3, 900).unwrap()),
+        expected[3..900]
+    );
+    // A transform id past the ones this reader knows is refused, never decoded as something else.
+    assert!(PipelineId(15).transform().is_err());
+}
+
+#[test]
+fn xor_floats_beat_every_existing_float_encoding_on_a_slowly_varying_metric() {
+    let values = memory_utilization_series(8192);
+    let data = ColumnData::F64(values.clone());
+    let best_existing = best_existing_float_block(&values);
+    let block = encode_block_with_xor_floats(&data, true, CascadeStrategy::DecodeOptimized);
+    let adaptive = encode_block_with_strategy(&data, true, CascadeStrategy::DecodeOptimized);
+    eprintln!(
+        "memory utilization, 8192 values: chimp {:.3} bytes/value, best existing {:.3} bytes/value, adaptive \
+         selection {:.3} bytes/value",
+        block.bytes.len() as f64 / values.len() as f64,
+        best_existing as f64 / values.len() as f64,
+        adaptive.bytes.len() as f64 / values.len() as f64
+    );
+    assert_eq!(block.pipeline.transform().unwrap(), Transform::Chimp);
+    assert!(block.bytes.len() < best_existing);
+    assert_eq!(decode_block(block.pipeline, &block.bytes).unwrap(), data);
+}
+
+#[test]
+fn xor_floats_are_kept_only_where_they_store_fewer_bytes() {
+    // Two-decimal readings are what ALP is built for; the time-series encoder keeps ALP there.
+    let decimal: Vec<f64> = (0..8192u64)
+        .map(|i| (2000 + (mix(i) % 50) as i64) as f64 / 100.0)
+        .collect();
+    let data = ColumnData::F64(decimal.clone());
+    let selected = encode_block_with_strategy(&data, true, CascadeStrategy::DecodeOptimized);
+    let time_series = encode_block_with_xor_floats(&data, true, CascadeStrategy::DecodeOptimized);
+    let forced =
+        encode_block_forced_for_conformance(&data, true, CascadeStrategy::DecodeOptimized, Transform::Chimp).unwrap();
+    eprintln!(
+        "two-decimal readings, 8192 values: chimp {:.3} bytes/value, adaptive selection {:.3} bytes/value",
+        forced.bytes.len() as f64 / decimal.len() as f64,
+        selected.bytes.len() as f64 / decimal.len() as f64
+    );
+    assert_eq!(time_series.pipeline, selected.pipeline);
+    assert_eq!(time_series.bytes, selected.bytes);
+    // Blocks that are not floats encode exactly as they always have.
+    let ints = ColumnData::I64((0..4096).collect());
+    assert_eq!(
+        encode_block_with_xor_floats(&ints, false, CascadeStrategy::DecodeOptimized).bytes,
+        encode_block_with_strategy(&ints, false, CascadeStrategy::DecodeOptimized).bytes
+    );
+}

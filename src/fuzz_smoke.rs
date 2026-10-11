@@ -9,10 +9,14 @@
 
 use super::artifacts::batch::{decode_batch, decode_variant_dictionary};
 use super::artifacts::frame;
-use super::encoding::{PipelineId, decode_block};
+use super::encoding::{
+    CascadeStrategy, ColumnData, Compression, PipelineId, Transform, ValueKind, decode_block,
+    encode_block_forced_for_conformance,
+};
 use super::events::variant::VariantRef;
 use super::layout::footer::{GranuleEntry, decode_footer};
 use super::layout::graph::{GraphInput, RowEdges, decode_granule_edges, encode_graph_blocks};
+use super::layout::time_series::TimeSeriesRollups;
 use super::layout::{decode_header, reader::HefFile};
 
 struct XorShift(u64);
@@ -44,6 +48,8 @@ fn exercise_all(bytes: &[u8]) {
     let _ = decode_header(bytes);
     let _ = HefFile::open(bytes.to_vec(), None);
     let _ = decode_granule_edges(bytes, 1_000, 64, 2_000);
+    let _ = decode_block(xor_float_pipeline(), bytes);
+    let _ = TimeSeriesRollups::decode(bytes);
     if bytes.len() >= 4 {
         let id = u32::from_le_bytes(bytes.get(..4).unwrap_or(&[0; 4]).try_into().unwrap());
         let _ = decode_block(PipelineId(id), bytes.get(4..).unwrap_or_default());
@@ -120,5 +126,41 @@ fn mutated_graph_edge_block_never_panics() {
     }
     for cut in 0..block.len() {
         assert!(decode_granule_edges(&block[..cut], 10, 64, 74).is_err());
+    }
+}
+
+fn xor_float_pipeline() -> PipelineId {
+    PipelineId::new(Transform::Chimp, Compression::None, ValueKind::F64)
+}
+
+/// Flips bytes across a valid Chimp float block and truncates it: the decoder refuses or answers, never panics, and
+/// every truncation is refused.
+#[test]
+fn mutated_xor_float_block_never_panics() {
+    let mut rng = XorShift(31);
+    let values: Vec<f64> = (0..300u64)
+        .map(|i| match i % 7 {
+            0 => f64::from_bits(rng.next()),
+            1 => f64::NAN,
+            2 => -0.0,
+            _ => 40.0 + (i as f64 / 13.0).sin(),
+        })
+        .collect();
+    let block = encode_block_forced_for_conformance(
+        &ColumnData::F64(values),
+        true,
+        CascadeStrategy::DecodeOptimized,
+        Transform::Chimp,
+    )
+    .unwrap();
+    assert_eq!(block.pipeline, xor_float_pipeline());
+    assert!(decode_block(block.pipeline, &block.bytes).is_ok());
+    for position in 0..block.bytes.len() {
+        let mut mutated = block.bytes.clone();
+        mutated[position] ^= (rng.next() as u8) | 1;
+        let _ = decode_block(block.pipeline, &mutated);
+    }
+    for cut in 0..block.bytes.len() {
+        assert!(decode_block(block.pipeline, &block.bytes[..cut]).is_err());
     }
 }

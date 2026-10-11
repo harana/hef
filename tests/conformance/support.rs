@@ -146,6 +146,7 @@ pub fn build_config() -> HefBuildConfig {
         promotion: hef::columns::PromotionPlan::default(),
         targets: small_targets(),
         tenant_id: tenant(),
+        time_series_bucket_nanos: None,
     }
 }
 

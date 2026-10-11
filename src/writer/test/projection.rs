@@ -100,6 +100,7 @@ fn config(generation_id: u64) -> HefBuildConfig {
             stripe_target_bytes: 64 * 1024,
         },
         tenant_id: tenant(),
+        time_series_bucket_nanos: None,
     }
 }
 

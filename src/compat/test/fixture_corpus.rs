@@ -72,6 +72,7 @@ fn built() -> crate::writer::build::BuiltHef {
             stripe_target_bytes: 1 << 20,
         },
         tenant_id: TenantId::new_test_id(7),
+        time_series_bucket_nanos: None,
     };
     build_hef_file((0..8).map(row).collect(), &config).unwrap()
 }

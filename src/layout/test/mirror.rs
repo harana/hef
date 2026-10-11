@@ -30,6 +30,7 @@ fn config(tenant: u128) -> HefBuildConfig {
         promotion: PromotionPlan::default(),
         targets: LayoutTargets::default(),
         tenant_id: TenantId::new_test_id(tenant),
+        time_series_bucket_nanos: None,
     }
 }
 

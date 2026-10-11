@@ -13,3 +13,8 @@ pub(crate) const AUDIT_REWRITE_REFUSED: FormatError = FormatError::Structural {
 
 /// Why a compaction publish refuses an audit input or output.
 pub(crate) const AUDIT_COMPACTION_REFUSED: &str = "an audit file is never compacted";
+
+/// The width of a time-series file's rollup buckets when the build configuration names none: one minute of
+/// `occurred_at`, in nanoseconds. Matches the finest resolution usage and stats views chart at, so their queries are
+/// answered from whole buckets.
+pub const DEFAULT_TIME_SERIES_BUCKET_NANOS: i64 = 60_000_000_000;

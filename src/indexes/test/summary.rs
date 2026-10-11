@@ -71,6 +71,7 @@ fn footer_with(granules: Vec<GranuleEntry>, row_count: u64) -> Footer {
         stripes: Vec::new(),
         text_token_indexes: Vec::new(),
         text_token_offsets: Vec::new(),
+        time_series_rollups: None,
     }
 }
 
