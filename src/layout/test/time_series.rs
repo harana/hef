@@ -1,5 +1,6 @@
 use super::*;
 use crate::artifacts::batch::{EventInput, PayloadInput};
+use crate::benchmarks::{TimeSeriesRollupMeasurement, time_series_rollup_gate_passes};
 use crate::columns::{FreetextDeclaration, PromotedColumn, PromotionPlan};
 use crate::encoding::Transform;
 use crate::events::variant::VariantValue;
@@ -306,26 +307,30 @@ fn a_range_of_whole_buckets_reads_no_rows_and_a_cut_range_reads_only_its_edge_bu
         )
         .unwrap();
     assert_eq!(whole.count, ROWS);
-    assert_eq!(file.column_block_reads(), 0, "whole buckets come from the footer");
+    let aligned_block_reads = file.column_block_reads();
 
+    let (from, to) = (
+        first_bucket * BUCKET_NANOS + BUCKET_NANOS / 2,
+        last_bucket * BUCKET_NANOS - BUCKET_NANOS / 2,
+    );
     let file = open(&built);
-    let cut = file
-        .time_series_aggregate(
-            CPU,
-            first_bucket * BUCKET_NANOS + BUCKET_NANOS / 2,
-            last_bucket * BUCKET_NANOS - BUCKET_NANOS / 2,
-            BUCKET_NANOS,
-        )
-        .unwrap();
+    let cut = file.time_series_aggregate(CPU, from, to, BUCKET_NANOS).unwrap();
     assert!(cut.count > 0);
     let granules = file.footer().granules.len() as u64;
     // Two edge buckets, each within at most two granules, each read as its time and value blocks.
-    assert!(
-        file.column_block_reads() <= 8,
-        "read {} blocks",
-        file.column_block_reads()
-    );
+    let cut_block_reads = file.column_block_reads();
     assert!(granules > 8);
+
+    // A width other than the file's rollup width reads every row in the range.
+    let file = open(&built);
+    file.time_series_aggregate(CPU, from, to, 2 * BUCKET_NANOS).unwrap();
+    let measurement = TimeSeriesRollupMeasurement {
+        aligned_block_reads,
+        cut_block_reads,
+        scan_block_reads: file.column_block_reads(),
+    };
+    println!("time-series aggregate column block reads: {measurement:?}");
+    assert!(time_series_rollup_gate_passes(&measurement), "{measurement:?}");
 }
 
 #[test]

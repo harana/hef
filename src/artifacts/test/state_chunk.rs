@@ -1,4 +1,5 @@
 use super::*;
+use crate::benchmarks::{StateChunkWriteMeasurement, state_chunk_write_gate_passes};
 use crate::security::TenantDek;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -422,6 +423,10 @@ fn prolly_trees_against_checkpointed_delta_chains() {
          fetches on average"
     );
     assert!(prolly_fetches < chain_fetches);
+    assert!(state_chunk_write_gate_passes(&StateChunkWriteMeasurement {
+        bytes_written: prolly_bytes as u64,
+        events: EVENTS,
+    }));
 }
 
 /// The bytes of the chunks a lookup of `state_key` at `root` reads.
