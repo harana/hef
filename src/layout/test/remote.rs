@@ -671,6 +671,62 @@ fn a_walk_costs_at_most_one_request_per_file_per_level() {
     assert_eq!(requests(), again, "a second walk is served from the held blocks");
 }
 
+/// A walk decodes each granule's edges once and keeps the decode, so walking the same graph again decodes nothing.
+#[test]
+fn a_second_walk_reuses_the_decoded_edges_of_the_first() {
+    let (graph, _sources) = two_files(&[1, 9]);
+    let walk = |graph: &RemoteGraph| {
+        graph
+            .walk(b"room", 63, EdgeKind::Prev, 64)
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+    };
+    let first = walk(&graph);
+    let held: Vec<u64> = graph.files.iter().map(HefFile::decoded_cache_bytes).collect();
+    assert!(
+        held.iter().all(|&bytes| bytes > 0),
+        "every file holds its decoded edges"
+    );
+    let file = &graph.files[0];
+    let granule = file.graph_granule_of(0).unwrap();
+    assert!(Arc::ptr_eq(
+        &file.cached_granule_edges(granule).unwrap(),
+        &file.cached_granule_edges(granule).unwrap()
+    ));
+    assert_eq!(walk(&graph), first);
+    let after: Vec<u64> = graph.files.iter().map(HefFile::decoded_cache_bytes).collect();
+    assert_eq!(after, held, "the second walk decoded nothing new");
+}
+
+/// Under a budget smaller than one granule's edges a reader keeps only the granule it touched last, and a walk still
+/// returns every ancestor.
+#[test]
+fn decoded_edges_stay_within_the_reader_budget() {
+    let built = [graph_file(0, 32, &[1, 9]), graph_file(32, 32, &[1, 9])];
+    let sources = [BatchSource::new(&built[0].bytes), BatchSource::new(&built[1].bytes)];
+    let files = sources
+        .iter()
+        .zip(&built)
+        .map(|(source, built)| open_graph_file(source, built).with_decoded_cache_budget(1))
+        .collect();
+    let graph = remote_graph(files, options(16));
+    let seen: usize = graph
+        .walk(b"room", 63, EdgeKind::Prev, 64)
+        .map(|level| level.unwrap().len())
+        .sum();
+    assert_eq!(seen, 63);
+    for file in &graph.files {
+        let largest = file
+            .footer()
+            .granules
+            .iter()
+            .map(|granule| file.granule_edges(granule.granule_id).unwrap().decoded_bytes())
+            .max()
+            .unwrap();
+        assert!(file.decoded_cache_bytes() <= largest);
+    }
+}
+
 /// Requests and bytes every source has been asked for so far.
 fn fetched(sources: &[Arc<BatchSource>]) -> (u64, u64) {
     let ranges: Vec<ByteRange> = sources.iter().flat_map(|source| source.batches()).flatten().collect();

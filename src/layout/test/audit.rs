@@ -263,6 +263,19 @@ fn a_reader_from_before_audit_files_refuses_one_and_event_files_stay_readable() 
     assert_eq!(event_file.footer.audit, None);
 }
 
+/// The chain's hashes are part of the format: a reader verifying a file written by an older build must recompute the
+/// same hashes, so the hash of a fixed run of rows covering every payload kind is pinned.
+#[test]
+fn the_chain_hash_of_a_fixed_run_of_rows_is_pinned() {
+    let built = build_hef_file(rows(0..28), &audit_config(AUDIT_GENESIS)).unwrap();
+    let hex: String = trail(&built)
+        .chain_end
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(hex, "ec86e17f82cffca034f9215649764f95e75cd09687e10cea62ebd3fdc51d2a0e");
+}
+
 /// Checks a run of eight audit files of 12,500 rows each with `verify_audit_files`, seven times, and prints the median
 /// time with the rows and file megabytes checked per second. Opening each file against its seal is not timed. Run by
 /// hand: `cargo test --release --all-features --lib audit_chain_verification_throughput -- --ignored --nocapture`.

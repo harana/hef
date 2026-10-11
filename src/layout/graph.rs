@@ -286,6 +286,15 @@ impl GranuleEdges {
         let row = usize::try_from(sn.checked_sub(self.first_sn)?).ok()?;
         self.labels.get(row).copied()
     }
+
+    /// Heap bytes the decoded tables hold, for the reader's decoded-cache budget.
+    pub(super) fn decoded_bytes(&self) -> u64 {
+        [&self.forward, &self.inbound, &self.reverse]
+            .iter()
+            .map(|csr| ((csr.offsets.len() + csr.targets.len()) * size_of::<u64>()) as u64)
+            .sum::<u64>()
+            + (self.labels.len() * size_of::<ChainLabel>()) as u64
+    }
 }
 
 impl Csr {

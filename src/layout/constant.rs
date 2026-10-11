@@ -1,5 +1,7 @@
 //! Constants shared across this module's files, in one place.
 
+use std::sync::LazyLock;
+
 /// The fixed trailer that ends a HEF content tail: an 8-byte little-endian footer-blob length followed by
 /// [`HEF_MAGIC`]. Mirrors [`crate::file::constant::TREE_TRAILER_LEN`], which plays the same role for the sibling
 /// outboard-tree trailer.
@@ -32,6 +34,15 @@ pub const AUDIT_GENESIS: [u8; 32] = [0; 32];
 /// The BLAKE3 key-derivation context that turns a row's `prev_row_hash` and the digest of its contents into the row's
 /// own hash, keeping audit row hashes apart from every other BLAKE3 value the format stores.
 pub const AUDIT_ROW_HASH_CONTEXT: &str = "pulse HEF v1 audit row hash";
+
+/// A BLAKE3 hasher already keyed by [`AUDIT_ROW_HASH_CONTEXT`]. Hashing a row clones it rather than deriving the
+/// context key again for every row.
+pub static AUDIT_ROW_HASHER: LazyLock<blake3::Hasher> =
+    LazyLock::new(|| blake3::Hasher::new_derive_key(AUDIT_ROW_HASH_CONTEXT));
+
+/// Bytes reserved up front for the encoding of one audit row that its digest hashes, enough for a typical row's
+/// envelope and a small payload so the buffer rarely grows.
+pub const ROW_DIGEST_INPUT_CAPACITY: usize = 512;
 
 /// The magic bytes of a log object ([`super::log`]): its first four bytes and, once sealed, its last four. Different
 /// from [`HEF_MAGIC`] at both ends, so a log object never opens as a HEF file and a HEF file never opens as a log.

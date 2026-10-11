@@ -14,9 +14,8 @@ use crate::error::FormatError;
 use crate::events::EventEnvelope;
 use crate::events::variant::{VariantRef, VariantValue};
 use crate::layout::Profile;
-use crate::layout::audit::{row_digest, row_hash};
+use crate::layout::audit::{DigestPayload, row_digest, row_hash};
 use crate::layout::footer::{AuditTrail, ObjectLockRetention};
-use crate::layout::reader::PayloadRead;
 use rayon::prelude::*;
 
 /// What the caller supplies to build an audit file: where its chain starts and how the object store must keep it.
@@ -97,19 +96,20 @@ fn build_row_digest(row: &BuildRow) -> Result<[u8; 32], FormatError> {
         });
     }
     let envelope = &row.envelope;
+    let decoded: VariantValue;
+    let fields: Vec<(&str, &VariantValue)>;
     let payload = match &row.payload {
         BuildPayload::Encoded(encoded) => {
-            PayloadRead::Value(VariantRef::new(&encoded.bytes).decode(&encoded.dictionary)?)
+            decoded = VariantRef::new(&encoded.bytes).decode(&encoded.dictionary)?;
+            DigestPayload::Value(&decoded)
         }
-        BuildPayload::ExternalRef(reference) => PayloadRead::External(reference.clone()),
-        BuildPayload::None => PayloadRead::None,
-        BuildPayload::Object(fields) => PayloadRead::Value(VariantValue::Object(
-            fields
-                .iter()
-                .map(|(name, value)| (name.to_string(), value.clone()))
-                .collect(),
-        )),
-        BuildPayload::Whole(value) => PayloadRead::Value(value.clone()),
+        BuildPayload::ExternalRef(reference) => DigestPayload::External(reference),
+        BuildPayload::None => DigestPayload::None,
+        BuildPayload::Object(object) => {
+            fields = object.iter().map(|(name, value)| (&**name, value)).collect();
+            DigestPayload::Object(&fields)
+        }
+        BuildPayload::Whole(value) => DigestPayload::Value(value),
     };
     let envelope = EventEnvelope {
         account_id: envelope.account_id.clone(),
@@ -134,7 +134,7 @@ fn build_row_digest(row: &BuildRow) -> Result<[u8; 32], FormatError> {
         tenant_id: envelope.tenant_id,
         trace_id_hash_low: envelope.trace_id_hash_low,
     };
-    row_digest(row.epoch, row.sequence, &envelope, &payload)
+    row_digest(row.epoch, row.sequence, &envelope, payload)
 }
 
 #[cfg(test)]

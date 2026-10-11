@@ -123,6 +123,8 @@ fn file_with_mark(mark: ColumnMark, bytes: Vec<u8>, usable_optional_features: u6
         granule_dictionaries: DashMap::default(),
         granule_dictionaries_bytes: AtomicU64::new(0),
         granule_stripe_base: HashMap::new(),
+        graph_edges: DashMap::default(),
+        graph_edges_bytes: AtomicU64::new(0),
         header: minimal_header(),
         inflated_residuals: DashMap::default(),
         inflated_residuals_bytes: AtomicU64::new(0),

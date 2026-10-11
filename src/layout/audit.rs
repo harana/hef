@@ -12,7 +12,7 @@
 //!
 //! See: hef-file-layout/spec.md
 
-use super::constant::AUDIT_ROW_HASH_CONTEXT;
+use super::constant::{AUDIT_ROW_HASHER, ROW_DIGEST_INPUT_CAPACITY};
 use super::event::read_u64s;
 use super::footer::AuditTrail;
 use super::reader::{HefFile, PayloadRead};
@@ -20,7 +20,7 @@ use crate::artifacts::batch::encode_variant_dictionary;
 use crate::columns::column_ids;
 use crate::error::{AuditChainError, FormatError};
 use crate::events::EventEnvelope;
-use crate::events::variant::{KeyDictionary, encode_value};
+use crate::events::variant::{KeyDictionary, VariantValue, encode_object_fields_into, encode_value_into};
 use crate::file::bytes::Writer;
 use std::collections::BTreeSet;
 
@@ -51,15 +51,38 @@ pub fn verify_audit_files(chain_start: [u8; 32], files: &[HefFile]) -> Result<[u
     Ok(expected)
 }
 
+/// A row's payload as its digest covers it, borrowed from wherever the row lives, so neither the writer nor the
+/// verifier copies a payload to hash it.
+///
+/// See: hef-file-layout/spec.md
+pub(crate) enum DigestPayload<'a> {
+    External(&'a str),
+    None,
+    /// A top-level object as its fields in ascending key order with no key repeated. Digested exactly as the
+    /// equivalent [`VariantValue::Object`].
+    Object(&'a [(&'a str, &'a VariantValue)]),
+    Value(&'a VariantValue),
+}
+
+impl<'a> From<&'a PayloadRead> for DigestPayload<'a> {
+    fn from(payload: &'a PayloadRead) -> Self {
+        match payload {
+            PayloadRead::External(reference) => DigestPayload::External(reference),
+            PayloadRead::None => DigestPayload::None,
+            PayloadRead::Value(value) => DigestPayload::Value(value),
+        }
+    }
+}
+
 /// The digest of one row's contents, the half of its hash that does not depend on the rows before it. A function of
 /// the row alone, so the writer and a verifier reading the row back out of the file compute the same digest.
 pub(crate) fn row_digest(
     epoch: u64,
     sequence: u64,
     envelope: &EventEnvelope,
-    payload: &PayloadRead,
+    payload: DigestPayload<'_>,
 ) -> Result<[u8; 32], FormatError> {
-    let mut out = Writer::new();
+    let mut out = Writer::with_capacity(ROW_DIGEST_INPUT_CAPACITY);
     out.put_u64(epoch);
     out.put_u64(sequence);
     put_optional_text(&mut out, envelope.account_id.as_deref());
@@ -84,26 +107,42 @@ pub(crate) fn row_digest(
     out.put_u128(envelope.tenant_id.uuid().as_u128());
     out.put_u64(envelope.trace_id_hash_low);
     match payload {
-        PayloadRead::None => out.put_u8(0),
-        PayloadRead::External(reference) => {
+        DigestPayload::None => out.put_u8(0),
+        DigestPayload::External(reference) => {
             out.put_u8(1);
             put_text(&mut out, reference);
         }
-        PayloadRead::Value(value) => {
+        DigestPayload::Object(fields) => {
+            out.put_u8(2);
+            let mut keys = BTreeSet::new();
+            for (name, value) in fields {
+                keys.insert(*name);
+                value.collect_keys(&mut keys);
+            }
+            let dictionary = put_dictionary(&mut out, keys)?;
+            encode_object_fields_into(fields, &dictionary, &mut out)?;
+        }
+        DigestPayload::Value(value) => {
             out.put_u8(2);
             let mut keys = BTreeSet::new();
             value.collect_keys(&mut keys);
-            let dictionary = KeyDictionary::build(keys.into_iter().map(str::to_owned));
-            out.put_slice(&encode_variant_dictionary(&dictionary));
-            out.put_slice(&encode_value(value, &dictionary)?);
+            let dictionary = put_dictionary(&mut out, keys)?;
+            encode_value_into(value, &dictionary, &mut out)?;
         }
     }
     Ok(*blake3::hash(out.bytes()).as_bytes())
 }
 
+/// Writes the dictionary of a payload's own keys and returns it for encoding the payload against.
+fn put_dictionary(out: &mut Writer, keys: BTreeSet<&str>) -> Result<KeyDictionary, FormatError> {
+    let dictionary = KeyDictionary::from_sorted_unique(keys.into_iter().map(str::to_owned).collect())?;
+    out.put_slice(&encode_variant_dictionary(&dictionary));
+    Ok(dictionary)
+}
+
 /// A row's hash, from the hash of the row before it and the digest of its own contents.
 pub(crate) fn row_hash(prev_row_hash: &[u8; 32], row_digest: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(AUDIT_ROW_HASH_CONTEXT);
+    let mut hasher = AUDIT_ROW_HASHER.clone();
     hasher.update(prev_row_hash);
     hasher.update(row_digest);
     *hasher.finalize().as_bytes()
@@ -120,7 +159,8 @@ fn recomputed_chain_end(file: &HefFile, trail: &AuditTrail) -> Result<[u8; 32], 
         for (ordinal, ((envelope, epoch), sequence)) in
             (granule.first_row_ordinal..).zip(envelopes.iter().zip(epochs).zip(sequences))
         {
-            hash = row_hash(&hash, &row_digest(epoch, sequence, envelope, &file.payload(ordinal)?)?);
+            let payload = file.payload(ordinal)?;
+            hash = row_hash(&hash, &row_digest(epoch, sequence, envelope, (&payload).into())?);
         }
     }
     Ok(hash)
