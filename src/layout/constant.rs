@@ -24,3 +24,23 @@ pub const SCAN_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 /// How many doubling buckets hold the verified ranges a remote reader has fetched: bucket `b` holds `2^b` ranges, so
 /// this bounds one reader at `2^48 - 1` fetches, far past anything a single file can need.
 pub const HELD_RANGE_BUCKETS: usize = 48;
+
+/// The magic bytes of a log object ([`super::log`]): its first four bytes and, once sealed, its last four. Different
+/// from [`HEF_MAGIC`] at both ends, so a log object never opens as a HEF file and a HEF file never opens as a log.
+pub const LOG_MAGIC: [u8; 4] = *b"HEFL";
+
+/// The log object format version stored in its header. A reader refuses any other value.
+pub const LOG_FORMAT_VERSION: u8 = 1;
+
+/// A log object's header: [`LOG_MAGIC`], the format version byte, and the profile code byte.
+pub const LOG_HEADER_LEN: usize = 6;
+
+/// The bytes one record adds around its payload: a 4-byte little-endian length before it and an 8-byte CRC-64/NVME
+/// after it.
+pub const LOG_RECORD_FRAME_LEN: usize = 12;
+
+/// The record length that marks the trailer instead of a record, so no record payload may be this long.
+pub const LOG_TRAILER_SENTINEL: u32 = u32::MAX;
+
+/// A sealed log object's trailer: [`LOG_TRAILER_SENTINEL`], the 4-byte little-endian record count, and [`LOG_MAGIC`].
+pub const LOG_TRAILER_LEN: usize = 12;

@@ -18,6 +18,7 @@ pub mod constant;
 pub mod entity_scan;
 pub mod event;
 pub mod footer;
+pub mod log;
 pub mod mirror;
 pub mod reader;
 mod remote;

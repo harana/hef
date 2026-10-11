@@ -52,6 +52,22 @@ impl From<CodecError> for FormatError {
     }
 }
 
+/// Why reading a log object forward stopped before its trailer. A torn tail is what a crash mid-write leaves behind:
+/// every record before it is intact and may be replayed. Corruption means the bytes are damaged, and no record of an
+/// object that should have been complete may be trusted to be the last one.
+///
+/// See: hef-physical-artifacts/spec.md
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum LogReadError {
+    #[error("log object corrupt: {0}")]
+    Corrupt(#[from] FormatError),
+    /// The bytes stop partway through a record or the trailer, or at a record boundary with no trailer: they are a
+    /// strict prefix of a log object. `intact_len` is the byte length of the header plus every intact record, the
+    /// point to truncate a local copy back to before appending again.
+    #[error("log object ends in a torn tail after {intact_records} intact records ({intact_len} bytes)")]
+    TornTail { intact_len: u64, intact_records: u64 },
+}
+
 /// Why an introspection query was refused.
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum IntrospectionError {
