@@ -87,6 +87,25 @@ A small append-only write-ahead log object (`log/{shard}/{seq}`, a few KiB) SHAL
 - **WHEN** a log object is written
 - **THEN** its header and trailer add 18 bytes in total and each record adds 12 bytes to its payload
 
+### Requirement: State chunks hold a subject's state as a content-addressed tree
+A subject's state (for a chat room: which event last set each `(event type, state key)`) SHALL be stored as a prolly tree of immutable state chunks, so successive states share every chunk a change does not touch. A state map SHALL take a key of two interned ids, type id `u32` and state key id `u32`, ordered by type id and then state key id, to the `u64` sequence number of the event that set it. A chunk's plaintext SHALL be, every integer little-endian: the magic `"HSC1"`, a level byte (0 for a leaf), three zero bytes, an entry count `u32`, the entries strictly ascending by key, then a CRC-64/NVME of everything before it. A leaf entry SHALL be the type id, state key id and sequence number (16 bytes); an interior entry SHALL be its child's first type id and state key id, then the child's 32-byte address (40 bytes). The writer SHALL cut each level into chunks of 4 to 16 KiB of entries at content-defined boundaries: a chunk ends after an entry once it holds at least 4 KiB of entries and `stable_hash` of the level byte and the entry's key (type id then state key id, little-endian) is a multiple of 4096 divided by the entry length, and it ends before any entry that would take it past 16 KiB; only the last chunk of a level may hold less than 4 KiB. The boundary hash covers the key and not the value, so a changed value never moves a boundary. Levels SHALL be built until one chunk remains, whose address is the state root; the empty map SHALL be one empty leaf. The same map under the same tenant key SHALL always give the same tree and root. Each chunk SHALL be sealed and addressed as the hef-security-and-isolation requirement "State chunks are sealed convergently per tenant" prescribes, and uploaded under `state/{tenant}/{address in lowercase hex}.hsc` with a create-only put in which an object already at the key counts as stored, children before their parents. A lookup SHALL read one chunk per level. A diff of two roots SHALL return every changed key in key order and SHALL NOT read a subtree whose address both trees share. A reader SHALL refuse a chunk that is missing, fails to open, breaks the framing, the CRC or the key order, or sits at any level but one below its parent. Chunks are read through the `StateChunkStore` interface, which the application backs with durable storage (in production, the object store the uploads write to).
+
+#### Scenario: Identical maps give identical roots
+- **WHEN** the same state map is built twice under one tenant's key
+- **THEN** both builds give the same chunks and the same root, and changing any one value gives a different root
+
+#### Scenario: A one-key change rewrites few chunks
+- **WHEN** one key of a 100,000-member room's state is changed, inserted or removed
+- **THEN** the new tree holds 1 to 3 chunks the old tree lacks
+
+#### Scenario: A diff skips shared subtrees
+- **WHEN** two roots of a 100,000-member room's state that differ in one key are diffed
+- **THEN** the diff returns exactly that key after reading at most 6 chunks, out of about 200 in each tree
+
+#### Scenario: Measured against checkpointed delta chains
+- **WHEN** a 100,000-member room takes 1,024 state events after its initial state (70% changes to existing memberships, 20% new joins, 10% power-level changes), and the same events are also stored as a delta chain that writes the whole map every 64 frames and only the changed keys between
+- **THEN** the prolly tree writes fewer bytes and a cold one-member lookup fetches fewer objects (measured: 13,878 B and 3.00 new chunks per event against 25,076 B per event; 3.00 fetches and 16 KB per lookup against 32.4 fetches and 1.6 MB), while rebuilding the whole state at one frame costs 200 chunk fetches against 32.5 frame fetches on average
+
 ### Requirement: LiveOverlay serves fresh durable ranges and is reconstructable
 LiveOverlay SHALL be the queryable Arrow-native representation of HEJ-durable, validated ranges not yet covered by a manifest-published HEF and not removed by a visible deletion vector. LiveOverlay SHALL NOT be a durability source; on crash its segments SHALL be rebuilt from HEJ replay or replicated fragments. Node-local LiveOverlay SHALL be required — nodes SHALL NOT forward event reads to the tenant's EventManager for LiveOverlay rows, and SHALL serve strict fresh queries only for ranges they have rebuilt, validated, and published locally. A LiveOverlay segment SHALL be evicted only when its complete `(epoch, sequence)` range is covered by a manifest-published HEF file visible to future query snapshots. Any overflow tier SHALL be non-authoritative and reconstructable from HEJ.
 

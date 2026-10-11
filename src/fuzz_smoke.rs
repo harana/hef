@@ -14,6 +14,7 @@ use super::events::variant::VariantRef;
 use super::layout::footer::{GranuleEntry, decode_footer};
 use super::layout::graph::{GraphInput, RowEdges, decode_granule_edges, encode_graph_blocks};
 use super::layout::{decode_header, reader::HefFile};
+use std::collections::BTreeMap;
 
 struct XorShift(u64);
 
@@ -92,6 +93,7 @@ fn mutated_graph_edge_block_never_panics() {
                 prev: vec![sn - 1],
             })
             .collect(),
+        state_roots: BTreeMap::new(),
         subject: b"room".to_vec(),
     };
     let granule = GranuleEntry {

@@ -248,3 +248,21 @@ pub enum InboxError {
     #[error("acknowledgement watermark store failed: {detail}")]
     Watermarks { detail: String },
 }
+
+/// Why reading or storing a subject's state chunks failed: a chunk was malformed or did not open, a chunk a root needs
+/// is missing, or a store failed. Addresses are lowercase hex.
+///
+/// See: hef-physical-artifacts/spec.md
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum StateChunkError {
+    #[error(transparent)]
+    Format(#[from] FormatError),
+    #[error("state chunk {address} is missing from the store")]
+    Missing { address: String },
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    /// The stored bytes did not open under the tenant's key: altered, stored under another address, or another
+    /// tenant's.
+    #[error("state chunk {address} failed authentication")]
+    Unauthentic { address: String },
+}

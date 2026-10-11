@@ -54,6 +54,7 @@ fn graph() -> GraphInput {
             row(&[103, 102], &[100]),
             row(&[104], &[100, 103]),
         ],
+        state_roots: BTreeMap::new(),
         subject: b"!room:example.org".to_vec(),
     }
 }
@@ -205,6 +206,7 @@ fn chain(first_sn: u64, rows: u64) -> GraphInput {
                 prev: sn.checked_sub(1).into_iter().collect(),
             })
             .collect(),
+        state_roots: BTreeMap::new(),
         subject: b"room".to_vec(),
     }
 }
@@ -233,6 +235,47 @@ fn a_built_graph_file_declares_its_edges_and_reads_them_back() {
     }
     let first = file.granule_edges(file.graph_granule_of(50).unwrap()).unwrap();
     assert_eq!(first.children(50, EdgeKind::Auth), (51..70).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_built_graph_file_records_the_state_root_after_each_state_event() {
+    let rows: Vec<_> = (0..20).map(plain_row).collect();
+    let root = |byte: u8| StateRoot {
+        address: [byte; 32],
+        entry_count: u32::from(byte),
+    };
+    let mut graph = chain(50, 20);
+    graph.state_roots = BTreeMap::from([(50, root(1)), (57, root(2)), (69, root(3))]);
+    let built = build_hef_file(rows.clone(), &graph_config(4, Some(graph.clone()))).unwrap();
+    assert_ne!(
+        built.footer.required_feature_flags & required_features::GRAPH_STATE_ROOTS,
+        0
+    );
+    let file = HefFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    assert_eq!(file.state_root(50), Some(root(1)));
+    assert_eq!(file.state_root(57), Some(root(2)));
+    assert_eq!(file.state_root(69), Some(root(3)));
+    for not_a_state_event in [49, 58, 70] {
+        assert_eq!(file.state_root(not_a_state_event), None);
+    }
+
+    let without = build_hef_file(rows.clone(), &graph_config(4, Some(chain(50, 20)))).unwrap();
+    assert_eq!(
+        without.footer.required_feature_flags & required_features::GRAPH_STATE_ROOTS,
+        0
+    );
+    assert!(without.footer.state_roots.is_empty());
+
+    for outside in [49, 70] {
+        graph.state_roots = BTreeMap::from([(outside, root(1))]);
+        assert!(
+            matches!(
+                build_hef_file(rows.clone(), &graph_config(4, Some(graph.clone()))),
+                Err(FormatError::Structural { .. })
+            ),
+            "{outside}"
+        );
+    }
 }
 
 /// A deterministic stand-in for a chat room's history: mostly a linear prev chain with an occasional fork, each event
@@ -276,6 +319,7 @@ fn room_graph(events: u64) -> GraphInput {
         first_sn: 0,
         inbound: Vec::new(),
         rows,
+        state_roots: BTreeMap::new(),
         subject: b"!bench:example.org".to_vec(),
     }
 }

@@ -41,7 +41,7 @@ use crate::layout::footer::{
     SharedDictionaryEntry, ShredEntry, SortDirection, SortednessProof, StripeEntry, StripeNdvEntry, StripeProofEntry,
     TextTokenEntry, TextTokenOffsetsEntry, encode_stripe_marks_pages,
 };
-use crate::layout::graph::{GraphInput, encode_graph_blocks};
+use crate::layout::graph::{GraphInput, encode_graph_blocks, state_root_entries};
 use crate::layout::reader::{HefFile, PayloadRead};
 use crate::layout::snapshot::SnapshotKeyIndex;
 use crate::layout::{
@@ -4826,6 +4826,10 @@ fn build_hef_file_sealed_in_order(
         }
         None => BTreeMap::new(),
     };
+    let state_roots = match &config.graph {
+        Some(graph) => state_root_entries(graph, row_count as u64)?,
+        None => Vec::new(),
+    };
 
     // One job per stripe on the injected executor: stripes are independent once their offsets are stripe-relative,
     // so each is laid out, its marks pages encoded, and its checksum taken beside the others instead of one after
@@ -5038,13 +5042,17 @@ fn build_hef_file_sealed_in_order(
         .collect();
 
     // An audit file declares its own required feature, so a reader or rewriter that predates audit files refuses it.
-    // A file with edges declares both edge features: the forward blocks and the reverse blocks built from them.
+    // A file with edges declares both edge features: the forward blocks and the reverse blocks built from them. One
+    // with state roots also declares the state roots feature.
     let mut required_feature_flags = required_features::ALL;
     if audit.is_some() {
         required_feature_flags |= required_features::AUDIT_HASH_CHAIN;
     }
     if config.graph.is_some() {
         required_feature_flags |= required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE;
+    }
+    if !state_roots.is_empty() {
+        required_feature_flags |= required_features::GRAPH_STATE_ROOTS;
     }
     let footer = Footer {
         audit,
@@ -5094,6 +5102,7 @@ fn build_hef_file_sealed_in_order(
         shredded: shred_plan,
         snapshot_keys,
         sparse_keys,
+        state_roots,
         stripe_checksums,
         stripe_proofs,
         stripe_ndv,

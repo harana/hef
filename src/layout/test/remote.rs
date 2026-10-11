@@ -515,6 +515,7 @@ fn graph_input(first_sn: u64, rows: u64, offsets: &[u64]) -> GraphInput {
                 prev: offsets.iter().filter_map(|offset| sn.checked_sub(*offset)).collect(),
             })
             .collect(),
+        state_roots: StdBTreeMap::new(),
         subject: b"room".to_vec(),
     }
 }

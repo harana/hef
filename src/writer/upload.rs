@@ -6,11 +6,17 @@
 //! upload. Whichever way it went up, the store's own size and CRC-64/NVME for the object must match the build before
 //! the caller may publish it.
 //!
+//! State chunks go up here too, each in one create-only PUT under its address. A chunk already there holds the same
+//! bytes, since its address is its content, so finding it there is success: that is how two states share a chunk.
+//!
 //! See: hef-write-path/spec.md
 
 use super::build::BuiltHef;
 use super::publish::{PublishFailure, hef_upload_segments};
-use crate::object_store::{MultipartUpload, ObjectStat, ObjectStore, PutOutcome, UploadedPart};
+use crate::artifacts::state_chunk::SealedStateChunk;
+use crate::error::StateChunkError;
+use crate::events::TenantId;
+use crate::object_store::{MultipartUpload, ObjectStat, ObjectStore, PutOutcome, UploadedPart, state_chunk_object_key};
 use std::ops::Range;
 
 /// Uploads `built` to `key` and checks that the stored object is exactly the file that was built.
@@ -44,6 +50,26 @@ pub(crate) fn upload_hef(
             "uploaded object is missing from the store",
         )),
     }
+}
+
+/// Stores `chunks`, a state tree's, in the order given (children before parents, as
+/// [`StateTree`](crate::artifacts::state_chunk::StateTree) lists them), each with a create-only put under its
+/// address. Pass the whole tree, or only the chunks its predecessor lacked
+/// ([`StateTree::new_chunks`](crate::artifacts::state_chunk::StateTree::new_chunks)) when that predecessor is already
+/// stored. A chunk already in the store is not written again. Returns how many chunks this call wrote.
+pub fn upload_state_chunks(
+    objects: &dyn ObjectStore,
+    tenant_id: TenantId,
+    chunks: &[SealedStateChunk],
+) -> Result<usize, StateChunkError> {
+    let mut written = 0;
+    for chunk in chunks {
+        let key = state_chunk_object_key(tenant_id, &chunk.address);
+        if let PutOutcome::Written { .. } = objects.put_if_absent(&key, &chunk.bytes)? {
+            written += 1;
+        }
+    }
+    Ok(written)
 }
 
 /// Groups stripe-aligned upload segments (see [`hef_upload_segments`]) into multipart parts of at least

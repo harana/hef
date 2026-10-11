@@ -60,6 +60,7 @@ fn minimal_footer() -> Footer {
         shredded: Vec::new(),
         snapshot_keys: None,
         sparse_keys: Vec::new(),
+        state_roots: Vec::new(),
         stripe_checksums: Vec::new(),
         stripe_proofs: Vec::new(),
         stripe_ndv: Vec::new(),
@@ -1149,6 +1150,69 @@ fn graph_edges_and_their_feature_bits_come_together_on_a_graph_profile_file() {
         graph.first_sn = u64::MAX;
     }
     for footer in [event_profile, forward_only, bits_without_edges, overflowing] {
+        assert!(matches!(
+            decode_footer(&encode_footer(&footer)),
+            Err(FormatError::Structural { .. })
+        ));
+    }
+}
+
+fn state_roots_footer() -> Footer {
+    let mut footer = graph_footer();
+    footer.exact_counts.row_count = 3;
+    footer.required_feature_flags |= required_features::GRAPH_STATE_ROOTS;
+    footer.state_roots = [0, 2]
+        .into_iter()
+        .map(|row_ordinal| StateRootEntry {
+            root: StateRoot {
+                address: [row_ordinal as u8 + 1; 32],
+                entry_count: 40 + row_ordinal as u32,
+            },
+            row_ordinal,
+        })
+        .collect();
+    footer
+}
+
+#[test]
+fn state_roots_round_trip_through_the_footer() {
+    let footer = state_roots_footer();
+    assert_eq!(
+        decode_footer(&encode_footer(&footer)).unwrap().state_roots,
+        footer.state_roots
+    );
+    assert!(
+        decode_footer(&encode_footer(&graph_footer()))
+            .unwrap()
+            .state_roots
+            .is_empty()
+    );
+}
+
+#[test]
+fn state_roots_come_only_with_their_bit_on_a_graph_file_with_edges_and_name_its_rows_in_order() {
+    let mut bit_without_roots = state_roots_footer();
+    bit_without_roots.state_roots.clear();
+    let mut roots_without_bit = state_roots_footer();
+    roots_without_bit.required_feature_flags &= !required_features::GRAPH_STATE_ROOTS;
+    let mut without_edges = state_roots_footer();
+    without_edges.graph = None;
+    without_edges.required_feature_flags &=
+        !(required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE);
+    let mut event_profile = state_roots_footer();
+    event_profile.profile = Profile::Event;
+    let mut out_of_order = state_roots_footer();
+    out_of_order.state_roots.reverse();
+    let mut past_the_file = state_roots_footer();
+    past_the_file.state_roots[1].row_ordinal = 3;
+    for footer in [
+        bit_without_roots,
+        roots_without_bit,
+        without_edges,
+        event_profile,
+        out_of_order,
+        past_the_file,
+    ] {
         assert!(matches!(
             decode_footer(&encode_footer(&footer)),
             Err(FormatError::Structural { .. })

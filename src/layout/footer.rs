@@ -9,6 +9,7 @@
 
 use super::snapshot::SnapshotKeyIndex;
 use super::{Profile, required_features};
+use crate::artifacts::state_chunk::StateRoot;
 use crate::compat::EscapeHatch;
 use crate::encoding::{ColumnData, PipelineId, decode_block, encode_block};
 use crate::error::FormatError;
@@ -46,6 +47,9 @@ pub mod sections {
     /// Optional: a graph-profile file's subject, first sequence number, and the stripe-relative byte range of each
     /// granule's edge block. Present exactly when the file declares `GRAPH_CSR_FORWARD` and `GRAPH_CSR_REVERSE`.
     pub const GRAPH_EDGES: u32 = 31;
+    /// Optional: a graph-profile file's state roots, one per state event in row order. Present exactly when the file
+    /// declares `GRAPH_STATE_ROOTS`.
+    pub const GRAPH_STATE_ROOTS: u32 = 38;
     /// Optional: an inbox file's recipient directory, one entry per recipient. Absent in files that do not declare
     /// `INBOX_RECIPIENT_DIRECTORY`.
     pub const INBOX_RECIPIENTS: u32 = 36;
@@ -282,6 +286,16 @@ pub struct GraphBlockEntry {
     pub granule_id: u32,
     pub len: u64,
     pub offset: u64,
+}
+
+/// The state root a graph-profile file records for one state event: the subject's state right after the event in row
+/// `row_ordinal` (event `first_sn + row_ordinal`).
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateRootEntry {
+    pub root: StateRoot,
+    pub row_ordinal: u64,
 }
 
 /// One row's entry in the file's external-id index: a stable hash of the id and the row that carries it. The footer
@@ -659,6 +673,9 @@ pub struct Footer {
     /// so the sparse key set is closed per file, exactly as the presence map declares promoted columns. Every entry
     /// also appears in `shredded`, since sparse columns ride the same block machinery.
     pub sparse_keys: Vec<ShredEntry>,
+    /// A graph-profile file's state roots, one per state event, strictly ascending by row. Empty in every other file
+    /// and in a graph file with no state events.
+    pub state_roots: Vec<StateRootEntry>,
     pub stripe_checksums: Vec<[u8; 32]>,
     /// Authenticated geometry for each stripe's outboard verified-streaming proof tree.
     pub stripe_proofs: Vec<StripeProofEntry>,
@@ -1290,6 +1307,17 @@ fn encode_sections(footer: &Footer) -> SectionArea {
                 out.put_u32(entry.granule_id);
                 out.put_u64(entry.offset);
                 out.put_u64(entry.len);
+            }
+        });
+    }
+
+    if !footer.state_roots.is_empty() {
+        sections.push(sections::GRAPH_STATE_ROOTS, |out| {
+            out.put_u32(footer.state_roots.len() as u32);
+            for entry in &footer.state_roots {
+                out.put_u64(entry.row_ordinal);
+                out.put_slice(&entry.root.address);
+                out.put_u32(entry.root.entry_count);
             }
         });
     }
@@ -2211,6 +2239,51 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         None => {}
     }
 
+    // The state roots: optional. Fixed entry size: 8 (row) + 32 (root address) + 4 (entry count) = 44 bytes.
+    let state_roots = match decode_section(&directory, section_area, sections::GRAPH_STATE_ROOTS)? {
+        None => Vec::new(),
+        Some(bytes) => {
+            let mut r = Reader::new(bytes);
+            let count = r.u32("state root count")? as usize;
+            let count = bounded_count(count, 44, &r, "state root count exceeds input")?;
+            let mut entries: Vec<StateRootEntry> = Vec::with_capacity(count);
+            for _ in 0..count {
+                let row_ordinal = r.u64("state root row")?;
+                let address = r.take(32, "state root address")?;
+                let entry_count = r.u32("state root entry count")?;
+                if entries.last().is_some_and(|last| last.row_ordinal >= row_ordinal)
+                    || row_ordinal >= exact_counts.row_count
+                {
+                    return Err(FormatError::Structural {
+                        rule: "state roots name rows of the file in strictly ascending order",
+                    });
+                }
+                entries.push(StateRootEntry {
+                    root: StateRoot {
+                        address: address.try_into().unwrap_or([0; 32]),
+                        entry_count,
+                    },
+                    row_ordinal,
+                });
+            }
+            if r.remaining() != 0 || entries.is_empty() {
+                return Err(FormatError::Structural {
+                    rule: "state roots section must hold at least one root and end with its last",
+                });
+            }
+            entries
+        }
+    };
+    // The section, the bit, the graph profile and the graph directory (whose first sequence number names the rows)
+    // travel together.
+    if state_roots.is_empty() == (required_feature_flags & required_features::GRAPH_STATE_ROOTS != 0)
+        || (!state_roots.is_empty() && (profile != Profile::Graph || graph.is_none()))
+    {
+        return Err(FormatError::Structural {
+            rule: "state roots, the graph_state_roots feature and a graph file with edges appear together",
+        });
+    }
+
     let snapshot_keys = decode_section(&directory, section_area, sections::SNAPSHOT_KEYS)?
         .map(SnapshotKeyIndex::decode)
         .transpose()?;
@@ -2259,6 +2332,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         shredded,
         snapshot_keys,
         sparse_keys,
+        state_roots,
         stripe_checksums,
         stripe_proofs,
         stripe_ndv,
