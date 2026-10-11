@@ -108,3 +108,10 @@ Write-ahead log objects SHALL be gated on their fixed framing and their verified
 #### Scenario: Log object passes the framing and streaming gate
 - **WHEN** a log object is written and read forward against its pinned root
 - **THEN** its measured header plus trailer bytes, the bytes hashed before its first record, and the bytes hashed for the whole read are within the gate, and the gate fails when any of them is not
+
+### Requirement: Audit file overhead gate
+An audit file SHALL add at most 192 bytes over an event file of the same rows, all of them in its footer (the profile and audit sections and their directory entries), and SHALL add exactly as much at many rows as at few, so the hash chain stores no bytes per row. The cost of hashing the chain at build time and the throughput of verifying a run of audit files SHALL be reported by a release-mode benchmark.
+
+#### Scenario: Audit file passes the overhead gate
+- **WHEN** the same rows are built as an event file and as an audit file, at a small and a large row count, with and without a retention
+- **THEN** the audit file's added bytes are within the ceiling and equal at both row counts, and the gate fails when either is not

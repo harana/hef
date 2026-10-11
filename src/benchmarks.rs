@@ -337,3 +337,23 @@ pub struct GraphEdgeBytesMeasurement {
 pub fn graph_edge_bytes_gate_passes(m: &GraphEdgeBytesMeasurement) -> bool {
     m.stored_bytes as f64 <= m.edges as f64 * GRAPH_EDGE_BYTES_TARGET
 }
+
+/// The gated ceiling on the bytes an audit file adds over the same rows built as an event file: its profile and audit
+/// footer sections and their two section directory entries. The hash chain stores nothing per row, so the cost stays
+/// the same however many rows the file holds.
+pub const AUDIT_FILE_OVERHEAD_CEILING_BYTES: u64 = 192;
+
+/// What an audit file adds over an event file of the same rows, measured at two row counts, needed to evaluate the
+/// audit file overhead gate.
+#[derive(Debug, Clone)]
+pub struct AuditFileOverheadMeasurement {
+    pub added_bytes_at_few_rows: u64,
+    pub added_bytes_at_many_rows: u64,
+}
+
+/// Returns `true` when an audit file adds at most `AUDIT_FILE_OVERHEAD_CEILING_BYTES` over an event file of the same
+/// rows and adds exactly as much at many rows as at few, so the hash chain costs no stored bytes per row.
+pub fn audit_file_overhead_gate_passes(m: &AuditFileOverheadMeasurement) -> bool {
+    m.added_bytes_at_few_rows <= AUDIT_FILE_OVERHEAD_CEILING_BYTES
+        && m.added_bytes_at_many_rows == m.added_bytes_at_few_rows
+}
