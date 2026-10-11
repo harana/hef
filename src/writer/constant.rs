@@ -13,3 +13,8 @@ pub(crate) const AUDIT_REWRITE_REFUSED: FormatError = FormatError::Structural {
 
 /// Why a compaction publish refuses an audit input or output.
 pub(crate) const AUDIT_COMPACTION_REFUSED: &str = "an audit file is never compacted";
+
+/// How long a state chunk no published root references stays stored after an upload last stored or reused it: 24
+/// hours, in nanoseconds. It must be at least the longest reader lease and the longest an upload may take to publish
+/// the file whose roots name its chunks.
+pub const STATE_CHUNK_GRACE_NANOS: i64 = 24 * 60 * 60 * 1_000_000_000;

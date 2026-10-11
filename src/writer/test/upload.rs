@@ -1,6 +1,7 @@
 use super::*;
 use crate::artifacts::batch::{EventInput, PayloadInput};
 use crate::artifacts::state_chunk::{ObjectStoreStateChunks, StateKey, build_state_tree, state_get};
+use crate::clock::FixedClock;
 use crate::columns::{FreetextDeclaration, PromotionPlan};
 use crate::error::StorageError;
 use crate::events::variant::VariantValue;
@@ -11,6 +12,7 @@ use crate::object_store::{ETag, StoredObject};
 use crate::security::{StateChunkKey, TenantDek};
 use crate::typed_id::TypedIdTestExt;
 use crate::writer::build::{BuildLifecycle, HefBuildConfig, HefRow, build_hef_file};
+use crate::writer::sim::SimStateChunkLedger;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -208,6 +210,8 @@ fn an_object_already_at_the_key_is_verified_not_uploaded_again() {
 #[test]
 fn state_chunks_go_up_create_only_and_a_stored_chunk_counts_as_stored() {
     let objects = SimObjectStore::new();
+    let ledger = SimStateChunkLedger::default();
+    let clock = FixedClock::at(1);
     let tenant = TenantId::new_test_id(9);
     let key = StateChunkKey::derive(&TenantDek::new([3; 32]));
     let member = |user: u32| StateKey {
@@ -218,16 +222,19 @@ fn state_chunks_go_up_create_only_and_a_stored_chunk_counts_as_stored() {
     let first = build_state_tree(&key, &state).unwrap();
     assert!(first.chunks.len() > 2);
     assert_eq!(
-        upload_state_chunks(&objects, tenant, &first.chunks).unwrap(),
+        upload_state_chunks(&objects, &ledger, tenant, &first.chunks, &clock).unwrap(),
         first.chunks.len()
     );
-    assert_eq!(upload_state_chunks(&objects, tenant, &first.chunks).unwrap(), 0);
+    assert_eq!(
+        upload_state_chunks(&objects, &ledger, tenant, &first.chunks, &clock).unwrap(),
+        0
+    );
 
     state.insert(member(1_000), 99);
     let second = build_state_tree(&key, &state).unwrap();
     let new = second.new_chunks(&first);
     assert_eq!(
-        upload_state_chunks(&objects, tenant, &second.chunks).unwrap(),
+        upload_state_chunks(&objects, &ledger, tenant, &second.chunks, &clock).unwrap(),
         new.len()
     );
     assert_eq!(objects.keys().len(), first.chunks.len() + new.len());
@@ -245,7 +252,7 @@ fn state_chunks_go_up_create_only_and_a_stored_chunk_counts_as_stored() {
     let third = build_state_tree(&key, &state).unwrap();
     objects.inject(ObjectFault::FailPutIfAbsent);
     assert!(matches!(
-        upload_state_chunks(&objects, tenant, &third.new_chunks(&second)),
+        upload_state_chunks(&objects, &ledger, tenant, &third.new_chunks(&second), &clock),
         Err(StateChunkError::Storage(_))
     ));
 }

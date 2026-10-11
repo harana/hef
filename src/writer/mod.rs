@@ -19,5 +19,6 @@ pub mod retry;
 pub mod rewrite;
 pub mod sim;
 pub(crate) mod source_form;
+pub mod state_gc;
 pub mod subject_seal;
 pub mod upload;

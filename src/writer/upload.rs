@@ -8,12 +8,15 @@
 //!
 //! State chunks go up here too, each in one create-only PUT under its address. A chunk already there holds the same
 //! bytes, since its address is its content, so finding it there is success: that is how two states share a chunk.
+//! Each chunk is first touched in the state chunk ledger, so a sweep never deletes a chunk an upload reuses.
 //!
 //! See: hef-write-path/spec.md
 
 use super::build::BuiltHef;
 use super::publish::{PublishFailure, hef_upload_segments};
+use super::state_gc::StateChunkLedger;
 use crate::artifacts::state_chunk::SealedStateChunk;
+use crate::clock::Clock;
 use crate::error::StateChunkError;
 use crate::events::TenantId;
 use crate::object_store::{MultipartUpload, ObjectStat, ObjectStore, PutOutcome, UploadedPart, state_chunk_object_key};
@@ -54,16 +57,29 @@ pub(crate) fn upload_hef(
 
 /// Stores `chunks`, a state tree's, in the order given (children before parents, as
 /// [`StateTree`](crate::artifacts::state_chunk::StateTree) lists them), each with a create-only put under its
-/// address. Pass the whole tree, or only the chunks its predecessor lacked
-/// ([`StateTree::new_chunks`](crate::artifacts::state_chunk::StateTree::new_chunks)) when that predecessor is already
-/// stored. A chunk already in the store is not written again. Returns how many chunks this call wrote.
+/// address, after recording in `ledger` that it is in use as of `clock`'s now. A chunk already in the store is not
+/// written again. Returns how many chunks this call wrote.
+///
+/// Pass the whole tree, or only the chunks its predecessor lacked
+/// ([`StateTree::new_chunks`](crate::artifacts::state_chunk::StateTree::new_chunks)) when that predecessor's root is
+/// recorded in a file of the head catalogue generation or was uploaded within the state chunk grace period: a sweep
+/// keeps exactly those. Fails with [`StateChunkError::BeingDeleted`] when a sweep is deleting one of the chunks;
+/// retry after the sweep.
 pub fn upload_state_chunks(
     objects: &dyn ObjectStore,
+    ledger: &dyn StateChunkLedger,
     tenant_id: TenantId,
     chunks: &[SealedStateChunk],
+    clock: &dyn Clock,
 ) -> Result<usize, StateChunkError> {
+    let now = clock.now_nanos();
     let mut written = 0;
     for chunk in chunks {
+        if !ledger.touch(&chunk.address, now)? {
+            return Err(StateChunkError::BeingDeleted {
+                address: hex_simd::encode_to_string(chunk.address, hex_simd::AsciiCase::Lower),
+            });
+        }
         let key = state_chunk_object_key(tenant_id, &chunk.address);
         if let PutOutcome::Written { .. } = objects.put_if_absent(&key, &chunk.bytes)? {
             written += 1;

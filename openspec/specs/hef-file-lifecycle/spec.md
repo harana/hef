@@ -65,3 +65,22 @@ A `snapshot` profile file SHALL be published into a catalogue that holds only th
 - **WHEN** a snapshot of an epoch not later than the Active one is published
 - **THEN** the publication fails and the head generation is unchanged
 
+
+### Requirement: Unreferenced state chunks are collected after a grace period
+State chunks are shared between state roots, so they SHALL NOT leave with the file that first stored them; a separate sweep SHALL collect them. The application SHALL keep, per tenant, a durable ledger (`StateChunkLedger`) of every stored chunk: when an upload last stored or reused it, whether the current sweep found it referenced, and whether a sweep has claimed it for deletion. The mark set SHALL live in that ledger, not in memory, since a tenant's chunks can outgrow one process. An upload SHALL touch each chunk in the ledger at the current time, read through the clock, before its create-only put, and SHALL fail without storing it when a sweep has claimed it. A sweep SHALL first clear the marks, then mark every chunk reachable from the state roots of every file of the tenant in the head catalogue generation that declares `graph_state_roots`, whatever its part state, since an `Outdated` or `DeleteOnDestroy` file may still be read; it learns a file's roots through the `FileStateRoots` interface, which the application implements by opening the file's footer. Marking reads only interior chunks and SHALL fail the sweep before anything is deleted when a referenced chunk is missing or does not open. The sweep SHALL then claim and delete every unmarked chunk no upload has used for the grace period `STATE_CHUNK_GRACE_NANOS` (24 hours, at least the longest reader lease and the longest an upload may take to publish its file), and SHALL finish any chunk an earlier sweep claimed. Touch and claim SHALL be atomic against each other, so a sweep never deletes a chunk an upload has just reused. Each object SHALL be deleted before its ledger record is dropped. The application runs the sweep periodically, one sweep per tenant at a time.
+
+#### Scenario: Referenced chunk never deleted
+- **WHEN** a sweep runs long after every upload, while a file in the head generation (`Active`, `Outdated` or `DeleteOnDestroy`) records a root
+- **THEN** no chunk reachable from that root is deleted and the root still reads
+
+#### Scenario: Unreferenced chunk kept inside the grace period
+- **WHEN** a sweep runs less than the grace period after an upload stored or reused a chunk no root references
+- **THEN** the chunk is kept
+
+#### Scenario: Orphan deleted after the grace period
+- **WHEN** the clock passes the grace period after the last upload that used a chunk no root references
+- **THEN** the next sweep deletes its object and drops its ledger record
+
+#### Scenario: Reuse during a sweep
+- **WHEN** an upload reuses a chunk a sweep has claimed for deletion
+- **THEN** the upload fails without storing anything, and once a sweep has deleted the chunk a retried upload stores it afresh
