@@ -49,7 +49,7 @@ use crate::events::{RelationshipKind, RelationshipRef, TargetIdSpace};
 use crate::file::bytes::{Reader, Writer};
 use crate::indexes::probabilistic::BinaryFuseFilter;
 use hashbrown::HashSet;
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -907,7 +907,8 @@ impl HefFile {
     }
 
     /// The chain-cover label of each event in `sns`, in the order asked: `None` for an event the file does not hold
-    /// or when the file stores no chain cover. Reads each granule the events lie in once.
+    /// or when the file stores no chain cover. Decodes each granule the events lie in once and keeps the decode, so
+    /// later lookups and walks into the same granules reuse it.
     pub fn graph_chain_labels(&self, sns: &[u64]) -> Result<Vec<Option<ChainLabel>>, FormatError> {
         if self
             .footer()
@@ -917,18 +918,13 @@ impl HefFile {
         {
             return Ok(vec![None; sns.len()]);
         }
-        let mut granules: BTreeMap<u32, GranuleEdges> = BTreeMap::new();
         let mut labels = Vec::with_capacity(sns.len());
         for &sn in sns {
-            let Some(granule_id) = self.graph_granule_of(sn) else {
-                labels.push(None);
-                continue;
+            let label = match self.graph_granule_of(sn) {
+                Some(granule_id) => self.cached_granule_edges(granule_id)?.label(sn),
+                None => None,
             };
-            let edges = match granules.entry(granule_id) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => entry.insert(self.granule_edges(granule_id)?),
-            };
-            labels.push(edges.label(sn));
+            labels.push(label);
         }
         Ok(labels)
     }
