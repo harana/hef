@@ -34,6 +34,7 @@ fn graph() -> GraphInput {
         prev: prev.to_vec(),
     };
     GraphInput {
+        chain_cover: None,
         first_sn: 100,
         inbound: vec![
             GraphEdge {
@@ -70,7 +71,7 @@ fn decoded(graph: &GraphInput) -> Vec<GranuleEdges> {
         .iter()
         .map(|granule| {
             let first_sn = graph.first_sn + granule.first_row_ordinal;
-            decode_granule_edges(&blocks[&granule.granule_id], first_sn, granule.row_count, 106).unwrap()
+            decode_granule_edges(&blocks[&granule.granule_id], first_sn, granule.row_count, 106, false).unwrap()
         })
         .collect()
 }
@@ -160,7 +161,7 @@ fn corrupt_offsets_are_refused() {
         let block = raw_block([(offsets, &[1]), empty, empty]);
         assert!(
             matches!(
-                decode_granule_edges(&block, 10, 1, 11),
+                decode_granule_edges(&block, 10, 1, 11, false),
                 Err(FormatError::Structural { .. })
             ),
             "{offsets:?}"
@@ -168,7 +169,10 @@ fn corrupt_offsets_are_refused() {
     }
     let mut block = raw_block([(&[0, 1, 1], &[1]), empty, empty]);
     block.push(0);
-    assert!(decode_granule_edges(&block, 10, 1, 11).is_err(), "trailing bytes");
+    assert!(
+        decode_granule_edges(&block, 10, 1, 11, false).is_err(),
+        "trailing bytes"
+    );
 }
 
 #[test]
@@ -190,14 +194,14 @@ fn out_of_range_targets_are_refused() {
         let block = raw_block(tables);
         assert!(
             matches!(
-                decode_granule_edges(&block, 10, 1, 11),
+                decode_granule_edges(&block, 10, 1, 11, false),
                 Err(FormatError::RefOutOfRange { .. })
             ),
             "{tables:?}"
         );
     }
     let block = raw_block([(one, &[10]), empty, (one, &[-1])]);
-    let edges = decode_granule_edges(&block, 10, 1, 11).unwrap();
+    let edges = decode_granule_edges(&block, 10, 1, 11, false).unwrap();
     assert_eq!(edges.parents(10, EdgeKind::Prev), [0]);
     assert_eq!(edges.children(10, EdgeKind::Prev), [11]);
 }
@@ -211,6 +215,7 @@ fn graph_config(rows_per_granule: usize, graph: Option<GraphInput>) -> HefBuildC
 
 fn chain(first_sn: u64, rows: u64) -> GraphInput {
     GraphInput {
+        chain_cover: None,
         first_sn,
         inbound: Vec::new(),
         rows: (first_sn..first_sn + rows)
@@ -290,6 +295,7 @@ fn room_graph(events: u64) -> GraphInput {
         })
         .collect();
     GraphInput {
+        chain_cover: None,
         first_sn: 0,
         inbound: Vec::new(),
         rows,
@@ -428,4 +434,165 @@ fn the_event_id_index_is_small_and_its_filter_rarely_admits_an_absent_id() {
     assert!(ids.iter().all(|id| event_id_filter_may_hold(&index.filter, id)));
     assert!(section_bytes / (events as f64) < 12.0);
     assert!(false_positive_rate < 0.02);
+}
+
+/// Labels for `rows` rows starting at row 0: rows alternate between chains 1 and 2, each chain's seq counting up from
+/// 10 along its own rows.
+fn chain_cover(rows: u32) -> ChainCoverInput {
+    ChainCoverInput {
+        labels: (0..rows)
+            .map(|row| ChainLabel {
+                chain_id: 1 + row % 2,
+                seq: 10 + row / 2,
+            })
+            .collect(),
+        links: vec![
+            ChainLink {
+                from_chain: 2,
+                from_seq: 12,
+                to_chain: 1,
+                to_seq: 11,
+            },
+            ChainLink {
+                from_chain: 1,
+                from_seq: 13,
+                to_chain: 2,
+                to_seq: 10,
+            },
+            ChainLink {
+                from_chain: 2,
+                from_seq: 11,
+                to_chain: 1,
+                to_seq: 10,
+            },
+            ChainLink {
+                from_chain: 2,
+                from_seq: 12,
+                to_chain: 1,
+                to_seq: 11,
+            },
+        ],
+    }
+}
+
+fn covered_file(cover: ChainCoverInput) -> Result<HefFile, FormatError> {
+    let mut graph = chain(50, 20);
+    graph.chain_cover = Some(cover);
+    let built = build_hef_file(
+        (0..20).map(plain_row).collect::<Vec<_>>(),
+        &graph_config(4, Some(graph)),
+    )?;
+    assert_ne!(
+        built.footer.required_feature_flags & required_features::GRAPH_CHAIN_COVER,
+        0
+    );
+    HefFile::open(built.bytes, Some(&built.file_seal))
+}
+
+#[test]
+fn a_non_monotonic_chain_seq_is_refused_at_write() {
+    let mut repeated = chain_cover(20);
+    repeated.labels[4].seq = repeated.labels[2].seq;
+    let mut backwards = chain_cover(20);
+    backwards.labels[19].seq = 3;
+    let mut short = chain_cover(20);
+    short.labels.pop();
+    for cover in [repeated, backwards, short] {
+        assert!(matches!(covered_file(cover), Err(FormatError::Structural { .. })));
+    }
+    // Seqs may jump, and chains interleave freely, as long as each chain only climbs.
+    let mut jumping = chain_cover(20);
+    jumping.labels[19].seq = 1_000;
+    assert!(covered_file(jumping).is_ok());
+}
+
+#[test]
+fn chain_labels_and_links_round_trip_through_a_built_file() {
+    let cover = chain_cover(20);
+    let file = covered_file(cover.clone()).unwrap();
+    let sns: Vec<u64> = (45..75).collect();
+    let expected: Vec<Option<ChainLabel>> = sns
+        .iter()
+        .map(|sn| {
+            sn.checked_sub(50)
+                .and_then(|row| cover.labels.get(row as usize).copied())
+        })
+        .collect();
+    assert_eq!(file.graph_chain_labels(&sns).unwrap(), expected);
+
+    let from_two = [
+        ChainLink {
+            from_chain: 2,
+            from_seq: 11,
+            to_chain: 1,
+            to_seq: 10,
+        },
+        ChainLink {
+            from_chain: 2,
+            from_seq: 12,
+            to_chain: 1,
+            to_seq: 11,
+        },
+    ];
+    assert_eq!(file.graph_chain_links(&[2]), from_two, "sorted, the repeated link once");
+    assert_eq!(file.graph_chain_links(&[2, 1, 2]).len(), 3);
+    assert!(file.graph_chain_links(&[7]).is_empty());
+
+    let built = build_hef_file(
+        (0..20).map(plain_row).collect::<Vec<_>>(),
+        &graph_config(4, Some(chain(50, 20))),
+    )
+    .unwrap();
+    let uncovered = HefFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    assert_eq!(uncovered.graph_chain_labels(&[50]).unwrap(), [None]);
+    assert!(uncovered.graph_chain_links(&[1, 2]).is_empty());
+}
+
+#[test]
+fn a_file_is_pruned_by_chain_range() {
+    // Chain 1 holds seqs 10 to 19 in this file, chain 2 the same.
+    let file = covered_file(chain_cover(20)).unwrap();
+    assert!(file.graph_may_hold_chain(1, 0..=10));
+    assert!(file.graph_may_hold_chain(2, 15..=15));
+    assert!(file.graph_may_hold_chain(1, 19..=u32::MAX));
+    assert!(
+        !file.graph_may_hold_chain(1, 0..=9),
+        "every seq asked for is older than the file's"
+    );
+    assert!(
+        !file.graph_may_hold_chain(2, 20..=30),
+        "every seq asked for is newer than the file's"
+    );
+    assert!(
+        !file.graph_may_hold_chain(3, 0..=u32::MAX),
+        "the file holds no event on chain 3"
+    );
+
+    let built = build_hef_file(
+        (0..20).map(plain_row).collect::<Vec<_>>(),
+        &graph_config(4, Some(chain(50, 20))),
+    )
+    .unwrap();
+    let uncovered = HefFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    assert!(!uncovered.graph_may_hold_chain(1, 0..=u32::MAX));
+}
+
+#[test]
+fn chain_labels_ride_the_edge_block_only_when_declared() {
+    let mut graph = graph();
+    graph.chain_cover = Some(chain_cover(6));
+    let granules = [granule(0, 0, 3), granule(1, 3, 3)];
+    let blocks = encode_graph_blocks(&graph, 6, &granules).unwrap();
+    let second = decode_granule_edges(&blocks[&1], 103, 3, 106, true).unwrap();
+    assert_eq!(second.label(104), Some(ChainLabel { chain_id: 1, seq: 12 }));
+    assert_eq!(second.label(100), None, "event 100 lives in the other granule");
+    assert!(
+        decode_granule_edges(&blocks[&1], 103, 3, 106, false).is_err(),
+        "labels read as trailing bytes"
+    );
+    let plain = encode_graph_blocks(&self::graph(), 6, &granules).unwrap();
+    assert!(
+        decode_granule_edges(&plain[&1], 103, 3, 106, true).is_err(),
+        "a block without labels"
+    );
 }

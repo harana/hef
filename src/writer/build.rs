@@ -41,7 +41,7 @@ use crate::layout::footer::{
     SharedDictionaryEntry, ShredEntry, SortDirection, SortednessProof, StripeEntry, StripeNdvEntry, StripeProofEntry,
     TextTokenEntry, TextTokenOffsetsEntry, encode_stripe_marks_pages,
 };
-use crate::layout::graph::{EventIdIndex, GraphInput, encode_graph_blocks};
+use crate::layout::graph::{ChainCover, EventIdIndex, GraphInput, encode_graph_blocks};
 use crate::layout::reader::{HefFile, PayloadRead};
 use crate::layout::snapshot::SnapshotKeyIndex;
 use crate::layout::{
@@ -5061,6 +5061,9 @@ fn build_hef_file_sealed_in_order(
     if graph_event_ids.is_some() {
         required_feature_flags |= required_features::GRAPH_EVENT_ID_INDEX;
     }
+    if config.graph.as_ref().is_some_and(|graph| graph.chain_cover.is_some()) {
+        required_feature_flags |= required_features::GRAPH_CHAIN_COVER;
+    }
     let footer = Footer {
         audit,
         clustering,
@@ -5080,6 +5083,7 @@ fn build_hef_file_sealed_in_order(
         granules: granules.iter().map(|granule| granule.entry).collect(),
         graph: config.graph.as_ref().map(|graph| GraphDirectory {
             blocks: graph_blocks,
+            chain_cover: graph.chain_cover.as_ref().map(ChainCover::build),
             event_ids: graph_event_ids,
             first_sn: graph.first_sn,
             subject: graph.subject.clone(),

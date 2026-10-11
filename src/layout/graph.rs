@@ -15,6 +15,10 @@
 //! the reference its event declared, in the footer's list of unresolved parents, and the event reads as having
 //! unresolved edges.
 //!
+//! A file may also store each event's auth chain-cover label, `(chain_id, seq)`, as the embedding application computed
+//! it: the labels ride at the end of each granule's edge block, so the read that returns a granule's edges returns its
+//! labels too, and the footer keeps the links between chains and each chain's sequence range (see [`ChainCover`]).
+//!
 //! A file may also index its events' protocol ids (a Matrix `$...` id, say), so a reader finds an event's sequence
 //! number without reading a granule and a planner skips files that cannot hold it (see [`EventIdIndex`]).
 //!
@@ -22,11 +26,12 @@
 //! per `(row, kind)` slot plus a final total, `prev` before `auth` within each row. A target is stored as
 //! `source_sn - target_sn`, positive for a parent and negative for a child. Both arrays go through the ordinary column
 //! block encoder (zigzag, frame-of-reference or delta bit-packing, and its trailing compression stage), each framed
-//! as `pipeline u32 | byte length u32 | bytes`.
+//! as `pipeline u32 | byte length u32 | bytes`. In a file with chain cover, the three tables are followed by the
+//! granule's chain ids, then its seqs, one value per row, each through the same encoder.
 //!
 //! See: hef-file-layout/spec.md
 
-use super::constant::{GRAPH_EDGE_KINDS, MAX_GRAPH_SUBJECT_BYTES, UNRESOLVED_ENTRY_MIN_BYTES};
+use super::constant::{CHAIN_RANGE_BYTES, GRAPH_EDGE_KINDS, MAX_GRAPH_SUBJECT_BYTES, UNRESOLVED_ENTRY_MIN_BYTES};
 use super::footer::GranuleEntry;
 use super::reader::HefFile;
 use crate::encoding::{ColumnData, PipelineId, decode_block, encode_block};
@@ -36,6 +41,7 @@ use crate::file::bytes::{Reader, Writer};
 use crate::indexes::probabilistic::BinaryFuseFilter;
 use hashbrown::HashSet;
 use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
 use xxhash_rust::xxh3::xxh3_64;
 
 /// Which relationship an edge records between two events of one subject.
@@ -92,6 +98,9 @@ impl EdgeKind {
 /// See: hef-file-layout/spec.md
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GraphInput {
+    /// The rows' auth chain-cover labels and the links between chains, computed by the embedding application, or
+    /// `None` for a file without them.
+    pub chain_cover: Option<ChainCoverInput>,
     /// The sequence number of the file's first row.
     pub first_sn: u64,
     /// Edges from events in later files to parents in this one, supplied when compaction rewrites the file. Each
@@ -133,6 +142,61 @@ pub struct UnresolvedEdge {
     pub parent: RelationshipRef,
 }
 
+/// Where an event sits in its subject's auth chain cover: the chain it lies on and its position along that chain.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChainLabel {
+    pub chain_id: u32,
+    pub seq: u32,
+}
+
+/// One link between two chains of a chain cover: the event at `from_seq` on `from_chain` reaches the event at `to_seq`
+/// on `to_chain` through auth edges.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ChainLink {
+    pub from_chain: u32,
+    pub from_seq: u32,
+    pub to_chain: u32,
+    pub to_seq: u32,
+}
+
+/// The auth chain cover a build stores for a graph-profile file, as the embedding application computed it from its
+/// view of the whole subject.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChainCoverInput {
+    /// Exactly one per row, in row order. Within one chain, `seq` must strictly increase in row order.
+    pub labels: Vec<ChainLabel>,
+    /// In any order; the build sorts them and drops repeats.
+    pub links: Vec<ChainLink>,
+}
+
+/// The sequence numbers one chain's events in a file run between, so a reader skips files that hold none of a range.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainRange {
+    pub chain_id: u32,
+    pub max_seq: u32,
+    pub min_seq: u32,
+}
+
+/// What a graph file's footer keeps of its chain cover: each chain's range of `seq` among the file's events and the
+/// links between chains. The per-row labels live in the edge blocks.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainCover {
+    /// Ascending by chain id, one per chain the file's events lie on.
+    pub chains: Vec<ChainRange>,
+    /// Sorted and distinct, so the links from one chain are adjacent.
+    pub links: Vec<ChainLink>,
+}
+
 /// Finds an event's sequence number from its protocol id (a Matrix `$...` id, say) without reading a granule, and lets
 /// a planner skip files that cannot hold the id.
 ///
@@ -159,6 +223,8 @@ pub struct GranuleEdges {
     first_sn: u64,
     forward: Csr,
     inbound: Csr,
+    /// One per row in a file with chain cover; empty otherwise.
+    labels: Vec<ChainLabel>,
     reverse: Csr,
 }
 
@@ -183,6 +249,13 @@ impl GranuleEdges {
         let mut children = self.reverse.edges(self.first_sn, sn, kind).to_vec();
         children.extend_from_slice(self.inbound.edges(self.first_sn, sn, kind));
         children
+    }
+
+    /// The chain-cover label of event `sn`, or `None` when the file stores no labels or this granule does not hold
+    /// the event.
+    pub fn label(&self, sn: u64) -> Option<ChainLabel> {
+        let row = usize::try_from(sn.checked_sub(self.first_sn)?).ok()?;
+        self.labels.get(row).copied()
     }
 }
 
@@ -251,6 +324,20 @@ pub fn encode_graph_blocks(
             ));
         }
     }
+    if let Some(cover) = &graph.chain_cover {
+        if cover.labels.len() != graph.rows.len() {
+            return Err(refuse("a graph chain cover carries one label per row"));
+        }
+        let mut last_seq: BTreeMap<u32, u32> = BTreeMap::new();
+        for label in &cover.labels {
+            if last_seq
+                .insert(label.chain_id, label.seq)
+                .is_some_and(|last| last >= label.seq)
+            {
+                return Err(refuse("a chain's seq must strictly increase in row order"));
+            }
+        }
+    }
     let mut inbound: Vec<[Vec<u64>; GRAPH_EDGE_KINDS]> = vec![Default::default(); graph.rows.len()];
     for edge in &graph.inbound {
         if edge.child < end_sn {
@@ -288,7 +375,22 @@ pub fn encode_graph_blocks(
             first_sn,
             &slot_lists(reverse.get(range.clone()).unwrap_or_default()),
         )?;
-        encode_csr(&mut out, first_sn, &slot_lists(inbound.get(range).unwrap_or_default()))?;
+        encode_csr(
+            &mut out,
+            first_sn,
+            &slot_lists(inbound.get(range.clone()).unwrap_or_default()),
+        )?;
+        if let Some(cover) = &graph.chain_cover {
+            let labels = cover.labels.get(range).unwrap_or_default();
+            put_block(
+                &mut out,
+                &ColumnData::U64(labels.iter().map(|label| u64::from(label.chain_id)).collect()),
+            );
+            put_block(
+                &mut out,
+                &ColumnData::U64(labels.iter().map(|label| u64::from(label.seq)).collect()),
+            );
+        }
         blocks.insert(granule.granule_id, out.into_bytes());
     }
     Ok(blocks)
@@ -330,6 +432,134 @@ fn put_block(out: &mut Writer, data: &ColumnData) {
     out.put_u32(encoded.pipeline.0);
     out.put_u32(encoded.bytes.len() as u32);
     out.put_slice(&encoded.bytes);
+}
+
+impl ChainCover {
+    /// The footer summary of `input`: each chain's `seq` range over the labels, and the links sorted with repeats
+    /// dropped. The labels themselves are checked when the edge blocks are built.
+    pub fn build(input: &ChainCoverInput) -> Self {
+        let mut ranges: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
+        for label in &input.labels {
+            let range = ranges.entry(label.chain_id).or_insert((label.seq, label.seq));
+            range.0 = range.0.min(label.seq);
+            range.1 = range.1.max(label.seq);
+        }
+        let mut links = input.links.clone();
+        links.sort_unstable();
+        links.dedup();
+        Self {
+            chains: ranges
+                .into_iter()
+                .map(|(chain_id, (min_seq, max_seq))| ChainRange {
+                    chain_id,
+                    max_seq,
+                    min_seq,
+                })
+                .collect(),
+            links,
+        }
+    }
+
+    /// Writes footer section `GRAPH_CHAIN_COVER`: `chain count u32`, then per chain `chain_id u32 | min_seq u32 |
+    /// max_seq u32`; then `link count u32` and, when there are links, four blocks through the ordinary column block
+    /// encoder: `from_chain` delta coded (each the difference from the link before, the first from zero), `from_seq`,
+    /// `to_chain`, `to_seq`.
+    pub(super) fn encode(&self, out: &mut Writer) {
+        out.put_u32(self.chains.len() as u32);
+        for chain in &self.chains {
+            out.put_u32(chain.chain_id);
+            out.put_u32(chain.min_seq);
+            out.put_u32(chain.max_seq);
+        }
+        out.put_u32(self.links.len() as u32);
+        if self.links.is_empty() {
+            return;
+        }
+        let mut previous = 0;
+        let from_chain_deltas = self
+            .links
+            .iter()
+            .map(|link| {
+                u64::from(
+                    link.from_chain
+                        .wrapping_sub(std::mem::replace(&mut previous, link.from_chain)),
+                )
+            })
+            .collect();
+        put_block(out, &ColumnData::U64(from_chain_deltas));
+        for field in [
+            |link: &ChainLink| link.from_seq,
+            |link: &ChainLink| link.to_chain,
+            |link: &ChainLink| link.to_seq,
+        ] {
+            put_block(
+                out,
+                &ColumnData::U64(self.links.iter().map(|link| u64::from(field(link))).collect()),
+            );
+        }
+    }
+
+    /// Reads [`Self::encode`]'s bytes. Refuses chains out of order or repeated, a range whose minimum passes its
+    /// maximum, links that are not sorted and distinct, and values past `u32`.
+    pub(super) fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let malformed = FormatError::Structural {
+            rule: "graph chain cover must hold sorted chains with ordered ranges and sorted, distinct links",
+        };
+        let mut reader = Reader::new(bytes);
+        let chain_count = reader.u32("graph chain count")? as usize;
+        let mut chains: Vec<ChainRange> = Vec::with_capacity(chain_count.min(reader.remaining() / CHAIN_RANGE_BYTES));
+        for _ in 0..chain_count {
+            let chain = ChainRange {
+                chain_id: reader.u32("graph chain id")?,
+                min_seq: reader.u32("graph chain min seq")?,
+                max_seq: reader.u32("graph chain max seq")?,
+            };
+            if chain.min_seq > chain.max_seq || chains.last().is_some_and(|last| last.chain_id >= chain.chain_id) {
+                return Err(malformed);
+            }
+            chains.push(chain);
+        }
+        let link_count = reader.u32("graph link count")? as usize;
+        let mut links = Vec::new();
+        if link_count > 0 {
+            let mut column = || -> Result<Vec<u32>, FormatError> {
+                let ColumnData::U64(values) = take_block(&mut reader)? else {
+                    return Err(malformed.clone());
+                };
+                let values: Vec<u32> = values
+                    .into_iter()
+                    .map(u32::try_from)
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| malformed.clone())?;
+                if values.len() != link_count {
+                    return Err(malformed.clone());
+                }
+                Ok(values)
+            };
+            let (deltas, from_seqs, to_chains, to_seqs) = (column()?, column()?, column()?, column()?);
+            let mut from_chain = 0u32;
+            for (((delta, from_seq), to_chain), to_seq) in deltas.into_iter().zip(from_seqs).zip(to_chains).zip(to_seqs)
+            {
+                from_chain = from_chain.checked_add(delta).ok_or(malformed.clone())?;
+                let link = ChainLink {
+                    from_chain,
+                    from_seq,
+                    to_chain,
+                    to_seq,
+                };
+                if links.last().is_some_and(|last| *last >= link) {
+                    return Err(malformed);
+                }
+                links.push(link);
+            }
+        }
+        if reader.remaining() != 0 {
+            return Err(FormatError::Structural {
+                rule: "graph chain cover section has trailing bytes",
+            });
+        }
+        Ok(Self { chains, links })
+    }
 }
 
 /// The hash a graph file's event-id index and its filter key a protocol id by: 64-bit XXH3.
@@ -473,14 +703,16 @@ fn take_block(reader: &mut Reader<'_>) -> Result<ColumnData, FormatError> {
 }
 
 /// Decodes one granule's edge block, written for `rows` events starting at `first_sn` in a file whose events end
-/// just before `file_end_sn`. Refuses bytes whose offsets do not run from zero to the edge count in order, or whose
-/// targets break the direction rules: a parent strictly earlier than its event, an in-file child later than its event
-/// and inside the file, an inbound child past the file's last event.
+/// just before `file_end_sn`, with the granule's chain-cover labels after the tables when `chain_cover` is set. Refuses
+/// bytes whose offsets do not run from zero to the edge count in order, whose targets break the direction rules (a
+/// parent strictly earlier than its event, an in-file child later than its event and inside the file, an inbound child
+/// past the file's last event), or whose labels are not one `u32` pair per row.
 pub fn decode_granule_edges(
     bytes: &[u8],
     first_sn: u64,
     rows: u32,
     file_end_sn: u64,
+    chain_cover: bool,
 ) -> Result<GranuleEdges, FormatError> {
     let mut reader = Reader::new(bytes);
     let forward = decode_csr(&mut reader, first_sn, rows, |source, target| target < source)?;
@@ -488,6 +720,28 @@ pub fn decode_granule_edges(
         source < target && target < file_end_sn
     })?;
     let inbound = decode_csr(&mut reader, first_sn, rows, |_, target| target >= file_end_sn)?;
+    let mut labels = Vec::new();
+    if chain_cover {
+        let (ColumnData::U64(chain_ids), ColumnData::U64(seqs)) = (take_block(&mut reader)?, take_block(&mut reader)?)
+        else {
+            return Err(FormatError::Structural {
+                rule: "graph chain labels must decode to u64 columns",
+            });
+        };
+        if chain_ids.len() != rows as usize || seqs.len() != rows as usize {
+            return Err(FormatError::Structural {
+                rule: "graph chain labels hold one label per row",
+            });
+        }
+        for (chain_id, seq) in chain_ids.into_iter().zip(seqs) {
+            let (Ok(chain_id), Ok(seq)) = (u32::try_from(chain_id), u32::try_from(seq)) else {
+                return Err(FormatError::RefOutOfRange {
+                    what: "graph chain label",
+                });
+            };
+            labels.push(ChainLabel { chain_id, seq });
+        }
+    }
     if reader.remaining() != 0 {
         return Err(FormatError::Structural {
             rule: "graph edge block has trailing bytes",
@@ -497,6 +751,7 @@ pub fn decode_granule_edges(
         first_sn,
         forward,
         inbound,
+        labels,
         reverse,
     })
 }
@@ -580,7 +835,76 @@ impl HefFile {
             first_sn.saturating_add(granule.first_row_ordinal),
             granule.row_count,
             first_sn.saturating_add(footer.exact_counts.row_count),
+            footer.graph.as_ref().is_some_and(|graph| graph.chain_cover.is_some()),
         )
+    }
+
+    /// The chain-cover label of each event in `sns`, in the order asked: `None` for an event the file does not hold
+    /// or when the file stores no chain cover. Reads each granule the events lie in once.
+    pub fn graph_chain_labels(&self, sns: &[u64]) -> Result<Vec<Option<ChainLabel>>, FormatError> {
+        if self
+            .footer()
+            .graph
+            .as_ref()
+            .is_none_or(|graph| graph.chain_cover.is_none())
+        {
+            return Ok(vec![None; sns.len()]);
+        }
+        let mut granules: BTreeMap<u32, GranuleEdges> = BTreeMap::new();
+        let mut labels = Vec::with_capacity(sns.len());
+        for &sn in sns {
+            let Some(granule_id) = self.graph_granule_of(sn) else {
+                labels.push(None);
+                continue;
+            };
+            if !granules.contains_key(&granule_id) {
+                granules.insert(granule_id, self.granule_edges(granule_id)?);
+            }
+            labels.push(granules.get(&granule_id).and_then(|edges| edges.label(sn)));
+        }
+        Ok(labels)
+    }
+
+    /// The chain-cover links of this graph file that start on any chain in `chains`, sorted. Empty when the file stores
+    /// no chain cover.
+    pub fn graph_chain_links(&self, chains: &[u32]) -> Vec<ChainLink> {
+        let Some(cover) = self
+            .footer()
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.chain_cover.as_ref())
+        else {
+            return Vec::new();
+        };
+        let mut links: Vec<ChainLink> = Vec::new();
+        for &chain in chains {
+            let start = cover.links.partition_point(|link| link.from_chain < chain);
+            let end = cover.links.partition_point(|link| link.from_chain <= chain);
+            links.extend_from_slice(cover.links.get(start..end).unwrap_or_default());
+        }
+        links.sort_unstable();
+        links.dedup();
+        links
+    }
+
+    /// Whether this graph file may hold an event on chain `chain_id` whose `seq` lies in `seqs`, from the footer alone:
+    /// `false` lets a reader skip the file. `false` too for a file that stores no chain cover, since it holds no labels
+    /// to read.
+    pub fn graph_may_hold_chain(&self, chain_id: u32, seqs: RangeInclusive<u32>) -> bool {
+        let Some(cover) = self
+            .footer()
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.chain_cover.as_ref())
+        else {
+            return false;
+        };
+        cover
+            .chains
+            .binary_search_by_key(&chain_id, |chain| chain.chain_id)
+            .ok()
+            .and_then(|index| cover.chains.get(index))
+            .is_some_and(|chain| chain.min_seq <= *seqs.end() && *seqs.start() <= chain.max_seq)
     }
 
     /// The sequence number of the event in this graph-profile file whose protocol id (its external id) is `event_id`,

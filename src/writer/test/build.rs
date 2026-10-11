@@ -4066,6 +4066,7 @@ fn an_encrypted_footer_still_prunes_on_the_entity_hash_filters() {
 /// A prev chain over events `0..rows`.
 fn graph_chain(rows: u64) -> GraphInput {
     GraphInput {
+        chain_cover: None,
         first_sn: 0,
         inbound: Vec::new(),
         rows: (0..rows)

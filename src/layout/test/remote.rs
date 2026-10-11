@@ -508,6 +508,7 @@ impl RangeSource for BatchSource {
 /// before it that exist, and authorized by event 0.
 fn graph_input(first_sn: u64, rows: u64, offsets: &[u64]) -> GraphInput {
     GraphInput {
+        chain_cover: None,
         first_sn,
         inbound: Vec::new(),
         rows: (first_sn..first_sn + rows)

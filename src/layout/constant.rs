@@ -63,6 +63,10 @@ pub const MAX_GRAPH_SUBJECT_BYTES: usize = 255;
 /// reference length `u16`, before the reference itself.
 pub const UNRESOLVED_ENTRY_MIN_BYTES: usize = 11;
 
+/// The bytes one chain's entry takes in a graph file's chain-cover summary: `chain_id`, `min_seq` and `max_seq`, each a
+/// `u32`.
+pub const CHAIN_RANGE_BYTES: usize = 12;
+
 /// A remote graph read bridges a gap of up to this many bytes between two ranges it needs, fetching the gap rather
 /// than paying for a second request.
 pub const GRAPH_FETCH_GAP_BYTES: u64 = 1024 * 1024;

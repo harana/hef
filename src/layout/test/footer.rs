@@ -1078,6 +1078,7 @@ fn graph_footer() -> Footer {
         | required_features::GRAPH_CSR_FORWARD
         | required_features::GRAPH_CSR_REVERSE;
     footer.graph = Some(GraphDirectory {
+        chain_cover: None,
         blocks: vec![GraphBlockEntry {
             granule_id: 0,
             len: 300,
@@ -1182,6 +1183,69 @@ fn a_graph_event_id_index_round_trips_only_with_its_feature_bit() {
     no_graph.required_feature_flags &= !required_features::GRAPH;
     no_graph.required_feature_flags |= required_features::GRAPH_EVENT_ID_INDEX;
     for footer in [no_bit, no_index, outside, repeated, no_filter, no_graph] {
+        assert!(decode_footer(&encode_footer(&footer)).is_err());
+    }
+}
+
+fn chain_cover_footer() -> Footer {
+    let mut footer = graph_footer();
+    footer.required_feature_flags |= required_features::GRAPH_CHAIN_COVER;
+    if let Some(graph) = &mut footer.graph {
+        graph.chain_cover = Some(crate::layout::graph::ChainCover::build(
+            &crate::layout::graph::ChainCoverInput {
+                labels: vec![crate::layout::graph::ChainLabel { chain_id: 4, seq: 9 }],
+                links: vec![
+                    crate::layout::graph::ChainLink {
+                        from_chain: 4,
+                        from_seq: 9,
+                        to_chain: 2,
+                        to_seq: 3,
+                    },
+                    crate::layout::graph::ChainLink {
+                        from_chain: 1,
+                        from_seq: 5,
+                        to_chain: 0,
+                        to_seq: 1,
+                    },
+                ],
+            },
+        ));
+    }
+    footer
+}
+
+#[test]
+fn a_graph_chain_cover_round_trips_only_with_its_feature_bit() {
+    let footer = chain_cover_footer();
+    assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().graph, footer.graph);
+
+    let mut no_bit = chain_cover_footer();
+    no_bit.required_feature_flags &= !required_features::GRAPH_CHAIN_COVER;
+    let mut no_cover = chain_cover_footer();
+    if let Some(graph) = &mut no_cover.graph {
+        graph.chain_cover = None;
+    }
+    let mut unsorted_links = chain_cover_footer();
+    if let Some(cover) = unsorted_links
+        .graph
+        .as_mut()
+        .and_then(|graph| graph.chain_cover.as_mut())
+    {
+        cover.links.swap(0, 1);
+    }
+    let mut inverted_range = chain_cover_footer();
+    if let Some(cover) = inverted_range
+        .graph
+        .as_mut()
+        .and_then(|graph| graph.chain_cover.as_mut())
+    {
+        cover.chains[0].min_seq = 10;
+    }
+    let mut no_graph = chain_cover_footer();
+    no_graph.graph = None;
+    no_graph.required_feature_flags &= !required_features::GRAPH;
+    no_graph.required_feature_flags |= required_features::GRAPH_CHAIN_COVER;
+    for footer in [no_bit, no_cover, unsorted_links, inverted_range, no_graph] {
         assert!(decode_footer(&encode_footer(&footer)).is_err());
     }
 }
