@@ -44,7 +44,7 @@ fn samples() -> Vec<Sample> {
     (0..ROWS)
         .map(|i| {
             at += (mix(i) % 75) as i64 * 1_000_000;
-            if mix(i + 7) % 2 == 0 {
+            if mix(i + 7).is_multiple_of(2) {
                 used += 40_960;
             }
             let temperature = match i {

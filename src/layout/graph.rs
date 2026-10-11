@@ -49,7 +49,7 @@ use crate::events::{RelationshipKind, RelationshipRef, TargetIdSpace};
 use crate::file::bytes::{Reader, Writer};
 use crate::indexes::probabilistic::BinaryFuseFilter;
 use hashbrown::HashSet;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::ops::RangeInclusive;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -915,10 +915,11 @@ impl HefFile {
                 labels.push(None);
                 continue;
             };
-            if !granules.contains_key(&granule_id) {
-                granules.insert(granule_id, self.granule_edges(granule_id)?);
-            }
-            labels.push(granules.get(&granule_id).and_then(|edges| edges.label(sn)));
+            let edges = match granules.entry(granule_id) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(self.granule_edges(granule_id)?),
+            };
+            labels.push(edges.label(sn));
         }
         Ok(labels)
     }

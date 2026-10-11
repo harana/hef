@@ -309,7 +309,7 @@ impl DeltaChain {
 
     /// Stores the next frame and returns its size in bytes.
     fn push(&mut self, state: &BTreeMap<StateKey, u64>, changed: &BTreeMap<StateKey, u64>) -> usize {
-        let source = if self.frames.len() % Self::CHECKPOINT_EVERY == 0 {
+        let source = if self.frames.len().is_multiple_of(Self::CHECKPOINT_EVERY) {
             state
         } else {
             changed

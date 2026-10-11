@@ -223,7 +223,7 @@ impl BitReader<'_> {
 
     /// The bits after the read position in its current byte, which a well-formed stream leaves zero.
     fn padding(&self) -> Result<u8, FormatError> {
-        if self.bit % 8 == 0 {
+        if self.bit.is_multiple_of(8) {
             return Ok(0);
         }
         let last = self

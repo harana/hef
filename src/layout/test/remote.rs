@@ -1137,7 +1137,7 @@ fn state_at_an_event_cold_and_warm() {
             chunks.remote.insert(chunk.address, chunk.bytes);
         }
     }
-    let half = (STATE_EVENTS + 1) / 2;
+    let half = STATE_EVENTS.div_ceil(2);
     let mut first = graph_input(0, half, &[1]);
     first.state_roots = roots.range(..half).map(|(sn, root)| (*sn, *root)).collect();
     let mut second = graph_input(half, STATE_EVENTS + 1 - half, &[1]);

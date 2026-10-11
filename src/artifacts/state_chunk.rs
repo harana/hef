@@ -220,7 +220,8 @@ fn seal_level<const N: usize>(
 fn is_boundary(level: u8, entry_key: StateKey, entry_len: usize) -> bool {
     let [t0, t1, t2, t3] = entry_key.type_id.to_le_bytes();
     let [s0, s1, s2, s3] = entry_key.state_key_id.to_le_bytes();
-    stable_hash(&[level, t0, t1, t2, t3, s0, s1, s2, s3]) % (STATE_CHUNK_BOUNDARY_SPAN_BYTES / entry_len) as u64 == 0
+    stable_hash(&[level, t0, t1, t2, t3, s0, s1, s2, s3])
+        .is_multiple_of((STATE_CHUNK_BOUNDARY_SPAN_BYTES / entry_len) as u64)
 }
 
 fn seal_chunk<const N: usize>(
