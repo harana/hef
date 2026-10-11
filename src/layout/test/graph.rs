@@ -4,6 +4,9 @@ use crate::layout::{Profile, required_features};
 use crate::writer::build::{HefBuildConfig, build_hef_file};
 use crate::writer::source_form::tests::{plain_row, source_form_config};
 
+/// One way to break a valid graph input.
+type GraphBreak = Box<dyn Fn(&mut GraphInput)>;
+
 fn granule(granule_id: u32, first_row_ordinal: u64, row_count: u32) -> GranuleEntry {
     GranuleEntry {
         compressed_bytes_estimate: 0,
@@ -89,7 +92,7 @@ fn edges_round_trip_through_granule_blocks() {
 
 #[test]
 fn a_graph_that_breaks_a_rule_is_refused() {
-    let cases: Vec<(&str, Box<dyn Fn(&mut GraphInput)>)> = vec![
+    let cases: Vec<(&str, GraphBreak)> = vec![
         ("parent not earlier", Box::new(|g| g.rows[2].prev = vec![102])),
         ("later parent", Box::new(|g| g.rows[2].auth = vec![104])),
         ("repeated parent", Box::new(|g| g.rows[3].prev = vec![102, 102])),
