@@ -73,3 +73,8 @@ pub const GRAPH_HEDGE_SAMPLES: usize = 128;
 /// Below this many timed requests a remote graph hedges at the caller's floor alone, because the percentile is not
 /// yet meaningful.
 pub const GRAPH_HEDGE_MIN_SAMPLES: usize = 20;
+
+/// The fit error, in rows, of a snapshot file's learned key model: a lookup's predicted window spans this many rows
+/// either side of the estimate (plus one, see `LearnedPositionIndex::build`), plus the longest run of keys sharing a
+/// model key. Small next to a granule, so the window almost always falls inside one.
+pub const SNAPSHOT_KEY_ERROR_BOUND: u64 = 32;

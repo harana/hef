@@ -7,6 +7,7 @@
 //! the feature it backs. Unknown section ids are ignorable extension blocks; whether the *file* is readable is governed
 //! by the required-feature flags in the preamble, which refuse.
 
+use super::snapshot::SnapshotKeyIndex;
 use super::{Profile, required_features};
 use crate::compat::EscapeHatch;
 use crate::encoding::{ColumnData, PipelineId, decode_block, encode_block};
@@ -72,6 +73,9 @@ pub mod sections {
     /// Optional: one file-scope dictionary alphabet per string column that shares it, under the
     /// `shared_dictionaries` required feature — blocks recording the file dictionary scope resolve their codes here.
     pub const SHARED_DICTIONARIES: u32 = 24;
+    /// Optional: a snapshot file's key index (see [`super::SnapshotKeyIndex`]). Absent in files that do not
+    /// declare `SNAPSHOT_KEY_INDEX`.
+    pub const SNAPSHOT_KEYS: u32 = 34;
     /// Optional: the sparse shredded key set — payload paths stored as sparse columns under the
     /// `sparse_shredded_columns` required feature, bounded per file by the writer's pinned key budget.
     pub const SPARSE_KEYS: u32 = 23;
@@ -648,6 +652,9 @@ pub struct Footer {
     pub schema_fingerprint: [u8; 32],
     pub shared_dictionaries: Vec<SharedDictionaryEntry>,
     pub shredded: Vec<ShredEntry>,
+    /// A snapshot file's key index. `None` in every other file, and in a snapshot file that does not declare
+    /// `SNAPSHOT_KEY_INDEX`.
+    pub snapshot_keys: Option<SnapshotKeyIndex>,
     /// Payload paths stored as sparse shredded columns — hot but under the dense promotion threshold — declared here
     /// so the sparse key set is closed per file, exactly as the presence map declares promoted columns. Every entry
     /// also appears in `shredded`, since sparse columns ride the same block machinery.
@@ -1285,6 +1292,10 @@ fn encode_sections(footer: &Footer) -> SectionArea {
                 out.put_u64(entry.len);
             }
         });
+    }
+
+    if let Some(index) = &footer.snapshot_keys {
+        sections.push(sections::SNAPSHOT_KEYS, |out| out.put_slice(&index.encode()));
     }
 
     // The sparse shredded key set: optional, emitted only when the writer stored sparse columns.
@@ -2200,6 +2211,18 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         None => {}
     }
 
+    let snapshot_keys = decode_section(&directory, section_area, sections::SNAPSHOT_KEYS)?
+        .map(SnapshotKeyIndex::decode)
+        .transpose()?;
+    if snapshot_keys
+        .as_ref()
+        .is_some_and(|index| index.granule_first_keys.len() != granules.len())
+    {
+        return Err(FormatError::Structural {
+            rule: "snapshot key index must hold one first key per granule",
+        });
+    }
+
     Ok(Footer {
         audit,
         clustering,
@@ -2234,6 +2257,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         schema_fingerprint,
         shared_dictionaries,
         shredded,
+        snapshot_keys,
         sparse_keys,
         stripe_checksums,
         stripe_proofs,

@@ -552,3 +552,107 @@ fn only_inbox_files_retire_by_acknowledgement() {
     assert!(matches!(result, Err(PublishFailure::Verification(_))));
     assert_eq!(set.head().unwrap().0, 1);
 }
+
+/// A snapshot file of `epoch`, keyed `opp-1` through `opp-{keys}`.
+fn snapshot_file(epoch: u64, keys: u64) -> BuiltHef {
+    let mut config = build_config();
+    config.profile = Profile::Snapshot;
+    let rows = (1..=keys)
+        .map(|sequence| HefRow {
+            epoch,
+            sequence,
+            event: event(sequence),
+        })
+        .collect();
+    build_hef_file(rows, &config).unwrap()
+}
+
+fn publish_snapshot(
+    set: &mut SimulatedPublishedSet,
+    objects: &SimObjectStore,
+    built: BuiltHef,
+) -> Result<Published, PublishFailure> {
+    let mut config = build_config();
+    config.profile = Profile::Snapshot;
+    HefPublisher::new().publish_snapshot(
+        built,
+        &config,
+        set,
+        objects,
+        &mut NoopPeerNotices::default(),
+        &FixedClock::at(START_NANOS),
+    )
+}
+
+/// Each epoch's snapshot replaces the last in one generation: the new file is the only active one and the old one is
+/// outdated with its retirement recorded, so the sweeper can delete it later.
+#[test]
+fn a_snapshot_replaces_the_previous_epoch_in_one_generation() {
+    let mut set = SimulatedPublishedSet::new();
+    let objects = SimObjectStore::new();
+    let first = publish_snapshot(&mut set, &objects, snapshot_file(1, 4)).unwrap();
+    assert_eq!(first.generation, 1);
+    assert_eq!(first.entry.profile, Profile::Snapshot);
+    assert_eq!(
+        first.entry.coverage,
+        SequenceRange {
+            epoch: 1,
+            first_sequence: 1,
+            last_sequence: 4
+        }
+    );
+
+    let second = publish_snapshot(&mut set, &objects, snapshot_file(2, 4)).unwrap();
+    assert_eq!(second.generation, 2);
+    let (_, head) = set.head().unwrap();
+    let mut outdated = first.entry.clone();
+    outdated.part_state = PartState::Outdated;
+    assert_eq!(head.files, vec![outdated, second.entry.clone()]);
+    assert_eq!(
+        head.retirements,
+        vec![Retirement {
+            file_id: first.entry.file_id,
+            generation: 2,
+            since_nanos: START_NANOS
+        }]
+    );
+    let active: Vec<u128> = head.snapshot_files().map(|file| file.file_id).collect();
+    assert_eq!(active, vec![second.entry.file_id]);
+}
+
+/// A stale writer cannot put an older epoch, or other content for the same epoch, over the current one; republishing
+/// the current file changes nothing; and a snapshot never lands in a catalogue of event files or carries an event
+/// file.
+#[test]
+fn a_snapshot_publication_refuses_an_older_epoch_a_mixed_catalogue_and_an_event_file() {
+    let mut set = SimulatedPublishedSet::new();
+    let objects = SimObjectStore::new();
+    let published = publish_snapshot(&mut set, &objects, snapshot_file(2, 4)).unwrap();
+    for (epoch, keys) in [(1, 4), (2, 3)] {
+        let result = publish_snapshot(&mut set, &objects, snapshot_file(epoch, keys));
+        assert!(matches!(result, Err(PublishFailure::Verification(_))), "epoch {epoch}");
+    }
+    assert_eq!(set.head().unwrap().0, 1);
+    let again = publish_snapshot(&mut set, &objects, snapshot_file(2, 4)).unwrap();
+    assert_eq!(
+        (again.generation, again.entry),
+        (1, published.entry),
+        "republishing the same file is a no-op"
+    );
+
+    let mut events = SimulatedPublishedSet::new();
+    publish_directly(
+        &mut events,
+        ManifestGeneration {
+            files: vec![entry(101, 1, 2, PartState::Active)],
+            generation: 1,
+            ..Default::default()
+        },
+    );
+    let result = publish_snapshot(&mut events, &objects, snapshot_file(3, 4));
+    assert!(matches!(result, Err(PublishFailure::Verification(_))));
+    assert_eq!(events.head().unwrap().0, 1);
+
+    let result = publish_snapshot(&mut SimulatedPublishedSet::new(), &objects, merged_file());
+    assert!(matches!(result, Err(PublishFailure::Verification(_))));
+}

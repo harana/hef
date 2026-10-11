@@ -28,6 +28,7 @@ pub mod log;
 pub mod mirror;
 pub mod reader;
 mod remote;
+pub mod snapshot;
 pub mod source_form;
 
 /// The fixed file header occupies the first 4 KiB block.
@@ -587,6 +588,11 @@ pub mod optional_features {
     /// reader that does not declare the feature scans every granule and returns the identical answer, and a filter
     /// never rules out a granule that holds the id, so a confirmed match is never lost.
     pub const ENTITY_HASH_POINT_FILTERS: u64 = 1 << 10;
+
+    /// A snapshot file's key index in the footer: a learned model of where each key sits plus each granule's first
+    /// key, so a lookup by key fetches the one granule that can hold it. Droppable acceleration state: a reader that
+    /// does not declare the feature searches the granules in turn and returns the identical answer.
+    pub const SNAPSHOT_KEY_INDEX: u64 = 1 << 11;
 
     /// An inbox file's footer carries a recipient directory: each recipient's row range and newest queue position, so
     /// a reader fetches one recipient's rows directly and the lifecycle tells from the footer alone whether every

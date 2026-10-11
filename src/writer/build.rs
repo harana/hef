@@ -43,6 +43,7 @@ use crate::layout::footer::{
 };
 use crate::layout::graph::{GraphInput, encode_graph_blocks};
 use crate::layout::reader::{HefFile, PayloadRead};
+use crate::layout::snapshot::SnapshotKeyIndex;
 use crate::layout::{
     EMPTY_VALUE_ROW_OFFSET, HEADER_BLOCK_LEN, HefHeader, LayoutClass, LayoutTargets, MAX_PAGE_BYTES, Profile,
     encode_header, optional_features, required_features,
@@ -3217,6 +3218,32 @@ fn build_hef_file_sealed_in_order(
     if sparse.is_none() && start < rows.len() {
         granule_row_ranges.push((start, rows.len()));
     }
+    // A snapshot file's key index, from the rows' keys before granule construction takes their strings. A snapshot
+    // is replaced whole each epoch, so a sparse update, which holds only some rows, is refused.
+    let snapshot_keys = match (config.profile, source) {
+        (Profile::Snapshot, Some(_)) => {
+            return Err(FormatError::Structural {
+                rule: "a snapshot file is replaced whole, never sparsely updated",
+            });
+        }
+        (Profile::Snapshot, None) => {
+            if rows.iter().any(|row| row.epoch != first_key.0) {
+                return Err(FormatError::Structural {
+                    rule: "a snapshot file holds one epoch",
+                });
+            }
+            let keys = rows
+                .iter()
+                .map(|row| row.envelope.entity_id.as_deref())
+                .collect::<Option<Vec<&str>>>()
+                .ok_or(FormatError::Structural {
+                    rule: "every snapshot row carries an entity_id",
+                })?;
+            let granule_first_rows: Vec<usize> = granule_row_ranges.iter().map(|&(start, _)| start).collect();
+            Some(SnapshotKeyIndex::build(&keys, &granule_first_rows)?)
+        }
+        _ => None,
+    };
     // The original-form blocks and indexes, from the rows before granule construction takes their strings. A sparse
     // update changes none of them, so it borrows the source's blocks and keeps its indexes.
     let (source_form_blocks, source_form_indexes) = match source {
@@ -3434,7 +3461,10 @@ fn build_hef_file_sealed_in_order(
                         .sum::<usize>()
                 })
                 .unwrap_or_default();
-        if stripe_bytes + granule_bytes > config.targets.stripe_target_bytes && stripe_bytes > 0 {
+        // A snapshot file gives every granule its own stripe, so a key lookup fetches exactly one granule.
+        if (config.profile == Profile::Snapshot || stripe_bytes + granule_bytes > config.targets.stripe_target_bytes)
+            && stripe_bytes > 0
+        {
             stripe_id += 1;
             stripe_bytes = 0;
         }
@@ -4987,6 +5017,9 @@ fn build_hef_file_sealed_in_order(
     if !inbox_recipients.is_empty() {
         optional_flags |= optional_features::INBOX_RECIPIENT_DIRECTORY;
     }
+    if snapshot_keys.is_some() {
+        optional_flags |= optional_features::SNAPSHOT_KEY_INDEX;
+    }
 
     // Schema fingerprint over the column directory.
     let mut schema_hash = blake3::Hasher::new();
@@ -5059,6 +5092,7 @@ fn build_hef_file_sealed_in_order(
         schema_fingerprint: *schema_hash.finalize().as_bytes(),
         shared_dictionaries,
         shredded: shred_plan,
+        snapshot_keys,
         sparse_keys,
         stripe_checksums,
         stripe_proofs,

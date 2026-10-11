@@ -60,7 +60,32 @@ impl LearnedPositionIndex {
     /// ready to answer range seek queries.
     pub fn build(column_id: u32, projection_id: u32, keys: &[i64], error_bound: u64) -> Self {
         let row_count = keys.len() as u64;
-        let segments = fit_segments(keys, error_bound);
+        let segments = fit_segments(keys, |i| i as f64, error_bound);
+        Self {
+            column_id,
+            direction: SortDirection::Ascending,
+            error_bound: error_bound.saturating_add(1),
+            projection_id,
+            row_count,
+            segments,
+        }
+    }
+
+    /// Builds a learned position index over sorted, distinct keys that each start at a given row, for a column where
+    /// one key can cover a run of rows: pass each distinct key once with the first row that holds it (`rows[i]` for
+    /// `keys[i]`, ascending), and the column's total `row_count`.
+    ///
+    /// The estimate for each passed key lands within `error_bound` rows of its first row, as with [`Self::build`]; a
+    /// caller widens the window by its longest run to reach the run's last row.
+    pub fn build_at_rows(
+        column_id: u32,
+        projection_id: u32,
+        keys: &[i64],
+        rows: &[u64],
+        row_count: u64,
+        error_bound: u64,
+    ) -> Self {
+        let segments = fit_segments(keys, |i| rows.get(i).map_or(0.0, |row| *row as f64), error_bound);
         Self {
             column_id,
             direction: SortDirection::Ascending,
@@ -231,11 +256,11 @@ impl<'a> LearnedSeek<'a> {
 }
 
 /// Fits a minimal piecewise linear model whose maximum per-point error is at most `error_bound` rows, using a greedy
-/// cone-intersection algorithm.
+/// cone-intersection algorithm. `position(i)` is the row `keys[i]` sits at.
 ///
 /// For each segment the algorithm maintains the range of slopes `[slope_lo, slope_hi]` consistent with all points seen
 /// so far staying within the error budget. When a new point would make that range empty, a new segment starts.
-fn fit_segments(keys: &[i64], error_bound: u64) -> Vec<Segment> {
+fn fit_segments(keys: &[i64], position: impl Fn(usize) -> f64, error_bound: u64) -> Vec<Segment> {
     if keys.is_empty() {
         return Vec::new();
     }
@@ -245,7 +270,7 @@ fn fit_segments(keys: &[i64], error_bound: u64) -> Vec<Segment> {
     let mut seg_start = 0usize;
 
     while let Some(&key0) = keys.get(seg_start) {
-        let pos0 = seg_start as f64;
+        let pos0 = position(seg_start);
 
         let mut slope_lo = f64::NEG_INFINITY;
         let mut slope_hi = f64::INFINITY;
@@ -258,7 +283,7 @@ fn fit_segments(keys: &[i64], error_bound: u64) -> Vec<Segment> {
             if dk == 0.0 {
                 // Duplicate key at a different row: only fits if the row distance from pos0 stays within budget (slope
                 // is 0 here).
-                if (pos0 - i as f64).abs() > error {
+                if (pos0 - position(i)).abs() > error {
                     break;
                 }
                 seg_end = i;
@@ -266,8 +291,8 @@ fn fit_segments(keys: &[i64], error_bound: u64) -> Vec<Segment> {
             }
 
             // Slope range for point i to stay within error_bound of pos_i.
-            let s_lo = (i as f64 - error - pos0) / dk;
-            let s_hi = (i as f64 + error - pos0) / dk;
+            let s_lo = (position(i) - error - pos0) / dk;
+            let s_hi = (position(i) + error - pos0) / dk;
             let new_lo = slope_lo.max(s_lo);
             let new_hi = slope_hi.min(s_hi);
 
