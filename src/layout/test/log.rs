@@ -4,6 +4,7 @@ use crate::file::constant::TREE_TRAILER_MAGIC;
 use crate::layout::constant::HEF_MAGIC;
 use crate::layout::decode_header;
 use crate::layout::reader::HefFile;
+use std::time::Instant;
 
 const PAYLOADS: [&[u8]; 4] = [b"first", b"", b"third record", b"4"];
 
@@ -214,4 +215,72 @@ fn a_large_object_streams_one_chunk_group_at_a_time_through_its_proof_tree() {
     let (payloads, error) = read_all(LogRecords::open_verified(&damaged, &object.root).unwrap());
     assert!(payloads.len() >= 16 && payloads.len() < 40);
     assert!(matches!(error, Some(LogReadError::Corrupt(_))));
+}
+
+/// Writes `objects` log objects of `records` copies of `payload`, then reads each back verified against its root,
+/// seven times, and prints the median write (append and finish) and read throughput. Returns one of the objects.
+fn report_log_throughput(label: &str, payload: &[u8], records: usize, objects: usize) -> SealedLogObject {
+    let mut write_samples = Vec::new();
+    let mut read_samples = Vec::new();
+    let mut sealed = Vec::new();
+    for _ in 0..7 {
+        sealed = Vec::with_capacity(objects);
+        let started = Instant::now();
+        for _ in 0..objects {
+            let mut writer = LogObjectWriter::new();
+            for _ in 0..records {
+                writer.append(payload).unwrap();
+            }
+            sealed.push(writer.finish());
+        }
+        write_samples.push(started.elapsed().as_secs_f64());
+
+        let started = Instant::now();
+        let mut read = 0;
+        for object in &sealed {
+            for record in LogRecords::open_verified(&object.bytes, &object.root).unwrap() {
+                std::hint::black_box(record.unwrap());
+                read += 1;
+            }
+        }
+        read_samples.push(started.elapsed().as_secs_f64());
+        assert_eq!(read, records * objects);
+    }
+    write_samples.sort_unstable_by(f64::total_cmp);
+    read_samples.sort_unstable_by(f64::total_cmp);
+    let total_records = (records * objects) as f64;
+    let total_bytes = sealed.iter().map(|object| object.bytes.len()).sum::<usize>() as f64;
+    for (phase, median) in [("write", write_samples[3]), ("verified read", read_samples[3])] {
+        println!(
+            "log {label}, {phase}: median {:.1} ms, {:.0} records/s, {:.1} MB/s",
+            median * 1e3,
+            total_records / median,
+            total_bytes / median / 1e6
+        );
+    }
+    sealed.swap_remove(0)
+}
+
+/// Times writing and verified reading of log objects in two shapes - 20,000 KiB-range objects of 64 records of 64
+/// bytes, and one 64 MiB object of 4 KiB records read through its proof tree - and prints records and megabytes per
+/// second for each, and the bytes the large read verifies before its first record. Run by hand:
+/// `cargo test --release --all-features --lib log_object_throughput -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-mode log object benchmark"]
+fn log_object_throughput() {
+    report_log_throughput("64 x 64 B objects", &[0x5A; 64], 64, 20_000);
+    let large = report_log_throughput("64 MiB object of 4 KiB records", &[0xA5; 4096], 16_384, 1);
+
+    let mut records = LogRecords::open_verified(&large.bytes, &large.root).unwrap();
+    records.next().unwrap().unwrap();
+    let first_record_verified_bytes = records.verified_len();
+    records.by_ref().for_each(|record| assert!(record.is_ok()));
+    let measurement = LogObjectMeasurement {
+        first_record_verified_bytes,
+        framing_bytes: (LOG_HEADER_LEN + LOG_TRAILER_LEN) as u64,
+        object_bytes: large.bytes.len() as u64,
+        verified_bytes: records.verified_len(),
+    };
+    println!("log 64 MiB object: {measurement:?}");
+    assert!(log_object_gate_passes(&measurement));
 }
