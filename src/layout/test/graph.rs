@@ -3,6 +3,8 @@ use crate::benchmarks::{GraphEdgeBytesMeasurement, graph_edge_bytes_gate_passes}
 use crate::layout::{Profile, required_features};
 use crate::writer::build::{HefBuildConfig, build_hef_file};
 use crate::writer::source_form::tests::{plain_row, source_form_config};
+use std::hint::black_box;
+use std::time::{Duration, Instant};
 
 /// One way to break a valid graph input.
 type GraphBreak = Box<dyn Fn(&mut GraphInput)>;
@@ -237,7 +239,7 @@ fn a_built_graph_file_declares_its_edges_and_reads_them_back() {
 
 /// A deterministic stand-in for a chat room's history: mostly a linear prev chain with an occasional fork, each event
 /// authorized by the create event, the latest power-levels event, and its sender's latest membership.
-fn room_graph(events: u64) -> GraphInput {
+pub(crate) fn room_graph(events: u64) -> GraphInput {
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let mut random = move || {
         state ^= state << 13;
@@ -280,25 +282,34 @@ fn room_graph(events: u64) -> GraphInput {
     }
 }
 
+/// `events` rows cut into 8192-row granules.
+fn room_granules(events: u64) -> Vec<GranuleEntry> {
+    (0..events.div_ceil(8192))
+        .map(|index| {
+            let first = index * 8192;
+            granule(index as u32, first, (events - first).min(8192) as u32)
+        })
+        .collect()
+}
+
+fn edge_count(graph: &GraphInput) -> u64 {
+    graph
+        .rows
+        .iter()
+        .map(|row| (row.auth.len() + row.prev.len()) as u64)
+        .sum()
+}
+
 /// Stored bytes per edge for a room-shaped graph in 8192-row granules, counting the forward and reverse copies both
 /// against the one edge they describe.
 #[test]
 fn a_room_graph_stores_few_bytes_per_edge() {
     let events = 100_000u64;
     let graph = room_graph(events);
-    let granules: Vec<GranuleEntry> = (0..events.div_ceil(8192))
-        .map(|index| {
-            let first = index * 8192;
-            granule(index as u32, first, (events - first).min(8192) as u32)
-        })
-        .collect();
+    let granules = room_granules(events);
     let blocks = encode_graph_blocks(&graph, events, &granules).unwrap();
     let measurement = GraphEdgeBytesMeasurement {
-        edges: graph
-            .rows
-            .iter()
-            .map(|row| (row.auth.len() + row.prev.len()) as u64)
-            .sum(),
+        edges: edge_count(&graph),
         stored_bytes: blocks.values().map(|block| block.len() as u64).sum(),
     };
     println!(
@@ -308,4 +319,63 @@ fn a_room_graph_stores_few_bytes_per_edge() {
         measurement.stored_bytes as f64 / measurement.edges as f64
     );
     assert!(graph_edge_bytes_gate_passes(&measurement));
+}
+
+/// Times building and decoding the edge blocks of the 100,000-event room in 8192-row granules, the median of five
+/// samples each, and prints edges per second, MB/s of edge-block bytes, and stored bytes per edge. Run by hand:
+/// `cargo test --release --all-features --lib benchmark_graph_edge_blocks -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-mode graph edge block benchmark"]
+fn benchmark_graph_edge_blocks() {
+    let events = 100_000u64;
+    let graph = room_graph(events);
+    let granules = room_granules(events);
+    let edges = edge_count(&graph);
+    let median = |mut samples: Vec<Duration>| {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    };
+
+    let encode = median(
+        (0..5)
+            .map(|_| {
+                let started = Instant::now();
+                black_box(encode_graph_blocks(&graph, events, &granules).unwrap());
+                started.elapsed()
+            })
+            .collect(),
+    );
+    let blocks = encode_graph_blocks(&graph, events, &granules).unwrap();
+    let decode = median(
+        (0..5)
+            .map(|_| {
+                let started = Instant::now();
+                for granule in &granules {
+                    black_box(
+                        decode_granule_edges(
+                            &blocks[&granule.granule_id],
+                            graph.first_sn + granule.first_row_ordinal,
+                            granule.row_count,
+                            events,
+                        )
+                        .unwrap(),
+                    );
+                }
+                started.elapsed()
+            })
+            .collect(),
+    );
+
+    let stored: u64 = blocks.values().map(|block| block.len() as u64).sum();
+    for (step, time) in [("encode", encode), ("decode", decode)] {
+        println!(
+            "graph edge blocks {step}: {edges} edges in {time:?}, {:.1} M edges/s, {:.1} MB/s",
+            edges as f64 / time.as_secs_f64() / 1e6,
+            stored as f64 / time.as_secs_f64() / 1e6
+        );
+    }
+    println!(
+        "graph edge blocks: {stored} bytes, {:.2} bytes per edge",
+        stored as f64 / edges as f64
+    );
 }

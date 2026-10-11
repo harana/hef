@@ -400,4 +400,4 @@ impl HefFile {
 
 #[cfg(test)]
 #[path = "test/graph.rs"]
-mod tests;
+pub(crate) mod tests;
