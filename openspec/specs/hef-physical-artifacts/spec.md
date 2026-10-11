@@ -68,6 +68,25 @@ HEF SHALL be the immutable, footer-indexed, range-readable query file selected b
 - **WHEN** the planner selects an HEF file for a query
 - **THEN** it inspects the footer and feature directory to determine available blocks rather than inferring behavior from a lifecycle label
 
+### Requirement: Log objects for small write-ahead logs
+A small append-only write-ahead log object (`log/{shard}/{seq}`, a few KiB) SHALL use compact log framing instead of the HEF container's 4 KiB header block and footer index, and SHALL declare the `log` profile code (4) up front. Its bytes, every integer little-endian, SHALL be a 6-byte header (`"HEFL"`, format version 1, profile code 4), then each record as a `u32` payload length, the payload, and a CRC-64/NVME of the length and payload, then a 12-byte trailer (`u32::MAX` in the length position, the `u32` record count, `"HEFL"`). A record payload SHALL be shorter than `u32::MAX` bytes. The magic SHALL differ from HEF's `"HEF1"` at both ends, so a HEF reader refuses a log object and a log reader refuses a HEF file. The object's root SHALL be the BLAKE3 of those bytes; an object larger than one 1 MiB chunk group SHALL carry the same outboard proof tree and `"HEFT"` trailer HEF stripes use under `stripe_verified_streaming`, after its log trailer. A reader SHALL read records forward. Opened with a root the caller pinned when the object was committed, it SHALL check every byte against that root, one chunk group at a time, before yielding it, and SHALL treat any mismatch as corruption. Opened without a root, it SHALL check each record's CRC and SHALL report bytes that stop partway through the header, a record, or the trailer, or at a record boundary with no trailer, as a torn tail carrying the intact record count and byte length; a CRC mismatch, a wrong trailer record count, or bytes after the trailer SHALL be corruption.
+
+#### Scenario: Torn tail after a crash mid-write
+- **WHEN** a log object without a pinned root is any strict prefix of a sealed object
+- **THEN** the reader yields every complete record and then reports a torn tail with their count and byte length, never corruption
+
+#### Scenario: Damage before the end
+- **WHEN** a complete record's CRC does not match, or a byte of an object with a pinned root differs from what the root commits to
+- **THEN** the reader reports corruption rather than a torn tail
+
+#### Scenario: Log object and HEF file are never confused
+- **WHEN** a log object is handed to the HEF header decoder or file opener, or a HEF file to the log reader
+- **THEN** it is refused on its magic
+
+#### Scenario: Log framing overhead
+- **WHEN** a log object is written
+- **THEN** its header and trailer add 18 bytes in total and each record adds 12 bytes to its payload
+
 ### Requirement: LiveOverlay serves fresh durable ranges and is reconstructable
 LiveOverlay SHALL be the queryable Arrow-native representation of HEJ-durable, validated ranges not yet covered by a manifest-published HEF and not removed by a visible deletion vector. LiveOverlay SHALL NOT be a durability source; on crash its segments SHALL be rebuilt from HEJ replay or replicated fragments. Node-local LiveOverlay SHALL be required — nodes SHALL NOT forward event reads to the tenant's EventManager for LiveOverlay rows, and SHALL serve strict fresh queries only for ranges they have rebuilt, validated, and published locally. A LiveOverlay segment SHALL be evicted only when its complete `(epoch, sequence)` range is covered by a manifest-published HEF file visible to future query snapshots. Any overflow tier SHALL be non-authoritative and reconstructable from HEJ.
 

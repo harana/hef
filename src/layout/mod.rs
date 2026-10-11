@@ -19,6 +19,7 @@ pub mod entity_scan;
 pub mod event;
 pub mod footer;
 pub mod inbox;
+pub mod log;
 pub mod mirror;
 pub mod reader;
 mod remote;

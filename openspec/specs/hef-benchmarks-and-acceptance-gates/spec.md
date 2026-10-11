@@ -102,3 +102,9 @@ Metadata economics SHALL be gated as its own dimension, because footer fetches, 
 - **WHEN** a query prunes a file out during planning on a build claiming lazy per-stripe marks
 - **THEN** the planner metadata bytes read for that file meet the near-zero gate, and the gate fails if the eliminated file still costs its full share of granule-level marks bytes
 
+### Requirement: Log object framing and streaming gate
+Write-ahead log objects SHALL be gated on their fixed framing and their verified forward read. The header plus trailer of a log object SHALL be at most 32 bytes, whatever its record count. A verified forward read SHALL hash at most one 1 MiB chunk group before returning the first record, and no more bytes than the object holds by the time it has returned every record.
+
+#### Scenario: Log object passes the framing and streaming gate
+- **WHEN** a log object is written and read forward against its pinned root
+- **THEN** its measured header plus trailer bytes, the bytes hashed before its first record, and the bytes hashed for the whole read are within the gate, and the gate fails when any of them is not
