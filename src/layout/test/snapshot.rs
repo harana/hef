@@ -1,5 +1,6 @@
 use super::*;
 use crate::artifacts::batch::{EventInput, PayloadInput};
+use crate::benchmarks::{SnapshotLookupMeasurement, snapshot_lookup_gate_passes};
 use crate::columns::{FreetextDeclaration, PromotionPlan};
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, SequenceRange, StreamId, TenantId, TimestampValue};
@@ -202,7 +203,7 @@ fn a_run_of_keys_sharing_one_model_key_widens_the_window_by_the_run() {
 }
 
 /// The acceptance bound: a remote open reads the tail once, and each lookup then reads one granule more, whether
-/// the key is present or not.
+/// the key is present or not, which holds every cold lookup to the snapshot lookup gate.
 #[test]
 fn a_remote_lookup_costs_one_tail_read_and_one_granule_read() {
     for (keys, absent) in [
@@ -219,6 +220,13 @@ fn a_remote_lookup_costs_one_tail_read_and_one_granule_read() {
         let source = counting_source(&built);
         let opened = open_remote(&source, &built);
         assert_eq!(source.requests.lock().unwrap().len(), 1, "the open reads only the tail");
+        let tail_bytes = source.requests.lock().unwrap()[0].1;
+        let cold_lookup = |requests: &[(u64, u64)]| SnapshotLookupMeasurement {
+            bytes_fetched: tail_bytes + requests.iter().map(|(_, len)| len).sum::<u64>(),
+            requests: 1 + requests.len() as u32,
+            stored_bytes: built.bytes.len() as u64,
+        };
+        let mut measurements = Vec::new();
 
         for key in keys.iter().step_by(37) {
             let file = opened.fresh_reader().unwrap();
@@ -235,11 +243,24 @@ fn a_remote_lookup_costs_one_tail_read_and_one_granule_read() {
                     .any(|stripe| stripe.file_offset == offset && stripe.byte_len == len),
                 "the one read is exactly one granule's stripe"
             );
+            measurements.push(cold_lookup(&requests[before..]));
         }
         let file = opened.fresh_reader().unwrap();
         let before = source.requests.lock().unwrap().len();
         assert_eq!(file.snapshot_get(absent).unwrap(), None);
-        assert!(source.requests.lock().unwrap().len() - before <= 1);
+        let requests = source.requests.lock().unwrap().clone();
+        assert!(requests.len() - before <= 1);
+        measurements.push(cold_lookup(&requests[before..]));
+
+        let largest = measurements.iter().max_by_key(|m| m.bytes_fetched).unwrap();
+        println!(
+            "snapshot lookup: {} keys, at most {} requests and {} of {} B fetched per cold lookup",
+            keys.len(),
+            largest.requests,
+            largest.bytes_fetched,
+            largest.stored_bytes
+        );
+        assert!(measurements.iter().all(snapshot_lookup_gate_passes));
     }
 }
 

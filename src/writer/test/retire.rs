@@ -553,15 +553,15 @@ fn only_inbox_files_retire_by_acknowledgement() {
     assert_eq!(set.head().unwrap().0, 1);
 }
 
-/// A snapshot file of `epoch`, keyed `opp-1` through `opp-{keys}`.
+/// A snapshot file of `epoch`, keyed `opp-000001` through `opp-{keys}`, zero-padded so the keys sort in row order.
 fn snapshot_file(epoch: u64, keys: u64) -> BuiltHef {
     let mut config = build_config();
     config.profile = Profile::Snapshot;
     let rows = (1..=keys)
-        .map(|sequence| HefRow {
-            epoch,
-            sequence,
-            event: event(sequence),
+        .map(|sequence| {
+            let mut event = event(sequence);
+            event.envelope.entity_id = Some(format!("opp-{sequence:06}"));
+            HefRow { epoch, sequence, event }
         })
         .collect();
     build_hef_file(rows, &config).unwrap()
@@ -655,4 +655,35 @@ fn a_snapshot_publication_refuses_an_older_epoch_a_mixed_catalogue_and_an_event_
 
     let result = publish_snapshot(&mut SimulatedPublishedSet::new(), &objects, merged_file());
     assert!(matches!(result, Err(PublishFailure::Verification(_))));
+}
+
+/// Times replacing a 100,000-key snapshot with the next epoch's, through the in-memory catalogue and object store:
+/// building the new file, then publishing it in place of the old one. Prints the median of seven epochs. Run by hand:
+/// `cargo test --release --all-features --lib snapshot_epoch_replacement -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-mode snapshot epoch replacement benchmark"]
+fn snapshot_epoch_replacement() {
+    let keys = 100_000;
+    let mut set = SimulatedPublishedSet::new();
+    let objects = SimObjectStore::new();
+    publish_snapshot(&mut set, &objects, snapshot_file(1, keys)).unwrap();
+    let mut builds = Vec::new();
+    let mut publishes = Vec::new();
+    let mut stored_bytes = 0;
+    for epoch in 2..9 {
+        let started = std::time::Instant::now();
+        let built = snapshot_file(epoch, keys);
+        builds.push(started.elapsed());
+        stored_bytes = built.bytes.len();
+        let started = std::time::Instant::now();
+        let published = publish_snapshot(&mut set, &objects, built).unwrap();
+        publishes.push(started.elapsed());
+        assert_eq!(published.generation, epoch);
+    }
+    builds.sort_unstable();
+    publishes.sort_unstable();
+    println!(
+        "snapshot epoch replacement: {keys} keys, {stored_bytes} B file, median build {:?}, median publish {:?}",
+        builds[3], publishes[3]
+    );
 }
