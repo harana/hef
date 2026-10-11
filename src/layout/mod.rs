@@ -12,7 +12,7 @@ use constant::HEF_MAGIC;
 use std::borrow::Cow;
 use uuid::Uuid;
 
-pub use remote::{RemoteGraph, RemoteGraphOptions};
+pub use remote::{RemoteGraph, RemoteGraphOptions, RemoteState};
 
 pub mod api;
 pub mod audit;

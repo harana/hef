@@ -1,12 +1,15 @@
 //! The questions a caller asks of a subject's event graph: which events an event points back to, which point at it,
-//! and everything it descends from, level by level.
+//! and everything it descends from, level by level; which sequence numbers a list of protocol event ids stand for;
+//! where events sit in the auth chain cover; and what the subject's state was after a state event.
 //!
-//! [`super::RemoteGraph`] answers them from graph-profile files in object storage.
+//! [`super::RemoteGraph`] answers them from graph-profile files in object storage, and [`super::RemoteState`] adds
+//! the state questions on top of it.
 //!
 //! See: hef-apis/spec.md
 
-use super::graph::EdgeKind;
-use crate::error::FormatError;
+use super::graph::{ChainLabel, ChainLink, EdgeKind};
+use crate::artifacts::state_chunk::{StateChange, StateKey, StateRoot};
+use crate::error::{FormatError, StateChunkError};
 use hashbrown::HashSet;
 
 /// Reads the edges between one subject's events, named by sequence number.
@@ -91,6 +94,44 @@ impl Iterator for GraphWalk<'_> {
         self.frontier.clone_from(&level);
         (!level.is_empty()).then_some(Ok(level))
     }
+}
+
+/// Turns the ids a protocol gives events (a Matrix `$...` id, say) into the sequence numbers the graph names them by.
+///
+/// See: hef-apis/spec.md
+pub trait EventIds {
+    /// The sequence number of the event of `subject` whose protocol id is each of `ids`, one answer per id in the order
+    /// asked: `None` for an id no event of the subject carries.
+    fn resolve_ids(&self, subject: &[u8], ids: &[&[u8]]) -> Result<Vec<Option<u64>>, FormatError>;
+}
+
+/// Reads where a subject's events sit in its auth chain cover, the labels and links that answer "does this event
+/// reach that one through auth edges?" without walking the graph.
+///
+/// See: hef-apis/spec.md
+pub trait AuthChains {
+    /// The chain-cover label of each event in `sns`, one per event in the order asked: `None` for an event whose file
+    /// stores no chain cover. Fails when no file holds one of the events.
+    fn chain_labels(&self, subject: &[u8], sns: &[u64]) -> Result<Vec<Option<ChainLabel>>, FormatError>;
+
+    /// Every link of `subject`'s chain cover that starts on one of `chains`, sorted and without repeats.
+    fn chain_links(&self, subject: &[u8], chains: &[u32]) -> Result<Vec<ChainLink>, FormatError>;
+}
+
+/// Reads a subject's state (a chat room's membership, say) as it stood after one of its state events: the event's
+/// state root, then one key of that state or every key that differs between two states.
+///
+/// See: hef-apis/spec.md
+pub trait SubjectState {
+    /// The subject's state root right after event `sn`, or `None` when `sn` is not a state event. Fails when no file
+    /// holds the event.
+    fn state_root(&self, subject: &[u8], sn: u64) -> Result<Option<StateRoot>, FormatError>;
+
+    /// The sequence number of the event that set `key` in the state at `root`, or `None` when that state lacks the key.
+    fn state_get(&self, root: &StateRoot, key: StateKey) -> Result<Option<u64>, StateChunkError>;
+
+    /// Every key whose value differs between the states at `before` and `after`, in key order.
+    fn state_diff(&self, before: &StateRoot, after: &StateRoot) -> Result<Vec<StateChange>, StateChunkError>;
 }
 
 #[cfg(test)]

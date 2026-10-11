@@ -625,15 +625,21 @@ impl EventIdIndex {
         event_id: &[u8],
         mut stored_id: impl FnMut(u64) -> Result<Option<Vec<u8>>, FormatError>,
     ) -> Result<Option<u64>, FormatError> {
-        let hash = event_id_hash(event_id);
-        let start = self.hashes.partition_point(|&stored| stored < hash);
-        let end = self.hashes.partition_point(|&stored| stored <= hash);
-        for &sn in self.sns.get(start..end).unwrap_or_default() {
+        for &sn in self.candidates(event_id) {
             if stored_id(sn)?.as_deref() == Some(event_id) {
                 return Ok(Some(sn));
             }
         }
         Ok(None)
+    }
+
+    /// The events that may carry protocol id `event_id`: every indexed event whose id shares its hash, usually one or
+    /// none. Each must still be confirmed against the id stored in its row.
+    pub(super) fn candidates(&self, event_id: &[u8]) -> &[u64] {
+        let hash = event_id_hash(event_id);
+        let start = self.hashes.partition_point(|&stored| stored < hash);
+        let end = self.hashes.partition_point(|&stored| stored <= hash);
+        self.sns.get(start..end).unwrap_or_default()
     }
 
     /// Writes footer section `GRAPH_EVENT_IDS`: the hashes, then the sequence numbers, each through the ordinary column

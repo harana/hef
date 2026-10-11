@@ -1,18 +1,22 @@
 use super::*;
 use crate::artifacts::batch::{EventInput, PayloadInput};
+use crate::artifacts::state_chunk::{SealedStateChunk, build_state_tree};
 use crate::clock::FixedClock;
 use crate::columns::{FreetextDeclaration, PromotionPlan, column_ids};
+use crate::error::StorageError;
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, SequenceRange, StreamId, TimestampValue};
 use crate::file::constant::CHUNK_GROUP_BYTES;
 use crate::layout::cache::CacheStore;
-use crate::layout::graph::{GraphInput, RowEdges};
+use crate::layout::graph::{ChainCoverInput, GraphInput, RowEdges};
 use crate::layout::reader::PayloadRead;
 use crate::layout::{HEADER_BLOCK_LEN, LayoutTargets, Profile, required_features};
 use crate::lifecycle::{FileType, PartState};
+use crate::security::TenantDek;
 use crate::typed_id::TypedIdTestExt;
 use crate::writer::build::{BuildLifecycle, BuiltHef, HefBuildConfig, HefRow, build_hef_file};
 use crate::writer::source_form::tests::{source_form_config, source_form_row};
+use std::cell::Cell;
 use std::collections::{BTreeMap as StdBTreeMap, HashMap as StdHashMap};
 use std::sync::{
     Mutex,
@@ -463,11 +467,13 @@ fn a_fresh_reader_of_a_remote_file_reads_the_same_values() {
     assert_eq!(fresh.header().row_count, built.header.row_count);
 }
 
-/// A remote object that records each batch of ranges asked of it, and can hold its first batch back until released.
+/// A remote object that records each batch of ranges asked of it, and each range asked on its own, and can hold its
+/// first batch back until released.
 struct BatchSource {
     batches: Mutex<Vec<Vec<ByteRange>>>,
     hold_first: Mutex<Option<Receiver<()>>>,
     object: Vec<u8>,
+    singles: Mutex<Vec<(u64, u64)>>,
 }
 
 impl BatchSource {
@@ -476,32 +482,39 @@ impl BatchSource {
             batches: Mutex::new(Vec::new()),
             hold_first: Mutex::new(None),
             object: object.to_vec(),
+            singles: Mutex::new(Vec::new()),
         })
     }
 
     fn batches(&self) -> Vec<Vec<ByteRange>> {
         self.batches.lock().unwrap().clone()
     }
-}
 
-impl RangeSource for BatchSource {
-    fn read_range(&self, _object: u128, offset: u64, len: u64) -> Result<Vec<u8>, FileError> {
+    fn singles(&self) -> usize {
+        self.singles.lock().unwrap().len()
+    }
+
+    fn bytes(&self, offset: u64, len: u64) -> Result<Vec<u8>, FileError> {
         self.object
             .get(offset as usize..(offset + len) as usize)
             .map(<[u8]>::to_vec)
             .ok_or(FileError::OutOfBounds)
     }
+}
 
-    fn read_ranges(&self, object: u128, ranges: &[ByteRange]) -> Result<Vec<Vec<u8>>, FileError> {
+impl RangeSource for BatchSource {
+    fn read_range(&self, _object: u128, offset: u64, len: u64) -> Result<Vec<u8>, FileError> {
+        self.singles.lock().unwrap().push((offset, len));
+        self.bytes(offset, len)
+    }
+
+    fn read_ranges(&self, _object: u128, ranges: &[ByteRange]) -> Result<Vec<Vec<u8>>, FileError> {
         self.batches.lock().unwrap().push(ranges.to_vec());
         let gate = self.hold_first.lock().unwrap().take();
         if let Some(gate) = gate {
             gate.recv().ok();
         }
-        ranges
-            .iter()
-            .map(|range| self.read_range(object, range.offset, range.len))
-            .collect()
+        ranges.iter().map(|range| self.bytes(range.offset, range.len)).collect()
     }
 }
 
@@ -526,11 +539,26 @@ fn graph_input(first_sn: u64, rows: u64, offsets: &[u64]) -> GraphInput {
 
 /// A graph file of `rows` small rows from sequence number `first_sn`, four rows per granule.
 fn graph_file(first_sn: u64, rows: u64, offsets: &[u64]) -> BuiltHef {
+    build_graph(graph_input(first_sn, rows, offsets))
+}
+
+/// The protocol id of event `sn`.
+fn event_id(sn: u64) -> Vec<u8> {
+    format!("$event{sn}:example.org").into_bytes()
+}
+
+/// A graph file holding `graph`, one small row per event, four rows per granule, each row carrying its protocol id.
+fn build_graph(graph: GraphInput) -> BuiltHef {
     let mut config = source_form_config(4);
-    config.graph = Some(graph_input(first_sn, rows, offsets));
+    let sns = graph.first_sn..graph.first_sn + graph.rows.len() as u64;
+    config.graph = Some(graph);
     config.profile = Profile::Graph;
-    let rows: Vec<_> = (first_sn..first_sn + rows)
-        .map(|i| source_form_row(i, VariantValue::Int(i as i64)))
+    let rows: Vec<_> = sns
+        .map(|i| {
+            let mut row = source_form_row(i, VariantValue::Int(i as i64));
+            row.external_id = Some(event_id(i));
+            row
+        })
         .collect();
     build_hef_file(rows, &config).unwrap()
 }
@@ -558,7 +586,12 @@ fn remote_graph(files: Vec<HefFile>, options: RemoteGraphOptions) -> RemoteGraph
 
 /// Two files of one subject, events 0..32 and 32..64, and their sources.
 fn two_files(offsets: &[u64]) -> (RemoteGraph, [Arc<BatchSource>; 2]) {
-    let built = [graph_file(0, 32, offsets), graph_file(32, 32, offsets)];
+    two_graph_files([graph_input(0, 32, offsets), graph_input(32, 32, offsets)])
+}
+
+/// A remote graph over one file per input, and the files' sources.
+fn two_graph_files(graphs: [GraphInput; 2]) -> (RemoteGraph, [Arc<BatchSource>; 2]) {
+    let built = graphs.map(build_graph);
     let sources = [BatchSource::new(&built[0].bytes), BatchSource::new(&built[1].bytes)];
     let files = vec![
         open_graph_file(&sources[0], &built[0]),
@@ -598,6 +631,8 @@ fn one_lookup_step_fetches_every_granule_it_needs_in_one_request_per_file() {
 fn a_walk_costs_at_most_one_request_per_file_per_level() {
     let (graph, sources) = two_files(&[1, 9]);
     let requests = || sources.iter().map(|source| source.batches().len()).sum::<usize>();
+    let singles = || sources.iter().map(|source| source.singles()).sum::<usize>();
+    let opened = singles();
     let mut seen = 0;
     let mut previous = requests();
     for level in graph.walk(b"room", 63, EdgeKind::Prev, 64) {
@@ -615,6 +650,7 @@ fn a_walk_costs_at_most_one_request_per_file_per_level() {
     }
     assert_eq!(seen, 63, "every ancestor of event 63 is reached once");
     assert!(requests() > 0);
+    assert_eq!(singles(), opened, "no level fetches anything outside its batches");
 
     let again = previous;
     let levels: Vec<_> = graph.walk(b"room", 63, EdgeKind::Prev, 64).collect();
@@ -638,7 +674,9 @@ fn spread_graph_file() -> BuiltHef {
             } else {
                 VariantValue::String(noise(i, 64 * 1024))
             };
-            source_form_row(i, VariantValue::Object(StdBTreeMap::from([("blob".to_owned(), blob)])))
+            let mut row = source_form_row(i, VariantValue::Object(StdBTreeMap::from([("blob".to_owned(), blob)])));
+            row.external_id = Some(event_id(i));
+            row
         })
         .collect();
     let built = build_hef_file(rows, &config).unwrap();
@@ -728,4 +766,228 @@ fn a_remote_graph_refuses_files_it_cannot_serve() {
         graph.parents(b"other", 3, EdgeKind::Prev).is_err(),
         "no file holds that subject"
     );
+}
+
+#[test]
+fn resolving_ids_in_small_stripes_costs_one_request_per_file() {
+    let (graph, sources) = two_files(&[1]);
+    let singles: Vec<usize> = sources.iter().map(|source| source.singles()).collect();
+    let mut ids: Vec<Vec<u8>> = (0..64).map(event_id).collect();
+    ids.push(b"$absent:example.org".to_vec());
+    let asked: Vec<&[u8]> = ids.iter().map(Vec::as_slice).collect();
+    let expected: Vec<Option<u64>> = (0..64).map(Some).chain([None]).collect();
+    assert_eq!(graph.resolve_ids(b"room", &asked).unwrap(), expected);
+    for (source, before) in sources.iter().zip(&singles) {
+        let batches = source.batches();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the proof leaves around these small stripes' marks pages hold their id blocks too"
+        );
+        assert_eq!(batches[0].len(), 1, "both stripes' marks pages join into one request");
+        assert_eq!(source.singles(), *before, "nothing is fetched outside the batches");
+    }
+
+    assert_eq!(graph.resolve_ids(b"room", &asked).unwrap(), expected);
+    assert!(
+        sources.iter().all(|source| source.batches().len() == 1),
+        "held blocks are never fetched again"
+    );
+    assert_eq!(graph.resolve_ids(b"other", &asked).unwrap(), vec![None; asked.len()]);
+}
+
+#[test]
+fn an_id_a_files_index_rules_out_costs_that_file_nothing() {
+    let (graph, sources) = two_files(&[1]);
+    let id = event_id(40);
+    assert_eq!(graph.resolve_ids(b"room", &[&id]).unwrap(), [Some(40)]);
+    assert!(sources[0].batches().is_empty(), "the first file cannot hold event 40");
+    assert_eq!(sources[1].batches().len(), 1);
+    assert_eq!(graph.resolve_ids(b"room", &[b"$absent:example.org"]).unwrap(), [None]);
+    assert!(sources[0].batches().is_empty() && sources[1].batches().len() == 1);
+}
+
+#[test]
+fn resolving_ids_in_a_large_stripe_fetches_marks_then_id_blocks() {
+    let built = spread_graph_file();
+    let source = BatchSource::new(&built.bytes);
+    let graph = remote_graph(vec![open_graph_file(&source, &built)], options(16));
+    let singles = source.singles();
+    let ids = [event_id(0), event_id(100), event_id(191)];
+    let asked: Vec<&[u8]> = ids.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+        graph.resolve_ids(b"room", &asked).unwrap(),
+        [Some(0), Some(100), Some(191)]
+    );
+    let batches = source.batches();
+    assert_eq!(
+        batches.len(),
+        2,
+        "one batch for the marks pages, then one for the id blocks"
+    );
+    assert_eq!(batches[0].len(), 1);
+    assert!(batches[1].len() <= 3, "one request per granule at most");
+    assert_eq!(source.singles(), singles, "nothing is fetched outside the batches");
+    let fetched: u64 = batches.iter().flatten().map(|range| range.len).sum();
+    assert!(
+        fetched < built.footer.stripes[0].byte_len / 2,
+        "only the marks pages' and id blocks' proof leaves are fetched"
+    );
+}
+
+fn label(sn: u64) -> ChainLabel {
+    ChainLabel {
+        chain_id: (sn % 3) as u32,
+        seq: sn as u32,
+    }
+}
+
+fn link(from_chain: u32, from_seq: u64) -> ChainLink {
+    ChainLink {
+        from_chain,
+        from_seq: from_seq as u32,
+        to_chain: 0,
+        to_seq: 0,
+    }
+}
+
+/// [`graph_input`] with each event on chain `sn % 3` at `seq` `sn`, and one link from chains 1 and 2 per file.
+fn chain_graph(first_sn: u64, rows: u64) -> GraphInput {
+    let mut graph = graph_input(first_sn, rows, &[1]);
+    graph.chain_cover = Some(ChainCoverInput {
+        labels: (first_sn..first_sn + rows).map(label).collect(),
+        links: vec![link(2, first_sn + 2), link(1, first_sn + 1)],
+    });
+    graph
+}
+
+#[test]
+fn chain_labels_ride_the_edge_blocks_in_one_request_per_file() {
+    let (graph, sources) = two_graph_files([chain_graph(0, 32), chain_graph(32, 32)]);
+    let sns: Vec<u64> = (0..64).collect();
+    let labels = graph.chain_labels(b"room", &sns).unwrap();
+    assert_eq!(labels, sns.iter().map(|&sn| Some(label(sn))).collect::<Vec<_>>());
+    for source in &sources {
+        let batches = source.batches();
+        assert_eq!(batches.len(), 1, "one batch per file");
+        assert_eq!(batches[0].len(), 1, "adjacent edge blocks join into one request");
+    }
+
+    let parents = graph.parents_of(b"room", &sns, EdgeKind::Prev).unwrap();
+    assert_eq!(parents[40], [39]);
+    assert_eq!(
+        graph.chain_links(b"room", &[1, 2]).unwrap(),
+        [link(1, 1), link(1, 33), link(2, 2), link(2, 34)]
+    );
+    assert!(graph.chain_links(b"room", &[0, 7]).unwrap().is_empty());
+    assert!(
+        sources.iter().all(|source| source.batches().len() == 1),
+        "the edges came with the labels, and links come from the footers"
+    );
+}
+
+#[test]
+fn a_file_without_chain_cover_labels_its_events_none() {
+    let (graph, _) = two_files(&[1]);
+    assert_eq!(graph.chain_labels(b"room", &[3, 40]).unwrap(), [None, None]);
+    assert!(graph.chain_links(b"room", &[0, 1]).unwrap().is_empty());
+    assert!(graph.chain_labels(b"room", &[64]).is_err(), "no file holds event 64");
+}
+
+/// A tenant's state chunks held in memory, counting every read.
+#[derive(Default)]
+struct CountingChunks {
+    chunks: StdHashMap<[u8; 32], Vec<u8>>,
+    reads: Cell<usize>,
+}
+
+impl CountingChunks {
+    fn store(&mut self, chunks: &[SealedStateChunk]) {
+        for chunk in chunks {
+            self.chunks.insert(chunk.address, chunk.bytes.clone());
+        }
+    }
+
+    fn take_reads(&self) -> usize {
+        self.reads.replace(0)
+    }
+}
+
+impl StateChunkStore for CountingChunks {
+    fn get(&self, address: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
+        self.reads.set(self.reads.get() + 1);
+        Ok(self.chunks.get(address).cloned())
+    }
+}
+
+fn member(user: u32) -> StateKey {
+    StateKey {
+        state_key_id: user,
+        type_id: 2,
+    }
+}
+
+#[test]
+fn state_is_read_at_a_state_event_through_the_graph() {
+    let key = StateChunkKey::derive(&TenantDek::new([7; 32]));
+    let before: StdBTreeMap<StateKey, u64> = (0..2000).map(|user| (member(user), 3)).collect();
+    let mut after = before.clone();
+    after.insert(member(500), 41);
+    after.remove(&member(1500));
+    let trees = [
+        build_state_tree(&key, &before).unwrap(),
+        build_state_tree(&key, &after).unwrap(),
+    ];
+    let mut chunks = CountingChunks::default();
+    for tree in &trees {
+        chunks.store(&tree.chunks);
+    }
+    let mut first = graph_input(0, 32, &[1]);
+    first.state_roots = StdBTreeMap::from([(3, trees[0].root)]);
+    let mut second = graph_input(32, 32, &[1]);
+    second.state_roots = StdBTreeMap::from([(41, trees[1].root)]);
+    let (graph, sources) = two_graph_files([first, second]);
+    let state = graph.state(&chunks, &key);
+
+    let roots = [
+        state.state_root(b"room", 3).unwrap().unwrap(),
+        state.state_root(b"room", 41).unwrap().unwrap(),
+    ];
+    assert_eq!(roots, [trees[0].root, trees[1].root]);
+    assert_eq!(state.state_root(b"room", 4).unwrap(), None, "not a state event");
+    assert!(state.state_root(b"room", 64).is_err(), "no file holds event 64");
+    assert!(
+        sources.iter().all(|source| source.batches().is_empty()),
+        "roots come from the footers"
+    );
+
+    assert_eq!(state.state_get(&roots[1], member(500)).unwrap(), Some(41));
+    assert_eq!(chunks.take_reads(), 2, "one chunk per level: the root, then one leaf");
+    assert_eq!(state.state_get(&roots[1], member(1500)).unwrap(), None);
+    assert_eq!(state.state_get(&roots[0], member(1500)).unwrap(), Some(3));
+    chunks.take_reads();
+
+    let changes = state.state_diff(&roots[0], &roots[1]).unwrap();
+    assert_eq!(
+        changes,
+        [
+            StateChange {
+                after: Some(41),
+                before: Some(3),
+                key: member(500),
+            },
+            StateChange {
+                after: None,
+                before: Some(3),
+                key: member(1500),
+            },
+        ]
+    );
+    let reads = chunks.take_reads();
+    assert!(
+        reads < trees[0].chunks.len() + trees[1].chunks.len(),
+        "shared leaves are never read ({reads} reads)"
+    );
+    assert!(state.state_diff(&roots[1], &roots[1]).unwrap().is_empty());
+    assert_eq!(chunks.take_reads(), 0, "a state compared with itself reads nothing");
 }

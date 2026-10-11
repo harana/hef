@@ -11,25 +11,29 @@
 //! [`RemoteGraph`] answers graph questions over such files. It gathers every edge block one step of a walk needs,
 //! joins nearby ranges into requests of up to a few megabytes, sends them as batches of at most the caller's in-flight
 //! cap, and sends a duplicate batch when one runs past the observed 95th-percentile latency, taking whichever answers
-//! first.
+//! first. Chain-cover labels ride in the same edge blocks, and resolving protocol event ids fetches the marks pages and
+//! external-id blocks it needs the same way. [`RemoteState`] reads the subject's state chunks behind it.
 //!
 //! See: hef-file-layout/spec.md
 
-use super::api::EventGraph;
+use super::api::{AuthChains, EventGraph, EventIds, SubjectState};
 use super::cache::{BlockCache, BlockKey, BlockKind};
 use super::constant::{
     GRAPH_FETCH_GAP_BYTES, GRAPH_FETCH_WINDOW_BYTES, GRAPH_HEDGE_MIN_SAMPLES, GRAPH_HEDGE_SAMPLES, HELD_RANGE_BUCKETS,
 };
 use super::footer::{Footer, StripeEntry};
-use super::graph::{EdgeKind, GranuleEdges};
+use super::graph::{ChainLabel, ChainLink, EdgeKind, GranuleEdges};
 use super::reader::{DECODED_CACHE_BUDGET_BYTES, HeaderCommitment, HefFile, HefFooter, VerifiedStripeRead};
 use super::{HefHeader, LayoutClass};
+use crate::artifacts::state_chunk::{self, StateChange, StateChunkStore, StateKey, StateRoot};
 use crate::clock::Clock;
-use crate::error::FormatError;
+use crate::columns::column_ids;
+use crate::error::{FormatError, StateChunkError};
 use crate::events::TenantId;
 use crate::file::bytes::slice;
 use crate::file::{ByteRange, FileError, RangeSource};
 use crate::lifecycle::HefFileEntry;
+use crate::security::StateChunkKey;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -713,31 +717,44 @@ impl RemoteGraph {
         })
     }
 
+    /// Reads the subject state behind this graph's state events, fetching chunks from `chunks` (in production
+    /// [`ObjectStoreStateChunks`](crate::artifacts::state_chunk::ObjectStoreStateChunks)) and opening them with the
+    /// tenant's `key`.
+    pub fn state<'a>(&'a self, chunks: &'a dyn StateChunkStore, key: &'a StateChunkKey) -> RemoteState<'a> {
+        RemoteState {
+            chunks,
+            graph: self,
+            key,
+        }
+    }
+
+    /// The files of `subject`, each with its position.
+    fn subject_files<'a>(&'a self, subject: &'a [u8]) -> impl Iterator<Item = (usize, &'a HefFile)> + 'a {
+        self.files.iter().enumerate().filter(move |(_, file)| {
+            file.footer()
+                .graph
+                .as_ref()
+                .is_some_and(|graph| graph.subject == subject)
+        })
+    }
+
     /// The position of the file holding event `sn` of `subject`, and the granule that holds it.
     fn locate(&self, subject: &[u8], sn: u64) -> Result<(usize, u32), FormatError> {
-        self.files
-            .iter()
-            .enumerate()
-            .filter(|(_, file)| {
-                file.footer()
-                    .graph
-                    .as_ref()
-                    .is_some_and(|graph| graph.subject == subject)
-            })
+        self.subject_files(subject)
             .find_map(|(index, file)| Some((index, file.graph_granule_of(sn)?)))
             .ok_or(FormatError::RefOutOfRange {
                 what: "no graph file holds the event",
             })
     }
 
-    /// One list per event in `sns`, read out of the event's decoded granule by `read`. Every granule the events touch
+    /// One answer per event in `sns`, read out of the event's decoded granule by `read`. Every granule the events touch
     /// is fetched first, all together, then decoded once.
-    fn edges_of(
+    fn edges_of<T: Default>(
         &self,
         subject: &[u8],
         sns: &[u64],
-        read: impl Fn(&GranuleEdges, u64) -> Vec<u64>,
-    ) -> Result<Vec<Vec<u64>>, FormatError> {
+        read: impl Fn(&GranuleEdges, u64) -> T,
+    ) -> Result<Vec<T>, FormatError> {
         let located: Vec<(usize, u32)> = sns
             .iter()
             .map(|&sn| self.locate(subject, sn))
@@ -770,6 +787,46 @@ impl RemoteGraph {
             .zip(&located)
             .map(|(&sn, key)| decoded.get(key).map(|edges| read(edges, sn)).unwrap_or_default())
             .collect())
+    }
+
+    /// Makes `remote`, the bytes of `file`, hold what confirming the protocol ids of events `sns` reads: first the
+    /// marks pages of the stripes the events lie in, then the external-id column block of each granule they lie in.
+    /// A block split into pages is left to the ordinary per-read fetch.
+    fn prefetch_external_ids(&self, file: &HefFile, remote: &RemoteFile, sns: &[u64]) -> Result<(), FormatError> {
+        let footer = file.footer();
+        let granules: BTreeSet<u32> = sns.iter().filter_map(|&sn| file.graph_granule_of(sn)).collect();
+        let stripes: BTreeSet<u32> = footer
+            .granules
+            .iter()
+            .filter(|granule| granules.contains(&granule.granule_id))
+            .map(|granule| granule.stripe_id)
+            .collect();
+        let marks: Vec<(u64, u64)> = footer
+            .stripes
+            .iter()
+            .filter(|stripe| stripes.contains(&stripe.stripe_id))
+            .flat_map(|stripe| {
+                let stripe_end = stripe.file_offset.saturating_add(stripe.byte_len);
+                remote
+                    .marks_extents
+                    .iter()
+                    .copied()
+                    .filter(move |(start, end)| stripe.file_offset <= *start && *end <= stripe_end)
+            })
+            .collect();
+        self.prefetch(remote, &marks)?;
+        let mut blocks = Vec::with_capacity(granules.len());
+        for &granule_id in &granules {
+            let Some(mark) = file.mark(column_ids::EXTERNAL_ID, 0, granule_id)? else {
+                continue;
+            };
+            if mark.page_count > 1 || mark.compressed_size == 0 {
+                continue;
+            }
+            let start = file.file_position(granule_id, mark.compressed_offset)? as u64;
+            blocks.push((start, start.saturating_add(mark.compressed_size)));
+        }
+        self.prefetch(remote, &blocks)
     }
 
     /// Makes `remote` hold `ranges`: plans the pieces it lacks, joins them into requests, and fetches those in
@@ -886,6 +943,95 @@ impl EventGraph for RemoteGraph {
 
     fn children_of(&self, subject: &[u8], sns: &[u64], kind: EdgeKind) -> Result<Vec<Vec<u64>>, FormatError> {
         self.edges_of(subject, sns, |edges, sn| edges.children(sn, kind))
+    }
+}
+
+impl EventIds for RemoteGraph {
+    /// Looks each id up in the event-id index of every file of `subject`: an id whose hash a file's index lacks costs
+    /// that file nothing, and the candidates a file does hold are confirmed against their stored ids after one fetch of
+    /// the marks pages and one of the external-id blocks they need.
+    fn resolve_ids(&self, subject: &[u8], ids: &[&[u8]]) -> Result<Vec<Option<u64>>, FormatError> {
+        let mut found: Vec<Option<u64>> = vec![None; ids.len()];
+        for (_, file) in self.subject_files(subject) {
+            let Some(index) = file.footer().graph.as_ref().and_then(|graph| graph.event_ids.as_ref()) else {
+                continue;
+            };
+            let candidates: Vec<(usize, u64)> = ids
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| found.get(*position).is_some_and(Option::is_none))
+                .flat_map(|(position, id)| index.candidates(id).iter().map(move |&sn| (position, sn)))
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            if let Some(remote) = file.remote() {
+                let sns: Vec<u64> = candidates.iter().map(|(_, sn)| *sn).collect();
+                self.prefetch_external_ids(file, remote, &sns)?;
+            }
+            for (position, sn) in candidates {
+                let (Some(slot), Some(id)) = (found.get_mut(position), ids.get(position)) else {
+                    continue;
+                };
+                if slot.is_some() {
+                    continue;
+                }
+                if let Some(row) = file.graph_row_of(sn)
+                    && file.external_id(row)?.as_deref() == Some(*id)
+                {
+                    *slot = Some(sn);
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
+impl AuthChains for RemoteGraph {
+    /// Fetches the edge blocks of every granule the events lie in, as one step of a walk does, since the labels are
+    /// stored inside them.
+    fn chain_labels(&self, subject: &[u8], sns: &[u64]) -> Result<Vec<Option<ChainLabel>>, FormatError> {
+        self.edges_of(subject, sns, |edges, sn| edges.label(sn))
+    }
+
+    /// Reads only the files' footers; no request is sent.
+    fn chain_links(&self, subject: &[u8], chains: &[u32]) -> Result<Vec<ChainLink>, FormatError> {
+        let mut links: Vec<ChainLink> = self
+            .subject_files(subject)
+            .flat_map(|(_, file)| file.graph_chain_links(chains))
+            .collect();
+        links.sort_unstable();
+        links.dedup();
+        Ok(links)
+    }
+}
+
+/// Reads a subject's state (a chat room's membership, say) as it stood after any state event of a [`RemoteGraph`]:
+/// the state root the event's file records, then one key of that state or the changes between two states, from the
+/// tenant's state chunks. Made by [`RemoteGraph::state`].
+///
+/// A lookup reads one chunk per level of the state tree; a diff never reads a subtree the two states share.
+///
+/// See: hef-apis/spec.md
+pub struct RemoteState<'a> {
+    chunks: &'a dyn StateChunkStore,
+    graph: &'a RemoteGraph,
+    key: &'a StateChunkKey,
+}
+
+impl SubjectState for RemoteState<'_> {
+    /// Reads only the footer of the file that holds `sn`; no request is sent.
+    fn state_root(&self, subject: &[u8], sn: u64) -> Result<Option<StateRoot>, FormatError> {
+        let (index, _) = self.graph.locate(subject, sn)?;
+        Ok(self.graph.files.get(index).and_then(|file| file.state_root(sn)))
+    }
+
+    fn state_get(&self, root: &StateRoot, key: StateKey) -> Result<Option<u64>, StateChunkError> {
+        state_chunk::state_get(self.chunks, self.key, root, key)
+    }
+
+    fn state_diff(&self, before: &StateRoot, after: &StateRoot) -> Result<Vec<StateChange>, StateChunkError> {
+        state_chunk::state_diff(self.chunks, self.key, before, after)
     }
 }
 
