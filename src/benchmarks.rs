@@ -337,3 +337,50 @@ pub struct GraphEdgeBytesMeasurement {
 pub fn graph_edge_bytes_gate_passes(m: &GraphEdgeBytesMeasurement) -> bool {
     m.stored_bytes as f64 <= m.edges as f64 * GRAPH_EDGE_BYTES_TARGET
 }
+
+/// The gated ceiling on what declaring a profile other than `Event` adds to a file, in bytes: one footer directory
+/// entry (52 B) and its one-byte section, with the 4 KiB header block no larger.
+pub const PROFILE_OVERHEAD_CEILING_BYTES: u64 = 64;
+
+/// The same rows built once as an event file and once under another profile, needed to evaluate the profile overhead
+/// gate.
+#[derive(Debug, Clone)]
+pub struct ProfileOverheadMeasurement {
+    pub event_file_bytes: u64,
+    /// Bytes before the first stripe: the fixed header block.
+    pub event_header_block_bytes: u64,
+    pub profiled_file_bytes: u64,
+    /// Bytes before the first stripe: the fixed header block.
+    pub profiled_header_block_bytes: u64,
+}
+
+/// Returns `true` when declaring a profile leaves the header block the same size and adds at most
+/// `PROFILE_OVERHEAD_CEILING_BYTES` to the file.
+pub fn profile_overhead_gate_passes(m: &ProfileOverheadMeasurement) -> bool {
+    m.profiled_header_block_bytes == m.event_header_block_bytes
+        && m.profiled_file_bytes.saturating_sub(m.event_file_bytes) <= PROFILE_OVERHEAD_CEILING_BYTES
+}
+
+/// The gated number of range requests one level of a graph walk may send to each file it reads: one, every edge block
+/// that level needs from the file joined into a single request.
+pub const GRAPH_WALK_REQUESTS_PER_FILE_PER_LEVEL: u64 = 1;
+
+/// One breadth-first walk over a graph spread across several remote files, needed to evaluate the graph walk request
+/// gate.
+#[derive(Debug, Clone)]
+pub struct GraphWalkMeasurement {
+    pub bytes_fetched: u64,
+    pub files: u64,
+    /// Levels of ancestors the walk returned.
+    pub levels: u64,
+    /// Range requests sent to every file together, after each file was opened.
+    pub requests: u64,
+}
+
+/// Returns `true` when a graph walk sent at most `GRAPH_WALK_REQUESTS_PER_FILE_PER_LEVEL` requests per file per level.
+pub fn graph_walk_gate_passes(m: &GraphWalkMeasurement) -> bool {
+    m.requests
+        <= m.levels
+            .saturating_mul(m.files)
+            .saturating_mul(GRAPH_WALK_REQUESTS_PER_FILE_PER_LEVEL)
+}
