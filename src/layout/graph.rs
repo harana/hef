@@ -117,6 +117,14 @@ impl GranuleEdges {
         children.extend_from_slice(self.inbound.edges(self.first_sn, sn, kind));
         children
     }
+
+    /// Heap bytes the decoded tables hold, for the reader's decoded-cache budget.
+    pub(super) fn decoded_bytes(&self) -> u64 {
+        [&self.forward, &self.inbound, &self.reverse]
+            .iter()
+            .map(|csr| ((csr.offsets.len() + csr.targets.len()) * size_of::<u64>()) as u64)
+            .sum()
+    }
 }
 
 impl Csr {

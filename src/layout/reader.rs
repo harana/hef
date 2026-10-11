@@ -21,6 +21,7 @@ use super::footer::{
     PageStats, PayloadGranule, ResidualCompression, StripeEntry, TextTokenOffsetsEntry, decode_footer,
     decode_marks_page, decode_marks_page_directory, decode_marks_page_extents,
 };
+use super::graph::GranuleEdges;
 use super::remote::{FileBytes, RemoteFile};
 use super::{EMPTY_VALUE_ROW_OFFSET, HEADER_BLOCK_LEN, HefHeader, decode_header, optional_features, required_features};
 use crate::artifacts::batch::decode_variant_dictionary;
@@ -274,6 +275,14 @@ struct InflatedResidualSlot {
 struct DictionarySlot {
     bytes: u64,
     dictionary: Arc<KeyDictionary>,
+    last_used: u64,
+}
+
+/// One granule's decoded graph edges, with the same eviction accounting as [`CachedColumnSlot`].
+#[derive(Debug)]
+struct GraphEdgesSlot {
+    bytes: u64,
+    edges: Arc<GranuleEdges>,
     last_used: u64,
 }
 
@@ -1717,6 +1726,13 @@ pub struct HefFile {
     /// The file-absolute base offset of each granule's stripe (`StripeEntry.file_offset`), used to turn a mark's
     /// stripe-relative offset back into a file position. Only consulted when `stripe_relative` is set.
     granule_stripe_base: HashMap<u32, u64>,
+    /// Edge blocks decoded once per granule of a graph-profile file, so a walk that steps through one granule many
+    /// times, or walks the same graph again, pays one decode per granule. An accelerator only, like `column_cache`,
+    /// and byte-budgeted the same way.
+    graph_edges: DashMap<u32, GraphEdgesSlot, ahash::RandomState>,
+    /// Running total of `graph_edges`'s slot bytes, kept current on every insert and eviction - see
+    /// `aliased_extent_cache_bytes`.
+    graph_edges_bytes: AtomicU64,
     header: HefHeader,
     /// Inflated spans of compressed residual arenas, keyed by `(granule_id, frame)` — one whole arena per `Zstd3`
     /// granule under frame 0, one frame per seekable granule — held for repeated point reads. An accelerator only,
@@ -2133,6 +2149,8 @@ impl HefFile {
             granule_dictionaries: DashMap::default(),
             granule_dictionaries_bytes: AtomicU64::new(0),
             granule_stripe_base,
+            graph_edges: DashMap::default(),
+            graph_edges_bytes: AtomicU64::new(0),
             header,
             inflated_residuals: DashMap::default(),
             inflated_residuals_bytes: AtomicU64::new(0),
@@ -3166,7 +3184,8 @@ impl HefFile {
         }
         let others = self.column_cache_bytes.load(Ordering::Relaxed)
             + self.inflated_residuals_bytes.load(Ordering::Relaxed)
-            + self.granule_dictionaries_bytes.load(Ordering::Relaxed);
+            + self.granule_dictionaries_bytes.load(Ordering::Relaxed)
+            + self.graph_edges_bytes.load(Ordering::Relaxed);
         let headroom = self.decoded_cache_budget.saturating_sub(others);
         while self.aliased_extent_cache_bytes.load(Ordering::Relaxed) > headroom
             && !self.aliased_extent_cache.is_empty()
@@ -3394,6 +3413,46 @@ impl HefFile {
         Ok(dictionary)
     }
 
+    /// The decoded edges of granule `granule_id` of a graph-profile file, decoded on first touch and cached per
+    /// granule so later steps of a walk, and later walks, reuse the decode. Fails as [`Self::granule_edges`] does.
+    pub(super) fn cached_granule_edges(&self, granule_id: u32) -> Result<Arc<GranuleEdges>, FormatError> {
+        let tick = self.cache_access_counter.fetch_add(1, Ordering::Relaxed);
+        if let Some(mut slot) = self.graph_edges.get_mut(&granule_id) {
+            slot.last_used = tick;
+            return Ok(Arc::clone(&slot.edges));
+        }
+        let decoded = Arc::new(self.granule_edges(granule_id)?);
+        let bytes = decoded.decoded_bytes();
+        let edges = {
+            let slot = self.graph_edges.entry(granule_id).or_insert(GraphEdgesSlot {
+                bytes,
+                edges: Arc::clone(&decoded),
+                last_used: tick,
+            });
+            if Arc::ptr_eq(&slot.edges, &decoded) {
+                self.graph_edges_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            Arc::clone(&slot.edges)
+        };
+        // The same budget-and-LRU discipline as the column cache: the granule just touched always survives.
+        while self.graph_edges_bytes.load(Ordering::Relaxed) > self.decoded_cache_budget && self.graph_edges.len() > 1 {
+            let Some(evict) = self
+                .graph_edges
+                .iter()
+                .filter(|slot| *slot.key() != granule_id)
+                .min_by_key(|slot| slot.last_used)
+                .map(|slot| *slot.key())
+            else {
+                break;
+            };
+            if let Some((_, evicted)) = self.graph_edges.remove(&evict) {
+                self.graph_edges_bytes.fetch_sub(evicted.bytes, Ordering::Relaxed);
+            }
+        }
+        self.shed_aliased_extents();
+        Ok(edges)
+    }
+
     fn row_payload_flags(&self, granule: &GranuleEntry, row_in_granule: u64) -> Result<u64, FormatError> {
         // Payload flags are dense (one value per row), so the block is decoded once per granule through the cache and
         // indexed directly by row — never re-decoded per row.
@@ -3584,12 +3643,13 @@ impl HefFile {
         self
     }
 
-    /// Decoded bytes currently held by the block, residual, and dictionary caches together. Never feeds a read
+    /// Decoded bytes currently held by the block, residual, dictionary, and graph edge caches together. Never feeds a read
     /// result; it lets tests observe that a long-lived reader's decoded working set stays within its budget.
     pub fn decoded_cache_bytes(&self) -> u64 {
         self.aliased_extent_cache_bytes.load(Ordering::Relaxed)
             + self.column_cache_bytes.load(Ordering::Relaxed)
             + self.granule_dictionaries_bytes.load(Ordering::Relaxed)
+            + self.graph_edges_bytes.load(Ordering::Relaxed)
             + self.inflated_residuals_bytes.load(Ordering::Relaxed)
     }
 

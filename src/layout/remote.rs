@@ -667,7 +667,7 @@ pub struct RemoteGraphOptions {
 /// ranges into requests of a few megabytes, and sends them per file in batches of at most
 /// [`RemoteGraphOptions::max_in_flight`]. A batch still running past the 95th-percentile latency of recent batches is
 /// sent again and the first answer wins. Fetched blocks are proven against the file's authenticated checksums and held
-/// by the file's reader, so a later step that needs the same granule sends nothing.
+/// by the file's reader, decoded once, so a later step that needs the same granule sends and decodes nothing.
 ///
 /// See: hef-file-layout/spec.md
 pub struct RemoteGraph {
@@ -759,10 +759,10 @@ impl RemoteGraph {
                 self.prefetch(remote, ranges)?;
             }
         }
-        let mut decoded: BTreeMap<(usize, u32), GranuleEdges> = BTreeMap::new();
+        let mut decoded: BTreeMap<(usize, u32), Arc<GranuleEdges>> = BTreeMap::new();
         for &(index, granule_id) in &granules {
             if let Some(file) = self.files.get(index) {
-                decoded.insert((index, granule_id), file.granule_edges(granule_id)?);
+                decoded.insert((index, granule_id), file.cached_granule_edges(granule_id)?);
             }
         }
         Ok(sns
