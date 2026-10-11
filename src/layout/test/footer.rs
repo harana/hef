@@ -55,6 +55,7 @@ fn minimal_footer() -> Footer {
         schema_fingerprint: [0u8; 32],
         shared_dictionaries: Vec::new(),
         shredded: Vec::new(),
+        snapshot_keys: None,
         sparse_keys: Vec::new(),
         stripe_checksums: Vec::new(),
         stripe_proofs: Vec::new(),
@@ -1010,6 +1011,25 @@ fn an_unknown_footer_profile_code_is_a_structural_error() {
         decode_footer(&blob).unwrap_err(),
         FormatError::Structural {
             rule: "unknown profile"
+        }
+    );
+}
+
+#[test]
+fn a_snapshot_key_index_round_trips_only_with_one_first_key_per_granule() {
+    let mut footer = minimal_footer();
+    assert_eq!(footer.granules.len(), 1);
+    footer.snapshot_keys = Some(SnapshotKeyIndex::build(&["a", "b"], &[0]).unwrap());
+    assert_eq!(
+        decode_footer(&encode_footer(&footer)).unwrap().snapshot_keys,
+        footer.snapshot_keys
+    );
+
+    footer.snapshot_keys = Some(SnapshotKeyIndex::build(&["a", "b"], &[0, 1]).unwrap());
+    assert_eq!(
+        decode_footer(&encode_footer(&footer)).unwrap_err(),
+        FormatError::Structural {
+            rule: "snapshot key index must hold one first key per granule"
         }
     );
 }

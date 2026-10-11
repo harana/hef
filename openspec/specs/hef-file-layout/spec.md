@@ -99,6 +99,21 @@ Graph files SHALL declare the required feature bits for the graph blocks they ca
 - **WHEN** a reader that predates the graph feature bits opens a file declaring any of them
 - **THEN** it refuses the file as declaring an unknown required feature
 
+### Requirement: Snapshot files answer a keyed point lookup from one granule
+A `snapshot` file SHALL hold one epoch's whole keyed state, one row per key, keyed by the row's `entity_id` and sorted strictly ascending by its bytes; the writer SHALL refuse a snapshot whose rows lack a key, repeat a key, are out of key order, or span more than one epoch, and SHALL give every granule its own stripe. The writer SHALL record a key index in footer section `SNAPSHOT_KEYS` (id 34) and declare the optional feature `snapshot_key_index` (bit 11): the bytes every key shares, a learned position model over the next eight key bytes (each distinct model key at the first row holding it), the longest run of rows sharing one model key, and every granule's first key. A lookup SHALL predict the key's row window from the model, widened by the longest run, and pick the last granule in that window whose first key does not exceed the key, so the footer alone names the one granule that can hold the key; it then fetches that granule's stripe in one request and confirms the exact key there. The index is droppable acceleration: a reader that does not use it searches the granules in turn and returns the same answer. A lookup on a file whose profile is not `snapshot` SHALL fail.
+
+#### Scenario: Remote lookup costs one tail read and one granule read
+- **WHEN** a snapshot file is opened remotely and one key is looked up
+- **THEN** the source sees exactly one request for the tail and one request for the stripe of the granule holding the key
+
+#### Scenario: Absent key
+- **WHEN** a key the snapshot does not hold is looked up
+- **THEN** the lookup returns nothing after at most one granule read
+
+#### Scenario: Unsorted snapshot rows
+- **WHEN** a snapshot is built from rows whose keys repeat or are out of order
+- **THEN** the build fails with a structural error
+
 ### Requirement: Feature directory governs capabilities
 An HEF file SHALL declare capabilities through a feature directory, not through lifecycle/freshness/archive labels. Every file SHALL include the required feature flags (envelope columns, payload arena, stripe/granule directories, per-column marks, page metadata, min/max/sequence/time skip indexes, exact counts, checksum/footer directories, layout class). Unknown required features SHALL refuse; unknown optional features SHALL be ignored. The planner SHALL use an optional feature only when the footer declares it and its block checksum verifies; absence of an optional feature SHALL leave the file valid with queries falling back to another valid plan.
 

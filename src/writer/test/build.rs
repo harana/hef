@@ -4059,3 +4059,56 @@ fn an_encrypted_footer_still_prunes_on_the_entity_hash_filters() {
     );
     assert!(file.granules_for_entity_hash(1_000).is_empty());
 }
+
+/// Rows of a snapshot file: `row(i)` keyed by `keys[i]`.
+fn snapshot_rows(keys: &[Option<&str>]) -> Vec<HefRow> {
+    keys.iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let mut row = row(i as u64);
+            row.event.envelope.entity_id = key.map(str::to_owned);
+            row
+        })
+        .collect()
+}
+
+/// A snapshot build gives every granule its own stripe and declares its key index; it refuses rows a snapshot cannot
+/// hold: keys out of order or repeated, a row without a key, or more than one epoch.
+#[test]
+fn a_snapshot_build_indexes_its_keys_and_refuses_rows_it_cannot_hold() {
+    let mut cfg = config();
+    cfg.profile = Profile::Snapshot;
+    cfg.targets.stripe_target_bytes = usize::MAX;
+    let keys: Vec<String> = (0..100).map(|i| format!("opp-{i:04}")).collect();
+    let sorted: Vec<Option<&str>> = keys.iter().map(|key| Some(key.as_str())).collect();
+    let built = build_hef_file(snapshot_rows(&sorted), &cfg).unwrap();
+    assert!(built.footer.granules.len() > 1);
+    assert_eq!(built.footer.stripes.len(), built.footer.granules.len());
+    assert_ne!(
+        built.footer.optional_feature_flags & optional_features::SNAPSHOT_KEY_INDEX,
+        0
+    );
+    let index = built.footer.snapshot_keys.as_ref().unwrap();
+    assert_eq!(index.granule_first_keys.first().map(String::as_str), Some("opp-0000"));
+
+    let mut event = cfg.clone();
+    event.profile = Profile::Event;
+    let built = build_hef_file(snapshot_rows(&sorted), &event).unwrap();
+    assert!(built.footer.snapshot_keys.is_none());
+    assert_eq!(
+        built.footer.optional_feature_flags & optional_features::SNAPSHOT_KEY_INDEX,
+        0
+    );
+
+    for keys in [
+        vec![Some("b"), Some("a")],
+        vec![Some("a"), Some("a")],
+        vec![Some("a"), None],
+    ] {
+        assert!(build_hef_file(snapshot_rows(&keys), &cfg).is_err(), "{keys:?}");
+    }
+    let mut two_epochs = snapshot_rows(&[Some("a"), Some("b")]);
+    two_epochs[1].epoch = 2;
+    two_epochs[1].sequence = 1;
+    assert!(build_hef_file(two_epochs, &cfg).is_err());
+}

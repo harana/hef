@@ -43,3 +43,14 @@ A compaction SHALL publish its output and retire its inputs in one manifest gene
 - **WHEN** the sweeper runs while a query still reads a generation in which the replaced files were Active
 - **THEN** it moves nothing and deletes nothing, however long that query has run
 
+### Requirement: A snapshot file replaces the previous epoch's file in one generation
+A `snapshot` profile file SHALL be published into a catalogue that holds only that snapshot's files, never event files, because its epoch and sequences number its rows rather than journal positions. Publishing SHALL use the same conditional manifest advance as compaction: one new generation in which the new file is `Active` and every previously `Active` file of the catalogue moves to `Outdated` with its retirement recorded, so the sweeper deletes it later. The new file SHALL hold a later epoch than every `Active` file; a lost race SHALL rebase and re-check, so a rival's equal or later epoch refuses the publication. Republishing the file already `Active` SHALL change nothing.
+
+#### Scenario: Next epoch replaces the last
+- **WHEN** a snapshot of epoch 2 is published over the Active snapshot of epoch 1
+- **THEN** one new generation holds epoch 2 as the only Active file and epoch 1 as Outdated
+
+#### Scenario: Stale epoch refused
+- **WHEN** a snapshot of an epoch not later than the Active one is published
+- **THEN** the publication fails and the head generation is unchanged
+

@@ -24,3 +24,8 @@ pub const SCAN_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 /// How many doubling buckets hold the verified ranges a remote reader has fetched: bucket `b` holds `2^b` ranges, so
 /// this bounds one reader at `2^48 - 1` fetches, far past anything a single file can need.
 pub const HELD_RANGE_BUCKETS: usize = 48;
+
+/// The fit error, in rows, of a snapshot file's learned key model: a lookup's predicted window spans this many rows
+/// either side of the estimate (plus one, see `LearnedPositionIndex::build`), plus the longest run of keys sharing a
+/// model key. Small next to a granule, so the window almost always falls inside one.
+pub const SNAPSHOT_KEY_ERROR_BOUND: u64 = 32;
