@@ -4076,6 +4076,7 @@ fn graph_chain(rows: u64) -> GraphInput {
                 prev: sn.checked_sub(1).into_iter().collect(),
             })
             .collect(),
+        state_roots: BTreeMap::new(),
         subject: b"room".to_vec(),
         unresolved: Vec::new(),
     }

@@ -248,3 +248,26 @@ pub enum InboxError {
     #[error("acknowledgement watermark store failed: {detail}")]
     Watermarks { detail: String },
 }
+
+/// Why reading, storing or collecting a subject's state chunks failed: a chunk was malformed or did not open, a chunk
+/// a root needs is missing, a store failed, or a sweep is deleting a chunk an upload wanted to reuse. Addresses are
+/// lowercase hex.
+///
+/// See: hef-physical-artifacts/spec.md
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum StateChunkError {
+    /// A sweep has claimed the chunk for deletion, so it cannot be reused yet. Retry the upload once the sweep has
+    /// deleted it; the chunk is then written fresh.
+    #[error("state chunk {address} is being deleted by a sweep; retry the upload")]
+    BeingDeleted { address: String },
+    #[error(transparent)]
+    Format(#[from] FormatError),
+    #[error("state chunk {address} is missing from the store")]
+    Missing { address: String },
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    /// The stored bytes did not open under the tenant's key: altered, stored under another address, or another
+    /// tenant's.
+    #[error("state chunk {address} failed authentication")]
+    Unauthentic { address: String },
+}

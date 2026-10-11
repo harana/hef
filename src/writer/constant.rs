@@ -18,3 +18,8 @@ pub(crate) const AUDIT_COMPACTION_REFUSED: &str = "an audit file is never compac
 /// `occurred_at`, in nanoseconds. Matches the finest resolution usage and stats views chart at, so their queries are
 /// answered from whole buckets.
 pub const DEFAULT_TIME_SERIES_BUCKET_NANOS: i64 = 60_000_000_000;
+
+/// How long a state chunk no published root references stays stored after an upload last stored or reused it: 24
+/// hours, in nanoseconds. It must be at least the longest reader lease and the longest an upload may take to publish
+/// the file whose roots name its chunks.
+pub const STATE_CHUNK_GRACE_NANOS: i64 = 24 * 60 * 60 * 1_000_000_000;

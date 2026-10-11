@@ -4,12 +4,17 @@
 //! frame and batch formats, the per-segment hash chain and crash replay that recover them intact, the deterministic
 //! conversion of a recovered frame into an in-memory row batch the query side can serve, and the watermarks that track
 //! how far durable and visible coverage has advanced.
+//!
+//! It also owns the state chunk, the immutable piece of a subject's state tree that graph files point at through
+//! their state roots.
 
 pub mod batch;
+pub mod constant;
 pub mod external;
 pub mod frame;
 pub mod overlay;
 pub mod segment;
+pub mod state_chunk;
 pub mod watermark;
 
 /// All HEJ frames are aligned to 4096 bytes.

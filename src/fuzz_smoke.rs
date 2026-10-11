@@ -20,6 +20,7 @@ use super::layout::graph::{
 };
 use super::layout::time_series::TimeSeriesRollups;
 use super::layout::{decode_header, reader::HefFile};
+use std::collections::BTreeMap;
 
 struct XorShift(u64);
 
@@ -109,6 +110,7 @@ fn mutated_graph_edge_block_never_panics() {
                 prev: vec![sn - 1],
             })
             .collect(),
+        state_roots: BTreeMap::new(),
         subject: b"room".to_vec(),
         unresolved: Vec::new(),
     };

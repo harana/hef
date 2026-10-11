@@ -92,6 +92,7 @@ fn minimal_footer(mark: ColumnMark) -> Footer {
         shredded: Vec::new(),
         snapshot_keys: None,
         sparse_keys: Vec::new(),
+        state_roots: Vec::new(),
         stripe_checksums: Vec::new(),
         stripe_proofs: Vec::new(),
         stripe_ndv: Vec::new(),

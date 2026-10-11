@@ -29,11 +29,16 @@
 //! as `pipeline u32 | byte length u32 | bytes`. In a file with chain cover, the three tables are followed by the
 //! granule's chain ids, then its seqs, one value per row, each through the same encoder.
 //!
+//! A state event's row also records the subject's state root after it: the address of a tree of content-addressed
+//! state chunks (see [`crate::artifacts::state_chunk`]) and its key count. The roots sit in the footer, one entry per
+//! state event in row order; other rows have none.
+//!
 //! See: hef-file-layout/spec.md
 
 use super::constant::{CHAIN_RANGE_BYTES, GRAPH_EDGE_KINDS, MAX_GRAPH_SUBJECT_BYTES, UNRESOLVED_ENTRY_MIN_BYTES};
-use super::footer::GranuleEntry;
+use super::footer::{GranuleEntry, StateRootEntry};
 use super::reader::HefFile;
+use crate::artifacts::state_chunk::StateRoot;
 use crate::encoding::{ColumnData, PipelineId, decode_block, encode_block};
 use crate::error::FormatError;
 use crate::events::{RelationshipKind, RelationshipRef, TargetIdSpace};
@@ -108,6 +113,10 @@ pub struct GraphInput {
     pub inbound: Vec<GraphEdge>,
     /// Exactly one entry per row, in row order.
     pub rows: Vec<RowEdges>,
+    /// The subject's state root after each state event, keyed by the event's sequence number; an event with no entry
+    /// is not a state event. Every root's chunks must be uploaded (`writer::upload::upload_state_chunks`) before the
+    /// file is published.
+    pub state_roots: BTreeMap<u64, StateRoot>,
     /// Whose graph this is, for example a room id: 1 to 255 bytes.
     pub subject: Vec<u8>,
     /// Parents no sequence number is known for yet (an event not yet received, say), kept as the references their
@@ -394,6 +403,26 @@ pub fn encode_graph_blocks(
         blocks.insert(granule.granule_id, out.into_bytes());
     }
     Ok(blocks)
+}
+
+/// The footer entries for `graph`'s state roots in a file of `row_count` rows, in row order. Refuses a root keyed by a
+/// sequence number the file does not hold.
+pub fn state_root_entries(graph: &GraphInput, row_count: u64) -> Result<Vec<StateRootEntry>, FormatError> {
+    graph
+        .state_roots
+        .iter()
+        .map(|(sn, root)| {
+            sn.checked_sub(graph.first_sn)
+                .filter(|row| *row < row_count)
+                .map(|row_ordinal| StateRootEntry {
+                    root: *root,
+                    row_ordinal,
+                })
+                .ok_or(FormatError::Structural {
+                    rule: "a state root belongs to an event in the file",
+                })
+        })
+        .collect()
 }
 
 fn slot_lists(lists: &[[Vec<u64>; GRAPH_EDGE_KINDS]]) -> Vec<[&[u64]; GRAPH_EDGE_KINDS]> {
@@ -952,6 +981,17 @@ impl HefFile {
         let start = graph.unresolved.partition_point(|edge| edge.child < sn);
         let end = graph.unresolved.partition_point(|edge| edge.child <= sn);
         graph.unresolved.get(start..end).unwrap_or_default()
+    }
+
+    /// The subject's state root right after event `sn`, or `None` when `sn` is not a state event this file holds.
+    pub fn state_root(&self, sn: u64) -> Option<StateRoot> {
+        let footer = self.footer();
+        let row = sn.checked_sub(footer.graph.as_ref()?.first_sn)?;
+        let index = footer
+            .state_roots
+            .binary_search_by_key(&row, |entry| entry.row_ordinal)
+            .ok()?;
+        footer.state_roots.get(index).map(|entry| entry.root)
     }
 
     /// The granule of a graph-profile file that holds event `sn`, or `None` when the file does not hold it.
