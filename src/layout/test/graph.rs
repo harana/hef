@@ -10,6 +10,8 @@ use crate::security::{StateChunkKey, TenantDek};
 use crate::writer::build::{HefBuildConfig, build_hef_file};
 use crate::writer::source_form::tests::{plain_row, source_form_config};
 use std::collections::HashMap;
+use std::hint::black_box;
+use std::time::{Duration, Instant};
 
 /// One way to break a valid graph input.
 type GraphBreak = Box<dyn Fn(&mut GraphInput)>;
@@ -389,7 +391,7 @@ pub(crate) fn room_graph(events: u64) -> GraphInput {
     }
 }
 
-/// 8192-row granules over `events` rows.
+/// `events` rows cut into 8192-row granules.
 fn room_granules(events: u64) -> Vec<GranuleEntry> {
     (0..events.div_ceil(8192))
         .map(|index| {
@@ -397,6 +399,14 @@ fn room_granules(events: u64) -> Vec<GranuleEntry> {
             granule(index as u32, first, (events - first).min(8192) as u32)
         })
         .collect()
+}
+
+fn edge_count(graph: &GraphInput) -> u64 {
+    graph
+        .rows
+        .iter()
+        .map(|row| (row.auth.len() + row.prev.len()) as u64)
+        .sum()
 }
 
 /// Stored bytes per edge for a room-shaped graph in 8192-row granules, counting the forward and reverse copies both
@@ -411,11 +421,7 @@ fn a_room_graph_stores_few_bytes_per_edge() {
     let granules = room_granules(events);
     let blocks = encode_graph_blocks(&graph, events, &granules).unwrap();
     let measurement = GraphEdgeBytesMeasurement {
-        edges: graph
-            .rows
-            .iter()
-            .map(|row| (row.auth.len() + row.prev.len()) as u64)
-            .sum(),
+        edges: edge_count(&graph),
         stored_bytes: blocks.values().map(|block| block.len() as u64).sum(),
     };
     println!(
@@ -814,5 +820,68 @@ fn chain_labels_ride_the_edge_block_only_when_declared() {
     assert!(
         decode_granule_edges(&plain[&1], 103, 3, 106, true).is_err(),
         "a block without labels"
+    );
+}
+
+/// Times building and decoding the edge blocks of the 100,000-event room in 8192-row granules, the median of five
+/// samples each, and prints edges per second, MB/s of edge-block bytes, and stored bytes per edge. Run by hand:
+/// `cargo test --release --all-features --lib benchmark_graph_edge_blocks -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-mode graph edge block benchmark"]
+fn benchmark_graph_edge_blocks() {
+    let events = 100_000u64;
+    let graph = GraphInput {
+        chain_cover: None,
+        ..room_graph(events)
+    };
+    let granules = room_granules(events);
+    let edges = edge_count(&graph);
+    let median = |mut samples: Vec<Duration>| {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    };
+
+    let encode = median(
+        (0..5)
+            .map(|_| {
+                let started = Instant::now();
+                black_box(encode_graph_blocks(&graph, events, &granules).unwrap());
+                started.elapsed()
+            })
+            .collect(),
+    );
+    let blocks = encode_graph_blocks(&graph, events, &granules).unwrap();
+    let decode = median(
+        (0..5)
+            .map(|_| {
+                let started = Instant::now();
+                for granule in &granules {
+                    black_box(
+                        decode_granule_edges(
+                            &blocks[&granule.granule_id],
+                            graph.first_sn + granule.first_row_ordinal,
+                            granule.row_count,
+                            events,
+                            false,
+                        )
+                        .unwrap(),
+                    );
+                }
+                started.elapsed()
+            })
+            .collect(),
+    );
+
+    let stored: u64 = blocks.values().map(|block| block.len() as u64).sum();
+    for (step, time) in [("encode", encode), ("decode", decode)] {
+        println!(
+            "graph edge blocks {step}: {edges} edges in {time:?}, {:.1} M edges/s, {:.1} MB/s",
+            edges as f64 / time.as_secs_f64() / 1e6,
+            stored as f64 / time.as_secs_f64() / 1e6
+        );
+    }
+    println!(
+        "graph edge blocks: {stored} bytes, {:.2} bytes per edge",
+        stored as f64 / edges as f64
     );
 }

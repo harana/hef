@@ -1,5 +1,7 @@
 use super::*;
+use crate::benchmarks::{AuditFileOverheadMeasurement, audit_file_overhead_gate_passes};
 use crate::invariants::sim::SerialEncodeExecutor;
+use crate::layout::LayoutTargets;
 use crate::layout::constant::AUDIT_GENESIS;
 use crate::layout::footer::RetentionMode;
 use crate::writer::build::{
@@ -12,6 +14,7 @@ use crate::writer::compaction::plan_rewrite;
 use crate::writer::constant::AUDIT_REWRITE_REFUSED;
 use crate::writer::projection::build_entity_projection;
 use crate::writer::source_form::tests::{plain_row, source_form_config};
+use std::time::Instant;
 
 fn settings() -> AuditSettings {
     AuditSettings {
@@ -178,4 +181,96 @@ fn an_audit_file_chains_from_the_supplied_start() {
     // The same rows chained from a different start end somewhere else.
     assert_ne!(next_trail.chain_end, trail.chain_end);
     assert_eq!(next_trail.retention, settings().retention);
+}
+
+fn footer_len(built: &BuiltHef) -> usize {
+    let len = built.bytes.len();
+    u64::from_le_bytes(built.bytes[len - 12..len - 4].try_into().unwrap()) as usize
+}
+
+/// The bytes an audit file of `count` rows with `retention` adds over the same rows built as an event file, checking
+/// every one of them sits in the footer.
+fn audit_added_bytes(count: u64, retention: Option<ObjectLockRetention>) -> u64 {
+    let rows: Vec<BuildRow> = (0..count).map(plain_row).collect();
+    let config = HefBuildConfig {
+        audit: Some(AuditSettings {
+            retention,
+            ..settings()
+        }),
+        ..audit_config()
+    };
+    let audit = build_hef_file(rows.clone(), &config).unwrap();
+    let event = build_hef_file(rows, &source_form_config(4)).unwrap();
+    let added = audit.bytes.len() - event.bytes.len();
+    assert_eq!(footer_len(&audit) - footer_len(&event), added, "only the footer grows");
+    added as u64
+}
+
+#[test]
+fn an_audit_file_adds_a_fixed_footer_cost_and_nothing_per_row() {
+    // Two 52-byte section directory entries, the one-byte profile section, and the audit section: two 32-byte hashes,
+    // the legal hold byte and the retention tag, then the retention's mode byte and retain-until time when it has one.
+    for (retention, expected) in [(settings().retention, 2 * 52 + 1 + 75), (None, 2 * 52 + 1 + 66)] {
+        let measurement = AuditFileOverheadMeasurement {
+            added_bytes_at_few_rows: audit_added_bytes(10, retention),
+            added_bytes_at_many_rows: audit_added_bytes(1_000, retention),
+        };
+        println!(
+            "audit file overhead, retention {}: {measurement:?}",
+            retention.is_some()
+        );
+        assert_eq!(measurement.added_bytes_at_few_rows, expected);
+        assert!(audit_file_overhead_gate_passes(&measurement), "{measurement:?}");
+    }
+}
+
+/// Builds 100,000 rows as an event file and as an audit file, seven times each, and prints the median build times and
+/// what hashing the rows into the chain adds per row. Run by hand:
+/// `cargo test --release --all-features --lib audit_chain_build_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-mode audit chain build benchmark"]
+fn audit_chain_build_cost() {
+    const ROWS: u64 = 100_000;
+    let rows: Vec<BuildRow> = (0..ROWS).map(plain_row).collect();
+    let event_config = HefBuildConfig {
+        targets: LayoutTargets::default(),
+        ..source_form_config(4)
+    };
+    let audit_config = HefBuildConfig {
+        audit: Some(settings()),
+        profile: Profile::Audit,
+        ..event_config.clone()
+    };
+    let time_build = |config: &HefBuildConfig| {
+        let input = rows.clone();
+        let started = Instant::now();
+        let built = build_hef_file(input, config).unwrap();
+        let elapsed = started.elapsed().as_nanos();
+        std::hint::black_box(built);
+        elapsed
+    };
+    let mut event_samples = Vec::new();
+    let mut audit_samples = Vec::new();
+    for iteration in 0..7 {
+        if iteration % 2 == 0 {
+            event_samples.push(time_build(&event_config));
+            audit_samples.push(time_build(&audit_config));
+        } else {
+            audit_samples.push(time_build(&audit_config));
+            event_samples.push(time_build(&event_config));
+        }
+    }
+    event_samples.sort_unstable();
+    audit_samples.sort_unstable();
+    let event_median = event_samples[3];
+    let audit_median = audit_samples[3];
+    let extra = audit_median as f64 - event_median as f64;
+    println!(
+        "audit chain build, {ROWS} rows: event median {:.1} ms, audit median {:.1} ms, chain adds {:.0} ns/row \
+         ({:+.1}%)",
+        event_median as f64 / 1e6,
+        audit_median as f64 / 1e6,
+        extra / ROWS as f64,
+        100.0 * extra / event_median as f64
+    );
 }

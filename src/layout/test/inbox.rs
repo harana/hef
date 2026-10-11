@@ -1,15 +1,18 @@
 use super::*;
 use crate::artifacts::batch::{EventInput, PayloadInput};
+use crate::benchmarks::{InboxReadMeasurement, inbox_read_gate_passes};
 use crate::columns::{FreetextDeclaration, PromotionPlan};
 use crate::deletes::CorrectionMetadata;
 use crate::error::EntityScanError;
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TimestampValue};
+use crate::layout::footer::encode_footer;
 use crate::layout::{LayoutTargets, Profile};
 use crate::security::FooterEncryption;
 use crate::typed_id::TypedIdTestExt;
-use crate::writer::build::{BuildLifecycle, HefBuildConfig, HefRow, build_hef_file};
+use crate::writer::build::{BuildLifecycle, BuiltHef, HefBuildConfig, HefRow, build_hef_file};
 use hashbrown::HashMap;
+use std::time::{Duration, Instant};
 
 const RECIPIENTS: u64 = 3;
 const ROWS: u64 = 30;
@@ -31,11 +34,11 @@ fn point(sequence: u64) -> SequencePoint {
     SequencePoint { epoch: 1, sequence }
 }
 
-/// The queue rows in arrival order: the recipients' messages interleave round-robin.
-fn rows() -> Vec<HefRow> {
-    (1..=ROWS)
+/// `count` queue rows in arrival order: the messages to `recipients` recipients interleave round-robin.
+fn rows(recipients: u64, count: u64) -> Vec<HefRow> {
+    (1..=count)
         .map(|sequence| {
-            let to = (sequence - 1) % RECIPIENTS;
+            let to = (sequence - 1) % recipients;
             HefRow {
                 epoch: 1,
                 event: EventInput {
@@ -76,8 +79,8 @@ fn rows() -> Vec<HefRow> {
         .collect()
 }
 
-fn build(profile: Profile) -> HefFile {
-    let config = HefBuildConfig {
+fn config(profile: Profile, index_granularity: usize) -> HefBuildConfig {
+    HefBuildConfig {
         analytical_columns: Vec::new(),
         audit: None,
         created_at_physical: 0,
@@ -93,14 +96,20 @@ fn build(profile: Profile) -> HefFile {
         profile,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
-            index_granularity: 4,
+            index_granularity,
             ..LayoutTargets::default()
         },
         tenant_id: tenant(),
         time_series_bucket_nanos: None,
-    };
-    let built = build_hef_file(rows(), &config).unwrap();
+    }
+}
+
+fn open(built: BuiltHef) -> HefFile {
     HefFile::open(built.bytes, Some(&built.file_seal)).unwrap()
+}
+
+fn build(profile: Profile) -> HefFile {
+    open(build_hef_file(rows(RECIPIENTS, ROWS), &config(profile, 4)).unwrap())
 }
 
 /// Every sequence addressed to recipient `index`, in queue order.
@@ -279,4 +288,124 @@ fn a_file_is_fully_acked_only_once_every_recipient_acks_its_newest_row() {
     // A watermark in a later epoch is past every row of this one.
     acks.0.insert(recipient(0), SequencePoint { epoch: 2, sequence: 1 });
     assert!(file.fully_acked(&acks).unwrap());
+}
+
+/// On a file of 1,000 recipients with 20 rows each in 16-row granules, the recipient directory costs 48 bytes per
+/// recipient and each recipient's queue reads only the granules holding its rows, where the same rows in an event
+/// file, which carries no directory, read more.
+#[test]
+fn a_queue_read_touches_only_the_granules_holding_the_recipients_rows() {
+    let recipients = 1_000;
+    let count = recipients * 20;
+    let inbox = open(build_hef_file(rows(recipients, count), &config(Profile::Inbox, 16)).unwrap());
+    let event = open(build_hef_file(rows(recipients, count), &config(Profile::Event, 16)).unwrap());
+
+    let mut without_directory = inbox.footer().clone();
+    without_directory.inbox_recipients.clear();
+    let directory_bytes = (encode_footer(inbox.footer()).len() - encode_footer(&without_directory).len()) as u64;
+
+    // Every granule holding a row of each recipient, by its hash, read from the rows themselves.
+    let mut covering: HashMap<u64, Vec<u32>> = HashMap::new();
+    for granule in &inbox.footer().granules {
+        for envelope in inbox.granule_envelopes(granule.granule_id).unwrap() {
+            let granules = covering.entry(envelope.entity_id_hash_low).or_default();
+            if granules.last() != Some(&granule.granule_id) {
+                granules.push(granule.granule_id);
+            }
+        }
+    }
+
+    let mut read_with_directory = 0;
+    let mut read_without_directory = 0;
+    for index in 0..recipients {
+        let measurement = InboxReadMeasurement {
+            covering_granules: covering[&(HASH_BASE + index)].len() as u64,
+            directory_bytes,
+            granules_read: recipient_granules(&inbox, recipient(index), None).len() as u64,
+            recipients,
+        };
+        assert!(inbox_read_gate_passes(&measurement), "recipient {index}");
+        read_with_directory += measurement.granules_read;
+        read_without_directory += recipient_granules(&event, recipient(index), None).len() as u64;
+    }
+    let (deletes, acks) = (Deletes::default(), Acks::default());
+    assert_eq!(
+        read_inbox(&[&inbox], tenant(), recipient(500), &acks, &deletes).unwrap(),
+        read_inbox(&[&event], tenant(), recipient(500), &acks, &deletes).unwrap()
+    );
+    println!(
+        "inbox directory: {directory_bytes} B for {recipients} recipients ({:.2} B each); granules read per queue: \
+         {:.2} with the directory, {:.2} without, of {} granules",
+        directory_bytes as f64 / recipients as f64,
+        read_with_directory as f64 / recipients as f64,
+        read_without_directory as f64 / recipients as f64,
+        inbox.footer().granules.len()
+    );
+    assert!(read_with_directory < read_without_directory);
+}
+
+/// Times an inbox file of 100,000 rows addressed round-robin to 10,000 recipients, in the default granule size:
+/// building it, reading one recipient's queue from a fresh reader with the recipient directory (the inbox file) and
+/// without it (an event file of the same rows), and checking that every recipient has acknowledged the whole file.
+/// Prints the median of seven samples of each. Run by hand:
+/// `cargo test --release --all-features --lib inbox_read_benchmark -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-mode inbox read benchmark"]
+fn inbox_read_benchmark() {
+    let recipients = 10_000;
+    let count = 100_000;
+    let granularity = LayoutTargets::default().index_granularity;
+    let samples = 7;
+    let median = |mut times: Vec<Duration>| {
+        times.sort_unstable();
+        times[times.len() / 2]
+    };
+
+    let mut builds = Vec::new();
+    let mut built = None;
+    for _ in 0..samples {
+        let input = rows(recipients, count);
+        let started = Instant::now();
+        built = Some(build_hef_file(input, &config(Profile::Inbox, granularity)).unwrap());
+        builds.push(started.elapsed());
+    }
+    let built = built.unwrap();
+    let file_bytes = built.bytes.len();
+    let inbox = open(built);
+    let event = open(build_hef_file(rows(recipients, count), &config(Profile::Event, granularity)).unwrap());
+
+    let probes: Vec<Recipient> = (0..recipients).step_by(101).map(recipient).collect();
+    let (deletes, mut acks) = (Deletes::default(), Acks::default());
+    let read = |file: &HefFile| {
+        let readers: Vec<HefFile> = probes.iter().map(|_| file.fresh_reader().unwrap()).collect();
+        let started = Instant::now();
+        for (reader, &to) in readers.iter().zip(&probes) {
+            let events = read_inbox(&[reader], tenant(), to, &acks, &deletes).unwrap();
+            assert_eq!(events.len() as u64, count / recipients);
+        }
+        started.elapsed() / probes.len() as u32
+    };
+    let with_directory = median((0..samples).map(|_| read(&inbox)).collect());
+    let without_directory = median((0..samples).map(|_| read(&event)).collect());
+
+    acks.0 = (0..recipients).map(|index| (recipient(index), point(count))).collect();
+    let fully_acked = median(
+        (0..samples)
+            .map(|_| {
+                let started = Instant::now();
+                assert!(inbox.fully_acked(&acks).unwrap());
+                started.elapsed()
+            })
+            .collect(),
+    );
+
+    println!(
+        "inbox: {count} rows, {recipients} recipients, {file_bytes} B file, {} granules",
+        inbox.footer().granules.len()
+    );
+    println!(
+        "median build {:?}; one recipient's queue from a fresh reader: {with_directory:?} with the directory, \
+         {without_directory:?} without; fully_acked over every recipient {fully_acked:?}",
+        median(builds)
+    );
 }

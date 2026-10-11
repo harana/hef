@@ -1,5 +1,9 @@
 use super::*;
+use crate::benchmarks::{ProfileOverheadMeasurement, profile_overhead_gate_passes};
 use crate::events::{RelationshipKind, RelationshipRef};
+use crate::layout::HEADER_BLOCK_LEN;
+use crate::writer::build::{BuiltHef, build_hef_file};
+use crate::writer::source_form::tests::{plain_row, source_form_config};
 
 fn minimal_footer() -> Footer {
     Footer {
@@ -1031,6 +1035,46 @@ fn an_event_footer_carries_no_profile_section() {
     // One directory entry (52 B) plus the one profile byte: the event footer is byte-identical to one written before
     // profiles existed.
     assert_eq!(graph.len(), event.len() + 4 + 8 + 8 + 32 + 1);
+}
+
+/// The section ids in a built file's stored footer directory.
+fn stored_section_ids(built: &BuiltHef) -> Vec<u32> {
+    let end = built.bytes.len() - built.tree_len.unwrap_or(0) as usize;
+    let blob = &built.bytes[end - built.footer_len as usize..end - 8];
+    (0..section_count(blob) as usize)
+        .map(|index| {
+            let at = DIRECTORY_START + index * DIRECTORY_ENTRY_LEN;
+            u32::from_le_bytes(blob[at..at + 4].try_into().unwrap())
+        })
+        .collect()
+}
+
+/// The same rows built as an event file and as a graph file with no edges differ by one footer directory entry and
+/// the one profile byte; the header block stays 4 KiB.
+#[test]
+fn a_profile_adds_one_footer_entry_and_one_byte_to_a_file() {
+    let rows = || (0..20).map(plain_row).collect::<Vec<_>>();
+    let event = build_hef_file(rows(), &source_form_config(4)).unwrap();
+    let mut config = source_form_config(4);
+    config.profile = Profile::Graph;
+    let graph = build_hef_file(rows(), &config).unwrap();
+    assert!(!stored_section_ids(&event).contains(&sections::PROFILE));
+    assert!(stored_section_ids(&graph).contains(&sections::PROFILE));
+
+    let measurement = ProfileOverheadMeasurement {
+        event_file_bytes: event.bytes.len() as u64,
+        event_header_block_bytes: event.footer.stripes[0].file_offset,
+        profiled_file_bytes: graph.bytes.len() as u64,
+        profiled_header_block_bytes: graph.footer.stripes[0].file_offset,
+    };
+    println!(
+        "profile overhead: {} extra bytes, header block {} bytes",
+        measurement.profiled_file_bytes - measurement.event_file_bytes,
+        measurement.profiled_header_block_bytes
+    );
+    assert_eq!(measurement.profiled_file_bytes - measurement.event_file_bytes, 52 + 1);
+    assert_eq!(measurement.profiled_header_block_bytes, HEADER_BLOCK_LEN as u64);
+    assert!(profile_overhead_gate_passes(&measurement));
 }
 
 #[test]

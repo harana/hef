@@ -2,7 +2,7 @@ use super::*;
 use crate::artifacts::batch::{EventInput, PayloadInput};
 use crate::artifacts::state_chunk::{SealedStateChunk, StateChunk, build_state_tree, decode_state_chunk};
 use crate::benchmarks::{
-    GraphWalkRequestsMeasurement, StateLookupMeasurement, graph_walk_requests_gate_passes, state_lookup_gate_passes,
+    GraphWalkMeasurement, StateLookupMeasurement, graph_walk_gate_passes, state_lookup_gate_passes,
 };
 use crate::clock::FixedClock;
 use crate::columns::{FreetextDeclaration, PromotionPlan, column_ids};
@@ -11,6 +11,7 @@ use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, SequenceRange, StreamId, TimestampValue};
 use crate::file::constant::CHUNK_GROUP_BYTES;
 use crate::layout::cache::CacheStore;
+use crate::layout::graph::tests::room_graph;
 use crate::layout::graph::{ChainCoverInput, GraphInput, RowEdges};
 use crate::layout::reader::PayloadRead;
 use crate::layout::{HEADER_BLOCK_LEN, LayoutTargets, Profile, required_features};
@@ -25,6 +26,7 @@ use std::sync::{
     Mutex,
     mpsc::{Receiver, channel},
 };
+use std::time::Instant;
 
 const TENANT: u128 = 3;
 
@@ -544,7 +546,7 @@ fn graph_input(first_sn: u64, rows: u64, offsets: &[u64]) -> GraphInput {
 
 /// A graph file of `rows` small rows from sequence number `first_sn`, four rows per granule.
 fn graph_file(first_sn: u64, rows: u64, offsets: &[u64]) -> BuiltHef {
-    build_graph(graph_input(first_sn, rows, offsets))
+    graph_file_of(graph_input(first_sn, rows, offsets), 4)
 }
 
 /// The protocol id of event `sn`.
@@ -554,12 +556,12 @@ fn event_id(sn: u64) -> Vec<u8> {
 
 /// A graph file holding `graph`, one small row per event, four rows per granule, each row carrying its protocol id.
 fn build_graph(graph: GraphInput) -> BuiltHef {
-    build_graph_in_granules(graph, 4)
+    graph_file_of(graph, 4)
 }
 
-/// A graph file holding `graph`, one small row per event, `rows_per_granule` rows per granule, each row carrying its
+/// A graph file holding `graph`'s events as small rows, `rows_per_granule` to a granule, each row carrying its
 /// protocol id.
-fn build_graph_in_granules(graph: GraphInput, rows_per_granule: usize) -> BuiltHef {
+fn graph_file_of(graph: GraphInput, rows_per_granule: usize) -> BuiltHef {
     let mut config = source_form_config(rows_per_granule);
     let sns = graph.first_sn..graph.first_sn + graph.rows.len() as u64;
     config.graph = Some(graph);
@@ -646,28 +648,19 @@ fn a_walk_costs_at_most_one_request_per_file_per_level() {
     let opened = singles();
     let mut seen = 0;
     let mut previous = requests();
-    let mut measurement = GraphWalkRequestsMeasurement {
-        files: 2,
-        levels: 0,
-        max_level_requests: 0,
-        requests: 0,
-    };
     for level in graph.walk(b"room", 63, EdgeKind::Prev, 64) {
         let level = level.unwrap();
         let requests_now = requests();
-        measurement.levels += 1;
-        measurement.max_level_requests = measurement.max_level_requests.max((requests_now - previous) as u64);
+        assert!(
+            requests_now - previous <= 2,
+            "a level costs at most one request per file"
+        );
         for source in &sources {
             assert!(source.batches().iter().all(|batch| batch.len() == 1));
         }
         previous = requests_now;
         seen += level.len();
     }
-    measurement.requests = requests() as u64;
-    assert!(
-        graph_walk_requests_gate_passes(&measurement),
-        "a level costs at most one request per file: {measurement:?}"
-    );
     assert_eq!(seen, 63, "every ancestor of event 63 is reached once");
     assert!(requests() > 0);
     assert_eq!(singles(), opened, "no level fetches anything outside its batches");
@@ -676,6 +669,122 @@ fn a_walk_costs_at_most_one_request_per_file_per_level() {
     let levels: Vec<_> = graph.walk(b"room", 63, EdgeKind::Prev, 64).collect();
     assert!(levels.iter().all(Result::is_ok));
     assert_eq!(requests(), again, "a second walk is served from the held blocks");
+}
+
+/// Requests and bytes every source has been asked for so far.
+fn fetched(sources: &[Arc<BatchSource>]) -> (u64, u64) {
+    let ranges: Vec<ByteRange> = sources.iter().flat_map(|source| source.batches()).flatten().collect();
+    (ranges.len() as u64, ranges.iter().map(|range| range.len).sum())
+}
+
+/// Opens each of `built` behind a source of its own and serves them as one remote graph.
+fn remote_graph_of(built: &[BuiltHef]) -> (RemoteGraph, Vec<Arc<BatchSource>>) {
+    let sources: Vec<_> = built.iter().map(|built| BatchSource::new(&built.bytes)).collect();
+    let files = sources
+        .iter()
+        .zip(built)
+        .map(|(source, built)| open_graph_file(source, built))
+        .collect();
+    (remote_graph(files, options(16)), sources)
+}
+
+#[test]
+fn a_walk_across_four_files_meets_the_graph_walk_gate() {
+    let built: Vec<_> = (0..4).map(|file| graph_file(file * 32, 32, &[1, 9])).collect();
+    let (graph, sources) = remote_graph_of(&built);
+    // The limit is exactly event 127's ancestor count, so the walk ends on its last level without another step.
+    let levels = graph
+        .walk(b"room", 127, EdgeKind::Prev, 127)
+        .map(Result::unwrap)
+        .count();
+    let (requests, bytes_fetched) = fetched(&sources);
+    let measurement = GraphWalkMeasurement {
+        bytes_fetched,
+        files: sources.len() as u64,
+        levels: levels as u64,
+        requests,
+    };
+    println!("graph walk: {measurement:?}");
+    assert!(requests > 0);
+    assert!(graph_walk_gate_passes(&measurement));
+}
+
+/// Walks back from the last event of the 100,000-event room, split into four files of 25,000 events in 8192-row
+/// granules, along `prev` and then `auth` edges. For each it prints the levels, requests and bytes fetched per level,
+/// and time per level for a cold walk and for a second, warm walk over the same graph. Run by hand:
+/// `cargo test --release --all-features --lib benchmark_graph_walk_over_a_room -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-mode graph walk benchmark"]
+fn benchmark_graph_walk_over_a_room() {
+    let events = 100_000u64;
+    let room = room_graph(events);
+    let per_file = 25_000usize;
+    let built: Vec<_> = room
+        .rows
+        .chunks(per_file)
+        .enumerate()
+        .map(|(file, rows)| {
+            let graph = GraphInput {
+                first_sn: (file * per_file) as u64,
+                inbound: Vec::new(),
+                rows: rows.to_vec(),
+                subject: room.subject.clone(),
+                ..GraphInput::default()
+            };
+            graph_file_of(graph, 8192)
+        })
+        .collect();
+    for kind in [EdgeKind::Prev, EdgeKind::Auth] {
+        let (graph, sources) = remote_graph_of(&built);
+        let (mut cold, mut requests, mut bytes) = (Vec::new(), Vec::new(), Vec::new());
+        let mut walk = graph.walk(&room.subject, events - 1, kind, usize::MAX);
+        loop {
+            let before = fetched(&sources);
+            let started = Instant::now();
+            let Some(level) = walk.next() else { break };
+            cold.push(started.elapsed());
+            level.unwrap();
+            let after = fetched(&sources);
+            requests.push(after.0 - before.0);
+            bytes.push(after.1 - before.1);
+        }
+        let (total_requests, bytes_fetched) = fetched(&sources);
+        let mut warm = Vec::new();
+        let mut walk = graph.walk(&room.subject, events - 1, kind, usize::MAX);
+        loop {
+            let started = Instant::now();
+            let Some(level) = walk.next() else { break };
+            warm.push(started.elapsed());
+            level.unwrap();
+        }
+        assert_eq!(warm.len(), cold.len());
+        assert_eq!(fetched(&sources).0, total_requests, "the warm walk sent nothing");
+
+        let levels = cold.len() as u32;
+        let per_level = |times: &mut Vec<Duration>| {
+            let mean = times.iter().sum::<Duration>() / levels;
+            times.sort_unstable();
+            (times[times.len() / 2], mean)
+        };
+        let (cold_median, cold_mean) = per_level(&mut cold);
+        let (warm_median, warm_mean) = per_level(&mut warm);
+        println!(
+            "graph walk {kind:?}: {levels} levels over {} files, {total_requests} requests and {bytes_fetched} bytes \
+             in all; per level: requests mean {:.5} max {}, bytes mean {:.0} max {}, cold median {cold_median:?} mean \
+             {cold_mean:?}, warm median {warm_median:?} mean {warm_mean:?}",
+            sources.len(),
+            requests.iter().sum::<u64>() as f64 / f64::from(levels),
+            requests.iter().max().unwrap(),
+            bytes.iter().sum::<u64>() as f64 / f64::from(levels),
+            bytes.iter().max().unwrap(),
+        );
+        assert!(graph_walk_gate_passes(&GraphWalkMeasurement {
+            bytes_fetched,
+            files: sources.len() as u64,
+            levels: u64::from(levels),
+            requests: total_requests,
+        }));
+    }
 }
 
 /// One stripe of three 64-row granules whose rows mostly carry 64 KiB of incompressible text (every eighth an
@@ -1010,56 +1119,6 @@ fn state_is_read_at_a_state_event_through_the_graph() {
     );
     assert!(state.state_diff(&roots[1], &roots[1]).unwrap().is_empty());
     assert_eq!(chunks.take_reads(), 0, "a state compared with itself reads nothing");
-}
-
-/// Requests per level of a cold walk back through a 100,000-event history held in four files of 25,000 events in
-/// 8192-row granules, each event pointing back at the one before and the one nine before. Prints the walk's levels,
-/// requests, mean requests per level and the most any level sent. Run by hand:
-/// `cargo test --release --features write --lib graph_walk_requests_per_level -- --ignored --nocapture`.
-#[test]
-#[ignore = "release-mode graph walk benchmark"]
-fn graph_walk_requests_per_level() {
-    const FILES: u64 = 4;
-    const FILE_EVENTS: u64 = 25_000;
-    let built: Vec<BuiltHef> = (0..FILES)
-        .map(|file| build_graph_in_granules(graph_input(file * FILE_EVENTS, FILE_EVENTS, &[1, 9]), 8192))
-        .collect();
-    let sources: Vec<Arc<BatchSource>> = built.iter().map(|built| BatchSource::new(&built.bytes)).collect();
-    let files = sources
-        .iter()
-        .zip(&built)
-        .map(|(source, built)| open_graph_file(source, built))
-        .collect();
-    let graph = remote_graph(files, options(16));
-    let requests = || sources.iter().map(|source| source.batches().len() as u64).sum::<u64>();
-    let mut measurement = GraphWalkRequestsMeasurement {
-        files: FILES,
-        levels: 0,
-        max_level_requests: 0,
-        requests: 0,
-    };
-    let last = FILES * FILE_EVENTS - 1;
-    let mut seen = 0;
-    let mut previous = requests();
-    for level in graph.walk(b"room", last, EdgeKind::Prev, last as usize) {
-        seen += level.unwrap().len() as u64;
-        let now = requests();
-        measurement.levels += 1;
-        measurement.max_level_requests = measurement.max_level_requests.max(now - previous);
-        previous = now;
-    }
-    measurement.requests = requests();
-    println!(
-        "graph walk over {} events in {FILES} files: {} levels, {} requests, {:.5} requests per level, at most {} \
-         in one level",
-        FILES * FILE_EVENTS,
-        measurement.levels,
-        measurement.requests,
-        measurement.requests as f64 / measurement.levels as f64,
-        measurement.max_level_requests
-    );
-    assert_eq!(seen, last, "every ancestor is reached once");
-    assert!(graph_walk_requests_gate_passes(&measurement));
 }
 
 /// A tenant's state chunks in a simulated object store with a node-local cache in front: a read the cache misses is

@@ -338,26 +338,6 @@ pub fn graph_edge_bytes_gate_passes(m: &GraphEdgeBytesMeasurement) -> bool {
     m.stored_bytes as f64 <= m.edges as f64 * GRAPH_EDGE_BYTES_TARGET
 }
 
-/// The gated ceiling on requests one level of a cold graph walk sends to each file of the subject.
-pub const GRAPH_WALK_REQUESTS_PER_FILE_TARGET: u64 = 1;
-
-/// The requests a cold graph walk sent, level by level, needed to evaluate the walk request gate.
-#[derive(Debug, Clone)]
-pub struct GraphWalkRequestsMeasurement {
-    /// Files of the walked subject, so a level may send at most this many requests.
-    pub files: u64,
-    pub levels: u64,
-    /// The most requests any one level sent.
-    pub max_level_requests: u64,
-    pub requests: u64,
-}
-
-/// Returns `true` when no level of a walk sent more than `GRAPH_WALK_REQUESTS_PER_FILE_TARGET` requests per file of
-/// the subject.
-pub fn graph_walk_requests_gate_passes(m: &GraphWalkRequestsMeasurement) -> bool {
-    m.max_level_requests <= m.files * GRAPH_WALK_REQUESTS_PER_FILE_TARGET
-}
-
 /// The gated ceiling on footer bytes a graph file's event-id index costs per indexed event, its filter included.
 pub const GRAPH_EVENT_ID_BYTES_TARGET: f64 = 12.0;
 
@@ -508,4 +488,119 @@ pub fn time_series_rollup_gate_passes(m: &TimeSeriesRollupMeasurement) -> bool {
     m.aligned_block_reads == 0
         && m.cut_block_reads <= TIME_SERIES_ROLLUP_EDGE_BLOCK_READS_TARGET
         && m.cut_block_reads < m.scan_block_reads
+}
+
+/// The gated ceiling on the bytes an audit file adds over the same rows built as an event file: its profile and audit
+/// footer sections and their two section directory entries. The hash chain stores nothing per row, so the cost stays
+/// the same however many rows the file holds.
+pub const AUDIT_FILE_OVERHEAD_CEILING_BYTES: u64 = 192;
+
+/// What an audit file adds over an event file of the same rows, measured at two row counts, needed to evaluate the
+/// audit file overhead gate.
+#[derive(Debug, Clone)]
+pub struct AuditFileOverheadMeasurement {
+    pub added_bytes_at_few_rows: u64,
+    pub added_bytes_at_many_rows: u64,
+}
+
+/// Returns `true` when an audit file adds at most `AUDIT_FILE_OVERHEAD_CEILING_BYTES` over an event file of the same
+/// rows and adds exactly as much at many rows as at few, so the hash chain costs no stored bytes per row.
+pub fn audit_file_overhead_gate_passes(m: &AuditFileOverheadMeasurement) -> bool {
+    m.added_bytes_at_few_rows <= AUDIT_FILE_OVERHEAD_CEILING_BYTES
+        && m.added_bytes_at_many_rows == m.added_bytes_at_few_rows
+}
+
+/// The gated ceiling on object-store requests for one cold snapshot lookup: one read of the file's tail to open it,
+/// then one read of the granule holding the key.
+pub const SNAPSHOT_LOOKUP_REQUEST_TARGET: u32 = 2;
+
+/// One cold point lookup in a snapshot file opened remotely, needed to evaluate the snapshot lookup gate.
+#[derive(Debug, Clone)]
+pub struct SnapshotLookupMeasurement {
+    /// Tail and granule bytes together.
+    pub bytes_fetched: u64,
+    /// Requests to open the file and look the key up, the open's tail read included.
+    pub requests: u32,
+    pub stored_bytes: u64,
+}
+
+/// Returns `true` when a cold snapshot lookup issues at most `SNAPSHOT_LOOKUP_REQUEST_TARGET` requests and fetches
+/// less than the whole file, which is what a snapshot file offers over reading a whole per-partition archive.
+pub fn snapshot_lookup_gate_passes(m: &SnapshotLookupMeasurement) -> bool {
+    m.requests <= SNAPSHOT_LOOKUP_REQUEST_TARGET && m.bytes_fetched < m.stored_bytes
+}
+
+/// The gated cost of one recipient's entry in an inbox file's recipient directory, in bytes: its two identity hashes,
+/// its row range, and its newest queue point, eight bytes each.
+pub const INBOX_DIRECTORY_BYTES_PER_RECIPIENT: u64 = 48;
+
+/// The gated ceiling on what the recipient directory adds to a footer beyond its entries, in bytes: its entry count
+/// and its line in the footer's section directory (56 bytes today).
+pub const INBOX_DIRECTORY_FRAMING_CEILING_BYTES: u64 = 64;
+
+/// One recipient's queue read from an inbox file, with the size of the file's recipient directory, needed to evaluate
+/// the inbox read gate.
+#[derive(Debug, Clone)]
+pub struct InboxReadMeasurement {
+    /// Granules holding at least one of the recipient's rows: the fewest any read of its queue can touch.
+    pub covering_granules: u64,
+    /// Bytes the recipient directory adds to the file's footer, framing included.
+    pub directory_bytes: u64,
+    pub granules_read: u64,
+    pub recipients: u64,
+}
+
+/// Returns `true` when the recipient directory costs `INBOX_DIRECTORY_BYTES_PER_RECIPIENT` bytes per recipient plus
+/// at most `INBOX_DIRECTORY_FRAMING_CEILING_BYTES`, and reading one recipient's queue touches no granule beyond those
+/// holding its rows.
+pub fn inbox_read_gate_passes(m: &InboxReadMeasurement) -> bool {
+    m.directory_bytes <= m.recipients * INBOX_DIRECTORY_BYTES_PER_RECIPIENT + INBOX_DIRECTORY_FRAMING_CEILING_BYTES
+        && m.granules_read <= m.covering_granules
+}
+
+/// The gated ceiling on what declaring a profile other than `Event` adds to a file, in bytes: one footer directory
+/// entry (52 B) and its one-byte section, with the 4 KiB header block no larger.
+pub const PROFILE_OVERHEAD_CEILING_BYTES: u64 = 64;
+
+/// The same rows built once as an event file and once under another profile, needed to evaluate the profile overhead
+/// gate.
+#[derive(Debug, Clone)]
+pub struct ProfileOverheadMeasurement {
+    pub event_file_bytes: u64,
+    /// Bytes before the first stripe: the fixed header block.
+    pub event_header_block_bytes: u64,
+    pub profiled_file_bytes: u64,
+    /// Bytes before the first stripe: the fixed header block.
+    pub profiled_header_block_bytes: u64,
+}
+
+/// Returns `true` when declaring a profile leaves the header block the same size and adds at most
+/// `PROFILE_OVERHEAD_CEILING_BYTES` to the file.
+pub fn profile_overhead_gate_passes(m: &ProfileOverheadMeasurement) -> bool {
+    m.profiled_header_block_bytes == m.event_header_block_bytes
+        && m.profiled_file_bytes.saturating_sub(m.event_file_bytes) <= PROFILE_OVERHEAD_CEILING_BYTES
+}
+
+/// The gated number of range requests one level of a graph walk may send to each file it reads: one, every edge block
+/// that level needs from the file joined into a single request.
+pub const GRAPH_WALK_REQUESTS_PER_FILE_PER_LEVEL: u64 = 1;
+
+/// One breadth-first walk over a graph spread across several remote files, needed to evaluate the graph walk request
+/// gate.
+#[derive(Debug, Clone)]
+pub struct GraphWalkMeasurement {
+    pub bytes_fetched: u64,
+    pub files: u64,
+    /// Levels of ancestors the walk returned.
+    pub levels: u64,
+    /// Range requests sent to every file together, after each file was opened.
+    pub requests: u64,
+}
+
+/// Returns `true` when a graph walk sent at most `GRAPH_WALK_REQUESTS_PER_FILE_PER_LEVEL` requests per file per level.
+pub fn graph_walk_gate_passes(m: &GraphWalkMeasurement) -> bool {
+    m.requests
+        <= m.levels
+            .saturating_mul(m.files)
+            .saturating_mul(GRAPH_WALK_REQUESTS_PER_FILE_PER_LEVEL)
 }
