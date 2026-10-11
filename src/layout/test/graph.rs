@@ -732,6 +732,22 @@ fn a_non_monotonic_chain_seq_is_refused_at_write() {
     assert!(covered_file(jumping).is_ok());
 }
 
+/// A labels lookup keeps the edges it decodes, so asking again for events in the same granules decodes nothing.
+#[test]
+fn a_second_labels_lookup_reuses_the_decoded_edges_of_the_first() {
+    let file = covered_file(chain_cover(20)).unwrap();
+    let sns: Vec<u64> = (50..70).collect();
+    let first = file.graph_chain_labels(&sns).unwrap();
+    let held = file.decoded_cache_bytes();
+    assert!(held > 0, "the lookup holds its decoded edges");
+    assert_eq!(file.graph_chain_labels(&sns).unwrap(), first);
+    assert_eq!(
+        file.decoded_cache_bytes(),
+        held,
+        "the second lookup decoded nothing new"
+    );
+}
+
 #[test]
 fn chain_labels_and_links_round_trip_through_a_built_file() {
     let cover = chain_cover(20);
