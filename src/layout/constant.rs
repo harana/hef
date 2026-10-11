@@ -24,3 +24,11 @@ pub const SCAN_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 /// How many doubling buckets hold the verified ranges a remote reader has fetched: bucket `b` holds `2^b` ranges, so
 /// this bounds one reader at `2^48 - 1` fetches, far past anything a single file can need.
 pub const HELD_RANGE_BUCKETS: usize = 48;
+
+/// The `prev_row_hash` the first row of a brand-new audit trail chains from: thirty-two zero bytes. Every later audit
+/// file starts from the previous file's last row hash instead.
+pub const AUDIT_GENESIS: [u8; 32] = [0; 32];
+
+/// The BLAKE3 key-derivation context that turns a row's `prev_row_hash` and the digest of its contents into the row's
+/// own hash, keeping audit row hashes apart from every other BLAKE3 value the format stores.
+pub const AUDIT_ROW_HASH_CONTEXT: &str = "pulse HEF v1 audit row hash";

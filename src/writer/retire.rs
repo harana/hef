@@ -16,12 +16,14 @@
 //! See: hef-file-lifecycle/spec.md
 
 use super::build::{BuiltHef, HefBuildConfig};
+use super::constant::AUDIT_COMPACTION_REFUSED;
 use super::publish::{HefPublisher, MAX_REBASE_ATTEMPTS, PeerNotices, PublishFailure, Published};
 use super::upload::upload_hef;
 use crate::clock::Clock;
 use crate::error::PublishError;
 use crate::events::{SequenceRange, TenantId};
 use crate::invariants::PublishedSet;
+use crate::layout::Profile;
 use crate::lifecycle::{FileType, HefFileEntry, ManifestGeneration, PartState, Retirement};
 use crate::object_store::{ObjectStore, constant::MIN_MULTIPART_PART_BYTES, hef_object_key};
 use hashbrown::HashSet;
@@ -62,7 +64,8 @@ impl HefPublisher {
     /// output covers exactly that range and must pass the same checks as a fresh publication. The output is uploaded
     /// and checked before the generation is written, and peers are told about it once the generation wins. A lost race
     /// rebases and retries; if an input was meanwhile replaced by someone else, the publication is refused and the
-    /// uploaded object is left unreferenced.
+    /// uploaded object is left unreferenced. An audit file is never compacted: an audit input or output is refused
+    /// before anything is uploaded.
     #[expect(
         clippy::too_many_arguments,
         reason = "the compaction publish wires every interface exactly once"
@@ -77,6 +80,9 @@ impl HefPublisher {
         notices: &mut dyn PeerNotices,
         clock: &dyn Clock,
     ) -> Result<Published, PublishFailure> {
+        if built.footer.profile == Profile::Audit {
+            return Err(PublishFailure::Verification(AUDIT_COMPACTION_REFUSED));
+        }
         let (_, head) = published.head().map_err(PublishFailure::Publish)?;
         let coverage = merged_coverage(&head, inputs, config.tenant_id)?;
         self.verify_staged(&built, config, &coverage)?;
@@ -275,10 +281,13 @@ fn merged_coverage(
                 .find(|entry| {
                     entry.file_id == *input && entry.tenant_id == tenant_id && entry.part_state == PartState::Active
                 })
-                .map(|entry| entry.coverage)
                 .ok_or(PublishFailure::Verification(
                     "a compaction input is not an active file of this tenant",
                 ))
+                .and_then(|entry| match entry.profile {
+                    Profile::Audit => Err(PublishFailure::Verification(AUDIT_COMPACTION_REFUSED)),
+                    _ => Ok(entry.coverage),
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
     ranges.sort();

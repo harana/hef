@@ -66,6 +66,7 @@ fn row(i: u64) -> HefRow {
 fn file(rows: u64, rows_per_granule: usize) -> HefFile {
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,

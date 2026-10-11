@@ -52,6 +52,27 @@ impl From<CodecError> for FormatError {
     }
 }
 
+/// Why a run of audit files failed to prove its rows untouched. `file_index` is the failing file's position in the
+/// run the caller handed in, which is manifest order.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum AuditChainError {
+    /// The file's first row does not chain from the row before it: a file is missing, extra, or out of order.
+    #[error("audit file {file_index} does not continue the chain: a file before it is missing, extra or out of order")]
+    ChainBreak { file_index: usize },
+    #[error("audit file {file_index} could not be read: {error}")]
+    Format { error: FormatError, file_index: usize },
+    /// The file carries no audit trail, so it cannot be part of one.
+    #[error("file {file_index} is not an audit file")]
+    NotAudit { file_index: usize },
+    /// The file's rows do not hash to the chain end its footer records.
+    #[error(
+        "audit file {file_index} rows do not hash to its recorded chain end: a row was altered, dropped or reordered"
+    )]
+    RowsAltered { file_index: usize },
+}
+
 /// Why an introspection query was refused.
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum IntrospectionError {

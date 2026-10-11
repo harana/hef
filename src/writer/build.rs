@@ -4,6 +4,7 @@
 //! The builder is deterministic: the same rows and configuration produce byte-identical files, which is what makes
 //! publication idempotent (the file identity is derived from its content).
 
+use super::audit::{AuditSettings, audit_trail, refuse_audit_rewrite};
 use super::source_form::{self, SourceFormIndexes};
 use crate::artifacts::batch::{
     EncodedPayload, EventInput, PAYLOAD_FLAG_EXTERNAL_REF, PayloadInput, encode_variant_dictionary,
@@ -446,6 +447,9 @@ pub struct HefBuildConfig {
     /// Pre-computed analytical columns (context projections, embeddings) to include alongside the required columns.
     /// Empty by default.
     pub analytical_columns: Vec<AnalyticalColumn>,
+    /// Where an audit file's row chain starts and how the object store must keep the file. Required with
+    /// [`Profile::Audit`] and refused with any other profile.
+    pub audit: Option<AuditSettings>,
     pub created_at_physical: i64,
     /// The 32-byte file DEK to seal the footer under when `footer_encryption` is `Encrypted`. The caller supplies it;
     /// the writer derives no keys of its own. Ignored (and normally `None`) for a plaintext footer.
@@ -2440,6 +2444,7 @@ pub fn update_hef_file_with_executor<R: BuildInput>(
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
 ) -> Result<BuiltHef, FormatError> {
+    refuse_audit_rewrite(source.header.profile, config.profile)?;
     let before = R::into_build_rows(before.to_vec());
     let after = R::into_build_rows(after);
     let reuse = plan_update_reuse(source, &before, &after, config).map(|reuse| with_sparse_plan(reuse, &after, config));
@@ -2456,6 +2461,7 @@ pub fn update_hef_file_from_changes_with_executor<R: BuildInput>(
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
 ) -> Result<BuiltHef, FormatError> {
+    refuse_audit_rewrite(source.header.profile, config.profile)?;
     let after = R::into_build_rows(after);
     let reuse = plan_change_set_reuse(source, &after, &R::build_changes(changes), config);
     build_hef_file_sealed(after, config, encode, None, None, reuse.as_ref())
@@ -2475,6 +2481,7 @@ pub fn update_hef_file_from_source_changes_with_executor<R: BuildInput>(
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
 ) -> Result<BuiltHef, FormatError> {
+    refuse_audit_rewrite(source.header.profile, config.profile)?;
     let (rows, reuse) = plan_source_update(source, &R::build_changes(changes), config)?;
     build_hef_file_sealed(rows, config, encode, None, None, Some(&reuse))
 }
@@ -2487,6 +2494,7 @@ pub fn update_hef_file_profiled_with_executor<R: BuildInput>(
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
 ) -> Result<(BuiltHef, BuildProfile), FormatError> {
+    refuse_audit_rewrite(source.header.profile, config.profile)?;
     let before = R::into_build_rows(before.to_vec());
     let after = R::into_build_rows(after);
     let reuse = plan_update_reuse(source, &before, &after, config).map(|reuse| with_sparse_plan(reuse, &after, config));
@@ -2503,6 +2511,7 @@ pub fn update_hef_file_from_changes_profiled_with_executor<R: BuildInput>(
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
 ) -> Result<(BuiltHef, BuildProfile), FormatError> {
+    refuse_audit_rewrite(source.header.profile, config.profile)?;
     let after = R::into_build_rows(after);
     let reuse = plan_change_set_reuse(source, &after, &R::build_changes(changes), config);
     let mut profile = BuildProfile::default();
@@ -2518,6 +2527,7 @@ pub fn update_hef_file_from_source_changes_profiled_with_executor<R: BuildInput>
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
 ) -> Result<(BuiltHef, BuildProfile), FormatError> {
+    refuse_audit_rewrite(source.header.profile, config.profile)?;
     let mut profile = BuildProfile::default();
     let decoding = PhaseClock::new(Some(&mut profile), BuildPhase::SourceDecoding);
     let planned = plan_source_update(source, &R::build_changes(changes), config);
@@ -2735,6 +2745,7 @@ fn build_hef_file_sealed_in_order(
         }
         previous = Some(last);
     }
+    let audit = audit_trail(&rows, config, order)?;
     // The rows of each source granule as this build holds them: every granule's for a build over the whole file,
     // only the built granules' — the rest empty — for one handed just those.
     let sparse_ranges: Option<Vec<(usize, usize)>> = sparse.zip(source).map(|(plan, source)| {
@@ -4904,7 +4915,14 @@ fn build_hef_file_sealed_in_order(
         .map(|(column_id, values)| SharedDictionaryEntry { column_id, values })
         .collect();
 
+    // An audit file declares its own required feature, so a reader or rewriter that predates audit files refuses it.
+    let required_feature_flags = if audit.is_some() {
+        required_features::ALL | required_features::AUDIT_HASH_CHAIN
+    } else {
+        required_features::ALL
+    };
     let footer = Footer {
+        audit,
         clustering,
         columns,
         dictionaries,
@@ -4939,7 +4957,7 @@ fn build_hef_file_sealed_in_order(
         presence: presence_entries,
         profile: config.profile,
         reference_filters: source_form_indexes.reference_filters,
-        required_feature_flags: required_features::ALL,
+        required_feature_flags,
         schema_fingerprint: *schema_hash.finalize().as_bytes(),
         shared_dictionaries,
         shredded: shred_plan,
@@ -5007,8 +5025,8 @@ fn build_hef_file_sealed_in_order(
         // The footer-encryption bit rides the header's required features so a reader gates it before decoding the
         // (now ciphertext) footer; kept out of `required_features::ALL`, it is set only for an encrypted footer.
         feature_flags: match config.footer_encryption {
-            FooterEncryption::Encrypted => required_features::ALL | required_features::FOOTER_ENCRYPTED,
-            FooterEncryption::Plaintext => required_features::ALL,
+            FooterEncryption::Encrypted => required_feature_flags | required_features::FOOTER_ENCRYPTED,
+            FooterEncryption::Plaintext => required_feature_flags,
         },
         footer_pointer_hint: data_end,
     };

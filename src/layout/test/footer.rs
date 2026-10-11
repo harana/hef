@@ -2,6 +2,7 @@ use super::*;
 
 fn minimal_footer() -> Footer {
     Footer {
+        audit: None,
         clustering: Vec::new(),
         columns: vec![ColumnDescriptor {
             column_id: 0,
@@ -1012,4 +1013,60 @@ fn an_unknown_footer_profile_code_is_a_structural_error() {
             rule: "unknown profile"
         }
     );
+}
+
+fn audit_footer(retention: Option<ObjectLockRetention>, legal_hold: bool) -> Footer {
+    let mut footer = minimal_footer();
+    footer.audit = Some(AuditTrail {
+        chain_end: [7; 32],
+        chain_start: [3; 32],
+        legal_hold,
+        retention,
+    });
+    footer.profile = Profile::Audit;
+    footer.required_feature_flags |= required_features::AUDIT_HASH_CHAIN;
+    footer
+}
+
+#[test]
+fn an_audit_trail_round_trips_through_the_footer() {
+    for (retention, legal_hold) in [
+        (None, false),
+        (None, true),
+        (
+            Some(ObjectLockRetention {
+                mode: RetentionMode::Governance,
+                retain_until: crate::events::TimestampValue::from_physical_nanos(-5),
+            }),
+            false,
+        ),
+        (
+            Some(ObjectLockRetention {
+                mode: RetentionMode::Compliance,
+                retain_until: crate::events::TimestampValue::from_physical_nanos(i64::MAX),
+            }),
+            true,
+        ),
+    ] {
+        let footer = audit_footer(retention, legal_hold);
+        assert_eq!(decode_footer(&encode_footer(&footer)).unwrap(), footer);
+    }
+    assert!(RetentionMode::from_u8(2).is_err());
+    assert_eq!(decode_footer(&encode_footer(&minimal_footer())).unwrap().audit, None);
+}
+
+#[test]
+fn an_audit_section_without_its_feature_or_profile_is_refused() {
+    let refused = Err(FormatError::Structural {
+        rule: "an audit section, the audit_hash_chain feature and the audit profile appear together",
+    });
+    let mut no_bit = audit_footer(None, false);
+    no_bit.required_feature_flags &= !required_features::AUDIT_HASH_CHAIN;
+    assert_eq!(decode_footer(&encode_footer(&no_bit)), refused);
+    let mut wrong_profile = audit_footer(None, false);
+    wrong_profile.profile = Profile::Log;
+    assert_eq!(decode_footer(&encode_footer(&wrong_profile)), refused);
+    let mut no_section = audit_footer(None, false);
+    no_section.audit = None;
+    assert_eq!(decode_footer(&encode_footer(&no_section)), refused);
 }

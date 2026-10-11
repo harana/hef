@@ -55,6 +55,7 @@ fn event(i: u64) -> EventInput {
 fn build_config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 1,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -215,6 +216,68 @@ fn a_compaction_over_a_gap_is_refused_before_anything_is_written() {
     );
 
     assert!(matches!(result, Err(PublishFailure::Verification(_))));
+    assert_eq!(set.head().unwrap().0, 1);
+    assert!(objects.keys().is_empty());
+}
+
+#[test]
+fn a_compaction_of_an_audit_file_is_refused_before_anything_is_written() {
+    let mut audit_input = entry(102, 3, 4, PartState::Active);
+    audit_input.profile = crate::layout::Profile::Audit;
+    let mut set = SimulatedPublishedSet::new();
+    publish_directly(
+        &mut set,
+        ManifestGeneration {
+            files: vec![entry(101, 1, 2, PartState::Active), audit_input],
+            generation: 1,
+            ..Default::default()
+        },
+    );
+    let objects = SimObjectStore::new();
+    let result = HefPublisher::new().publish_compaction(
+        merged_file(),
+        &build_config(),
+        &[101, 102],
+        &mut set,
+        &objects,
+        &mut NoopPeerNotices::default(),
+        &FixedClock::at(START_NANOS),
+    );
+    assert!(matches!(
+        result,
+        Err(PublishFailure::Verification(AUDIT_COMPACTION_REFUSED))
+    ));
+
+    // An audit file as the output is refused the same way.
+    let rows = (1..=4)
+        .map(crate::writer::source_form::tests::plain_row)
+        .collect::<Vec<_>>();
+    let audit_output = build_hef_file(
+        rows,
+        &HefBuildConfig {
+            audit: Some(crate::writer::audit::AuditSettings {
+                chain_start: crate::layout::constant::AUDIT_GENESIS,
+                legal_hold: false,
+                retention: None,
+            }),
+            profile: crate::layout::Profile::Audit,
+            ..crate::writer::source_form::tests::source_form_config(4)
+        },
+    )
+    .unwrap();
+    let result = HefPublisher::new().publish_compaction(
+        audit_output,
+        &build_config(),
+        &[101],
+        &mut set,
+        &objects,
+        &mut NoopPeerNotices::default(),
+        &FixedClock::at(START_NANOS),
+    );
+    assert!(matches!(
+        result,
+        Err(PublishFailure::Verification(AUDIT_COMPACTION_REFUSED))
+    ));
     assert_eq!(set.head().unwrap().0, 1);
     assert!(objects.keys().is_empty());
 }

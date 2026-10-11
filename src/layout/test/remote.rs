@@ -121,6 +121,7 @@ fn row(i: u64, payload: StdBTreeMap<String, VariantValue>) -> HefRow {
 fn config(index_granularity: usize, granule_bytes: usize, stripe_target_bytes: usize) -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,

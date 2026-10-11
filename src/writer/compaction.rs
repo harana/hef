@@ -8,7 +8,9 @@
 //! The replacement seal composes from its stripe checksums, so unchanged stripes reuse both their bytes and their
 //! integrity leaves regardless of where they land. The output is byte-identical to a full rewrite.
 
+use super::audit::refuse_audit_rewrite;
 use super::build::BuiltHef;
+use crate::error::FormatError;
 use crate::events::TimestampValue;
 use crate::layout::footer::StripeEntry;
 use hashbrown::HashMap;
@@ -152,7 +154,10 @@ fn stripe_bytes<'a>(built: &'a BuiltHef, stripe: &StripeEntry) -> Option<&'a [u8
 ///
 /// The replacement writer has already built its authoritative seal from these checksum leaves, so no raw whole-file
 /// or prefix-subtree re-hash is part of this plan.
-pub fn plan_rewrite(source: &BuiltHef, replacement: &BuiltHef) -> RewritePlan {
+///
+/// Refuses, with a structural error, when either file is an audit file: an audit file is never replaced.
+pub fn plan_rewrite(source: &BuiltHef, replacement: &BuiltHef) -> Result<RewritePlan, FormatError> {
+    refuse_audit_rewrite(source.header.profile, replacement.header.profile)?;
     // Index the source stripes by their per-stripe BLAKE3, so a replacement stripe can find its unchanged twin wherever
     // it moved. First checksum wins when several source stripes share bytes; any of them copies identically.
     let mut source_by_checksum: HashMap<[u8; STRIPE_CHECKSUM_BYTES], &StripeEntry> = HashMap::default();
@@ -195,7 +200,7 @@ pub fn plan_rewrite(source: &BuiltHef, replacement: &BuiltHef) -> RewritePlan {
         })
         .collect();
 
-    plan_stripe_reuse(&changes, 0)
+    Ok(plan_stripe_reuse(&changes, 0))
 }
 
 #[cfg(test)]
