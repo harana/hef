@@ -115,3 +115,17 @@ An audit file SHALL add at most 192 bytes over an event file of the same rows, a
 #### Scenario: Audit file passes the overhead gate
 - **WHEN** the same rows are built as an event file and as an audit file, at a small and a large row count, with and without a retention
 - **THEN** the audit file's added bytes are within the ceiling and equal at both row counts, and the gate fails when either is not
+
+### Requirement: Snapshot lookup gate
+A cold point lookup in a snapshot file opened from an object store SHALL issue at most two requests, one for the file's tail and one for the granule that can hold the key, whether the key is present or not, and SHALL fetch less than the whole file. Lookup time, epoch build time, and epoch publish time SHALL be reported by release-mode benchmarks against the per-partition archive a snapshot file replaces.
+
+#### Scenario: Snapshot lookup passes the request gate
+- **WHEN** a snapshot file is opened remotely and a stored or absent key is looked up
+- **THEN** the open and the lookup together issue at most two requests and fetch fewer bytes than the file holds, and the gate fails when either is not so
+
+### Requirement: Inbox read gate
+An inbox file's recipient directory SHALL cost 48 bytes per recipient plus at most 64 bytes of framing, and reading one recipient's queue from a file with the directory SHALL touch no granule beyond those holding that recipient's rows. Queue read latency with and without the directory, the fully-acknowledged check, and build time SHALL be reported by a release-mode benchmark over at least 100,000 rows across 10,000 recipients.
+
+#### Scenario: Inbox read passes the directory gate
+- **WHEN** each recipient's queue is read from an inbox file of many recipients in small granules
+- **THEN** the directory's footer bytes are within the per-recipient cost plus framing, and the granules read for each recipient are exactly those holding its rows, and the gate fails when either is not so

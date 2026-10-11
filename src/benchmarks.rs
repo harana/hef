@@ -357,3 +357,51 @@ pub fn audit_file_overhead_gate_passes(m: &AuditFileOverheadMeasurement) -> bool
     m.added_bytes_at_few_rows <= AUDIT_FILE_OVERHEAD_CEILING_BYTES
         && m.added_bytes_at_many_rows == m.added_bytes_at_few_rows
 }
+
+/// The gated ceiling on object-store requests for one cold snapshot lookup: one read of the file's tail to open it,
+/// then one read of the granule holding the key.
+pub const SNAPSHOT_LOOKUP_REQUEST_TARGET: u32 = 2;
+
+/// One cold point lookup in a snapshot file opened remotely, needed to evaluate the snapshot lookup gate.
+#[derive(Debug, Clone)]
+pub struct SnapshotLookupMeasurement {
+    /// Tail and granule bytes together.
+    pub bytes_fetched: u64,
+    /// Requests to open the file and look the key up, the open's tail read included.
+    pub requests: u32,
+    pub stored_bytes: u64,
+}
+
+/// Returns `true` when a cold snapshot lookup issues at most `SNAPSHOT_LOOKUP_REQUEST_TARGET` requests and fetches
+/// less than the whole file, which is what a snapshot file offers over reading a whole per-partition archive.
+pub fn snapshot_lookup_gate_passes(m: &SnapshotLookupMeasurement) -> bool {
+    m.requests <= SNAPSHOT_LOOKUP_REQUEST_TARGET && m.bytes_fetched < m.stored_bytes
+}
+
+/// The gated cost of one recipient's entry in an inbox file's recipient directory, in bytes: its two identity hashes,
+/// its row range, and its newest queue point, eight bytes each.
+pub const INBOX_DIRECTORY_BYTES_PER_RECIPIENT: u64 = 48;
+
+/// The gated ceiling on what the recipient directory adds to a footer beyond its entries, in bytes: its entry count
+/// and its line in the footer's section directory (56 bytes today).
+pub const INBOX_DIRECTORY_FRAMING_CEILING_BYTES: u64 = 64;
+
+/// One recipient's queue read from an inbox file, with the size of the file's recipient directory, needed to evaluate
+/// the inbox read gate.
+#[derive(Debug, Clone)]
+pub struct InboxReadMeasurement {
+    /// Granules holding at least one of the recipient's rows: the fewest any read of its queue can touch.
+    pub covering_granules: u64,
+    /// Bytes the recipient directory adds to the file's footer, framing included.
+    pub directory_bytes: u64,
+    pub granules_read: u64,
+    pub recipients: u64,
+}
+
+/// Returns `true` when the recipient directory costs `INBOX_DIRECTORY_BYTES_PER_RECIPIENT` bytes per recipient plus
+/// at most `INBOX_DIRECTORY_FRAMING_CEILING_BYTES`, and reading one recipient's queue touches no granule beyond those
+/// holding its rows.
+pub fn inbox_read_gate_passes(m: &InboxReadMeasurement) -> bool {
+    m.directory_bytes <= m.recipients * INBOX_DIRECTORY_BYTES_PER_RECIPIENT + INBOX_DIRECTORY_FRAMING_CEILING_BYTES
+        && m.granules_read <= m.covering_granules
+}
