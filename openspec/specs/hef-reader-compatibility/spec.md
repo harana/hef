@@ -21,6 +21,10 @@ A reader SHALL fail the file on an unknown required feature, and SHALL validate 
 - **WHEN** a reader encounters an unknown required feature flag
 - **THEN** it fails the file rather than producing partial results
 
+#### Scenario: Graph file refused by a reader that predates graph features
+- **WHEN** a reader whose known required set ends at bit 22 opens a graph-profile file declaring any of the graph feature bits 23 to 28
+- **THEN** it fails the file, while a current reader accepts it and every event file (which declares none of those bits) stays readable by both
+
 #### Scenario: Unknown optional block ignored or read via portable decoder
 - **WHEN** a reader encounters an optional feature block it does not natively understand
 - **THEN** it ignores the block and falls back to a correct scan, unless the block carries a `min_reader_version` the reader meets and a conformance-passing `portable_decoder_ref` the fleet resolves, in which case it MAY read the block through that portable decoder, and in either case it returns correct results and never surfaces unverified bytes

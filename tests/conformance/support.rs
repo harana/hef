@@ -131,15 +131,18 @@ pub fn small_targets() -> LayoutTargets {
 pub fn build_config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 42,
         footer_dek: None,
         footer_encryption: hef::security::FooterEncryption::Plaintext,
         freetext: hef::columns::FreetextDeclaration::default(),
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: hef::layout::Profile::Event,
         promotion: hef::columns::PromotionPlan::default(),
         targets: small_targets(),
         tenant_id: tenant(),

@@ -25,6 +25,7 @@ fn outdated_file_after_replacement() {
         optional_feature_flags: 0,
         part_index: 0,
         part_state: PartState::Outdated,
+        profile: hef::layout::Profile::Event,
         required_feature_flags: 0,
         size_bytes: 4096,
         tenant_id: support::tenant(),

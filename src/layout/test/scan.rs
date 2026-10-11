@@ -66,6 +66,7 @@ fn row(i: u64) -> HefRow {
 fn file(rows: u64, rows_per_granule: usize) -> HefFile {
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -74,9 +75,11 @@ fn file(rows: u64, rows_per_granule: usize) -> HefFile {
         },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: rows_per_granule,

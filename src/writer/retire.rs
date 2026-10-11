@@ -13,15 +13,21 @@
 //!    still reads. It moves `Outdated` files no query can still select to `DeleteOnDestroy`, and deletes the objects
 //!    of `DeleteOnDestroy` files that have waited out the safety window, dropping them from the catalogue.
 //!
+//! Inbox files leave by acknowledgement instead of compaction: open each `Active` inbox file's footer, keep the ones
+//! [`HefFile::fully_acked`](crate::layout::reader::HefFile::fully_acked) confirms, and hand them to
+//! [`retire_acked_inbox_files`], which moves them to `Outdated`; step 3 then deletes them like any replaced file.
+//!
 //! See: hef-file-lifecycle/spec.md
 
 use super::build::{BuiltHef, HefBuildConfig};
+use super::constant::AUDIT_COMPACTION_REFUSED;
 use super::publish::{HefPublisher, MAX_REBASE_ATTEMPTS, PeerNotices, PublishFailure, Published};
 use super::upload::upload_hef;
 use crate::clock::Clock;
 use crate::error::PublishError;
 use crate::events::{SequenceRange, TenantId};
 use crate::invariants::PublishedSet;
+use crate::layout::Profile;
 use crate::lifecycle::{FileType, HefFileEntry, ManifestGeneration, PartState, Retirement};
 use crate::object_store::{ObjectStore, constant::MIN_MULTIPART_PART_BYTES, hef_object_key};
 use hashbrown::HashSet;
@@ -62,7 +68,8 @@ impl HefPublisher {
     /// output covers exactly that range and must pass the same checks as a fresh publication. The output is uploaded
     /// and checked before the generation is written, and peers are told about it once the generation wins. A lost race
     /// rebases and retries; if an input was meanwhile replaced by someone else, the publication is refused and the
-    /// uploaded object is left unreferenced.
+    /// uploaded object is left unreferenced. An audit file is never compacted: an audit input or output is refused
+    /// before anything is uploaded.
     #[expect(
         clippy::too_many_arguments,
         reason = "the compaction publish wires every interface exactly once"
@@ -77,82 +84,224 @@ impl HefPublisher {
         notices: &mut dyn PeerNotices,
         clock: &dyn Clock,
     ) -> Result<Published, PublishFailure> {
+        if built.footer.profile == Profile::Audit {
+            return Err(PublishFailure::Verification(AUDIT_COMPACTION_REFUSED));
+        }
         let (_, head) = published.head().map_err(PublishFailure::Publish)?;
         let coverage = merged_coverage(&head, inputs, config.tenant_id)?;
         self.verify_staged(&built, config, &coverage)?;
-        upload_hef(
-            objects,
-            &hef_object_key(config.tenant_id, built.file_id),
-            &built,
-            MIN_MULTIPART_PART_BYTES,
-        )?;
-        let output = HefFileEntry {
+        publish_in_place_of(
+            built,
+            config,
             coverage,
-            feature_metadata: None,
-            file_seal: built.file_seal,
-            file_id: built.file_id,
-            file_type: FileType::HefFile,
-            footer_len: Some(built.footer_len),
-            optional_feature_flags: built.footer.optional_feature_flags,
-            part_index: 0,
-            part_state: PartState::Active,
-            required_feature_flags: built.footer.required_feature_flags,
-            size_bytes: built.bytes.len() as u64,
-            tenant_id: config.tenant_id,
-            tree_len: built.tree_len,
-        };
-
-        let mut head_id = 0;
-        for _ in 0..=MAX_REBASE_ATTEMPTS {
-            let (current_id, head) = published.head().map_err(PublishFailure::Publish)?;
-            head_id = current_id;
-            if head.files.contains(&output) {
-                // This publication already won: a rival helped this attempt's generation onto the head after it saw
-                // its own head advance fail.
-                return Ok(Published {
-                    entry: output,
-                    file_bytes: built.bytes,
-                    generation: head_id,
-                });
-            }
-            let next_id = head_id + 1;
-            let now = clock.now_nanos();
-            // The file set changes, so any footer mirror of the previous generation no longer covers it.
-            let mut next = ManifestGeneration {
-                footer_mirror: None,
-                generation: next_id,
-                ..head
-            };
-            for input in inputs {
-                let entry = next
-                    .files
-                    .iter_mut()
-                    .find(|entry| entry.file_id == *input && entry.part_state == PartState::Active)
-                    .ok_or(PublishFailure::Verification(
-                        "a compaction input is no longer an active file",
-                    ))?;
-                debug_assert!(entry.part_state.can_transition_to(PartState::Outdated));
-                entry.part_state = PartState::Outdated;
-                next.retirements.push(Retirement {
-                    file_id: *input,
-                    generation: next_id,
-                    since_nanos: now,
-                });
-            }
-            next.files.push(output.clone());
-            if commit(published, head_id, next)? {
-                notices.hef_published(&output);
-                return Ok(Published {
-                    entry: output,
-                    file_bytes: built.bytes,
-                    generation: next_id,
-                });
-            }
-        }
-        Err(PublishFailure::Publish(PublishError::CasLost {
-            current_generation: head_id,
-        }))
+            |_| Ok(inputs.to_vec()),
+            published,
+            objects,
+            notices,
+            clock,
+        )
     }
+
+    /// Publishes `built`, a snapshot file holding one epoch's whole keyed state, as the one `Active` file of
+    /// `published`, in a single new generation that moves the previous epoch's file to `Outdated` so queries already
+    /// reading it can finish. [`sweep_retired_files`] later deletes the replaced file.
+    ///
+    /// `published` is the catalogue of this one snapshot (one per partition, say), holding nothing but its files:
+    /// a snapshot's epoch and sequences number its rows, not journal positions, so it never shares a catalogue with
+    /// event files. The new file must hold a later epoch than every file there. A lost race rebases and retries; if a
+    /// rival meanwhile published the same or a later epoch, the publication is refused and the uploaded object is left
+    /// unreferenced.
+    pub fn publish_snapshot(
+        &mut self,
+        built: BuiltHef,
+        config: &HefBuildConfig,
+        published: &mut dyn PublishedSet,
+        objects: &dyn ObjectStore,
+        notices: &mut dyn PeerNotices,
+        clock: &dyn Clock,
+    ) -> Result<Published, PublishFailure> {
+        if built.footer.profile != Profile::Snapshot {
+            return Err(PublishFailure::Verification("not a snapshot file"));
+        }
+        let coverage = SequenceRange {
+            epoch: built.header.min_epoch,
+            first_sequence: built.header.min_sequence,
+            last_sequence: built.header.max_sequence,
+        };
+        self.verify_staged(&built, config, &coverage)?;
+        let tenant_id = config.tenant_id;
+        let replaced = |head: &ManifestGeneration| {
+            if head
+                .files
+                .iter()
+                .any(|entry| entry.profile != Profile::Snapshot || entry.tenant_id != tenant_id)
+            {
+                return Err(PublishFailure::Verification(
+                    "a snapshot catalogue holds only that snapshot's files",
+                ));
+            }
+            let active: Vec<&HefFileEntry> = head
+                .files
+                .iter()
+                .filter(|entry| entry.part_state == PartState::Active)
+                .collect();
+            if active.iter().any(|entry| entry.coverage.epoch >= coverage.epoch) {
+                return Err(PublishFailure::Verification(
+                    "a snapshot replaces only an earlier epoch",
+                ));
+            }
+            Ok(active.iter().map(|entry| entry.file_id).collect())
+        };
+        publish_in_place_of(built, config, coverage, replaced, published, objects, notices, clock)
+    }
+}
+
+/// Uploads `built` and publishes it as an `Active` file covering `coverage`, in one new generation that also moves
+/// the `Active` files `replaced` names in the head to `Outdated`. A lost race rebases onto the new head and asks
+/// `replaced` again.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the replacing publish wires every interface exactly once"
+)]
+fn publish_in_place_of(
+    built: BuiltHef,
+    config: &HefBuildConfig,
+    coverage: SequenceRange,
+    replaced: impl Fn(&ManifestGeneration) -> Result<Vec<u128>, PublishFailure>,
+    published: &mut dyn PublishedSet,
+    objects: &dyn ObjectStore,
+    notices: &mut dyn PeerNotices,
+    clock: &dyn Clock,
+) -> Result<Published, PublishFailure> {
+    upload_hef(
+        objects,
+        &hef_object_key(config.tenant_id, built.file_id),
+        &built,
+        MIN_MULTIPART_PART_BYTES,
+    )?;
+    let output = HefFileEntry {
+        coverage,
+        feature_metadata: None,
+        file_seal: built.file_seal,
+        file_id: built.file_id,
+        file_type: FileType::HefFile,
+        footer_len: Some(built.footer_len),
+        optional_feature_flags: built.footer.optional_feature_flags,
+        part_index: 0,
+        part_state: PartState::Active,
+        profile: built.footer.profile,
+        required_feature_flags: built.footer.required_feature_flags,
+        size_bytes: built.bytes.len() as u64,
+        tenant_id: config.tenant_id,
+        tree_len: built.tree_len,
+    };
+
+    let mut head_id = 0;
+    for _ in 0..=MAX_REBASE_ATTEMPTS {
+        let (current_id, head) = published.head().map_err(PublishFailure::Publish)?;
+        head_id = current_id;
+        if head.files.contains(&output) {
+            // This publication already won: a rival helped this attempt's generation onto the head after it saw
+            // its own head advance fail.
+            return Ok(Published {
+                entry: output,
+                file_bytes: built.bytes,
+                generation: head_id,
+            });
+        }
+        let inputs = replaced(&head)?;
+        let next_id = head_id + 1;
+        let now = clock.now_nanos();
+        // The file set changes, so any footer mirror of the previous generation no longer covers it.
+        let mut next = ManifestGeneration {
+            footer_mirror: None,
+            generation: next_id,
+            ..head
+        };
+        for input in &inputs {
+            let entry = next
+                .files
+                .iter_mut()
+                .find(|entry| entry.file_id == *input && entry.part_state == PartState::Active)
+                .ok_or(PublishFailure::Verification(
+                    "a compaction input is no longer an active file",
+                ))?;
+            debug_assert!(entry.part_state.can_transition_to(PartState::Outdated));
+            entry.part_state = PartState::Outdated;
+            next.retirements.push(Retirement {
+                file_id: *input,
+                generation: next_id,
+                since_nanos: now,
+            });
+        }
+        next.files.push(output.clone());
+        if commit(published, head_id, next)? {
+            notices.hef_published(&output);
+            return Ok(Published {
+                entry: output,
+                file_bytes: built.bytes,
+                generation: next_id,
+            });
+        }
+    }
+    Err(PublishFailure::Publish(PublishError::CasLost {
+        current_generation: head_id,
+    }))
+}
+
+/// Retires inbox files every recipient has acknowledged in full: publishes one generation in which each file named in
+/// `file_ids` that is still an `Active` inbox file becomes `Outdated`, so new queries stop selecting it and
+/// [`sweep_retired_files`] later deletes it once no query can still be reading it.
+///
+/// Name only files [`HefFile::fully_acked`](crate::layout::reader::HefFile::fully_acked) confirmed. A named file that
+/// is no longer `Active`, or no longer in the catalogue, is skipped, since another call already retired it; a named
+/// file that is not an inbox file is refused. Returns the generation published, or `None` when nothing was left to
+/// retire.
+pub fn retire_acked_inbox_files(
+    published: &mut dyn PublishedSet,
+    file_ids: &[u128],
+    clock: &dyn Clock,
+) -> Result<Option<u64>, PublishFailure> {
+    let mut head_id = 0;
+    for _ in 0..=MAX_REBASE_ATTEMPTS {
+        let (current_id, head) = published.head().map_err(PublishFailure::Publish)?;
+        head_id = current_id;
+        let next_id = head_id + 1;
+        let now = clock.now_nanos();
+        let mut next = ManifestGeneration {
+            footer_mirror: None,
+            generation: next_id,
+            ..head
+        };
+        let mut retired = Vec::new();
+        for entry in next.files.iter_mut().filter(|entry| file_ids.contains(&entry.file_id)) {
+            if entry.profile != Profile::Inbox {
+                return Err(PublishFailure::Verification(
+                    "only inbox files retire by acknowledgement",
+                ));
+            }
+            if entry.part_state != PartState::Active {
+                continue;
+            }
+            debug_assert!(entry.part_state.can_transition_to(PartState::Outdated));
+            entry.part_state = PartState::Outdated;
+            retired.push(Retirement {
+                file_id: entry.file_id,
+                generation: next_id,
+                since_nanos: now,
+            });
+        }
+        if retired.is_empty() {
+            return Ok(None);
+        }
+        next.retirements.extend(retired);
+        if commit(published, head_id, next)? {
+            return Ok(Some(next_id));
+        }
+    }
+    Err(PublishFailure::Publish(PublishError::CasLost {
+        current_generation: head_id,
+    }))
 }
 
 /// Moves replaced files toward deletion, and deletes the ones that have waited long enough, in one new generation.
@@ -274,10 +423,13 @@ fn merged_coverage(
                 .find(|entry| {
                     entry.file_id == *input && entry.tenant_id == tenant_id && entry.part_state == PartState::Active
                 })
-                .map(|entry| entry.coverage)
                 .ok_or(PublishFailure::Verification(
                     "a compaction input is not an active file of this tenant",
                 ))
+                .and_then(|entry| match entry.profile {
+                    Profile::Audit => Err(PublishFailure::Verification(AUDIT_COMPACTION_REFUSED)),
+                    _ => Ok(entry.coverage),
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
     ranges.sort();

@@ -21,7 +21,7 @@ use super::footer::{
     PageStats, PayloadGranule, ResidualCompression, StripeEntry, TextTokenOffsetsEntry, decode_footer,
     decode_marks_page, decode_marks_page_directory, decode_marks_page_extents,
 };
-use super::remote::FileBytes;
+use super::remote::{FileBytes, RemoteFile};
 use super::{EMPTY_VALUE_ROW_OFFSET, HEADER_BLOCK_LEN, HefHeader, decode_header, optional_features, required_features};
 use crate::artifacts::batch::decode_variant_dictionary;
 use crate::columns::column_ids;
@@ -821,6 +821,11 @@ impl HefFooter {
         if header.row_count != opened.footer.exact_counts.row_count {
             return Err(FormatError::Structural {
                 rule: "header row_count must match exact counts",
+            });
+        }
+        if header.profile != opened.footer.profile {
+            return Err(FormatError::Structural {
+                rule: "header profile must match footer profile",
             });
         }
         Ok(opened)
@@ -1864,6 +1869,11 @@ impl HefFile {
             usable_optional_features,
             ..
         } = opened_footer;
+        if header.profile != footer.profile {
+            return Err(FormatError::Structural {
+                rule: "header profile must match footer profile",
+            });
+        }
 
         // The manifest seal authenticates the header, exact segment geometry, stripe checksum leaves, gaps, and footer.
         // It is deliberately verified before reading the large stripes, then each stripe is hashed exactly once against
@@ -2166,7 +2176,7 @@ impl HefFile {
     /// already, and for a lazy open this hashes each stripe the range touches against its footer checksum, the first
     /// time any of its bytes are read. Bytes outside every stripe — the header, the footer, and the alignment gaps —
     /// were verified at open.
-    fn data(&self, position: usize, len: usize, what: &'static str) -> Result<&[u8], FormatError> {
+    pub(super) fn data(&self, position: usize, len: usize, what: &'static str) -> Result<&[u8], FormatError> {
         let file = match &self.bytes {
             FileBytes::Local(file) => file,
             FileBytes::Remote(remote) => return remote.read(position as u64, len, what),
@@ -2188,6 +2198,14 @@ impl HefFile {
             }
         }
         Ok(bytes)
+    }
+
+    /// The remote object this file reads from, or `None` for a file held in memory.
+    pub(super) fn remote(&self) -> Option<&RemoteFile> {
+        match &self.bytes {
+            FileBytes::Local(_) => None,
+            FileBytes::Remote(remote) => Some(remote),
+        }
     }
 
     /// Whether this file frames block presence as tagged side-stream forms. Files written before the
@@ -2232,7 +2250,7 @@ impl HefFile {
     /// Turns a footer-declared offset for `granule_id` into an absolute file position by adding the granule's stripe
     /// base. Offsets come from the untrusted footer, so a sum that overflows refuses as a format error instead of
     /// aborting on the arithmetic; `slice` then bounds the resulting position against the file's actual length.
-    fn file_position(&self, granule_id: u32, offset: u64) -> Result<usize, FormatError> {
+    pub(super) fn file_position(&self, granule_id: u32, offset: u64) -> Result<usize, FormatError> {
         self.stripe_base_for(granule_id)
             .checked_add(offset)
             .and_then(|position| usize::try_from(position).ok())
@@ -3523,6 +3541,40 @@ impl HefFile {
         }
         self.shed_aliased_extents();
         Ok(column)
+    }
+
+    /// The granule row in `from..=to` whose value is `key`, in a string block of `(column_id, granule_id)` that stores
+    /// every one of its `row_count` rows in ascending order. Decodes the block once into the decoded-block cache, so
+    /// repeated lookups into the granule pay only a binary search. Refuses a block that stores only some rows' values.
+    pub(super) fn sorted_string_row(
+        &self,
+        column_id: u32,
+        granule_id: u32,
+        row_count: u32,
+        (from, to): (usize, usize),
+        key: &str,
+    ) -> Result<Option<usize>, FormatError> {
+        let column = self.cached_column(column_id, granule_id)?;
+        let ColumnData::Strings(values) = &column.data else {
+            return Err(FormatError::Structural {
+                rule: "a sorted key column is a string column",
+            });
+        };
+        if values.len() != row_count as usize {
+            return Err(FormatError::Structural {
+                rule: "a sorted key column stores every row's key",
+            });
+        }
+        let end = to.saturating_add(1).min(values.len());
+        let (mut low, mut high) = (from.min(end), end);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            match values.get(middle).flatten() {
+                Some(value) if value < key => low = middle + 1,
+                _ => high = middle,
+            }
+        }
+        Ok((low < end && values.get(low).flatten() == Some(key)).then_some(low))
     }
 
     /// Sizes the decoded-block cache budget, replacing [`DECODED_CACHE_BUDGET_BYTES`]. A caller-supplied working-set

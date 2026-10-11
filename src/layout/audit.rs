@@ -1,0 +1,146 @@
+//! Proves that the rows of an audit file are the ones that were written, in the order they were written, and that a
+//! run of audit files is complete and in order.
+//!
+//! Every audit row has a hash that covers its own contents and the hash of the row before it, its `prev_row_hash`.
+//! Altering, dropping or reordering a row therefore changes the hash of every row after it, and the chain runs on from
+//! one audit file into the next. A file's footer records the chain's two ends ([`AuditTrail`]); the verifier here
+//! recomputes every row's hash from the rows themselves and checks each file starts where the one before it ended.
+//!
+//! A row's hash is `BLAKE3-derive-key(AUDIT_ROW_HASH_CONTEXT, prev_row_hash || row_digest)`, where `row_digest` is
+//! the plain BLAKE3 of a fixed encoding of the row: epoch, sequence, every envelope field in name order, and the
+//! payload in the variant encoding against a dictionary of the payload's own keys.
+//!
+//! See: hef-file-layout/spec.md
+
+use super::constant::AUDIT_ROW_HASH_CONTEXT;
+use super::event::read_u64s;
+use super::footer::AuditTrail;
+use super::reader::{HefFile, PayloadRead};
+use crate::artifacts::batch::encode_variant_dictionary;
+use crate::columns::column_ids;
+use crate::error::{AuditChainError, FormatError};
+use crate::events::EventEnvelope;
+use crate::events::variant::{KeyDictionary, encode_value};
+use crate::file::bytes::Writer;
+use std::collections::BTreeSet;
+
+/// Checks a run of audit files, handed over in manifest order, and returns the hash of the run's last row.
+///
+/// `chain_start` is the `prev_row_hash` the run's first row must carry:
+/// [`AUDIT_GENESIS`](super::constant::AUDIT_GENESIS) when the run starts the trail, or the last row hash of the audit
+/// file just before the run. Each file must start where the one before it ended, so a missing, extra or reordered
+/// file is caught; and every row's hash is recomputed from the row itself, so an altered, dropped or reordered row is
+/// caught. Open each file against its manifest entry's `file_seal` first: the seal is what ties the chain ends in the
+/// footer to the manifest. To check one file on its own, pass it as a one-element slice with its own chain start.
+pub fn verify_audit_files(chain_start: [u8; 32], files: &[HefFile]) -> Result<[u8; 32], AuditChainError> {
+    let mut expected = chain_start;
+    for (file_index, file) in files.iter().enumerate() {
+        let Some(trail) = file.footer().audit else {
+            return Err(AuditChainError::NotAudit { file_index });
+        };
+        if trail.chain_start != expected {
+            return Err(AuditChainError::ChainBreak { file_index });
+        }
+        let recomputed =
+            recomputed_chain_end(file, &trail).map_err(|error| AuditChainError::Format { error, file_index })?;
+        if recomputed != trail.chain_end {
+            return Err(AuditChainError::RowsAltered { file_index });
+        }
+        expected = trail.chain_end;
+    }
+    Ok(expected)
+}
+
+/// The digest of one row's contents, the half of its hash that does not depend on the rows before it. A function of
+/// the row alone, so the writer and a verifier reading the row back out of the file compute the same digest.
+pub(crate) fn row_digest(
+    epoch: u64,
+    sequence: u64,
+    envelope: &EventEnvelope,
+    payload: &PayloadRead,
+) -> Result<[u8; 32], FormatError> {
+    let mut out = Writer::new();
+    out.put_u64(epoch);
+    out.put_u64(sequence);
+    put_optional_text(&mut out, envelope.account_id.as_deref());
+    out.put_u64(envelope.account_id_hash_low);
+    put_optional_text(&mut out, envelope.actor_id.as_deref());
+    out.put_u64(envelope.actor_id_hash_low);
+    out.put_u64(envelope.dedupe_hash_high);
+    out.put_u64(envelope.dedupe_hash_low);
+    put_optional_text(&mut out, envelope.entity_id.as_deref());
+    out.put_u64(envelope.entity_id_hash_high);
+    out.put_u64(envelope.entity_id_hash_low);
+    put_text(&mut out, &envelope.entity_type);
+    out.put_u128(envelope.event_id.uuid().as_u128());
+    put_text(&mut out, &envelope.event_type);
+    out.put_u32(envelope.flags.0);
+    out.put_i64(envelope.ingested_at.physical_nanos());
+    out.put_i64(envelope.occurred_at.physical_nanos());
+    out.put_u32(envelope.schema_version);
+    put_text(&mut out, &envelope.source);
+    out.put_u64(envelope.stream_id.0);
+    out.put_u64(envelope.stream_sequence);
+    out.put_u128(envelope.tenant_id.uuid().as_u128());
+    out.put_u64(envelope.trace_id_hash_low);
+    match payload {
+        PayloadRead::None => out.put_u8(0),
+        PayloadRead::External(reference) => {
+            out.put_u8(1);
+            put_text(&mut out, reference);
+        }
+        PayloadRead::Value(value) => {
+            out.put_u8(2);
+            let mut keys = BTreeSet::new();
+            value.collect_keys(&mut keys);
+            let dictionary = KeyDictionary::build(keys.into_iter().map(str::to_owned));
+            out.put_slice(&encode_variant_dictionary(&dictionary));
+            out.put_slice(&encode_value(value, &dictionary)?);
+        }
+    }
+    Ok(*blake3::hash(out.bytes()).as_bytes())
+}
+
+/// A row's hash, from the hash of the row before it and the digest of its own contents.
+pub(crate) fn row_hash(prev_row_hash: &[u8; 32], row_digest: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(AUDIT_ROW_HASH_CONTEXT);
+    hasher.update(prev_row_hash);
+    hasher.update(row_digest);
+    *hasher.finalize().as_bytes()
+}
+
+/// The hash of `file`'s last row, recomputed from its rows with the first one chained from the trail's start.
+fn recomputed_chain_end(file: &HefFile, trail: &AuditTrail) -> Result<[u8; 32], FormatError> {
+    let mut hash = trail.chain_start;
+    for granule in &file.footer().granules {
+        let rows = granule.row_count as usize;
+        let envelopes = file.granule_envelopes(granule.granule_id)?;
+        let epochs = read_u64s(file, column_ids::EPOCH, granule.granule_id, rows)?;
+        let sequences = read_u64s(file, column_ids::SEQUENCE, granule.granule_id, rows)?;
+        for (ordinal, ((envelope, epoch), sequence)) in
+            (granule.first_row_ordinal..).zip(envelopes.iter().zip(epochs).zip(sequences))
+        {
+            hash = row_hash(&hash, &row_digest(epoch, sequence, envelope, &file.payload(ordinal)?)?);
+        }
+    }
+    Ok(hash)
+}
+
+fn put_text(out: &mut Writer, text: &str) {
+    out.put_u32(text.len() as u32);
+    out.put_slice(text.as_bytes());
+}
+
+fn put_optional_text(out: &mut Writer, text: Option<&str>) {
+    match text {
+        Some(text) => {
+            out.put_u8(1);
+            put_text(out, text);
+        }
+        None => out.put_u8(0),
+    }
+}
+
+#[cfg(test)]
+#[path = "test/audit.rs"]
+mod tests;

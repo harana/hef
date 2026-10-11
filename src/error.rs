@@ -52,6 +52,43 @@ impl From<CodecError> for FormatError {
     }
 }
 
+/// Why a run of audit files failed to prove its rows untouched. `file_index` is the failing file's position in the
+/// run the caller handed in, which is manifest order.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum AuditChainError {
+    /// The file's first row does not chain from the row before it: a file is missing, extra, or out of order.
+    #[error("audit file {file_index} does not continue the chain: a file before it is missing, extra or out of order")]
+    ChainBreak { file_index: usize },
+    #[error("audit file {file_index} could not be read: {error}")]
+    Format { error: FormatError, file_index: usize },
+    /// The file carries no audit trail, so it cannot be part of one.
+    #[error("file {file_index} is not an audit file")]
+    NotAudit { file_index: usize },
+    /// The file's rows do not hash to the chain end its footer records.
+    #[error(
+        "audit file {file_index} rows do not hash to its recorded chain end: a row was altered, dropped or reordered"
+    )]
+    RowsAltered { file_index: usize },
+}
+
+/// Why reading a log object forward stopped before its trailer. A torn tail is what a crash mid-write leaves behind:
+/// every record before it is intact and may be replayed. Corruption means the bytes are damaged, and no record of an
+/// object that should have been complete may be trusted to be the last one.
+///
+/// See: hef-physical-artifacts/spec.md
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum LogReadError {
+    #[error("log object corrupt: {0}")]
+    Corrupt(#[from] FormatError),
+    /// The bytes stop partway through a record or the trailer, or at a record boundary with no trailer: they are a
+    /// strict prefix of a log object. `intact_len` is the byte length of the header plus every intact record, the
+    /// point to truncate a local copy back to before appending again.
+    #[error("log object ends in a torn tail after {intact_records} intact records ({intact_len} bytes)")]
+    TornTail { intact_len: u64, intact_records: u64 },
+}
+
 /// Why an introspection query was refused.
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum IntrospectionError {
@@ -196,4 +233,18 @@ pub enum EntityScanError {
     Format(#[from] FormatError),
     #[error("deletes and corrections store failed: {detail}")]
     Store { detail: String },
+}
+
+/// Why reading a recipient's inbox, or checking whether an inbox file is fully acknowledged, failed: a stored file was
+/// malformed, or the application's store of acknowledgement watermarks or of deletes could not answer.
+///
+/// See: hef-file-lifecycle/spec.md
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum InboxError {
+    #[error(transparent)]
+    Deletes(#[from] EntityScanError),
+    #[error(transparent)]
+    Format(#[from] FormatError),
+    #[error("acknowledgement watermark store failed: {detail}")]
+    Watermarks { detail: String },
 }

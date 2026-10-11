@@ -2,6 +2,7 @@ use super::*;
 
 fn minimal_footer() -> Footer {
     Footer {
+        audit: None,
         clustering: Vec::new(),
         columns: vec![ColumnDescriptor {
             column_id: 0,
@@ -37,6 +38,8 @@ fn minimal_footer() -> Footer {
             row_count: 1,
             stripe_id: 0,
         }],
+        graph: None,
+        inbox_recipients: Vec::new(),
         integrity_gaps: Vec::new(),
         io_alignment_bytes: 0,
         marks: Vec::new(),
@@ -49,11 +52,13 @@ fn minimal_footer() -> Footer {
         page_stats: Vec::new(),
         payload_granules: Vec::new(),
         presence: Vec::new(),
+        profile: crate::layout::Profile::Event,
         reference_filters: None,
         required_feature_flags: 0,
         schema_fingerprint: [0u8; 32],
         shared_dictionaries: Vec::new(),
         shredded: Vec::new(),
+        snapshot_keys: None,
         sparse_keys: Vec::new(),
         stripe_checksums: Vec::new(),
         stripe_proofs: Vec::new(),
@@ -204,6 +209,45 @@ fn external_id_index_and_reference_filters_round_trip_through_encode_decode() {
     let decoded = decode_footer(&encode_footer(&minimal_footer())).expect("footer decodes without error");
     assert_eq!(decoded.reference_filters, None);
     assert!(decoded.external_ids.is_empty());
+}
+
+#[test]
+fn inbox_recipient_directory_round_trips_and_rejects_a_forged_count() {
+    let mut footer = minimal_footer();
+    footer.inbox_recipients = vec![
+        InboxRecipientEntry {
+            entity_id_hash_high: 2,
+            entity_id_hash_low: 1,
+            first_row_ordinal: 0,
+            last_epoch: 1,
+            last_sequence: 9,
+            row_count: 3,
+        },
+        InboxRecipientEntry {
+            entity_id_hash_high: 2,
+            entity_id_hash_low: 5,
+            first_row_ordinal: 3,
+            last_epoch: 2,
+            last_sequence: 4,
+            row_count: 1,
+        },
+    ];
+    let mut bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes without error");
+    assert_eq!(decoded.inbox_recipients, footer.inbox_recipients);
+    let decoded = decode_footer(&encode_footer(&minimal_footer())).expect("footer decodes without error");
+    assert!(decoded.inbox_recipients.is_empty());
+
+    let (entry_start, section_offset, section_len) = find_directory_entry(&bytes, sections::INBOX_RECIPIENTS);
+    bytes[section_offset..section_offset + 4].copy_from_slice(&3u32.to_le_bytes());
+    let section_bytes = bytes[section_offset..section_offset + section_len].to_vec();
+    write_checksum_at(&mut bytes, entry_start, &section_bytes);
+    assert_eq!(
+        decode_footer(&bytes),
+        Err(FormatError::Structural {
+            rule: "inbox recipient count exceeds input"
+        })
+    );
 }
 
 #[test]
@@ -956,4 +1000,177 @@ fn page_directory_bounds_that_are_inverted_are_rejected_by_both_encodings() {
         footer.page_directory = vec![forged];
         assert!(decode_footer(&encode_footer(&footer)).is_err());
     }
+}
+
+#[test]
+fn every_profile_round_trips_through_the_footer() {
+    for profile in [
+        Profile::Audit,
+        Profile::Event,
+        Profile::Graph,
+        Profile::Inbox,
+        Profile::Log,
+        Profile::Snapshot,
+    ] {
+        let mut footer = minimal_footer();
+        footer.profile = profile;
+        assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().profile, profile);
+    }
+}
+
+#[test]
+fn an_event_footer_carries_no_profile_section() {
+    let event = encode_footer(&minimal_footer());
+    let mut graph = minimal_footer();
+    graph.profile = Profile::Graph;
+    let graph = encode_footer(&graph);
+    // One directory entry (52 B) plus the one profile byte: the event footer is byte-identical to one written before
+    // profiles existed.
+    assert_eq!(graph.len(), event.len() + 4 + 8 + 8 + 32 + 1);
+}
+
+#[test]
+fn an_unknown_footer_profile_code_is_a_structural_error() {
+    let mut footer = minimal_footer();
+    footer.profile = Profile::Graph;
+    let mut blob = encode_footer(&footer);
+    // The profile section is the only one-byte section, and the last byte of this footer's section area.
+    let last = blob.len() - 1;
+    assert_eq!(blob[last], Profile::Graph.code());
+    blob[last] = 0xEE;
+    // Re-seal the section checksum so the decoder reaches the profile code instead of failing on the hash.
+    let section_count = u32::from_le_bytes(blob[52..56].try_into().unwrap()) as usize;
+    let directory_end = 56 + section_count * 52;
+    for entry in 0..section_count {
+        let at = 56 + entry * 52;
+        if u32::from_le_bytes(blob[at..at + 4].try_into().unwrap()) == sections::PROFILE {
+            let offset = u64::from_le_bytes(blob[at + 4..at + 12].try_into().unwrap()) as usize;
+            let hash = crate::file::integrity::hash_tree(&blob[directory_end + offset..directory_end + offset + 1]);
+            blob[at + 20..at + 52].copy_from_slice(hash.as_bytes());
+        }
+    }
+    assert_eq!(
+        decode_footer(&blob).unwrap_err(),
+        FormatError::Structural {
+            rule: "unknown profile"
+        }
+    );
+}
+
+fn audit_footer(retention: Option<ObjectLockRetention>, legal_hold: bool) -> Footer {
+    let mut footer = minimal_footer();
+    footer.audit = Some(AuditTrail {
+        chain_end: [7; 32],
+        chain_start: [3; 32],
+        legal_hold,
+        retention,
+    });
+    footer.profile = Profile::Audit;
+    footer.required_feature_flags |= required_features::AUDIT_HASH_CHAIN;
+    footer
+}
+
+fn graph_footer() -> Footer {
+    let mut footer = minimal_footer();
+    footer.profile = Profile::Graph;
+    footer.required_feature_flags |= required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE;
+    footer.graph = Some(GraphDirectory {
+        blocks: vec![GraphBlockEntry {
+            granule_id: 0,
+            len: 300,
+            offset: 4_096,
+        }],
+        first_sn: 77,
+        subject: b"!room:example.org".to_vec(),
+    });
+    footer
+}
+
+#[test]
+fn an_audit_trail_round_trips_through_the_footer() {
+    for (retention, legal_hold) in [
+        (None, false),
+        (None, true),
+        (
+            Some(ObjectLockRetention {
+                mode: RetentionMode::Governance,
+                retain_until: crate::events::TimestampValue::from_physical_nanos(-5),
+            }),
+            false,
+        ),
+        (
+            Some(ObjectLockRetention {
+                mode: RetentionMode::Compliance,
+                retain_until: crate::events::TimestampValue::from_physical_nanos(i64::MAX),
+            }),
+            true,
+        ),
+    ] {
+        let footer = audit_footer(retention, legal_hold);
+        assert_eq!(decode_footer(&encode_footer(&footer)).unwrap(), footer);
+    }
+    assert!(RetentionMode::from_u8(2).is_err());
+    assert_eq!(decode_footer(&encode_footer(&minimal_footer())).unwrap().audit, None);
+}
+
+#[test]
+fn an_audit_section_without_its_feature_or_profile_is_refused() {
+    let refused = Err(FormatError::Structural {
+        rule: "an audit section, the audit_hash_chain feature and the audit profile appear together",
+    });
+    let mut no_bit = audit_footer(None, false);
+    no_bit.required_feature_flags &= !required_features::AUDIT_HASH_CHAIN;
+    assert_eq!(decode_footer(&encode_footer(&no_bit)), refused);
+    let mut wrong_profile = audit_footer(None, false);
+    wrong_profile.profile = Profile::Log;
+    assert_eq!(decode_footer(&encode_footer(&wrong_profile)), refused);
+    let mut no_section = audit_footer(None, false);
+    no_section.audit = None;
+    assert_eq!(decode_footer(&encode_footer(&no_section)), refused);
+}
+
+#[test]
+fn the_graph_edge_directory_round_trips_through_the_footer() {
+    let footer = graph_footer();
+    assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().graph, footer.graph);
+    assert_eq!(decode_footer(&encode_footer(&minimal_footer())).unwrap().graph, None);
+}
+
+#[test]
+fn graph_edges_and_their_feature_bits_come_together_on_a_graph_profile_file() {
+    let mut event_profile = graph_footer();
+    event_profile.profile = Profile::Event;
+    let mut forward_only = graph_footer();
+    forward_only.required_feature_flags &= !required_features::GRAPH_CSR_REVERSE;
+    let mut bits_without_edges = graph_footer();
+    bits_without_edges.graph = None;
+    let mut overflowing = graph_footer();
+    if let Some(graph) = &mut overflowing.graph {
+        graph.first_sn = u64::MAX;
+    }
+    for footer in [event_profile, forward_only, bits_without_edges, overflowing] {
+        assert!(matches!(
+            decode_footer(&encode_footer(&footer)),
+            Err(FormatError::Structural { .. })
+        ));
+    }
+}
+
+#[test]
+fn a_snapshot_key_index_round_trips_only_with_one_first_key_per_granule() {
+    let mut footer = minimal_footer();
+    assert_eq!(footer.granules.len(), 1);
+    footer.snapshot_keys = Some(SnapshotKeyIndex::build(&["a", "b"], &[0]).unwrap());
+    assert_eq!(
+        decode_footer(&encode_footer(&footer)).unwrap().snapshot_keys,
+        footer.snapshot_keys
+    );
+
+    footer.snapshot_keys = Some(SnapshotKeyIndex::build(&["a", "b"], &[0, 1]).unwrap());
+    assert_eq!(
+        decode_footer(&encode_footer(&footer)).unwrap_err(),
+        FormatError::Structural {
+            rule: "snapshot key index must hold one first key per granule"
+        }
+    );
 }

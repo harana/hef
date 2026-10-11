@@ -16,6 +16,7 @@ fn entry(file_id: u128, first_sequence: u64, size_bytes: u64, part_state: PartSt
         optional_feature_flags: 0,
         part_index: 0,
         part_state,
+        profile: Profile::Event,
         required_feature_flags: 0,
         size_bytes,
         tenant_id: TenantId::new_test_id(7),
@@ -262,4 +263,18 @@ fn coverage_index_agrees_with_covers_including_overlapping_entries() {
         },
         TenantId::new_test_id(999)
     ));
+}
+
+#[test]
+fn a_manifest_entry_written_before_profiles_reads_as_an_event_file() {
+    let mut graph = entry(1, 1, 100, PartState::Active);
+    graph.profile = Profile::Graph;
+    let json = serde_json::to_value(&graph).unwrap();
+    assert_eq!(serde_json::from_value::<HefFileEntry>(json.clone()).unwrap(), graph);
+    let mut legacy = json;
+    legacy.as_object_mut().unwrap().remove("profile");
+    assert_eq!(
+        serde_json::from_value::<HefFileEntry>(legacy).unwrap().profile,
+        Profile::Event
+    );
 }

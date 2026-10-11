@@ -27,6 +27,7 @@ fn sealed_file_not_yet_visible() {
         optional_feature_flags: 0,
         part_index: 0,
         part_state: PartState::Sealed,
+        profile: hef::layout::Profile::Event,
         required_feature_flags: 0,
         size_bytes: 4096,
         tenant_id: support::tenant(),

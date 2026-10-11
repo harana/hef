@@ -402,6 +402,7 @@ impl HefPublisher {
             optional_feature_flags: built.footer.optional_feature_flags,
             part_index: 0,
             part_state,
+            profile: built.footer.profile,
             required_feature_flags: built.footer.required_feature_flags,
             size_bytes: built.bytes.len() as u64,
             tenant_id: config.tenant_id,

@@ -115,6 +115,7 @@ fn covering_manifest(segment: &LiveOverlaySegment) -> ManifestGeneration {
             optional_feature_flags: 0,
             part_index: 0,
             part_state: PartState::Active,
+            profile: crate::layout::Profile::Event,
             required_feature_flags: 0,
             size_bytes: 0,
             tenant_id: segment.meta.tenant_id,

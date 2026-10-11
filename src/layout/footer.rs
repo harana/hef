@@ -7,10 +7,12 @@
 //! the feature it backs. Unknown section ids are ignorable extension blocks; whether the *file* is readable is governed
 //! by the required-feature flags in the preamble, which refuse.
 
-use super::required_features;
+use super::snapshot::SnapshotKeyIndex;
+use super::{Profile, required_features};
 use crate::compat::EscapeHatch;
 use crate::encoding::{ColumnData, PipelineId, decode_block, encode_block};
 use crate::error::FormatError;
+use crate::events::TimestampValue;
 use crate::file::bytes::{Reader, Writer, slice};
 use hashbrown::HashMap;
 use std::collections::BTreeMap;
@@ -18,6 +20,9 @@ use std::ops::Range;
 
 /// Section ids. New ids are forward-compatible extension blocks: readers ignore ids they do not know.
 pub mod sections {
+    /// Optional: an audit file's chain ends and retention ([`super::AuditTrail`]). Present exactly when the file
+    /// declares the `AUDIT_HASH_CHAIN` required feature.
+    pub const AUDIT: u32 = 35;
     pub const CLUSTERING_METADATA: u32 = 16;
     pub const COLUMNS: u32 = 1;
     pub const DICTIONARIES: u32 = 5;
@@ -38,6 +43,12 @@ pub mod sections {
     /// `TYPED_COLUMN_ROW_OFFSETS`.
     pub const FREETEXT_ROW_OFFSETS: u32 = 18;
     pub const GRANULES: u32 = 3;
+    /// Optional: a graph-profile file's subject, first sequence number, and the stripe-relative byte range of each
+    /// granule's edge block. Present exactly when the file declares `GRAPH_CSR_FORWARD` and `GRAPH_CSR_REVERSE`.
+    pub const GRAPH_EDGES: u32 = 31;
+    /// Optional: an inbox file's recipient directory, one entry per recipient. Absent in files that do not declare
+    /// `INBOX_RECIPIENT_DIRECTORY`.
+    pub const INBOX_RECIPIENTS: u32 = 36;
     /// Exact commitments for non-stripe byte ranges between the fixed header and footer. These are normally alignment
     /// padding; recording their roots lets a cold reader authenticate the complete segment partition without fetching
     /// padding bytes.
@@ -51,6 +62,9 @@ pub mod sections {
     pub const PAGE_STATS: u32 = 6;
     pub const PAYLOAD_GRANULES: u32 = 8;
     pub const PRESENCE: u32 = 9;
+    /// Optional: the file's one-byte [`super::Profile`] code. Absent in an event file, which reads as
+    /// [`super::Profile::Event`].
+    pub const PROFILE: u32 = 30;
     /// Optional: per-(relationship column, granule) membership filters over the stored references. Present in every
     /// file that carries relationship columns written since the filters existed; absent otherwise, and a reader then
     /// scans every granule.
@@ -59,6 +73,9 @@ pub mod sections {
     /// Optional: one file-scope dictionary alphabet per string column that shares it, under the
     /// `shared_dictionaries` required feature — blocks recording the file dictionary scope resolve their codes here.
     pub const SHARED_DICTIONARIES: u32 = 24;
+    /// Optional: a snapshot file's key index (see [`super::SnapshotKeyIndex`]). Absent in files that do not
+    /// declare `SNAPSHOT_KEY_INDEX`.
+    pub const SNAPSHOT_KEYS: u32 = 34;
     /// Optional: the sparse shredded key set — payload paths stored as sparse columns under the
     /// `sparse_shredded_columns` required feature, bounded per file by the writer's pinned key budget.
     pub const SPARSE_KEYS: u32 = 23;
@@ -246,6 +263,27 @@ pub struct EntityHashFilterEntry {
     pub index_offset: u64,
 }
 
+/// Where a graph-profile file's edges live: whose graph it is, the sequence number of its first row (row `i` is event
+/// `first_sn + i`), and one edge block per granule.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphDirectory {
+    pub blocks: Vec<GraphBlockEntry>,
+    pub first_sn: u64,
+    /// 1 to 255 bytes.
+    pub subject: Vec<u8>,
+}
+
+/// The byte range of one granule's edge block. `offset` is stripe-relative, like every other data-area offset the
+/// footer records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphBlockEntry {
+    pub granule_id: u32,
+    pub len: u64,
+    pub offset: u64,
+}
+
 /// One row's entry in the file's external-id index: a stable hash of the id and the row that carries it. The footer
 /// keeps the entries sorted by `(id_hash, row_ordinal)`, so finding an id is a binary search; two ids can share a
 /// hash, so a reader confirms every hit against the stored id before answering.
@@ -256,6 +294,23 @@ pub struct ExternalIdEntry {
     /// [`stable_hash`](crate::indexes::stable_hash) of the id's bytes.
     pub id_hash: u64,
     pub row_ordinal: u64,
+}
+
+/// One recipient's rows in an inbox file: where they start, how many there are, and the newest queue position among
+/// them. An inbox file stores each recipient's rows side by side, so this is all a reader needs to fetch one
+/// recipient's queue, and all the retirement check needs to tell whether the recipient has acknowledged everything in
+/// the file. The footer keeps the entries sorted by `(entity_id_hash_low, entity_id_hash_high)`, the file's row order.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboxRecipientEntry {
+    pub entity_id_hash_high: u64,
+    pub entity_id_hash_low: u64,
+    pub first_row_ordinal: u64,
+    /// With `last_sequence`, the recipient's newest `(epoch, sequence)` point in this file.
+    pub last_epoch: u64,
+    pub last_sequence: u64,
+    pub row_count: u64,
 }
 
 /// A small filter that says whether one granule might hold a given reference in one relationship column, so a "who
@@ -463,10 +518,76 @@ pub struct ClusteringEntry {
     pub sortedness_proof: Option<SortednessProof>,
 }
 
+/// How strictly an object store must hold an audit file until its retain-until time: the two S3 Object Lock modes.
+/// Stored as an explicit one-byte code, so the variants stay alphabetical.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionMode {
+    /// No one, the account root included, may delete the file or shorten its retention before it lapses.
+    Compliance,
+    /// Only a caller holding the store's bypass permission may delete the file or shorten its retention early.
+    Governance,
+}
+
+impl RetentionMode {
+    /// The byte this mode is stored as.
+    pub fn code(self) -> u8 {
+        match self {
+            RetentionMode::Governance => 0,
+            RetentionMode::Compliance => 1,
+        }
+    }
+
+    /// Reads a mode from its stored byte, or a structural error for a code this reader does not know.
+    pub fn from_u8(value: u8) -> Result<Self, FormatError> {
+        match value {
+            0 => Ok(RetentionMode::Governance),
+            1 => Ok(RetentionMode::Compliance),
+            _ => Err(FormatError::Structural {
+                rule: "unknown retention mode",
+            }),
+        }
+    }
+}
+
+/// How long an object store must keep an audit file unchanged and undeleted: S3 Object Lock's retention mode and
+/// retain-until date.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectLockRetention {
+    pub mode: RetentionMode,
+    pub retain_until: TimestampValue,
+}
+
+/// What an audit file records about its rows' hash chain and how it must be stored.
+///
+/// Each row's hash covers its contents and the hash of the row before it, so altering, dropping or reordering a row
+/// changes every hash after it. The chain runs on across files: a file's first row chains from the previous audit
+/// file's last row. The retention fields are the S3 Object Lock settings the file was written to be stored under; the
+/// application that uploads the file applies them, since the file itself can never change.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditTrail {
+    /// The hash of the file's last row: the `prev_row_hash` the next audit file's first row chains from.
+    pub chain_end: [u8; 32],
+    /// The first row's `prev_row_hash`: the previous audit file's `chain_end`, or
+    /// [`AUDIT_GENESIS`](super::constant::AUDIT_GENESIS) for the first file of a trail.
+    pub chain_start: [u8; 32],
+    /// S3 Object Lock legal hold: keep the file, whatever its retention, until the hold is lifted.
+    pub legal_hold: bool,
+    /// `None` when the file was written with no retention period.
+    pub retention: Option<ObjectLockRetention>,
+}
+
 /// Everything decoded out of a file's footer: its feature flags, the column list, the on-disk directories, the exact
 /// counts, and the payload geometry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Footer {
+    /// Present only in an audit file, which also declares the `AUDIT_HASH_CHAIN` required feature.
+    pub audit: Option<AuditTrail>,
     pub clustering: Vec<ClusteringEntry>,
     pub columns: Vec<ColumnDescriptor>,
     pub dictionaries: FileDictionaries,
@@ -489,6 +610,11 @@ pub struct Footer {
     /// empty in files that read free-text at granule granularity only.
     pub freetext_row_offsets: Vec<FreetextRowOffsets>,
     pub granules: Vec<GranuleEntry>,
+    /// The edge block directory of a graph-profile file that carries edges; `None` otherwise.
+    pub graph: Option<GraphDirectory>,
+    /// An inbox file's recipient directory. Present when `INBOX_RECIPIENT_DIRECTORY` is declared; empty otherwise, and
+    /// a reader then finds a recipient's rows through the entity hash bounds instead.
+    pub inbox_recipients: Vec<InboxRecipientEntry>,
     /// Authenticated commitments for the padding ranges between stripes.
     pub integrity_gaps: Vec<IntegrityGapEntry>,
     /// Byte alignment for column block boundaries, enabling aligned `O_DIRECT` reads of individual pages. Zero means
@@ -517,6 +643,8 @@ pub struct Footer {
     pub page_stats: Vec<PageStats>,
     pub payload_granules: Vec<PayloadGranule>,
     pub presence: Vec<PresenceEntry>,
+    /// Stored only for a non-event profile, so an event footer stays byte-identical to one written before profiles.
+    pub profile: Profile,
     /// Per-(relationship column, granule) reference filters. `None` when the file predates them or carries no
     /// relationship columns, in which case a lookup scans every granule.
     pub reference_filters: Option<Vec<ReferenceFilterEntry>>,
@@ -524,6 +652,9 @@ pub struct Footer {
     pub schema_fingerprint: [u8; 32],
     pub shared_dictionaries: Vec<SharedDictionaryEntry>,
     pub shredded: Vec<ShredEntry>,
+    /// A snapshot file's key index. `None` in every other file, and in a snapshot file that does not declare
+    /// `SNAPSHOT_KEY_INDEX`.
+    pub snapshot_keys: Option<SnapshotKeyIndex>,
     /// Payload paths stored as sparse shredded columns — hot but under the dense promotion threshold — declared here
     /// so the sparse key set is closed per file, exactly as the presence map declares promoted columns. Every entry
     /// also appears in `shredded`, since sparse columns ride the same block machinery.
@@ -1072,6 +1203,21 @@ fn encode_sections(footer: &Footer) -> SectionArea {
         });
     }
 
+    // The inbox recipient directory: optional, emitted only for an inbox file.
+    if !footer.inbox_recipients.is_empty() {
+        sections.push(sections::INBOX_RECIPIENTS, |out| {
+            out.put_u32(footer.inbox_recipients.len() as u32);
+            for entry in &footer.inbox_recipients {
+                out.put_u64(entry.entity_id_hash_low);
+                out.put_u64(entry.entity_id_hash_high);
+                out.put_u64(entry.first_row_ordinal);
+                out.put_u64(entry.row_count);
+                out.put_u64(entry.last_epoch);
+                out.put_u64(entry.last_sequence);
+            }
+        });
+    }
+
     // Reference filters: emitted, possibly empty, whenever the file carries relationship columns, so a reader can
     // tell "no granule holds this kind" from "this file has no filters".
     if let Some(filters) = &footer.reference_filters {
@@ -1112,6 +1258,44 @@ fn encode_sections(footer: &Footer) -> SectionArea {
                 }
             }
         });
+    }
+
+    if footer.profile != Profile::Event {
+        sections.push(sections::PROFILE, |out| out.put_u8(footer.profile.code()));
+    }
+
+    if let Some(audit) = &footer.audit {
+        sections.push(sections::AUDIT, |out| {
+            out.put_slice(&audit.chain_start);
+            out.put_slice(&audit.chain_end);
+            out.put_u8(u8::from(audit.legal_hold));
+            match audit.retention {
+                Some(retention) => {
+                    out.put_u8(1);
+                    out.put_u8(retention.mode.code());
+                    out.put_i64(retention.retain_until.physical_nanos());
+                }
+                None => out.put_u8(0),
+            }
+        });
+    }
+
+    if let Some(graph) = &footer.graph {
+        sections.push(sections::GRAPH_EDGES, |out| {
+            out.put_u8(graph.subject.len() as u8);
+            out.put_slice(&graph.subject);
+            out.put_u64(graph.first_sn);
+            out.put_u32(graph.blocks.len() as u32);
+            for entry in &graph.blocks {
+                out.put_u32(entry.granule_id);
+                out.put_u64(entry.offset);
+                out.put_u64(entry.len);
+            }
+        });
+    }
+
+    if let Some(index) = &footer.snapshot_keys {
+        sections.push(sections::SNAPSHOT_KEYS, |out| out.put_slice(&index.encode()));
     }
 
     // The sparse shredded key set: optional, emitted only when the writer stored sparse columns.
@@ -1176,6 +1360,50 @@ fn decode_section<'a>(
         });
     }
     Ok(Some(bytes))
+}
+
+fn read_hash(reader: &mut Reader<'_>, what: &'static str) -> Result<[u8; 32], FormatError> {
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(reader.take(32, what)?);
+    Ok(hash)
+}
+
+fn decode_audit_trail(bytes: &[u8]) -> Result<AuditTrail, FormatError> {
+    let mut reader = Reader::new(bytes);
+    let chain_start = read_hash(&mut reader, "audit chain start")?;
+    let chain_end = read_hash(&mut reader, "audit chain end")?;
+    let legal_hold = match reader.u8("audit legal hold")? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(FormatError::Structural {
+                rule: "audit legal hold must be 0 or 1",
+            });
+        }
+    };
+    let retention = match reader.u8("audit retention tag")? {
+        0 => None,
+        1 => Some(ObjectLockRetention {
+            mode: RetentionMode::from_u8(reader.u8("audit retention mode")?)?,
+            retain_until: TimestampValue::from_physical_nanos(reader.i64("audit retain until")?),
+        }),
+        _ => {
+            return Err(FormatError::Structural {
+                rule: "footer option tag must be 0 or 1",
+            });
+        }
+    };
+    if reader.remaining() != 0 {
+        return Err(FormatError::Structural {
+            rule: "audit section has trailing bytes",
+        });
+    }
+    Ok(AuditTrail {
+        chain_end,
+        chain_start,
+        legal_hold,
+        retention,
+    })
 }
 
 fn require<'a>(section: Option<&'a [u8]>, rule: &'static str) -> Result<&'a [u8], FormatError> {
@@ -1777,6 +2005,31 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         }
     }
 
+    // The inbox recipient directory: optional. Fixed entry size: six u64s = 48 bytes.
+    let mut inbox_recipients = Vec::new();
+    if let Some(directory_bytes) = decode_section(&directory, section_area, sections::INBOX_RECIPIENTS)? {
+        let mut r = Reader::new(directory_bytes);
+        let count = r.u32("inbox recipient count")? as usize;
+        let count = bounded_count(count, 48, &r, "inbox recipient count exceeds input")?;
+        inbox_recipients = Vec::with_capacity(count);
+        for _ in 0..count {
+            let entity_id_hash_low = r.u64("inbox recipient hash low")?;
+            let entity_id_hash_high = r.u64("inbox recipient hash high")?;
+            let first_row_ordinal = r.u64("inbox recipient first row")?;
+            let row_count = r.u64("inbox recipient row count")?;
+            let last_epoch = r.u64("inbox recipient last epoch")?;
+            let last_sequence = r.u64("inbox recipient last sequence")?;
+            inbox_recipients.push(InboxRecipientEntry {
+                entity_id_hash_high,
+                entity_id_hash_low,
+                first_row_ordinal,
+                last_epoch,
+                last_sequence,
+                row_count,
+            });
+        }
+    }
+
     // Reference filters: optional. Minimum entry size: 4+4 (ids) + 4 (filter length) = 12 bytes.
     let mut reference_filters = None;
     if let Some(filter_bytes) = decode_section(&directory, section_area, sections::REFERENCE_FILTERS)? {
@@ -1875,7 +2128,103 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         }
     }
 
+    let profile = match decode_section(&directory, section_area, sections::PROFILE)? {
+        None => Profile::Event,
+        Some(bytes) => {
+            let mut r = Reader::new(bytes);
+            let profile = Profile::from_u8(r.u8("profile")?)?;
+            if r.remaining() != 0 {
+                return Err(FormatError::Structural {
+                    rule: "profile section has trailing bytes",
+                });
+            }
+            profile
+        }
+    };
+
+    let audit = match decode_section(&directory, section_area, sections::AUDIT)? {
+        None => None,
+        Some(bytes) => Some(decode_audit_trail(bytes)?),
+    };
+    // The section, the required bit and the profile travel together: an audit section in a file that does not declare
+    // itself an audit file, or the bit without the section, is a forgery or a writer bug.
+    if audit.is_some() != (required_feature_flags & required_features::AUDIT_HASH_CHAIN != 0)
+        || (audit.is_some() && profile != Profile::Audit)
+    {
+        return Err(FormatError::Structural {
+            rule: "an audit section, the audit_hash_chain feature and the audit profile appear together",
+        });
+    }
+    // The graph edge directory: optional. Fixed entry size: 4 (granule) + 8+8 (offset/len) = 20 bytes.
+    let graph = match decode_section(&directory, section_area, sections::GRAPH_EDGES)? {
+        None => None,
+        Some(bytes) => {
+            let mut r = Reader::new(bytes);
+            let subject_len = usize::from(r.u8("graph subject length")?);
+            let subject = r.take(subject_len, "graph subject")?.to_vec();
+            let first_sn = r.u64("graph first sequence number")?;
+            let count = r.u32("graph block count")? as usize;
+            let count = bounded_count(count, 20, &r, "graph block count exceeds input")?;
+            let mut blocks = Vec::with_capacity(count);
+            for _ in 0..count {
+                let granule_id = r.u32("graph block granule")?;
+                let offset = r.u64("graph block offset")?;
+                let len = r.u64("graph block length")?;
+                blocks.push(GraphBlockEntry {
+                    granule_id,
+                    len,
+                    offset,
+                });
+            }
+            if r.remaining() != 0 || subject.is_empty() {
+                return Err(FormatError::Structural {
+                    rule: "graph section must name a subject and end with its last block",
+                });
+            }
+            Some(GraphDirectory {
+                blocks,
+                first_sn,
+                subject,
+            })
+        }
+    };
+    let graph_flags = required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE;
+    let declared = required_feature_flags & graph_flags;
+    match &graph {
+        Some(graph) => {
+            if declared != graph_flags || profile != Profile::Graph {
+                return Err(FormatError::Structural {
+                    rule: "graph edges ride only a graph-profile file declaring both edge features",
+                });
+            }
+            if graph.first_sn.checked_add(exact_counts.row_count).is_none() {
+                return Err(FormatError::Structural {
+                    rule: "graph sequence numbers overflow",
+                });
+            }
+        }
+        None if declared != 0 => {
+            return Err(FormatError::Structural {
+                rule: "a file declaring graph edge features must carry the graph section",
+            });
+        }
+        None => {}
+    }
+
+    let snapshot_keys = decode_section(&directory, section_area, sections::SNAPSHOT_KEYS)?
+        .map(SnapshotKeyIndex::decode)
+        .transpose()?;
+    if snapshot_keys
+        .as_ref()
+        .is_some_and(|index| index.granule_first_keys.len() != granules.len())
+    {
+        return Err(FormatError::Structural {
+            rule: "snapshot key index must hold one first key per granule",
+        });
+    }
+
     Ok(Footer {
+        audit,
         clustering,
         columns,
         dictionaries,
@@ -1888,6 +2237,8 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         freetext,
         freetext_row_offsets,
         granules,
+        graph,
+        inbox_recipients,
         integrity_gaps,
         io_alignment_bytes,
         marks,
@@ -1900,11 +2251,13 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         page_stats,
         payload_granules,
         presence,
+        profile,
         reference_filters,
         required_feature_flags,
         schema_fingerprint,
         shared_dictionaries,
         shredded,
+        snapshot_keys,
         sparse_keys,
         stripe_checksums,
         stripe_proofs,

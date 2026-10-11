@@ -292,3 +292,48 @@ pub struct WafMeasurement {
 pub fn waf_gate_passes(m: &WafMeasurement) -> bool {
     m.measured_waf <= m.ceiling
 }
+
+/// The gated ceiling on what a write-ahead log object's header and trailer add on top of its records, in bytes. Log
+/// objects are a few KiB, so their fixed framing must stay a few dozen bytes rather than HEF's 4 KiB header block.
+pub const LOG_OBJECT_FRAMING_CEILING_BYTES: u64 = 32;
+
+/// The gated ceiling on the bytes a verified forward read of a log object hashes before returning its first record:
+/// one 1 MiB chunk group, however large the object.
+pub const LOG_STREAM_FIRST_RECORD_CEILING_BYTES: u64 = 1 << 20;
+
+/// One log object's framing cost and verified forward-read cost, needed to evaluate the log-object gate.
+#[derive(Debug, Clone)]
+pub struct LogObjectMeasurement {
+    /// Bytes checked against the pinned root before the first record was returned.
+    pub first_record_verified_bytes: u64,
+    /// Header plus trailer, excluding every record's own length and checksum.
+    pub framing_bytes: u64,
+    pub object_bytes: u64,
+    /// Bytes checked against the pinned root by the time every record had been read.
+    pub verified_bytes: u64,
+}
+
+/// Returns `true` when a log object's framing is within its ceiling and a verified forward read streams it: the first
+/// record arrives within one chunk group of hashing, and a full read hashes no more bytes than the object holds.
+pub fn log_object_gate_passes(m: &LogObjectMeasurement) -> bool {
+    m.framing_bytes <= LOG_OBJECT_FRAMING_CEILING_BYTES
+        && m.first_record_verified_bytes <= LOG_STREAM_FIRST_RECORD_CEILING_BYTES
+        && m.verified_bytes <= m.object_bytes
+}
+
+/// The gated ceiling on stored graph bytes per edge, forward and reverse copies together.
+pub const GRAPH_EDGE_BYTES_TARGET: f64 = 6.0;
+
+/// The edge blocks of a graph measured against the edges they describe, needed to evaluate the graph edge size gate.
+#[derive(Debug, Clone)]
+pub struct GraphEdgeBytesMeasurement {
+    /// Each parent link counted once, though it is stored forward and reverse.
+    pub edges: u64,
+    pub stored_bytes: u64,
+}
+
+/// Returns `true` when a graph's edge blocks stay within `GRAPH_EDGE_BYTES_TARGET` bytes per edge. A graph with no
+/// edges passes only when it stores nothing.
+pub fn graph_edge_bytes_gate_passes(m: &GraphEdgeBytesMeasurement) -> bool {
+    m.stored_bytes as f64 <= m.edges as f64 * GRAPH_EDGE_BYTES_TARGET
+}

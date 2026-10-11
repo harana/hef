@@ -21,6 +21,7 @@ fn spanning_header(min_epoch: u64, max_epoch: u64, min_sequence: u64, max_sequen
         min_ingested_at_physical: 0,
         min_occurred_at_physical: 0,
         min_sequence,
+        profile: crate::layout::Profile::Event,
         projection_count: 1,
         row_count: 1,
         tenant_id: TenantId::new_test_id(1),
@@ -210,4 +211,71 @@ fn presence_frame_decoding_follows_the_declared_feature() {
     let compressed_bytes = compressed.into_bytes();
     let decoded = super::decode_presence_frame(&mut Reader::new(&compressed_bytes), 10, true).unwrap();
     assert_eq!(decoded, bitmap);
+}
+
+const PROFILES: [Profile; 6] = [
+    Profile::Audit,
+    Profile::Event,
+    Profile::Graph,
+    Profile::Inbox,
+    Profile::Log,
+    Profile::Snapshot,
+];
+
+fn header_len_word(block: &[u8]) -> usize {
+    u32::from_le_bytes(block[8..12].try_into().unwrap()) as usize
+}
+
+#[test]
+fn every_profile_round_trips_through_the_header() {
+    for profile in PROFILES {
+        let mut header = spanning_header(1, 1, 1, 10);
+        header.profile = profile;
+        assert_eq!(decode_header(&encode_header(&header)).unwrap(), header);
+        assert_eq!(Profile::from_u8(profile.code()).unwrap(), profile);
+    }
+}
+
+#[test]
+fn profile_codes_are_explicit_and_distinct() {
+    let codes: Vec<u8> = PROFILES.iter().map(|profile| profile.code()).collect();
+    assert_eq!(codes, vec![3, 0, 1, 5, 4, 2]);
+}
+
+#[test]
+fn an_event_header_keeps_the_original_layout_and_other_profiles_do_not() {
+    let event = encode_header(&spanning_header(1, 1, 1, 10));
+    assert_eq!(header_len_word(&event), HEADER_FIXED_LEN);
+    let mut graph = spanning_header(1, 1, 1, 10);
+    graph.profile = Profile::Graph;
+    // A reader from before profiles requires exactly `HEADER_FIXED_LEN` and so refuses a graph header.
+    assert_eq!(header_len_word(&encode_header(&graph)), PROFILED_HEADER_FIXED_LEN);
+}
+
+#[test]
+fn an_unknown_header_profile_code_is_a_structural_error() {
+    let mut header = spanning_header(1, 1, 1, 10);
+    header.profile = Profile::Graph;
+    let mut block = encode_header(&header);
+    let profile_at = PROFILED_HEADER_FIXED_LEN - 8 - 32 - 1;
+    assert_eq!(block[profile_at], Profile::Graph.code());
+    block[profile_at] = 0xEE;
+    let crc = crate::file::integrity::crc64_nvme(&block[..profile_at + 1]);
+    block[profile_at + 1..profile_at + 9].copy_from_slice(&crc.to_le_bytes());
+    let digest = blake3::hash(&block[..profile_at + 9]);
+    block[profile_at + 9..profile_at + 41].copy_from_slice(digest.as_bytes());
+    assert_eq!(
+        decode_header(&block).unwrap_err(),
+        FormatError::Structural {
+            rule: "unknown profile"
+        }
+    );
+    assert!(Profile::from_u8(6).is_err());
+}
+
+#[test]
+fn graph_bits_are_known_but_not_declared_by_every_file() {
+    assert_eq!(required_features::GRAPH & required_features::ALL, 0);
+    assert_eq!(required_features::GRAPH & !required_features::KNOWN, 0);
+    assert_eq!(required_features::GRAPH, ((1 << 29) - 1) & !((1 << 23) - 1));
 }

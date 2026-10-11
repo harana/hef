@@ -21,6 +21,7 @@ fn granule(id: u32, first_seq: u64, last_seq: u64, min_occ: i64, max_occ: i64) -
 
 fn footer_with(granules: Vec<GranuleEntry>, row_count: u64) -> Footer {
     Footer {
+        audit: None,
         clustering: Vec::new(),
         columns: vec![ColumnDescriptor {
             column_id: 0,
@@ -42,6 +43,8 @@ fn footer_with(granules: Vec<GranuleEntry>, row_count: u64) -> Footer {
         freetext: Vec::new(),
         freetext_row_offsets: Vec::new(),
         granules,
+        graph: None,
+        inbox_recipients: Vec::new(),
         integrity_gaps: Vec::new(),
         io_alignment_bytes: 0,
         marks: Vec::new(),
@@ -54,11 +57,13 @@ fn footer_with(granules: Vec<GranuleEntry>, row_count: u64) -> Footer {
         page_stats: Vec::new(),
         payload_granules: Vec::new(),
         presence: Vec::new(),
+        profile: crate::layout::Profile::Event,
         reference_filters: None,
         required_feature_flags: 0,
         schema_fingerprint: [7u8; 32],
         shared_dictionaries: Vec::new(),
         shredded: Vec::new(),
+        snapshot_keys: None,
         sparse_keys: Vec::new(),
         stripe_checksums: Vec::new(),
         stripe_proofs: Vec::new(),
