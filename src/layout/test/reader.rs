@@ -67,6 +67,7 @@ fn minimal_footer(mark: ColumnMark) -> Footer {
             row_count: mark.row_count,
             stripe_id: 0,
         }],
+        inbox_recipients: Vec::new(),
         integrity_gaps: Vec::new(),
         io_alignment_bytes: 0,
         marks: vec![mark],

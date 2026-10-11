@@ -13,6 +13,10 @@
 //!    still reads. It moves `Outdated` files no query can still select to `DeleteOnDestroy`, and deletes the objects
 //!    of `DeleteOnDestroy` files that have waited out the safety window, dropping them from the catalogue.
 //!
+//! Inbox files leave by acknowledgement instead of compaction: open each `Active` inbox file's footer, keep the ones
+//! [`HefFile::fully_acked`](crate::layout::reader::HefFile::fully_acked) confirms, and hand them to
+//! [`retire_acked_inbox_files`], which moves them to `Outdated`; step 3 then deletes them like any replaced file.
+//!
 //! See: hef-file-lifecycle/spec.md
 
 use super::build::{BuiltHef, HefBuildConfig};
@@ -22,6 +26,7 @@ use crate::clock::Clock;
 use crate::error::PublishError;
 use crate::events::{SequenceRange, TenantId};
 use crate::invariants::PublishedSet;
+use crate::layout::Profile;
 use crate::lifecycle::{FileType, HefFileEntry, ManifestGeneration, PartState, Retirement};
 use crate::object_store::{ObjectStore, constant::MIN_MULTIPART_PART_BYTES, hef_object_key};
 use hashbrown::HashSet;
@@ -154,6 +159,61 @@ impl HefPublisher {
             current_generation: head_id,
         }))
     }
+}
+
+/// Retires inbox files every recipient has acknowledged in full: publishes one generation in which each file named in
+/// `file_ids` that is still an `Active` inbox file becomes `Outdated`, so new queries stop selecting it and
+/// [`sweep_retired_files`] later deletes it once no query can still be reading it.
+///
+/// Name only files [`HefFile::fully_acked`](crate::layout::reader::HefFile::fully_acked) confirmed. A named file that
+/// is no longer `Active`, or no longer in the catalogue, is skipped, since another call already retired it; a named
+/// file that is not an inbox file is refused. Returns the generation published, or `None` when nothing was left to
+/// retire.
+pub fn retire_acked_inbox_files(
+    published: &mut dyn PublishedSet,
+    file_ids: &[u128],
+    clock: &dyn Clock,
+) -> Result<Option<u64>, PublishFailure> {
+    let mut head_id = 0;
+    for _ in 0..=MAX_REBASE_ATTEMPTS {
+        let (current_id, head) = published.head().map_err(PublishFailure::Publish)?;
+        head_id = current_id;
+        let next_id = head_id + 1;
+        let now = clock.now_nanos();
+        let mut next = ManifestGeneration {
+            footer_mirror: None,
+            generation: next_id,
+            ..head
+        };
+        let mut retired = Vec::new();
+        for entry in next.files.iter_mut().filter(|entry| file_ids.contains(&entry.file_id)) {
+            if entry.profile != Profile::Inbox {
+                return Err(PublishFailure::Verification(
+                    "only inbox files retire by acknowledgement",
+                ));
+            }
+            if entry.part_state != PartState::Active {
+                continue;
+            }
+            debug_assert!(entry.part_state.can_transition_to(PartState::Outdated));
+            entry.part_state = PartState::Outdated;
+            retired.push(Retirement {
+                file_id: entry.file_id,
+                generation: next_id,
+                since_nanos: now,
+            });
+        }
+        if retired.is_empty() {
+            return Ok(None);
+        }
+        next.retirements.extend(retired);
+        if commit(published, head_id, next)? {
+            return Ok(Some(next_id));
+        }
+    }
+    Err(PublishFailure::Publish(PublishError::CasLost {
+        current_generation: head_id,
+    }))
 }
 
 /// Moves replaced files toward deletion, and deletes the ones that have waited long enough, in one new generation.

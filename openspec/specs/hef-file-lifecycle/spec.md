@@ -43,3 +43,13 @@ A compaction SHALL publish its output and retire its inputs in one manifest gene
 - **WHEN** the sweeper runs while a query still reads a generation in which the replaced files were Active
 - **THEN** it moves nothing and deletes nothing, however long that query has run
 
+### Requirement: Inbox files retire once every recipient acknowledges them
+An `Active` inbox file SHALL become retireable once every recipient in its recipient directory has an acknowledgement watermark at or after its newest point in the file; a file without a directory SHALL NOT be retired this way. Retirement SHALL reuse the compaction lifecycle: the application checks the files, and one manifest generation moves each fully acknowledged file `Active -> Outdated` with a retirement record (generation and time read through the clock), after which the sweeper moves and deletes it exactly as it does a compaction input. Retiring a file that is no longer `Active` SHALL be a no-op, and naming a file that is not an inbox file SHALL be refused.
+
+#### Scenario: Retired after all recipients acknowledge
+- **WHEN** some but not all recipients of an inbox file have acknowledged their newest row in it
+- **THEN** the file is not fully acknowledged, and once the last recipient acknowledges it is, retirement moves it to Outdated, and the sweeper later deletes its object
+
+#### Scenario: Only inbox files retire by acknowledgement
+- **WHEN** retirement by acknowledgement names a file whose profile is not `inbox`
+- **THEN** the publication is refused and no generation is written

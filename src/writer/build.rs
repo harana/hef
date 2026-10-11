@@ -35,10 +35,10 @@ use crate::invariants::EncodeExecutor;
 use crate::invariants::sim::SerialEncodeExecutor;
 use crate::layout::footer::{
     ClusteringEntry, ColumnDescriptor, ColumnKind, ColumnMark, EntityHashFilterEntry, ExactCounts, FileDictionaries,
-    Footer, FreetextEntry, FreetextRowOffsets, GranuleEntry, MarksPageEntry, PageDirectoryEntry, PageMinMax, PageStats,
-    PayloadGranule, PresenceEntry, ResidualCompression, SharedDictionaryEntry, ShredEntry, SortDirection,
-    SortednessProof, StripeEntry, StripeNdvEntry, StripeProofEntry, TextTokenEntry, TextTokenOffsetsEntry,
-    encode_stripe_marks_pages,
+    Footer, FreetextEntry, FreetextRowOffsets, GranuleEntry, InboxRecipientEntry, MarksPageEntry, PageDirectoryEntry,
+    PageMinMax, PageStats, PayloadGranule, PresenceEntry, ResidualCompression, SharedDictionaryEntry, ShredEntry,
+    SortDirection, SortednessProof, StripeEntry, StripeNdvEntry, StripeProofEntry, TextTokenEntry,
+    TextTokenOffsetsEntry, encode_stripe_marks_pages,
 };
 use crate::layout::reader::{HefFile, PayloadRead};
 use crate::layout::{
@@ -2551,6 +2551,35 @@ fn check_rows(
     Ok(rows.first().map(|row| order.key(row)).zip(previous))
 }
 
+/// An inbox file's recipient directory: one entry per run of rows sharing an entity hash, with the run's first row,
+/// length, and last `(epoch, sequence)` point. `rows` are in the entity order, so each recipient is one run and its
+/// last row is its newest.
+fn inbox_recipient_directory(rows: &[BuildRow]) -> Vec<InboxRecipientEntry> {
+    let mut directory: Vec<InboxRecipientEntry> = Vec::new();
+    for (ordinal, row) in rows.iter().enumerate() {
+        let envelope = &row.envelope;
+        match directory.last_mut() {
+            Some(entry)
+                if entry.entity_id_hash_low == envelope.entity_id_hash_low
+                    && entry.entity_id_hash_high == envelope.entity_id_hash_high =>
+            {
+                entry.last_epoch = row.epoch;
+                entry.last_sequence = row.sequence;
+                entry.row_count += 1;
+            }
+            _ => directory.push(InboxRecipientEntry {
+                entity_id_hash_high: envelope.entity_id_hash_high,
+                entity_id_hash_low: envelope.entity_id_hash_low,
+                first_row_ordinal: ordinal as u64,
+                last_epoch: row.epoch,
+                last_sequence: row.sequence,
+                row_count: 1,
+            }),
+        }
+    }
+    directory
+}
+
 /// Abandons a sparse update whose rebuilt granules no longer reproduce the source's granule or stripe geometry and
 /// builds the file the ordinary way from every row, exactly as an update without a sparse plan would. Only a build
 /// holding every row can; one holding only the touched granules' rows has nothing to fall back to.
@@ -2651,14 +2680,22 @@ pub fn build_hef_file_streamed_profiled<R: BuildInput>(
 }
 
 fn build_hef_file_sealed(
-    rows: Vec<BuildRow>,
+    mut rows: Vec<BuildRow>,
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
     sink: Option<&mut dyn FnMut(u64, Vec<u8>)>,
     profile: Option<&mut BuildProfile>,
     update_reuse: Option<&UpdateReuse<'_>>,
 ) -> Result<BuiltHef, FormatError> {
-    build_hef_file_sealed_in_order(rows, config, encode, sink, profile, update_reuse, RowOrder::Sequence)
+    // An inbox file stores each recipient's rows side by side, in queue order, so one recipient's queue reads from a
+    // few neighbouring granules: its rows are sorted into the entity order whatever order they arrive in.
+    let order = if config.profile == Profile::Inbox {
+        rows.par_sort_unstable_by_key(|row| RowOrder::Entity.key(row));
+        RowOrder::Entity
+    } else {
+        RowOrder::Sequence
+    };
+    build_hef_file_sealed_in_order(rows, config, encode, sink, profile, update_reuse, order)
 }
 
 /// Builds one file from rows already sorted in `order`: the primary `(epoch, sequence)` order, or the entity order
@@ -2735,6 +2772,16 @@ fn build_hef_file_sealed_in_order(
         }
         previous = Some(last);
     }
+    let inbox_recipients = if config.profile == Profile::Inbox {
+        if order != RowOrder::Entity || sparse.is_some_and(|plan| !plan.rows_cover_file) {
+            return Err(FormatError::Structural {
+                rule: "an inbox file is built from all of its rows in recipient order",
+            });
+        }
+        inbox_recipient_directory(&rows)
+    } else {
+        Vec::new()
+    };
     // The rows of each source granule as this build holds them: every granule's for a build over the whole file,
     // only the built granules' — the rest empty — for one handed just those.
     let sparse_ranges: Option<Vec<(usize, usize)>> = sparse.zip(source).map(|(plan, source)| {
@@ -4887,6 +4934,9 @@ fn build_hef_file_sealed_in_order(
     if !entity_hash_filters.is_empty() {
         optional_flags |= optional_features::ENTITY_HASH_POINT_FILTERS;
     }
+    if !inbox_recipients.is_empty() {
+        optional_flags |= optional_features::INBOX_RECIPIENT_DIRECTORY;
+    }
 
     // Schema fingerprint over the column directory.
     let mut schema_hash = blake3::Hasher::new();
@@ -4920,6 +4970,7 @@ fn build_hef_file_sealed_in_order(
         freetext: freetext_entries,
         freetext_row_offsets,
         granules: granules.iter().map(|granule| granule.entry).collect(),
+        inbox_recipients,
         integrity_gaps,
         // The real applied alignment: the IO granularity the caller declared (and the writer padded every block to),
         // or zero when none was requested — in which case readers fall back to unaligned reads.

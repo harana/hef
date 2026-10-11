@@ -42,6 +42,7 @@ fn footer_with(granules: Vec<GranuleEntry>, row_count: u64) -> Footer {
         freetext: Vec::new(),
         freetext_row_offsets: Vec::new(),
         granules,
+        inbox_recipients: Vec::new(),
         integrity_gaps: Vec::new(),
         io_alignment_bytes: 0,
         marks: Vec::new(),
