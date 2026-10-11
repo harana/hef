@@ -131,6 +131,7 @@ pub fn small_targets() -> LayoutTargets {
 pub fn build_config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 42,
         footer_dek: None,
         footer_encryption: hef::security::FooterEncryption::Plaintext,

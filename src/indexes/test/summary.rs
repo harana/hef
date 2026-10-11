@@ -21,6 +21,7 @@ fn granule(id: u32, first_seq: u64, last_seq: u64, min_occ: i64, max_occ: i64) -
 
 fn footer_with(granules: Vec<GranuleEntry>, row_count: u64) -> Footer {
     Footer {
+        audit: None,
         clustering: Vec::new(),
         columns: vec![ColumnDescriptor {
             column_id: 0,

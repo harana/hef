@@ -38,6 +38,7 @@ fn minimal_header() -> HefHeader {
 
 fn minimal_footer(mark: ColumnMark) -> Footer {
     Footer {
+        audit: None,
         clustering: Vec::new(),
         columns: Vec::new(),
         dictionaries: Default::default(),
@@ -519,6 +520,7 @@ fn freetext_point_lookup_matches_whole_granule_decode_and_falls_back_identically
         .collect();
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -588,6 +590,7 @@ fn payload_path_and_payload_agree_on_a_freetext_declared_field() {
         .collect();
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -637,6 +640,7 @@ fn payload_path_and_payload_agree_on_a_freetext_declared_field() {
 fn freetext_config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -832,6 +836,7 @@ fn cold_scan_never_initializes_the_search_cache_a_point_lookup_pays_for() {
     let rows: Vec<_> = (0..20).map(|i| freetext_row(i, Some("free text body"))).collect();
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -882,6 +887,7 @@ fn cold_scan_never_initializes_the_search_cache_a_point_lookup_pays_for() {
 fn small_stripe_config(stripe_target_bytes: usize) -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -2005,6 +2011,7 @@ fn relationship_lookups_filter_threads_and_resolve_references() {
         .collect();
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -2090,6 +2097,7 @@ fn link_lookups_match_whole_references_only() {
         .collect();
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,

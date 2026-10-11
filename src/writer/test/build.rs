@@ -379,6 +379,7 @@ fn benchmark_string_paths_against_stable_field_ids() {
 fn config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 42,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,

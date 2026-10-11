@@ -234,6 +234,7 @@ fn built_file() -> BuiltHef {
     let rows: Vec<HefRow> = (0..40).map(built_file_row).collect();
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,

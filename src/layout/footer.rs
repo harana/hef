@@ -11,6 +11,7 @@ use super::{Profile, required_features};
 use crate::compat::EscapeHatch;
 use crate::encoding::{ColumnData, PipelineId, decode_block, encode_block};
 use crate::error::FormatError;
+use crate::events::TimestampValue;
 use crate::file::bytes::{Reader, Writer, slice};
 use hashbrown::HashMap;
 use std::collections::BTreeMap;
@@ -18,6 +19,9 @@ use std::ops::Range;
 
 /// Section ids. New ids are forward-compatible extension blocks: readers ignore ids they do not know.
 pub mod sections {
+    /// Optional: an audit file's chain ends and retention ([`super::AuditTrail`]). Present exactly when the file
+    /// declares the `AUDIT_HASH_CHAIN` required feature.
+    pub const AUDIT: u32 = 35;
     pub const CLUSTERING_METADATA: u32 = 16;
     pub const COLUMNS: u32 = 1;
     pub const DICTIONARIES: u32 = 5;
@@ -486,10 +490,76 @@ pub struct ClusteringEntry {
     pub sortedness_proof: Option<SortednessProof>,
 }
 
+/// How strictly an object store must hold an audit file until its retain-until time: the two S3 Object Lock modes.
+/// Stored as an explicit one-byte code, so the variants stay alphabetical.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionMode {
+    /// No one, the account root included, may delete the file or shorten its retention before it lapses.
+    Compliance,
+    /// Only a caller holding the store's bypass permission may delete the file or shorten its retention early.
+    Governance,
+}
+
+impl RetentionMode {
+    /// The byte this mode is stored as.
+    pub fn code(self) -> u8 {
+        match self {
+            RetentionMode::Governance => 0,
+            RetentionMode::Compliance => 1,
+        }
+    }
+
+    /// Reads a mode from its stored byte, or a structural error for a code this reader does not know.
+    pub fn from_u8(value: u8) -> Result<Self, FormatError> {
+        match value {
+            0 => Ok(RetentionMode::Governance),
+            1 => Ok(RetentionMode::Compliance),
+            _ => Err(FormatError::Structural {
+                rule: "unknown retention mode",
+            }),
+        }
+    }
+}
+
+/// How long an object store must keep an audit file unchanged and undeleted: S3 Object Lock's retention mode and
+/// retain-until date.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectLockRetention {
+    pub mode: RetentionMode,
+    pub retain_until: TimestampValue,
+}
+
+/// What an audit file records about its rows' hash chain and how it must be stored.
+///
+/// Each row's hash covers its contents and the hash of the row before it, so altering, dropping or reordering a row
+/// changes every hash after it. The chain runs on across files: a file's first row chains from the previous audit
+/// file's last row. The retention fields are the S3 Object Lock settings the file was written to be stored under; the
+/// application that uploads the file applies them, since the file itself can never change.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditTrail {
+    /// The hash of the file's last row: the `prev_row_hash` the next audit file's first row chains from.
+    pub chain_end: [u8; 32],
+    /// The first row's `prev_row_hash`: the previous audit file's `chain_end`, or
+    /// [`AUDIT_GENESIS`](super::constant::AUDIT_GENESIS) for the first file of a trail.
+    pub chain_start: [u8; 32],
+    /// S3 Object Lock legal hold: keep the file, whatever its retention, until the hold is lifted.
+    pub legal_hold: bool,
+    /// `None` when the file was written with no retention period.
+    pub retention: Option<ObjectLockRetention>,
+}
+
 /// Everything decoded out of a file's footer: its feature flags, the column list, the on-disk directories, the exact
 /// counts, and the payload geometry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Footer {
+    /// Present only in an audit file, which also declares the `AUDIT_HASH_CHAIN` required feature.
+    pub audit: Option<AuditTrail>,
     pub clustering: Vec<ClusteringEntry>,
     pub columns: Vec<ColumnDescriptor>,
     pub dictionaries: FileDictionaries,
@@ -1161,6 +1231,22 @@ fn encode_sections(footer: &Footer) -> SectionArea {
         sections.push(sections::PROFILE, |out| out.put_u8(footer.profile.code()));
     }
 
+    if let Some(audit) = &footer.audit {
+        sections.push(sections::AUDIT, |out| {
+            out.put_slice(&audit.chain_start);
+            out.put_slice(&audit.chain_end);
+            out.put_u8(u8::from(audit.legal_hold));
+            match audit.retention {
+                Some(retention) => {
+                    out.put_u8(1);
+                    out.put_u8(retention.mode.code());
+                    out.put_i64(retention.retain_until.physical_nanos());
+                }
+                None => out.put_u8(0),
+            }
+        });
+    }
+
     // The sparse shredded key set: optional, emitted only when the writer stored sparse columns.
     if !footer.sparse_keys.is_empty() {
         sections.push(sections::SPARSE_KEYS, |out| {
@@ -1223,6 +1309,50 @@ fn decode_section<'a>(
         });
     }
     Ok(Some(bytes))
+}
+
+fn read_hash(reader: &mut Reader<'_>, what: &'static str) -> Result<[u8; 32], FormatError> {
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(reader.take(32, what)?);
+    Ok(hash)
+}
+
+fn decode_audit_trail(bytes: &[u8]) -> Result<AuditTrail, FormatError> {
+    let mut reader = Reader::new(bytes);
+    let chain_start = read_hash(&mut reader, "audit chain start")?;
+    let chain_end = read_hash(&mut reader, "audit chain end")?;
+    let legal_hold = match reader.u8("audit legal hold")? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(FormatError::Structural {
+                rule: "audit legal hold must be 0 or 1",
+            });
+        }
+    };
+    let retention = match reader.u8("audit retention tag")? {
+        0 => None,
+        1 => Some(ObjectLockRetention {
+            mode: RetentionMode::from_u8(reader.u8("audit retention mode")?)?,
+            retain_until: TimestampValue::from_physical_nanos(reader.i64("audit retain until")?),
+        }),
+        _ => {
+            return Err(FormatError::Structural {
+                rule: "footer option tag must be 0 or 1",
+            });
+        }
+    };
+    if reader.remaining() != 0 {
+        return Err(FormatError::Structural {
+            rule: "audit section has trailing bytes",
+        });
+    }
+    Ok(AuditTrail {
+        chain_end,
+        chain_start,
+        legal_hold,
+        retention,
+    })
 }
 
 fn require<'a>(section: Option<&'a [u8]>, rule: &'static str) -> Result<&'a [u8], FormatError> {
@@ -1961,7 +2091,22 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         }
     };
 
+    let audit = match decode_section(&directory, section_area, sections::AUDIT)? {
+        None => None,
+        Some(bytes) => Some(decode_audit_trail(bytes)?),
+    };
+    // The section, the required bit and the profile travel together: an audit section in a file that does not declare
+    // itself an audit file, or the bit without the section, is a forgery or a writer bug.
+    if audit.is_some() != (required_feature_flags & required_features::AUDIT_HASH_CHAIN != 0)
+        || (audit.is_some() && profile != Profile::Audit)
+    {
+        return Err(FormatError::Structural {
+            rule: "an audit section, the audit_hash_chain feature and the audit profile appear together",
+        });
+    }
+
     Ok(Footer {
+        audit,
         clustering,
         columns,
         dictionaries,

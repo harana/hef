@@ -53,6 +53,7 @@ fn event(i: u64) -> EventInput {
 fn build_config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 1,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,

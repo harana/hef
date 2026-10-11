@@ -79,6 +79,7 @@ fn rows() -> Vec<HefRow> {
 fn build(profile: Profile) -> HefFile {
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: FooterEncryption::Plaintext,

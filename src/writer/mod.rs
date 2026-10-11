@@ -4,6 +4,7 @@
 //! building and publishing the file, and the policy that decides when to roll to a new file. This runs only on the
 //! leader (behind the `write` feature) and is not reachable from a read-only binary.
 
+pub mod audit;
 pub mod build;
 pub mod compaction;
 pub mod constant;

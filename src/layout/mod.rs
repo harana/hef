@@ -12,6 +12,7 @@ use constant::HEF_MAGIC;
 use std::borrow::Cow;
 use uuid::Uuid;
 
+pub mod audit;
 pub mod cache;
 pub mod clustering;
 pub mod constant;
@@ -530,14 +531,21 @@ pub mod required_features {
         | GRAPH_CHAIN_COVER
         | GRAPH_STATE_ROOTS;
 
+    /// The file is an audit file: every row is chained to the one before it by hash, the footer carries the chain's
+    /// ends and the file's retention, and the file must never be rewritten. Required and refusing on purpose: a
+    /// reader or compactor that predates it would treat the file as plain events, and a rewrite by one would drop the
+    /// chain and the retention without noticing. Remote readers never see the header's profile byte, so this bit is
+    /// what stops them.
+    pub const AUDIT_HASH_CHAIN: u64 = 1 << 29;
+
     /// Every required feature this reader implements.
-    pub const KNOWN: u64 = (1 << 29) - 1;
+    pub const KNOWN: u64 = (1 << 30) - 1;
 
     /// The full required set every v1 file declares, `COLUMNAR_MARKS` included — the writer emits the columnar,
     /// per-stripe marks form. Excludes `FOOTER_ENCRYPTED` (opt-in per build, set only when the caller requests footer
-    /// encryption) and the graph bits (set only on a graph file that carries their blocks); declaring a bit before it
-    /// applies would misrepresent the file.
-    pub const ALL: u64 = KNOWN & !FOOTER_ENCRYPTED & !GRAPH;
+    /// encryption), the graph bits (set only on a graph file that carries their blocks) and `AUDIT_HASH_CHAIN` (set
+    /// only on an audit file); declaring a bit before it applies would misrepresent the file.
+    pub const ALL: u64 = KNOWN & !FOOTER_ENCRYPTED & !GRAPH & !AUDIT_HASH_CHAIN;
 }
 
 /// Optional feature flags: unknown optional features are ignored; known ones are validated and used.

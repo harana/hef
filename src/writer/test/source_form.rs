@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 pub(crate) fn source_form_config(rows_per_granule: usize) -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 42,
         footer_dek: None,
         footer_encryption: FooterEncryption::Plaintext,

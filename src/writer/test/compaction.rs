@@ -191,6 +191,7 @@ fn row(i: u64, note: &str) -> HefRow {
 fn config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 42,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -263,7 +264,7 @@ fn plan_rewrite_reuses_unchanged_stripes_of_a_real_file_byte_identically() {
     let source = build(&(0..48).map(|i| row(i, "a short note")).collect::<Vec<_>>());
     let replacement = build(&(0..64).map(|i| row(i, "a short note")).collect::<Vec<_>>());
 
-    let plan = plan_rewrite(&source, &replacement);
+    let plan = plan_rewrite(&source, &replacement).unwrap();
     assert!(
         plan.reused_bytes() > 0,
         "unchanged leading stripes are copied by reference"
@@ -295,7 +296,7 @@ fn plan_rewrite_reuses_a_relocated_stripe_from_its_new_offset() {
     changed_rows[0] = row(0, &noisy(4_000));
     let replacement = build(&changed_rows);
 
-    let plan = plan_rewrite(&source, &replacement);
+    let plan = plan_rewrite(&source, &replacement).unwrap();
 
     // At least one reused stripe is copied from a source offset different from where it lands in the replacement.
     let segments = rewrite_segments(&plan, &replacement.footer.stripes, replacement.bytes.len() as u64, 0);
@@ -333,7 +334,7 @@ fn plan_rewrite_of_an_identical_file_reuses_everything() {
         "deterministic builds are byte-identical"
     );
 
-    let plan = plan_rewrite(&source, &replacement);
+    let plan = plan_rewrite(&source, &replacement).unwrap();
     assert!(plan.reuses_every_stripe());
     assert_eq!(source.file_seal, replacement.file_seal);
 }
@@ -346,7 +347,7 @@ fn plan_rewrite_rebuilds_a_changed_stripe() {
     rows[0] = row(0, "AFTER — a different note entirely");
     let replacement = build(&rows);
 
-    let plan = plan_rewrite(&source, &replacement);
+    let plan = plan_rewrite(&source, &replacement).unwrap();
     assert!(
         plan.dispositions
             .iter()
@@ -430,7 +431,7 @@ fn a_signed_event_re_verifies_offline_from_a_compacted_file_that_reused_its_stri
 
     let source = build(&published);
     let replacement = build(&compacted_rows);
-    let plan = plan_rewrite(&source, &replacement);
+    let plan = plan_rewrite(&source, &replacement).unwrap();
     assert!(
         plan.reused_bytes() > 0,
         "the published stripes carry forward into the compacted file by reference"

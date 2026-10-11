@@ -202,3 +202,26 @@ Every footer section SHALL decode either zero-copy (read in place, no per-elemen
 - **WHEN** a reader encounters a directory entry whose section id it does not know, and another entry whose section bytes do not hash to the entry's recorded BLAKE3 checksum
 - **THEN** it skips the unknown section using its directory-recorded length, and rejects the checksum-failing section rather than decoding it
 
+
+### Requirement: Audit files chain their rows by hash and are never rewritten
+An `audit` profile file SHALL chain every row to the one before it. A row's digest SHALL be the BLAKE3 of a fixed encoding of the row: its epoch and sequence, every envelope field in field-name order (integers little-endian, strings length-prefixed, absent optional strings as a zero tag), and its payload (none, an external reference, or the variant encoding against a dictionary of the payload's own keys). A row's hash SHALL be the BLAKE3 derive-key hash, under the context `pulse HEF v1 audit row hash`, of its `prev_row_hash` followed by its digest. The first row of a file SHALL chain from a caller-supplied start: the last row hash of the previous audit file, or 32 zero bytes for the first file of a trail. An audit row SHALL carry only its envelope and payload, and an audit file SHALL carry no analytical columns, so every stored row field is under the chain.
+
+The footer SHALL carry the optional section `AUDIT = 35`: chain start (32 bytes), chain end (the last row's hash, 32 bytes), an S3 Object Lock legal-hold byte (0 or 1), and a retention option tag followed, when present, by the retention mode (`governance` = 0, `compliance` = 1) and the retain-until time in signed nanoseconds. The file SHALL declare the required feature `audit_hash_chain` (bit 29), which is not part of the set every file declares, so a reader or rewriter that predates audit files refuses one, remote readers included. A reader SHALL refuse a footer where the section, the bit, and the `audit` profile do not appear together. The manifest entry carries no chain fields: its `file_seal` authenticates the footer, and with it the chain ends.
+
+A verifier given audit files in manifest order SHALL check that each file's chain start equals the previous file's chain end (or the expected start) and SHALL recompute every row's hash from the stored rows and compare the result with the recorded chain end. Every writer path that would replace an existing file (an update, a stripe-reusing rewrite or splice, an entity projection, a compaction publish) SHALL refuse an audit file as its source or its output.
+
+#### Scenario: Tampered or dropped row
+- **WHEN** an audit file's rows are altered or one is dropped, whether its recorded chain end is kept or recomputed
+- **THEN** the verifier reports that the file's rows do not hash to its recorded chain end, or that the next file does not continue the chain
+
+#### Scenario: Reordered or missing file
+- **WHEN** audit files are verified in an order other than the one they were written in, or with one missing
+- **THEN** the verifier reports the first file whose chain start does not equal the previous file's chain end
+
+#### Scenario: Rewrite refused
+- **WHEN** an update, splice rewrite, entity projection, or compaction is asked to replace an audit file or to produce one
+- **THEN** it refuses with an error and writes nothing
+
+#### Scenario: Old reader refuses an audit file
+- **WHEN** a reader whose known required set ends at bit 28 opens an audit file
+- **THEN** it refuses the file as declaring an unknown required feature, while every event file stays readable by it

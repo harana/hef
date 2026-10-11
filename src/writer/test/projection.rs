@@ -79,6 +79,7 @@ fn ingest_rows() -> Vec<HefRow> {
 fn config(generation_id: u64) -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: FooterEncryption::Plaintext,

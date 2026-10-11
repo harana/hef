@@ -52,6 +52,7 @@ fn event(i: u64) -> EventInput {
 fn multi_stripe_file() -> BuiltHef {
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 1,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,

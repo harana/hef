@@ -52,6 +52,7 @@ fn tenant() -> TenantId {
 fn config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 42,
         footer_dek: None,
         footer_encryption: FooterEncryption::Plaintext,
