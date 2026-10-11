@@ -3,12 +3,13 @@ use crate::events::variant::VariantValue;
 use crate::events::{EventId, TimestampValue};
 use crate::layout::constant::AUDIT_GENESIS;
 use crate::layout::footer::{ObjectLockRetention, RetentionMode, encode_footer};
-use crate::layout::{Profile, required_features};
+use crate::layout::{LayoutTargets, Profile, required_features};
 use crate::typed_id::TypedIdTestExt;
 use crate::writer::audit::AuditSettings;
 use crate::writer::build::{BuildPayload, BuildRow, BuiltHef, HefBuildConfig, build_hef_file};
 use crate::writer::source_form::tests::{source_form_config, source_form_row};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 fn audit_config(chain_start: [u8; 32]) -> HefBuildConfig {
     HefBuildConfig {
@@ -260,4 +261,44 @@ fn a_reader_from_before_audit_files_refuses_one_and_event_files_stay_readable() 
     let event_file = build_hef_file(rows(0..3), &source_form_config(4)).unwrap();
     assert_eq!(event_file.footer.required_feature_flags & !pre_audit_known, 0);
     assert_eq!(event_file.footer.audit, None);
+}
+
+/// Checks a run of eight audit files of 12,500 rows each with `verify_audit_files`, seven times, and prints the median
+/// time with the rows and file megabytes checked per second. Opening each file against its seal is not timed. Run by
+/// hand: `cargo test --release --all-features --lib audit_chain_verification_throughput -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-mode audit chain verification benchmark"]
+fn audit_chain_verification_throughput() {
+    const FILES: u64 = 8;
+    const ROWS_PER_FILE: u64 = 12_500;
+    let mut built = Vec::new();
+    let mut chain_end = AUDIT_GENESIS;
+    for file in 0..FILES {
+        let config = HefBuildConfig {
+            targets: LayoutTargets::default(),
+            ..audit_config(chain_end)
+        };
+        let next = build_hef_file(rows(file * ROWS_PER_FILE..(file + 1) * ROWS_PER_FILE), &config).unwrap();
+        chain_end = trail(&next).chain_end;
+        built.push(next);
+    }
+    let mut samples = Vec::new();
+    for _ in 0..7 {
+        let opened: Vec<HefFile> = built.iter().map(open).collect();
+        let started = Instant::now();
+        let verified = verify_audit_files(AUDIT_GENESIS, &opened);
+        samples.push(started.elapsed().as_secs_f64());
+        assert_eq!(verified, Ok(chain_end));
+    }
+    samples.sort_unstable_by(f64::total_cmp);
+    let median = samples[3];
+    let rows = FILES * ROWS_PER_FILE;
+    let file_bytes: usize = built.iter().map(|file| file.bytes.len()).sum();
+    println!(
+        "audit chain verification, {FILES} files, {rows} rows, {file_bytes} bytes: median {:.1} ms, {:.0} rows/s, \
+         {:.1} MB/s",
+        median * 1e3,
+        rows as f64 / median,
+        file_bytes as f64 / median / 1e6
+    );
 }

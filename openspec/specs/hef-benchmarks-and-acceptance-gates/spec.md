@@ -108,3 +108,45 @@ Write-ahead log objects SHALL be gated on their fixed framing and their verified
 #### Scenario: Log object passes the framing and streaming gate
 - **WHEN** a log object is written and read forward against its pinned root
 - **THEN** its measured header plus trailer bytes, the bytes hashed before its first record, and the bytes hashed for the whole read are within the gate, and the gate fails when any of them is not
+
+### Requirement: Audit file overhead gate
+An audit file SHALL add at most 192 bytes over an event file of the same rows, all of them in its footer (the profile and audit sections and their directory entries), and SHALL add exactly as much at many rows as at few, so the hash chain stores no bytes per row. The cost of hashing the chain at build time and the throughput of verifying a run of audit files SHALL be reported by a release-mode benchmark.
+
+#### Scenario: Audit file passes the overhead gate
+- **WHEN** the same rows are built as an event file and as an audit file, at a small and a large row count, with and without a retention
+- **THEN** the audit file's added bytes are within the ceiling and equal at both row counts, and the gate fails when either is not
+
+### Requirement: Snapshot lookup gate
+A cold point lookup in a snapshot file opened from an object store SHALL issue at most two requests, one for the file's tail and one for the granule that can hold the key, whether the key is present or not, and SHALL fetch less than the whole file. Lookup time, epoch build time, and epoch publish time SHALL be reported by release-mode benchmarks against the per-partition archive a snapshot file replaces.
+
+#### Scenario: Snapshot lookup passes the request gate
+- **WHEN** a snapshot file is opened remotely and a stored or absent key is looked up
+- **THEN** the open and the lookup together issue at most two requests and fetch fewer bytes than the file holds, and the gate fails when either is not so
+
+### Requirement: Inbox read gate
+An inbox file's recipient directory SHALL cost 48 bytes per recipient plus at most 64 bytes of framing, and reading one recipient's queue from a file with the directory SHALL touch no granule beyond those holding that recipient's rows. Queue read latency with and without the directory, the fully-acknowledged check, and build time SHALL be reported by a release-mode benchmark over at least 100,000 rows across 10,000 recipients.
+
+#### Scenario: Inbox read passes the directory gate
+- **WHEN** each recipient's queue is read from an inbox file of many recipients in small granules
+- **THEN** the directory's footer bytes are within the per-recipient cost plus framing, and the granules read for each recipient are exactly those holding its rows, and the gate fails when either is not so
+
+### Requirement: File profile overhead gate
+Declaring a file profile other than `Event` SHALL cost at most 64 bytes over the same rows built as an event file: one footer directory entry and its one-byte profile section, with the 4 KiB header block no larger. An event file SHALL carry no profile section, so its footer stays byte-identical to one written before profiles existed.
+
+#### Scenario: Graph profile with no edges stays within the overhead ceiling
+- **WHEN** the same rows are built once as an event file and once as a graph-profile file with no edges
+- **THEN** the event file's footer holds no profile section, both header blocks are 4096 bytes, and the graph file is at most 64 bytes larger, and the gate fails when any of them is not
+
+### Requirement: Graph edge block size and throughput
+A graph-profile file's edge blocks SHALL store at most 6 bytes per edge, counting the forward and reverse copies of a parent link against the one edge. The committed harness SHALL measure this on a deterministic 100,000-event room-shaped graph in 8192-row granules, and SHALL carry a release-mode benchmark that reports, for the same graph, edges per second and megabytes per second for building every granule's edge block and for decoding them all.
+
+#### Scenario: Room graph stays within the edge size ceiling
+- **WHEN** the 100,000-event room graph's edge blocks are built
+- **THEN** their stored bytes divided by the edge count are at most 6, and the gate fails when they are not
+
+### Requirement: Graph walk request gate
+A breadth-first walk over a subject's graph spread across several remote files SHALL send at most one range request per file per level, every edge block a level needs from one file joined into a single request. The committed harness SHALL measure levels, files, requests, and bytes fetched for a walk over a multi-file graph, and SHALL carry a release-mode benchmark over a room of at least 100,000 events split across several files that reports requests, bytes fetched, and time per level for a cold walk and for a second walk over the same graph, which SHALL send no request.
+
+#### Scenario: Walk across four files meets the request gate
+- **WHEN** an event's ancestors are walked level by level across four remote graph files
+- **THEN** the requests sent are at most the number of levels times the number of files, and the gate fails when they are not
