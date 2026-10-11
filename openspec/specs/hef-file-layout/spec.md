@@ -99,6 +99,21 @@ Graph files SHALL declare the required feature bits for the graph blocks they ca
 - **WHEN** a reader that predates the graph feature bits opens a file declaring any of them
 - **THEN** it refuses the file as declaring an unknown required feature
 
+### Requirement: Graph files store forward and reverse edge blocks per granule
+A graph-profile file MAY carry its subject's event graph. Such a file SHALL hold one subject (1 to 255 bytes) whose events have dense, gap-free sequence numbers in row order, so row `i` is event `first_sn + i`; the writer takes each row's `prev` and `auth` parents as sequence numbers, plus inbound edges from later files supplied when compaction rewrites the file, and SHALL refuse a parent not strictly earlier than its event, a repeated edge, an inbound edge that does not run from a later file into this one, a row list that does not match the file, or edges on any build that is not a whole graph-profile build in sequence order. Each granule SHALL carry one edge block in the data area right after its payload arenas, holding three compressed sparse row tables (forward parents; reverse children built at seal from in-file forward edges; inbound children from later files) whose offsets restart at the granule's first row, one slot per `(row, kind)` with `prev` before `auth`. A target SHALL be stored as `source_sn - target_sn`, and offsets and targets SHALL go through the ordinary column block encoder. Footer section `GRAPH_EDGES` (id 31) SHALL record the subject, `first_sn`, and each block's stripe-relative range. A file carrying edges SHALL declare both `graph_csr_forward` and `graph_csr_reverse`; a reader SHALL refuse the section without both bits or on a non-graph profile, the bits without the section, and a block whose offsets do not run in order from zero to its edge count or whose targets break the direction rules.
+
+#### Scenario: Edges round trip
+- **WHEN** a graph file is built with edges and read back
+- **THEN** each event's parents come back in the order given and its children in ascending order, in-file children before inbound ones
+
+#### Scenario: Corrupt edge block refused
+- **WHEN** an edge block's offsets are out of order or its targets point at the event itself, a later event, or outside the file for an in-file child
+- **THEN** the reader fails the read instead of serving edges
+
+#### Scenario: Compact edges
+- **WHEN** a room-shaped graph of 100,000 events is stored in 8192-row granules
+- **THEN** its edge blocks cost at most 6 bytes per edge, forward and reverse copies together (measured: about 3.0)
+
 ### Requirement: Feature directory governs capabilities
 An HEF file SHALL declare capabilities through a feature directory, not through lifecycle/freshness/archive labels. Every file SHALL include the required feature flags (envelope columns, payload arena, stripe/granule directories, per-column marks, page metadata, min/max/sequence/time skip indexes, exact counts, checksum/footer directories, layout class). Unknown required features SHALL refuse; unknown optional features SHALL be ignored. The planner SHALL use an optional feature only when the footer declares it and its block checksum verifies; absence of an optional feature SHALL leave the file valid with queries falling back to another valid plan.
 

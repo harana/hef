@@ -407,6 +407,7 @@ fn indexed_config() -> HefBuildConfig {
         freetext: FreetextDeclaration { fields: Vec::new() },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 5,

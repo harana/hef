@@ -38,6 +38,9 @@ pub mod sections {
     /// `TYPED_COLUMN_ROW_OFFSETS`.
     pub const FREETEXT_ROW_OFFSETS: u32 = 18;
     pub const GRANULES: u32 = 3;
+    /// Optional: a graph-profile file's subject, first sequence number, and the stripe-relative byte range of each
+    /// granule's edge block. Present exactly when the file declares `GRAPH_CSR_FORWARD` and `GRAPH_CSR_REVERSE`.
+    pub const GRAPH_EDGES: u32 = 31;
     /// Exact commitments for non-stripe byte ranges between the fixed header and footer. These are normally alignment
     /// padding; recording their roots lets a cold reader authenticate the complete segment partition without fetching
     /// padding bytes.
@@ -247,6 +250,27 @@ pub struct EntityHashFilterEntry {
     pub granule_id: u32,
     pub index_len: u64,
     pub index_offset: u64,
+}
+
+/// Where a graph-profile file's edges live: whose graph it is, the sequence number of its first row (row `i` is event
+/// `first_sn + i`), and one edge block per granule.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphDirectory {
+    pub blocks: Vec<GraphBlockEntry>,
+    pub first_sn: u64,
+    /// 1 to 255 bytes.
+    pub subject: Vec<u8>,
+}
+
+/// The byte range of one granule's edge block. `offset` is stripe-relative, like every other data-area offset the
+/// footer records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphBlockEntry {
+    pub granule_id: u32,
+    pub len: u64,
+    pub offset: u64,
 }
 
 /// One row's entry in the file's external-id index: a stable hash of the id and the row that carries it. The footer
@@ -492,6 +516,8 @@ pub struct Footer {
     /// empty in files that read free-text at granule granularity only.
     pub freetext_row_offsets: Vec<FreetextRowOffsets>,
     pub granules: Vec<GranuleEntry>,
+    /// The edge block directory of a graph-profile file that carries edges; `None` otherwise.
+    pub graph: Option<GraphDirectory>,
     /// Authenticated commitments for the padding ranges between stripes.
     pub integrity_gaps: Vec<IntegrityGapEntry>,
     /// Byte alignment for column block boundaries, enabling aligned `O_DIRECT` reads of individual pages. Zero means
@@ -1121,6 +1147,20 @@ fn encode_sections(footer: &Footer) -> SectionArea {
 
     if footer.profile != Profile::Event {
         sections.push(sections::PROFILE, |out| out.put_u8(footer.profile.code()));
+    }
+
+    if let Some(graph) = &footer.graph {
+        sections.push(sections::GRAPH_EDGES, |out| {
+            out.put_u8(graph.subject.len() as u8);
+            out.put_slice(&graph.subject);
+            out.put_u64(graph.first_sn);
+            out.put_u32(graph.blocks.len() as u32);
+            for entry in &graph.blocks {
+                out.put_u32(entry.granule_id);
+                out.put_u64(entry.offset);
+                out.put_u64(entry.len);
+            }
+        });
     }
 
     // The sparse shredded key set: optional, emitted only when the writer stored sparse columns.
@@ -1898,6 +1938,62 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         }
     };
 
+    // The graph edge directory: optional. Fixed entry size: 4 (granule) + 8+8 (offset/len) = 20 bytes.
+    let graph = match decode_section(&directory, section_area, sections::GRAPH_EDGES)? {
+        None => None,
+        Some(bytes) => {
+            let mut r = Reader::new(bytes);
+            let subject_len = usize::from(r.u8("graph subject length")?);
+            let subject = r.take(subject_len, "graph subject")?.to_vec();
+            let first_sn = r.u64("graph first sequence number")?;
+            let count = r.u32("graph block count")? as usize;
+            let count = bounded_count(count, 20, &r, "graph block count exceeds input")?;
+            let mut blocks = Vec::with_capacity(count);
+            for _ in 0..count {
+                let granule_id = r.u32("graph block granule")?;
+                let offset = r.u64("graph block offset")?;
+                let len = r.u64("graph block length")?;
+                blocks.push(GraphBlockEntry {
+                    granule_id,
+                    len,
+                    offset,
+                });
+            }
+            if r.remaining() != 0 || subject.is_empty() {
+                return Err(FormatError::Structural {
+                    rule: "graph section must name a subject and end with its last block",
+                });
+            }
+            Some(GraphDirectory {
+                blocks,
+                first_sn,
+                subject,
+            })
+        }
+    };
+    let graph_flags = required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE;
+    let declared = required_feature_flags & graph_flags;
+    match &graph {
+        Some(graph) => {
+            if declared != graph_flags || profile != Profile::Graph {
+                return Err(FormatError::Structural {
+                    rule: "graph edges ride only a graph-profile file declaring both edge features",
+                });
+            }
+            if graph.first_sn.checked_add(exact_counts.row_count).is_none() {
+                return Err(FormatError::Structural {
+                    rule: "graph sequence numbers overflow",
+                });
+            }
+        }
+        None if declared != 0 => {
+            return Err(FormatError::Structural {
+                rule: "a file declaring graph edge features must carry the graph section",
+            });
+        }
+        None => {}
+    }
+
     Ok(Footer {
         clustering,
         columns,
@@ -1911,6 +2007,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         freetext,
         freetext_row_offsets,
         granules,
+        graph,
         integrity_gaps,
         io_alignment_bytes,
         marks,

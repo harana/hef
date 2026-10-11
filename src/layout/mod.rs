@@ -12,12 +12,16 @@ use constant::HEF_MAGIC;
 use std::borrow::Cow;
 use uuid::Uuid;
 
+pub use remote::{RemoteGraph, RemoteGraphOptions};
+
+pub mod api;
 pub mod cache;
 pub mod clustering;
 pub mod constant;
 pub mod entity_scan;
 pub mod event;
 pub mod footer;
+pub mod graph;
 pub mod mirror;
 pub mod reader;
 mod remote;

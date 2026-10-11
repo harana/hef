@@ -1,17 +1,23 @@
 use super::*;
 use crate::artifacts::batch::{EventInput, PayloadInput};
+use crate::clock::FixedClock;
 use crate::columns::{FreetextDeclaration, PromotionPlan, column_ids};
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, SequenceRange, StreamId, TimestampValue};
 use crate::file::constant::CHUNK_GROUP_BYTES;
 use crate::layout::cache::CacheStore;
+use crate::layout::graph::{GraphInput, RowEdges};
 use crate::layout::reader::PayloadRead;
-use crate::layout::{HEADER_BLOCK_LEN, LayoutTargets, required_features};
+use crate::layout::{HEADER_BLOCK_LEN, LayoutTargets, Profile, required_features};
 use crate::lifecycle::{FileType, PartState};
 use crate::typed_id::TypedIdTestExt;
 use crate::writer::build::{BuildLifecycle, BuiltHef, HefBuildConfig, HefRow, build_hef_file};
+use crate::writer::source_form::tests::{source_form_config, source_form_row};
 use std::collections::{BTreeMap as StdBTreeMap, HashMap as StdHashMap};
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    mpsc::{Receiver, channel},
+};
 
 const TENANT: u128 = 3;
 
@@ -127,6 +133,7 @@ fn config(index_granularity: usize, granule_bytes: usize, stripe_target_bytes: u
         freetext: FreetextDeclaration::default(),
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
@@ -207,7 +214,7 @@ fn entry(built: &BuiltHef) -> HefFileEntry {
         optional_feature_flags: built.footer.optional_feature_flags,
         part_index: 0,
         part_state: PartState::Active,
-        profile: crate::layout::Profile::Event,
+        profile: built.footer.profile,
         required_feature_flags: built.footer.required_feature_flags,
         size_bytes: built.bytes.len() as u64,
         tenant_id: TenantId::new_test_id(TENANT),
@@ -451,4 +458,268 @@ fn a_fresh_reader_of_a_remote_file_reads_the_same_values() {
     assert_eq!(fresh.payload(5).unwrap(), first);
     assert_eq!(fresh.header().file_id, built.file_id);
     assert_eq!(fresh.header().row_count, built.header.row_count);
+}
+
+/// A remote object that records each batch of ranges asked of it, and can hold its first batch back until released.
+struct BatchSource {
+    batches: Mutex<Vec<Vec<ByteRange>>>,
+    hold_first: Mutex<Option<Receiver<()>>>,
+    object: Vec<u8>,
+}
+
+impl BatchSource {
+    fn new(object: &[u8]) -> Arc<Self> {
+        Arc::new(Self {
+            batches: Mutex::new(Vec::new()),
+            hold_first: Mutex::new(None),
+            object: object.to_vec(),
+        })
+    }
+
+    fn batches(&self) -> Vec<Vec<ByteRange>> {
+        self.batches.lock().unwrap().clone()
+    }
+}
+
+impl RangeSource for BatchSource {
+    fn read_range(&self, _object: u128, offset: u64, len: u64) -> Result<Vec<u8>, FileError> {
+        self.object
+            .get(offset as usize..(offset + len) as usize)
+            .map(<[u8]>::to_vec)
+            .ok_or(FileError::OutOfBounds)
+    }
+
+    fn read_ranges(&self, object: u128, ranges: &[ByteRange]) -> Result<Vec<Vec<u8>>, FileError> {
+        self.batches.lock().unwrap().push(ranges.to_vec());
+        let gate = self.hold_first.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.recv().ok();
+        }
+        ranges
+            .iter()
+            .map(|range| self.read_range(object, range.offset, range.len))
+            .collect()
+    }
+}
+
+/// Events `first_sn..first_sn + rows` of subject `room`, each pointing back along `prev` at the events `offsets`
+/// before it that exist, and authorized by event 0.
+fn graph_input(first_sn: u64, rows: u64, offsets: &[u64]) -> GraphInput {
+    GraphInput {
+        first_sn,
+        inbound: Vec::new(),
+        rows: (first_sn..first_sn + rows)
+            .map(|sn| RowEdges {
+                auth: if sn > 0 { vec![0] } else { Vec::new() },
+                prev: offsets.iter().filter_map(|offset| sn.checked_sub(*offset)).collect(),
+            })
+            .collect(),
+        subject: b"room".to_vec(),
+    }
+}
+
+/// A graph file of `rows` small rows from sequence number `first_sn`, four rows per granule.
+fn graph_file(first_sn: u64, rows: u64, offsets: &[u64]) -> BuiltHef {
+    let mut config = source_form_config(4);
+    config.graph = Some(graph_input(first_sn, rows, offsets));
+    config.profile = Profile::Graph;
+    let rows: Vec<_> = (first_sn..first_sn + rows)
+        .map(|i| source_form_row(i, VariantValue::Int(i as i64)))
+        .collect();
+    build_hef_file(rows, &config).unwrap()
+}
+
+fn open_graph_file(source: &Arc<BatchSource>, built: &BuiltHef) -> HefFile {
+    let source: Arc<dyn RangeSource> = source.clone();
+    let header = HeaderCommitment::from_header_block(&built.bytes[..HEADER_BLOCK_LEN]).unwrap();
+    let entry = HefFileEntry {
+        tenant_id: TenantId::new_test_id(7),
+        ..entry(built)
+    };
+    HefFile::open_remote(source, None, &entry, &header, None).unwrap()
+}
+
+fn options(max_in_flight: usize) -> RemoteGraphOptions {
+    RemoteGraphOptions {
+        hedge_floor_nanos: 60_000_000_000,
+        max_in_flight,
+    }
+}
+
+fn remote_graph(files: Vec<HefFile>, options: RemoteGraphOptions) -> RemoteGraph {
+    RemoteGraph::new(files, Arc::new(FixedClock::at(0)), options).unwrap()
+}
+
+/// Two files of one subject, events 0..32 and 32..64, and their sources.
+fn two_files(offsets: &[u64]) -> (RemoteGraph, [Arc<BatchSource>; 2]) {
+    let built = [graph_file(0, 32, offsets), graph_file(32, 32, offsets)];
+    let sources = [BatchSource::new(&built[0].bytes), BatchSource::new(&built[1].bytes)];
+    let files = vec![
+        open_graph_file(&sources[0], &built[0]),
+        open_graph_file(&sources[1], &built[1]),
+    ];
+    assert!(built[0].footer.granules.len() > 1 && built[0].footer.stripes.len() > 1);
+    (remote_graph(files, options(16)), sources)
+}
+
+#[test]
+fn one_lookup_step_fetches_every_granule_it_needs_in_one_request_per_file() {
+    let (graph, sources) = two_files(&[1]);
+    let sns: Vec<u64> = (0..64).collect();
+    let parents = graph.parents_of(b"room", &sns, EdgeKind::Prev).unwrap();
+    let expected: Vec<Vec<u64>> = sns.iter().map(|sn| sn.checked_sub(1).into_iter().collect()).collect();
+    assert_eq!(parents, expected);
+    for source in &sources {
+        let batches = source.batches();
+        assert_eq!(batches.len(), 1, "one batch per file");
+        assert_eq!(batches[0].len(), 1, "adjacent edge blocks join into one request");
+    }
+
+    let children = graph.children_of(b"room", &sns, EdgeKind::Auth).unwrap();
+    assert_eq!(
+        children[0],
+        (1..32).collect::<Vec<_>>(),
+        "children stay with the parent's file"
+    );
+    assert_eq!(graph.children(b"room", 40, EdgeKind::Prev).unwrap(), [41]);
+    assert!(
+        sources.iter().all(|source| source.batches().len() == 1),
+        "held edge blocks are never fetched again"
+    );
+}
+
+#[test]
+fn a_walk_costs_at_most_one_request_per_file_per_level() {
+    let (graph, sources) = two_files(&[1, 9]);
+    let requests = || sources.iter().map(|source| source.batches().len()).sum::<usize>();
+    let mut seen = 0;
+    let mut previous = requests();
+    for level in graph.walk(b"room", 63, EdgeKind::Prev, 64) {
+        let level = level.unwrap();
+        let requests_now = requests();
+        assert!(
+            requests_now - previous <= 2,
+            "a level costs at most one request per file"
+        );
+        for source in &sources {
+            assert!(source.batches().iter().all(|batch| batch.len() == 1));
+        }
+        previous = requests_now;
+        seen += level.len();
+    }
+    assert_eq!(seen, 63, "every ancestor of event 63 is reached once");
+    assert!(requests() > 0);
+
+    let again = previous;
+    let levels: Vec<_> = graph.walk(b"room", 63, EdgeKind::Prev, 64).collect();
+    assert!(levels.iter().all(Result::is_ok));
+    assert_eq!(requests(), again, "a second walk is served from the held blocks");
+}
+
+/// One stripe of three 64-row granules whose rows mostly carry 64 KiB of incompressible text (every eighth an
+/// integer, so the field stays in the payload arena). Neighbouring edge blocks then sit about 3.5 MiB apart, so even
+/// widened to their 1 MiB proof leaves they lie more than the joining gap apart.
+fn spread_graph_file() -> BuiltHef {
+    let mut config = source_form_config(64);
+    config.targets.index_granularity_bytes = 64 << 20;
+    config.targets.stripe_target_bytes = 64 << 20;
+    config.graph = Some(graph_input(0, 192, &[1]));
+    config.profile = Profile::Graph;
+    let rows: Vec<_> = (0..192u64)
+        .map(|i| {
+            let blob = if i.is_multiple_of(8) {
+                VariantValue::Int(i as i64)
+            } else {
+                VariantValue::String(noise(i, 64 * 1024))
+            };
+            source_form_row(i, VariantValue::Object(StdBTreeMap::from([("blob".to_owned(), blob)])))
+        })
+        .collect();
+    let built = build_hef_file(rows, &config).unwrap();
+    assert_eq!((built.footer.stripes.len(), built.footer.granules.len()), (1, 3));
+    built
+}
+
+#[test]
+fn the_in_flight_cap_splits_a_step_into_batches() {
+    let built = spread_graph_file();
+    let sns: Vec<u64> = (0..192).collect();
+    for (cap, expected) in [(1, vec![1, 1, 1]), (2, vec![2, 1]), (3, vec![3])] {
+        let source = BatchSource::new(&built.bytes);
+        let graph = remote_graph(vec![open_graph_file(&source, &built)], options(cap));
+        let parents = graph.parents_of(b"room", &sns, EdgeKind::Prev).unwrap();
+        assert_eq!(parents[191], [190]);
+        let sizes: Vec<usize> = source.batches().iter().map(Vec::len).collect();
+        assert_eq!(sizes, expected, "cap {cap}");
+        let fetched: u64 = source.batches().iter().flatten().map(|range| range.len).sum();
+        assert!(
+            fetched < built.footer.stripes[0].byte_len / 2,
+            "only the edge blocks' proof leaves are fetched"
+        );
+    }
+}
+
+#[test]
+fn a_slow_batch_is_hedged_and_the_first_answer_wins() {
+    let built = graph_file(0, 32, &[1]);
+    let source = BatchSource::new(&built.bytes);
+    let (release, gate) = channel();
+    *source.hold_first.lock().unwrap() = Some(gate);
+    let options = RemoteGraphOptions {
+        hedge_floor_nanos: 10_000_000,
+        max_in_flight: 8,
+    };
+    let graph = remote_graph(vec![open_graph_file(&source, &built)], options);
+    assert_eq!(graph.parents(b"room", 20, EdgeKind::Prev).unwrap(), [19]);
+    let batches = source.batches();
+    assert_eq!(batches.len(), 2, "the stalled batch was sent again");
+    assert_eq!(batches[0], batches[1]);
+    release.send(()).unwrap();
+}
+
+#[test]
+fn the_hedge_delay_follows_the_95th_percentile_above_the_floor() {
+    let floor = 5_000_000;
+    let graph = remote_graph(
+        Vec::new(),
+        RemoteGraphOptions {
+            hedge_floor_nanos: floor,
+            max_in_flight: 4,
+        },
+    );
+    for millis in 1..=19 {
+        graph.record(millis * 1_000_000);
+    }
+    assert_eq!(graph.hedge_delay(), floor, "too few samples to trust a percentile");
+    for millis in 20..=100 {
+        graph.record(millis * 1_000_000);
+    }
+    assert_eq!(graph.hedge_delay(), 95_000_000);
+    for _ in 0..200 {
+        graph.record(1_000);
+    }
+    assert_eq!(graph.hedge_delay(), floor, "never below the floor");
+}
+
+#[test]
+fn a_remote_graph_refuses_files_it_cannot_serve() {
+    let clock = || -> Arc<dyn crate::clock::Clock> { Arc::new(FixedClock::at(0)) };
+    let open_one = |built: &BuiltHef| open_graph_file(&BatchSource::new(&built.bytes), built);
+    let built = graph_file(0, 8, &[1]);
+    assert!(RemoteGraph::new(vec![open_one(&built)], clock(), options(0)).is_err());
+    let overlapping = graph_file(4, 8, &[1]);
+    assert!(RemoteGraph::new(vec![open_one(&built), open_one(&overlapping)], clock(), options(4)).is_err());
+    let events = multi_stripe_file(None);
+    let source = CountingSource::new(&events.bytes);
+    assert!(RemoteGraph::new(vec![open(&source, None, &events, None)], clock(), options(4)).is_err());
+
+    let graph = remote_graph(vec![open_one(&built)], options(4));
+    assert!(
+        graph.parents(b"room", 8, EdgeKind::Prev).is_err(),
+        "no file holds event 8"
+    );
+    assert!(
+        graph.parents(b"other", 3, EdgeKind::Prev).is_err(),
+        "no file holds that subject"
+    );
 }

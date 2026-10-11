@@ -24,6 +24,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub enum BlockKind {
     /// The file's trailing bytes as one tail fetch returns them: the footer region plus any proof appendix.
     Footer,
+    /// A range inside one stripe that a graph read fetched for its edge blocks, widened to the proof leaves that
+    /// verify it.
+    GraphIndex,
     /// A range inside one stripe, widened to the proof leaves that verify it.
     Stripe,
 }

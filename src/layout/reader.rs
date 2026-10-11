@@ -21,7 +21,7 @@ use super::footer::{
     PageStats, PayloadGranule, ResidualCompression, StripeEntry, TextTokenOffsetsEntry, decode_footer,
     decode_marks_page, decode_marks_page_directory, decode_marks_page_extents,
 };
-use super::remote::FileBytes;
+use super::remote::{FileBytes, RemoteFile};
 use super::{EMPTY_VALUE_ROW_OFFSET, HEADER_BLOCK_LEN, HefHeader, decode_header, optional_features, required_features};
 use crate::artifacts::batch::decode_variant_dictionary;
 use crate::columns::column_ids;
@@ -2176,7 +2176,7 @@ impl HefFile {
     /// already, and for a lazy open this hashes each stripe the range touches against its footer checksum, the first
     /// time any of its bytes are read. Bytes outside every stripe — the header, the footer, and the alignment gaps —
     /// were verified at open.
-    fn data(&self, position: usize, len: usize, what: &'static str) -> Result<&[u8], FormatError> {
+    pub(super) fn data(&self, position: usize, len: usize, what: &'static str) -> Result<&[u8], FormatError> {
         let file = match &self.bytes {
             FileBytes::Local(file) => file,
             FileBytes::Remote(remote) => return remote.read(position as u64, len, what),
@@ -2198,6 +2198,14 @@ impl HefFile {
             }
         }
         Ok(bytes)
+    }
+
+    /// The remote object this file reads from, or `None` for a file held in memory.
+    pub(super) fn remote(&self) -> Option<&RemoteFile> {
+        match &self.bytes {
+            FileBytes::Local(_) => None,
+            FileBytes::Remote(remote) => Some(remote),
+        }
     }
 
     /// Whether this file frames block presence as tagged side-stream forms. Files written before the
@@ -2242,7 +2250,7 @@ impl HefFile {
     /// Turns a footer-declared offset for `granule_id` into an absolute file position by adding the granule's stripe
     /// base. Offsets come from the untrusted footer, so a sum that overflows refuses as a format error instead of
     /// aborting on the arithmetic; `slice` then bounds the resulting position against the file's actual length.
-    fn file_position(&self, granule_id: u32, offset: u64) -> Result<usize, FormatError> {
+    pub(super) fn file_position(&self, granule_id: u32, offset: u64) -> Result<usize, FormatError> {
         self.stripe_base_for(granule_id)
             .checked_add(offset)
             .and_then(|position| usize::try_from(position).ok())

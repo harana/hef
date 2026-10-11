@@ -292,3 +292,20 @@ pub struct WafMeasurement {
 pub fn waf_gate_passes(m: &WafMeasurement) -> bool {
     m.measured_waf <= m.ceiling
 }
+
+/// The gated ceiling on stored graph bytes per edge, forward and reverse copies together.
+pub const GRAPH_EDGE_BYTES_TARGET: f64 = 6.0;
+
+/// The edge blocks of a graph measured against the edges they describe, needed to evaluate the graph edge size gate.
+#[derive(Debug, Clone)]
+pub struct GraphEdgeBytesMeasurement {
+    /// Each parent link counted once, though it is stored forward and reverse.
+    pub edges: u64,
+    pub stored_bytes: u64,
+}
+
+/// Returns `true` when a graph's edge blocks stay within `GRAPH_EDGE_BYTES_TARGET` bytes per edge. A graph with no
+/// edges passes only when it stores nothing.
+pub fn graph_edge_bytes_gate_passes(m: &GraphEdgeBytesMeasurement) -> bool {
+    m.stored_bytes as f64 <= m.edges as f64 * GRAPH_EDGE_BYTES_TARGET
+}

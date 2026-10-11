@@ -59,6 +59,7 @@ fn build_config() -> HefBuildConfig {
         freetext: FreetextDeclaration::default(),
         freetext_row_offset_index: false,
         generation_id: 0,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,

@@ -24,3 +24,24 @@ pub const SCAN_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
 /// How many doubling buckets hold the verified ranges a remote reader has fetched: bucket `b` holds `2^b` ranges, so
 /// this bounds one reader at `2^48 - 1` fetches, far past anything a single file can need.
 pub const HELD_RANGE_BUCKETS: usize = 48;
+
+/// How many edge kinds a graph edge block keeps per event: `prev` and `auth`, so each row owns two offset slots.
+pub const GRAPH_EDGE_KINDS: usize = 2;
+
+/// The longest subject name a graph-profile file records, in bytes; its length is stored in one byte.
+pub const MAX_GRAPH_SUBJECT_BYTES: usize = 255;
+
+/// A remote graph read bridges a gap of up to this many bytes between two ranges it needs, fetching the gap rather
+/// than paying for a second request.
+pub const GRAPH_FETCH_GAP_BYTES: u64 = 1024 * 1024;
+
+/// A remote graph read never grows one coalesced request past this many bytes by joining ranges; a single range
+/// larger than this is still fetched whole.
+pub const GRAPH_FETCH_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How many recent request latencies a remote graph keeps to estimate its 95th percentile for hedging.
+pub const GRAPH_HEDGE_SAMPLES: usize = 128;
+
+/// Below this many timed requests a remote graph hedges at the caller's floor alone, because the percentile is not
+/// yet meaningful.
+pub const GRAPH_HEDGE_MIN_SAMPLES: usize = 20;
