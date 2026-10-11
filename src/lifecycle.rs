@@ -7,7 +7,8 @@
 
 use super::events::{SequenceRange, TenantId};
 use super::layout::Profile;
-use super::layout::graph::event_id_filter_may_hold;
+use super::layout::footer::Footer;
+use super::layout::graph::{ChainRange, DepthRange, event_id_filter_may_hold};
 use hashbrown::HashMap;
 
 /// The role a stored file plays in the published catalogue.
@@ -114,6 +115,10 @@ pub struct HefFileEntry {
     /// written before the filter existed.
     #[serde(default)]
     pub graph_event_id_filter: Option<Vec<u8>>,
+    /// What a graph file holds, copied from its footer so a planner can choose files and plan merges without opening
+    /// them. `None` for every other file, and on entries written before the summary existed.
+    #[serde(default)]
+    pub graph_summary: Option<GraphFileSummary>,
     pub optional_feature_flags: u64,
     /// Zero-based index within a multi-part SuperHEF; always 0 for `HefFile` and `DerivedColumns` entries.
     pub part_index: u32,
@@ -129,6 +134,43 @@ pub struct HefFileEntry {
     /// per-stripe proof nodes plus its length word and `"HEFT"` magic. Added to `footer_len` to size the exact tail GET.
     /// `None` when every stripe is small enough to verify with a whole-stripe read.
     pub tree_len: Option<u64>,
+}
+
+/// What one graph file holds, as its manifest entry records it: whose graph, which events, how deep they sit, and which
+/// stretch of each auth chain they cover, so a planner can skip the file or plan a merge without opening it. The
+/// event-id filter rides beside it in [`HefFileEntry::graph_event_id_filter`].
+///
+/// See: hef-manifest-integration/spec.md
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphFileSummary {
+    /// Each auth chain the file's events lie on and the `seq` range they cover, ascending by chain id. Empty when the
+    /// file stores no chain cover.
+    pub chains: Vec<ChainRange>,
+    /// `None` when the file records no depths.
+    pub depth: Option<DepthRange>,
+    pub max_event_sn: u64,
+    pub min_event_sn: u64,
+    pub subject: Vec<u8>,
+}
+
+impl GraphFileSummary {
+    /// The summary of the graph file whose footer is `footer`, or `None` for a file that carries no graph.
+    pub(crate) fn of(footer: &Footer) -> Option<Self> {
+        let graph = footer.graph.as_ref()?;
+        Some(Self {
+            chains: graph
+                .chain_cover
+                .as_ref()
+                .map(|cover| cover.chains.clone())
+                .unwrap_or_default(),
+            depth: graph.depth,
+            max_event_sn: graph
+                .first_sn
+                .saturating_add(footer.exact_counts.row_count.saturating_sub(1)),
+            min_event_sn: graph.first_sn,
+            subject: graph.subject.clone(),
+        })
+    }
 }
 
 impl HefFileEntry {
@@ -205,7 +247,8 @@ pub struct CompactionJob {
 
 /// Plans one tenant's compaction cycle: which runs of sequence-adjacent small files merge now, and which wait.
 ///
-/// Candidates are the tenant's `Active` base event files below the roll byte target, in ascending sequence order; a
+/// Candidates are the tenant's `Active` base event files below the roll byte target, in ascending sequence order (graph
+/// files merge per subject instead, through [`plan_graph_compaction_cycle`]); a
 /// finished (roll-target-sized) file breaks a run. From the front of each run the planner takes up to
 /// `max_merge_width` files and schedules them only when the doubling bound holds — the combined bytes reach
 /// `min_output_over_largest` times the largest input, or the roll target — so a trickle tenant's newest small file is
@@ -232,6 +275,7 @@ pub fn plan_compaction_cycle(
             entry.tenant_id == tenant_id
                 && entry.part_state == PartState::Active
                 && entry.file_type == FileType::HefFile
+                && entry.profile != Profile::Graph
         })
         .collect();
     candidates.sort_by_key(|entry| (entry.coverage.epoch, entry.coverage.first_sequence));
@@ -269,6 +313,100 @@ pub fn plan_compaction_cycle(
         }
         run.clear();
     }
+    jobs
+}
+
+/// Decides when one subject's small graph files merge, so a subject that trickles in a file per seal converges on a
+/// few large files while its edges stay cheap to walk.
+///
+/// The thresholds are size tiers: a file at or above `finished_bytes` is done; a run of unfinished files merges once
+/// there are more than `max_files` of them or once they add up to less than `small_total_bytes`, and each merge stops
+/// taking inputs before its output would pass `max_output_bytes`. Every parameter is a pinned code parameter, never an
+/// operator key.
+///
+/// See: hef-file-lifecycle/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphCompactionPolicy {
+    /// Bytes at or above which a graph file is finished: neither merged nor merged into. 64 MiB by default.
+    pub finished_bytes: u64,
+    /// A run of more than this many unfinished files merges, whatever their size. 8 by default.
+    pub max_files: usize,
+    /// A merge stops taking inputs before its output would pass this many bytes. 256 MiB by default.
+    pub max_output_bytes: u64,
+    /// A run of unfinished files adding up to fewer bytes than this merges, however few files it holds. 8 MiB by
+    /// default.
+    pub small_total_bytes: u64,
+}
+
+impl Default for GraphCompactionPolicy {
+    fn default() -> Self {
+        Self {
+            finished_bytes: 64 * 1024 * 1024,
+            max_files: 8,
+            max_output_bytes: 256 * 1024 * 1024,
+            small_total_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+/// Plans one tenant's graph compaction cycle: which runs of one subject's small graph files merge now.
+///
+/// Candidates are the tenant's `Active` graph files below `finished_bytes` whose entries carry a graph summary. A run
+/// is a stretch of one subject's candidates whose events follow on with no gap (each file's first event comes right
+/// after the previous file's last), so the merged file keeps its events densely numbered; a finished file or a gap ends
+/// the run. A run of two or more files merges when it holds more than `max_files` files or adds up to less than
+/// `small_total_bytes`, cut front to back into jobs that each stop before passing `max_output_bytes`; a job left with
+/// one file is dropped. Scheduling is deterministic: the same generation always plans the same jobs.
+///
+/// Nothing in HEF calls this: the application calls it each compaction cycle on the head generation, builds each job's
+/// merged file from its inputs' rows with the graph from
+/// `rebuild_graph_input` (in the `writer::compaction` module, behind the `write` feature), and publishes it with
+/// `HefPublisher::publish_compaction` like any other merge.
+pub fn plan_graph_compaction_cycle(
+    policy: &GraphCompactionPolicy,
+    generation: &ManifestGeneration,
+    tenant_id: TenantId,
+) -> Vec<CompactionJob> {
+    let mut candidates: Vec<(&HefFileEntry, &GraphFileSummary)> = generation
+        .files
+        .iter()
+        .filter(|entry| {
+            entry.tenant_id == tenant_id
+                && entry.part_state == PartState::Active
+                && entry.file_type == FileType::HefFile
+                && entry.size_bytes < policy.finished_bytes
+        })
+        .filter_map(|entry| Some((entry, entry.graph_summary.as_ref()?)))
+        .collect();
+    candidates.sort_by(|(_, a), (_, b)| (&a.subject, a.min_event_sn).cmp(&(&b.subject, b.min_event_sn)));
+
+    let mut jobs = Vec::new();
+    let follows_on = |(_, a): &(&HefFileEntry, &GraphFileSummary), (_, b): &(&HefFileEntry, &GraphFileSummary)| {
+        a.subject == b.subject && a.max_event_sn.checked_add(1) == Some(b.min_event_sn)
+    };
+    for run in candidates.chunk_by(follows_on) {
+        let total: u64 = run.iter().map(|(entry, _)| entry.size_bytes).sum();
+        if run.len() < 2 || (run.len() <= policy.max_files && total >= policy.small_total_bytes) {
+            continue;
+        }
+        let mut job = CompactionJob {
+            expected_output_bytes: 0,
+            file_ids: Vec::new(),
+        };
+        for (entry, _) in run {
+            if !job.file_ids.is_empty() && job.expected_output_bytes + entry.size_bytes > policy.max_output_bytes {
+                jobs.push(job);
+                job = CompactionJob {
+                    expected_output_bytes: 0,
+                    file_ids: Vec::new(),
+                };
+            }
+            job.expected_output_bytes += entry.size_bytes;
+            job.file_ids.push(entry.file_id);
+        }
+        jobs.push(job);
+    }
+    jobs.retain(|job| job.file_ids.len() >= 2);
     jobs
 }
 

@@ -5,13 +5,17 @@ use crate::encoding::{ColumnData, StringColumn};
 use crate::events::provenance::{SignatureScheme, SignedEventProvenance, hex_bytes};
 use crate::events::sim::{SimulatedEventAuthor, signed_event_payload};
 use crate::events::variant::VariantValue;
-use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TenantId};
+use crate::events::{EventEnvelope, EventFlags, EventId, RelationshipKind, RelationshipRef, StreamId, TenantId};
 use crate::layout::LayoutTargets;
-use crate::layout::footer::ColumnKind;
+use crate::layout::footer::{ColumnKind, GraphDirectory};
+use crate::layout::graph::tests::room_graph;
+use crate::layout::graph::{ChainLabel, ChainLink, UnresolvedEdge};
 use crate::layout::reader::{HefFile, PayloadRead};
 use crate::typed_id::TypedIdTestExt;
-use crate::writer::build::{BuildLifecycle, HefBuildConfig, HefRow, build_hef_file};
+use crate::writer::build::{BuildLifecycle, BuildRow, HefBuildConfig, HefRow, build_hef_file};
 use crate::writer::rewrite::{RewriteSegment, rewrite_segments};
+use crate::writer::source_form::tests::{source_form_config, source_form_row};
+use std::collections::BTreeMap;
 
 fn column(name: &str, settle_horizon_nanos: i64) -> DerivedColumnEntry {
     DerivedColumnEntry {
@@ -469,4 +473,417 @@ fn a_signed_event_re_verifies_offline_from_a_compacted_file_that_reused_its_stri
             .verify(&payload)
             .unwrap_or_else(|error| panic!("compacted row {index} must re-verify offline: {error}"));
     }
+}
+
+// --- Graph rewrites ---------------------------------------------------------------------------------------------------
+
+const SUBJECT: &[u8] = b"!room:example.org";
+
+/// The parents of event `sn` in a forty-event room history: a prev chain, every fifth event from 15 on also naming
+/// the event twelve back (so edges cross file boundaries), and every event but the first authorized by event 0 and,
+/// for every fourth from 11 on, by the event five back.
+fn truth_parents(sn: u64, kind: EdgeKind) -> Vec<u64> {
+    let mut parents = Vec::new();
+    match kind {
+        EdgeKind::Prev => {
+            parents.extend(sn.checked_sub(1));
+            if sn >= 12 && sn.is_multiple_of(5) {
+                parents.push(sn - 12);
+            }
+        }
+        EdgeKind::Auth => {
+            parents.extend((sn > 0).then_some(0));
+            if sn >= 8 && sn % 4 == 3 {
+                parents.push(sn - 5);
+            }
+        }
+    }
+    parents
+}
+
+/// Every child of event `sn` along `kind` edges among the forty events, ascending.
+fn truth_children(sn: u64, kind: EdgeKind) -> Vec<u64> {
+    (sn + 1..40)
+        .filter(|&child| truth_parents(child, kind).contains(&sn))
+        .collect()
+}
+
+fn graph_event_id(sn: u64) -> Vec<u8> {
+    format!("${sn}:example.org").into_bytes()
+}
+
+fn graph_row(sn: u64, body: &str) -> BuildRow {
+    let mut row = source_form_row(
+        sn,
+        VariantValue::Object(BTreeMap::from([(
+            "body".to_owned(),
+            VariantValue::String(body.to_owned()),
+        )])),
+    );
+    row.external_id = Some(graph_event_id(sn));
+    row
+}
+
+/// The graph of events `first..end`, with chain-cover labels, one link, a depth range, an unresolved parent on event
+/// 15, and the inbound edges from the events of `inbound_from`, as a compaction that saw those events recorded them.
+fn graph_input(first: u64, end: u64, inbound_from: std::ops::Range<u64>) -> GraphInput {
+    let mut inbound = Vec::new();
+    for child in inbound_from {
+        for kind in [EdgeKind::Auth, EdgeKind::Prev] {
+            for parent in truth_parents(child, kind) {
+                if (first..end).contains(&parent) {
+                    inbound.push(GraphEdge { child, kind, parent });
+                }
+            }
+        }
+    }
+    GraphInput {
+        chain_cover: Some(ChainCoverInput {
+            labels: (first..end)
+                .map(|sn| ChainLabel {
+                    chain_id: 1 + (sn % 2) as u32,
+                    seq: (sn / 2) as u32,
+                })
+                .collect(),
+            links: vec![ChainLink {
+                from_chain: 2,
+                from_seq: (first / 2) as u32,
+                to_chain: 1,
+                to_seq: (first / 2) as u32,
+            }],
+        }),
+        depth: Some(DepthRange {
+            max: 100 + end - 1,
+            min: 100 + first,
+        }),
+        first_sn: first,
+        inbound,
+        rows: (first..end)
+            .map(|sn| RowEdges {
+                auth: truth_parents(sn, EdgeKind::Auth),
+                prev: truth_parents(sn, EdgeKind::Prev),
+            })
+            .collect(),
+        subject: SUBJECT.to_vec(),
+        unresolved: (first..end)
+            .filter(|&sn| sn == 15)
+            .map(|child| UnresolvedEdge {
+                child,
+                parent: RelationshipRef::to_external(RelationshipKind::Prev, b"$late:example.org").unwrap(),
+            })
+            .collect(),
+    }
+}
+
+fn built_graph(rows: Vec<BuildRow>, graph: GraphInput) -> BuiltHef {
+    let mut config = source_form_config(4);
+    config.graph = Some(graph);
+    config.profile = crate::layout::Profile::Graph;
+    build_hef_file(rows, &config).unwrap()
+}
+
+fn open_graph(built: &BuiltHef) -> HefFile {
+    HefFile::open(built.bytes.clone(), Some(&built.file_seal)).unwrap()
+}
+
+fn graph_file(first: u64, end: u64, inbound_from: std::ops::Range<u64>) -> HefFile {
+    let rows = (first..end).map(|sn| graph_row(sn, "hello")).collect();
+    open_graph(&built_graph(rows, graph_input(first, end, inbound_from)))
+}
+
+/// How many edges of `file` (events `first..end`) run to a child at or past `end`, from its inbound tables.
+fn inbound_count(file: &HefFile, first: u64, end: u64) -> usize {
+    (first..end)
+        .map(|sn| {
+            let edges = file.granule_edges(file.graph_granule_of(sn).unwrap()).unwrap();
+            [EdgeKind::Auth, EdgeKind::Prev]
+                .into_iter()
+                .map(|kind| {
+                    edges
+                        .children(sn, kind)
+                        .into_iter()
+                        .filter(|&child| child >= end)
+                        .count()
+                })
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+#[test]
+fn merging_graph_files_keeps_every_edge_and_every_id_lookup() {
+    // Files of events 0-9, 10-19 and 20-29 merge; 30-39 stays a later file. The first file was last rewritten while
+    // 10-19 was its later file, so it already lists their edges into it as inbound.
+    let sources = [
+        graph_file(0, 10, 10..20),
+        graph_file(10, 20, 0..0),
+        graph_file(20, 30, 0..0),
+    ];
+    let later = [graph_file(30, 40, 0..0)];
+    assert!(inbound_count(&sources[0], 0, 10) > 0);
+
+    let graph = rebuild_graph_input(&sources, &later).unwrap();
+    let file = open_graph(&built_graph((0..30).map(|sn| graph_row(sn, "hello")).collect(), graph));
+
+    for sn in 0..30 {
+        let edges = file.granule_edges(file.graph_granule_of(sn).unwrap()).unwrap();
+        for kind in [EdgeKind::Auth, EdgeKind::Prev] {
+            assert_eq!(edges.parents(sn, kind), truth_parents(sn, kind), "parents of {sn}");
+            assert_eq!(edges.children(sn, kind), truth_children(sn, kind), "children of {sn}");
+        }
+        let source = &sources[(sn / 10) as usize];
+        assert_eq!(source.graph_sn_of(&graph_event_id(sn)).unwrap(), Some(sn));
+        assert_eq!(file.graph_sn_of(&graph_event_id(sn)).unwrap(), Some(sn));
+    }
+    assert_eq!(file.graph_sn_of(&graph_event_id(35)).unwrap(), None);
+    // Every cross-file edge among the sources is in-file now, so the inbound edges are exactly the later file's.
+    let from_later: usize = (30..40)
+        .map(|child| {
+            [EdgeKind::Auth, EdgeKind::Prev]
+                .into_iter()
+                .map(|kind| {
+                    truth_parents(child, kind)
+                        .into_iter()
+                        .filter(|&parent| parent < 30)
+                        .count()
+                })
+                .sum::<usize>()
+        })
+        .sum();
+    assert!(from_later > 0);
+    assert_eq!(inbound_count(&file, 0, 30), from_later);
+
+    let sns: Vec<u64> = (0..30).collect();
+    let labels: Vec<Option<ChainLabel>> = sns
+        .iter()
+        .map(|&sn| {
+            Some(ChainLabel {
+                chain_id: 1 + (sn % 2) as u32,
+                seq: (sn / 2) as u32,
+            })
+        })
+        .collect();
+    assert_eq!(file.graph_chain_labels(&sns).unwrap(), labels);
+    assert_eq!(file.graph_chain_links(&[2]).len(), 3, "one link from each source");
+    assert_eq!(file.graph_unresolved_parents(15).len(), 1);
+    assert_eq!(
+        file.footer().graph.as_ref().unwrap().depth,
+        Some(DepthRange { max: 129, min: 100 })
+    );
+}
+
+#[test]
+fn a_graph_rewrite_refuses_sources_that_do_not_join_into_one_subject() {
+    let refused = |sources: &[HefFile], later: &[HefFile]| {
+        matches!(rebuild_graph_input(sources, later), Err(FormatError::Structural { .. }))
+    };
+    // Events 10-19, changed by `edit`.
+    let second = |edit: fn(&mut GraphInput)| {
+        let mut graph = graph_input(10, 20, 0..0);
+        edit(&mut graph);
+        open_graph(&built_graph((10..20).map(|sn| graph_row(sn, "hello")).collect(), graph))
+    };
+    let other_subject: fn(&mut GraphInput) = |graph| graph.subject = b"!other:example.org".to_vec();
+    assert!(refused(&[], &[]), "no sources");
+    assert!(
+        refused(&[graph_file(0, 10, 0..0), graph_file(20, 30, 0..0)], &[]),
+        "a gap between sources"
+    );
+    assert!(
+        refused(&[graph_file(20, 30, 0..0)], &[graph_file(0, 10, 0..0)]),
+        "a later file that starts inside"
+    );
+    assert!(
+        refused(&[graph_file(0, 10, 0..0), second(other_subject)], &[]),
+        "two subjects"
+    );
+    assert!(
+        refused(&[graph_file(0, 10, 0..0)], &[second(other_subject)]),
+        "a later file of another subject"
+    );
+    assert!(
+        refused(
+            &[graph_file(0, 10, 0..0), second(|graph| graph.chain_cover = None)],
+            &[]
+        ),
+        "a chain cover on only some sources"
+    );
+    assert!(rebuild_graph_input(&[graph_file(0, 10, 0..0), second(|_| {})], &[]).is_ok());
+}
+
+/// The bytes of each of a built graph file's edge blocks, in directory order.
+fn edge_blocks(built: &BuiltHef) -> Vec<Vec<u8>> {
+    let footer = &built.footer;
+    footer
+        .graph
+        .as_ref()
+        .unwrap()
+        .blocks
+        .iter()
+        .map(|block| {
+            let granule = footer
+                .granules
+                .iter()
+                .find(|granule| granule.granule_id == block.granule_id)
+                .unwrap();
+            let base = footer
+                .stripes
+                .iter()
+                .find(|stripe| stripe.stripe_id == granule.stripe_id)
+                .unwrap()
+                .file_offset;
+            let start = (base + block.offset) as usize;
+            built.bytes[start..start + block.len as usize].to_vec()
+        })
+        .collect()
+}
+
+/// A body of 600 characters no other event's body shares, so it does not compress away.
+fn distinct_body(sn: u64) -> String {
+    (0..600u64)
+        .map(|k| char::from(b'!' + ((k ^ (sn << 10)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as u8))
+        .collect()
+}
+
+#[test]
+fn redacting_bodies_leaves_the_graph_byte_identical() {
+    let original = built_graph(
+        (10..30).map(|sn| graph_row(sn, &distinct_body(sn))).collect(),
+        graph_input(10, 30, 30..40),
+    );
+
+    // Redaction strips the bodies of events 12, 17 and 25; their edges, labels and ids stay.
+    let redacted = built_graph(
+        (10..30)
+            .map(|sn| {
+                let body = if [12, 17, 25].contains(&sn) {
+                    String::new()
+                } else {
+                    distinct_body(sn)
+                };
+                graph_row(sn, &body)
+            })
+            .collect(),
+        rebuild_graph_input(&[open_graph(&original)], &[]).unwrap(),
+    );
+    let offsets = |built: &BuiltHef| -> Vec<u64> {
+        built
+            .footer
+            .graph
+            .as_ref()
+            .unwrap()
+            .blocks
+            .iter()
+            .map(|block| block.offset)
+            .collect()
+    };
+    assert_ne!(
+        offsets(&redacted),
+        offsets(&original),
+        "the stripped bodies moved the edge blocks that follow them"
+    );
+
+    assert_eq!(edge_blocks(&redacted), edge_blocks(&original));
+    let (before, after) = (
+        original.footer.graph.as_ref().unwrap(),
+        redacted.footer.graph.as_ref().unwrap(),
+    );
+    assert_eq!(after.chain_cover, before.chain_cover);
+    assert_eq!(after.depth, before.depth);
+    assert_eq!(after.event_ids, before.event_ids);
+    assert_eq!(after.first_sn, before.first_sn);
+    assert_eq!(after.subject, before.subject);
+    assert_eq!(after.unresolved, before.unresolved);
+    let shape = |directory: &GraphDirectory| -> Vec<(u32, u64)> {
+        directory
+            .blocks
+            .iter()
+            .map(|block| (block.granule_id, block.len))
+            .collect()
+    };
+    assert_eq!(
+        shape(after),
+        shape(before),
+        "each edge block keeps its granule and length; only where it sits moves"
+    );
+}
+
+/// Seals a 100,000-event room-shaped graph into per-subject files of 4096 events, then compacts them all into one
+/// file and prints the edge-block bytes per edge before and after, the whole output's bytes per event, and how long
+/// the rebuild and the build took. Run by hand:
+/// `cargo test --release --features write --lib graph_compaction_of_a_room -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-mode graph compaction benchmark"]
+fn graph_compaction_of_a_room() {
+    let events = 100_000u64;
+    let seal = 4096u64;
+    let room = room_graph(events);
+    let edges: u64 = room
+        .rows
+        .iter()
+        .map(|row| (row.auth.len() + row.prev.len()) as u64)
+        .sum();
+    let rows_of = |first: u64, end: u64| -> Vec<BuildRow> { (first..end).map(|sn| graph_row(sn, "hi")).collect() };
+    let build = |rows: Vec<BuildRow>, graph: GraphInput| {
+        let mut config = source_form_config(8192);
+        config.graph = Some(graph);
+        config.profile = crate::layout::Profile::Graph;
+        build_hef_file(rows, &config).unwrap()
+    };
+    let edge_bytes = |built: &BuiltHef| -> usize { edge_blocks(built).iter().map(Vec::len).sum() };
+
+    let sealed: Vec<BuiltHef> = (0..events.div_ceil(seal))
+        .map(|index| {
+            let (first, end) = (index * seal, ((index + 1) * seal).min(events));
+            let graph = GraphInput {
+                first_sn: first,
+                rows: room.rows[first as usize..end as usize].to_vec(),
+                subject: room.subject.clone(),
+                ..GraphInput::default()
+            };
+            build(rows_of(first, end), graph)
+        })
+        .collect();
+    let sources: Vec<HefFile> = sealed.iter().map(open_graph).collect();
+    assert!(sources.len() >= 8);
+
+    let started = std::time::Instant::now();
+    let graph = rebuild_graph_input(&sources, &[]).unwrap();
+    let rebuilt = started.elapsed();
+    let rows = rows_of(0, events);
+    let started = std::time::Instant::now();
+    let merged = build(rows, graph);
+    let built = started.elapsed();
+
+    let file = open_graph(&merged);
+    for sn in (0..events).step_by(997) {
+        let edges = file.granule_edges(file.graph_granule_of(sn).unwrap()).unwrap();
+        let row = &room.rows[sn as usize];
+        assert_eq!(edges.parents(sn, EdgeKind::Prev), row.prev);
+        assert_eq!(edges.parents(sn, EdgeKind::Auth), row.auth);
+        assert_eq!(file.graph_sn_of(&graph_event_id(sn)).unwrap(), Some(sn));
+    }
+    let sealed_edge_bytes: usize = sealed.iter().map(edge_bytes).sum();
+    let sealed_bytes: usize = sealed.iter().map(|built| built.bytes.len()).sum();
+    println!(
+        "graph compaction: {} events, {edges} edges, {} sealed files -> 1",
+        events,
+        sealed.len()
+    );
+    println!(
+        "  edge blocks: {:.2} bytes/edge sealed, {:.2} bytes/edge compacted",
+        sealed_edge_bytes as f64 / edges as f64,
+        edge_bytes(&merged) as f64 / edges as f64
+    );
+    println!(
+        "  whole files: {:.1} bytes/event sealed, {:.1} bytes/event compacted ({} bytes)",
+        sealed_bytes as f64 / events as f64,
+        merged.bytes.len() as f64 / events as f64,
+        merged.bytes.len()
+    );
+    println!(
+        "  rebuild_graph_input {:.1} ms, build {:.1} ms",
+        rebuilt.as_secs_f64() * 1e3,
+        built.as_secs_f64() * 1e3
+    );
 }

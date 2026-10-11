@@ -7,13 +7,18 @@
 //! reference turns a day-scale compaction that touches a few stripes into a few requests instead of a full re-upload,
 //! The replacement seal composes from its stripe checksums, so unchanged stripes reuse both their bytes and their
 //! integrity leaves regardless of where they land. The output is byte-identical to a full rewrite.
+//!
+//! A third job rebuilds a graph file's edges when compaction merges one subject's graph files, or when one is rewritten
+//! alone to redact event bodies: see [`rebuild_graph_input`].
 
 use super::audit::refuse_audit_rewrite;
 use super::build::BuiltHef;
 use crate::error::FormatError;
 use crate::events::TimestampValue;
 use crate::layout::footer::StripeEntry;
-use hashbrown::HashMap;
+use crate::layout::graph::{ChainCoverInput, DepthRange, EdgeKind, GraphEdge, GraphInput, RowEdges};
+use crate::layout::reader::HefFile;
+use hashbrown::{HashMap, HashSet};
 
 /// The byte length of a stripe's BLAKE3 checksum, matching [`StripeEntry`]'s paired `stripe_checksums` entries.
 const STRIPE_CHECKSUM_BYTES: usize = 32;
@@ -201,6 +206,125 @@ pub fn plan_rewrite(source: &BuiltHef, replacement: &BuiltHef) -> Result<Rewrite
         .collect();
 
     Ok(plan_stripe_reuse(&changes, 0))
+}
+
+/// The graph to build a rewritten graph file with: `sources`, one subject's files in order, each starting right after
+/// the one before, rebuilt as one file. Pass several files to merge them in a compaction, or one file to rewrite it
+/// alone (to redact event bodies, say): a graph is never redacted, so its edges come back exactly as stored and its
+/// edge blocks and graph footer sections rebuild byte for byte as long as the rows fall into the same granules.
+///
+/// Every parent comes back as its event declared it, in order; the build derives each event's in-file children from
+/// them again. A child the sources recorded from a later file stays an inbound edge when it lies past the rebuilt file
+/// and becomes an in-file edge when it lies inside it. Each file of `later`, the subject's files after the sources, adds
+/// an inbound edge for every parent it names inside the rebuilt file; pass all of them so the rebuilt file lists every
+/// child. Unresolved parents, chain-cover labels and links carry over, and so does the depth range, widened over all
+/// sources, when every source records one. Event ids are not part of a graph: the build indexes them again from the
+/// rows, so build the rewritten file from the sources' rows, in order, with their ids.
+///
+/// Refuses no sources, a source without a graph, sources of different subjects, sources that leave a gap or overlap,
+/// sources that mix files with and without a chain cover, and a later file of another subject or one that starts
+/// inside the sources.
+pub fn rebuild_graph_input(sources: &[HefFile], later: &[HefFile]) -> Result<GraphInput, FormatError> {
+    let refuse = |rule: &'static str| FormatError::Structural { rule };
+    let first = sources
+        .first()
+        .and_then(|file| file.footer().graph.as_ref())
+        .ok_or(refuse("a graph rewrite needs a source graph file"))?;
+    let mut graph = GraphInput {
+        chain_cover: first.chain_cover.as_ref().map(|_| ChainCoverInput::default()),
+        depth: first.depth,
+        first_sn: first.first_sn,
+        subject: first.subject.clone(),
+        ..GraphInput::default()
+    };
+    let mut inbound = Vec::new();
+    let mut end_sn = first.first_sn;
+    for file in sources {
+        let footer = file.footer();
+        let directory = footer
+            .graph
+            .as_ref()
+            .ok_or(refuse("every graph rewrite source carries a graph"))?;
+        if directory.subject != graph.subject || directory.first_sn != end_sn {
+            return Err(refuse(
+                "graph rewrite sources are one subject's files, each starting right after the one before",
+            ));
+        }
+        if directory.chain_cover.is_some() != graph.chain_cover.is_some() {
+            return Err(refuse("graph rewrite sources all carry a chain cover or none does"));
+        }
+        graph.depth = graph.depth.zip(directory.depth).map(|(a, b)| DepthRange {
+            max: a.max.max(b.max),
+            min: a.min.min(b.min),
+        });
+        if let (Some(cover), Some(summary)) = (&mut graph.chain_cover, &directory.chain_cover) {
+            cover.links.extend_from_slice(&summary.links);
+        }
+        graph.unresolved.extend_from_slice(&directory.unresolved);
+        end_sn = end_sn
+            .checked_add(footer.exact_counts.row_count)
+            .ok_or(refuse("graph sequence numbers overflow"))?;
+        for granule in &footer.granules {
+            let edges = file.granule_edges(granule.granule_id)?;
+            let first_sn = directory.first_sn + granule.first_row_ordinal;
+            for sn in first_sn..first_sn + u64::from(granule.row_count) {
+                graph.rows.push(RowEdges {
+                    auth: edges.parents(sn, EdgeKind::Auth).to_vec(),
+                    prev: edges.parents(sn, EdgeKind::Prev).to_vec(),
+                });
+                if let Some(cover) = &mut graph.chain_cover {
+                    cover.labels.push(
+                        edges
+                            .label(sn)
+                            .ok_or(refuse("a chain-covered graph file labels every event"))?,
+                    );
+                }
+                for kind in [EdgeKind::Auth, EdgeKind::Prev] {
+                    for child in edges.children(sn, kind) {
+                        if child >= end_sn {
+                            inbound.push(GraphEdge {
+                                child,
+                                kind,
+                                parent: sn,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // A child recorded as inbound by an earlier source may live in a later source: it is an in-file edge now.
+    inbound.retain(|edge| edge.child >= end_sn);
+    for file in later {
+        let footer = file.footer();
+        let directory = footer
+            .graph
+            .as_ref()
+            .ok_or(refuse("every later graph file carries a graph"))?;
+        if directory.subject != graph.subject || directory.first_sn < end_sn {
+            return Err(refuse(
+                "later graph files belong to the same subject and start after the rewritten file",
+            ));
+        }
+        for granule in &footer.granules {
+            let edges = file.granule_edges(granule.granule_id)?;
+            let first_sn = directory.first_sn + granule.first_row_ordinal;
+            for child in first_sn..first_sn + u64::from(granule.row_count) {
+                for kind in [EdgeKind::Auth, EdgeKind::Prev] {
+                    for &parent in edges.parents(child, kind) {
+                        if (graph.first_sn..end_sn).contains(&parent) {
+                            inbound.push(GraphEdge { child, kind, parent });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // An edge from a later file may already be one the sources recorded as inbound when they were last rewritten.
+    let mut seen = HashSet::with_capacity(inbound.len());
+    inbound.retain(|edge| seen.insert(*edge));
+    graph.inbound = inbound;
+    Ok(graph)
 }
 
 #[cfg(test)]

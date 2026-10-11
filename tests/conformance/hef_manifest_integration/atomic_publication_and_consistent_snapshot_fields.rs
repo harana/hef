@@ -23,6 +23,7 @@ fn entry_for(range: SequenceRange) -> HefFileEntry {
         file_type: FileType::HefFile,
         footer_len: None,
         graph_event_id_filter: None,
+        graph_summary: None,
         optional_feature_flags: 0,
         part_index: 0,
         part_state: PartState::Active,

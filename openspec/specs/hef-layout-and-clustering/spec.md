@@ -32,3 +32,9 @@ Compaction MAY rewrite ingest files into a secondary entity projection whose row
 - **WHEN** an ordinary build is handed rows in entity order
 - **THEN** it refuses them, while the entity-projection build accepts the same rows
 
+### Requirement: Graph files cluster by sequence and record depth
+A graph file's rows SHALL stay in their subject's sequence order, so row `i` is event `first_sn + i`; depth-ordered clustering SHALL NOT reorder rows. Depth locality SHALL come from recording each file's depth range in its footer and manifest entry, so a walk by depth skips files outside the depths it wants. Seal and compaction SHALL only cut and merge runs of consecutive sequence numbers.
+
+#### Scenario: Depth prunes without reordering
+- **WHEN** a graph file records a depth range
+- **THEN** its rows keep their sequence order and a planner skips it for depths outside the range

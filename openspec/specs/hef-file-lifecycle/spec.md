@@ -65,3 +65,13 @@ A `snapshot` profile file SHALL be published into a catalogue that holds only th
 - **WHEN** a snapshot of an epoch not later than the Active one is published
 - **THEN** the publication fails and the head generation is unchanged
 
+### Requirement: Graph files compact per subject in size tiers
+Graph files SHALL be compacted per subject, never by the event-file planner. A run is a stretch of one subject's `Active` graph files below 64 MiB whose events follow on with no gap; a file of 64 MiB or more, a gap, or another subject ends it. A run of two or more files SHALL merge when it holds more than 8 files or adds up to less than 8 MiB, cut front to back into merges that each stop before their output passes 256 MiB. The merged file's graph SHALL be rebuilt from its inputs: every parent kept in order, reverse edges derived again, an edge from a later input into an earlier one becoming an in-file edge, an edge from a later file outside the merge becoming an inbound edge of the merged file, unresolved parents, chain-cover labels and links carried over, and the event-id index rebuilt from the rows. The merge publishes through the ordinary compaction publication.
+
+#### Scenario: Compaction preserves every edge and id
+- **WHEN** three sealed files of a subject are merged while a fourth, later file names parents in them
+- **THEN** every event's parents and children, and every event id lookup, read back from the merged file as they did across the four files
+
+#### Scenario: Size-tiered trigger
+- **WHEN** a subject has three files adding up to under 8 MiB, three adding up to 8 MiB or more, or nine of any size below 64 MiB
+- **THEN** the first and last merge and the second waits

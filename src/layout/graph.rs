@@ -19,6 +19,10 @@
 //! it: the labels ride at the end of each granule's edge block, so the read that returns a granule's edges returns its
 //! labels too, and the footer keeps the links between chains and each chain's sequence range (see [`ChainCover`]).
 //!
+//! A file may also record the range of its events' depths (a Matrix event's `depth`, say), as the embedding application
+//! read them, so a walk that pages back through the subject by depth skips files outside the depths it wants (see
+//! [`DepthRange`]). Rows stay in sequence order: ordering them by depth would break `row i = first_sn + i`.
+//!
 //! A file may also index its events' protocol ids (a Matrix `$...` id, say), so a reader finds an event's sequence
 //! number without reading a granule and a planner skips files that cannot hold it (see [`EventIdIndex`]).
 //!
@@ -101,6 +105,9 @@ pub struct GraphInput {
     /// The rows' auth chain-cover labels and the links between chains, computed by the embedding application, or
     /// `None` for a file without them.
     pub chain_cover: Option<ChainCoverInput>,
+    /// The lowest and highest depth among the rows, as the embedding application read them from its events, or `None`
+    /// for a file that records no depths.
+    pub depth: Option<DepthRange>,
     /// The sequence number of the file's first row.
     pub first_sn: u64,
     /// Edges from events in later files to parents in this one, supplied when compaction rewrites the file. Each
@@ -178,11 +185,24 @@ pub struct ChainCoverInput {
 /// The sequence numbers one chain's events in a file run between, so a reader skips files that hold none of a range.
 ///
 /// See: hef-file-layout/spec.md
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChainRange {
     pub chain_id: u32,
     pub max_seq: u32,
     pub min_seq: u32,
+}
+
+/// The lowest and highest depth among a graph file's events: how far each event sits from the start of its subject's
+/// history, as the embedding application counts it (a Matrix event's `depth`, say).
+///
+/// A walk that pages back through a subject by depth reads it from the file's footer or manifest entry and skips files
+/// whose range misses the depths it wants. `min` never passes `max`.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DepthRange {
+    pub max: u64,
+    pub min: u64,
 }
 
 /// What a graph file's footer keeps of its chain cover: each chain's range of `seq` among the file's events and the
@@ -274,9 +294,9 @@ impl Csr {
 
 /// Checks `graph` against a file of `row_count` rows cut into `granules`, then builds each granule's edge block,
 /// keyed by granule id. Refuses a graph whose row list does not match the file, whose sequence numbers would
-/// overflow, or that names a parent not strictly earlier than its event, a repeated edge, an inbound edge that does
-/// not run from a later file into this one, or an unresolved parent that is not a `prev` or `auth` reference by
-/// protocol id from an event in the file.
+/// overflow, whose depth range's minimum passes its maximum, or that names a parent not strictly earlier than its
+/// event, a repeated edge, an inbound edge that does not run from a later file into this one, or an unresolved parent
+/// that is not a `prev` or `auth` reference by protocol id from an event in the file.
 pub fn encode_graph_blocks(
     graph: &GraphInput,
     row_count: u64,
@@ -323,6 +343,9 @@ pub fn encode_graph_blocks(
                 "an unresolved graph edge names a prev or auth parent by protocol id",
             ));
         }
+    }
+    if graph.depth.is_some_and(|depth| depth.min > depth.max) {
+        return Err(refuse("a graph depth range's minimum does not pass its maximum"));
     }
     if let Some(cover) = &graph.chain_cover {
         if cover.labels.len() != graph.rows.len() {
@@ -983,4 +1006,4 @@ impl HefFile {
 
 #[cfg(test)]
 #[path = "test/graph.rs"]
-mod tests;
+pub(crate) mod tests;

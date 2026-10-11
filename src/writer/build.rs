@@ -5221,6 +5221,7 @@ fn build_hef_file_sealed_in_order(
         graph: config.graph.as_ref().map(|graph| GraphDirectory {
             blocks: graph_blocks,
             chain_cover: graph.chain_cover.as_ref().map(ChainCover::build),
+            depth: graph.depth,
             event_ids: graph_event_ids,
             first_sn: graph.first_sn,
             subject: graph.subject.clone(),

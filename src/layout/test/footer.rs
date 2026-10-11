@@ -1086,6 +1086,7 @@ fn graph_footer() -> Footer {
             len: 300,
             offset: 4_096,
         }],
+        depth: None,
         event_ids: None,
         first_sn: 77,
         subject: b"!room:example.org".to_vec(),
@@ -1145,6 +1146,25 @@ fn the_graph_edge_directory_round_trips_through_the_footer() {
     let footer = graph_footer();
     assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().graph, footer.graph);
     assert_eq!(decode_footer(&encode_footer(&minimal_footer())).unwrap().graph, None);
+}
+
+#[test]
+fn a_graph_depth_range_round_trips_and_a_reversed_one_is_refused() {
+    let mut footer = graph_footer();
+    if let Some(graph) = &mut footer.graph {
+        graph.depth = Some(crate::layout::graph::DepthRange { max: 90, min: 12 });
+    }
+    assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().graph, footer.graph);
+
+    if let Some(graph) = &mut footer.graph {
+        graph.depth = Some(crate::layout::graph::DepthRange { max: 11, min: 12 });
+    }
+    assert_eq!(
+        decode_footer(&encode_footer(&footer)),
+        Err(FormatError::Structural {
+            rule: "graph depth section holds a minimum then a maximum it does not pass",
+        })
+    );
 }
 
 fn indexed_graph_footer() -> Footer {

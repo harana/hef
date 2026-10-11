@@ -78,3 +78,9 @@ When a service mutates derived state while observing rows during HEF publication
 - **WHEN** a service staged derived-state changes for a publish attempt that then loses
 - **THEN** it rolls back or rebuilds from its last checkpoint plus UnifiedEvents before serving reads
 
+### Requirement: Graph files seal per subject by event count or age
+Each subject's events SHALL fill that subject's own open graph file. The application SHALL seal a subject's open file once it holds the policy's event count (4096 by default) or once the policy's age (five minutes by default) has passed since its first event arrived, whichever comes first, reading the time through the shared clock; an empty file SHALL never seal. The open file's event count and first-arrival time are the application's durable state, not HEF's.
+
+#### Scenario: Seal by count and by age
+- **WHEN** a subject's open file reaches 4096 events, or a quiet subject's first event has waited the policy's age
+- **THEN** the seal check fires with the event-count trigger, or the age trigger, and not a moment before
