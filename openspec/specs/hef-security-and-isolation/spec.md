@@ -48,6 +48,23 @@ Key granularity SHALL be the caller's explicit choice, through what it names as 
 - **WHEN** a row names a subject whose key has been destroyed
 - **THEN** sealing fails and the row is left untouched
 
+### Requirement: State chunks are sealed convergently per tenant
+A content-addressed state chunk (see the hef-physical-artifacts requirement "State chunks hold a subject's state as a content-addressed tree") SHALL be sealed so that two identical chunks of one tenant seal to the same bytes under the same address and are stored once. Sealing with a random nonce cannot do this: identical chunks would differ, every write of an unchanged subtree would store a new object, and the tree would share nothing between successive states. From the tenant DEK HEF SHALL derive two independent keys with BLAKE3 `derive_key` under fixed context strings: an address key and a seal key. A chunk's address SHALL be the BLAKE3 of its plaintext keyed with the address key. The stored object SHALL be the plaintext sealed with XChaCha20-Poly1305 under the seal key, with the first 24 bytes of the address as the nonce and the whole address as associated data; the nonce is not stored, since the reader fetches the object by its address. Because the nonce is a keyed hash of the whole plaintext (a synthetic-nonce construction, as in SIV), one nonce under the seal key only ever seals one plaintext, so the derived nonce cannot repeat across different chunks and resealing the same chunk is harmless. XChaCha20-Poly1305 SHALL be the cipher for this path whatever the deployment's default, because its 192-bit nonce keeps a collision between two derived nonces negligible where a 96-bit AES-256-GCM nonce would not. Opening SHALL check the tag and that the keyed hash of the recovered plaintext equals the address the object was fetched under, so a chunk copied to another address, or into another tenant, is refused.
+
+The leakage this accepts SHALL be exactly the following, and no more. Within one tenant, anyone who can list or read the object store learns which chunks are equal: that two state roots share a subtree, or that a state map returned to an earlier value, plus the number and sizes of chunks. Across tenants nothing is learned: addresses are keyed per tenant, so the same plaintext in two tenants has unrelated addresses and ciphertexts, and an address is not an unkeyed hash of the plaintext that an outsider could confirm a guessed chunk against. Deduplication SHALL therefore be per tenant only. Rotating the tenant DEK changes every address, so roots written after a rotation share no chunks with roots written before it; the old chunks are collected once no published root references them. The alternative, sealing with a random nonce and addressing a chunk by the hash of its ciphertext, leaks no equality but never deduplicates, and was rejected for that reason.
+
+#### Scenario: Identical chunks of one tenant share one object
+- **WHEN** the same chunk is sealed twice with one tenant's key
+- **THEN** both seals give the same address and the same bytes
+
+#### Scenario: Tenants share no addresses
+- **WHEN** the same chunk is sealed with two tenants' keys
+- **THEN** the addresses and the bytes differ, and neither tenant's key opens the other's object
+
+#### Scenario: Relocated or altered chunk refused
+- **WHEN** a sealed chunk is opened under an address other than its own, or with any byte altered
+- **THEN** opening fails and no plaintext is returned
+
 ### Requirement: Key-scope and residency as job-eligibility constraints
 HEF background jobs (compaction, projection and derived-column builds, re-extraction, index rebuilds) SHALL declare the key scope they require (none, tenant-DEK, subject-keys) and SHALL be schedulable only on nodes holding a valid lease for that scope; jobs over subject-encrypted blocks SHALL respect residency/region constraints so processing stays in the subject's jurisdiction. A key lease SHALL carry the residency region it was granted for, and a node SHALL be eligible for a scope-requiring job only when it holds the required-scope lease for the job's residency region: a lease granted for another region SHALL NOT satisfy the job, so a tenant's keys are never used to process data outside their jurisdiction. Blocks SHALL stay encrypted at rest and in transit on every node, decrypted only transiently during authorized processing, and a key-lease revocation (including erasure) SHALL fail in-flight jobs closed so no output derived from revoked keys is ever published.
 
