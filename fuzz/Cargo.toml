@@ -58,6 +58,12 @@ path = "fuzz_targets/xor_float_block.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "state_chunk"
+path = "fuzz_targets/state_chunk.rs"
+test = false
+doc = false
+
 [dependencies]
 hef = { path = "..", features = ["write"] }
 libfuzzer-sys = "0.4"

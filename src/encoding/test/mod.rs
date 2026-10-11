@@ -1,4 +1,5 @@
 use super::*;
+use crate::benchmarks::{XorFloatMeasurement, xor_float_gate_passes};
 use crate::file::bytes::{Reader, Writer};
 use arrow_array::Array;
 use miniz_oxide::deflate::compress_to_vec;
@@ -2960,7 +2961,11 @@ fn xor_floats_beat_every_existing_float_encoding_on_a_slowly_varying_metric() {
         adaptive.bytes.len() as f64 / values.len() as f64
     );
     assert_eq!(block.pipeline.transform().unwrap(), Transform::Chimp);
-    assert!(block.bytes.len() < best_existing);
+    assert!(xor_float_gate_passes(&XorFloatMeasurement {
+        best_existing_bytes: best_existing as u64,
+        chimp_bytes: block.bytes.len() as u64,
+        values: values.len() as u64,
+    }));
     assert_eq!(decode_block(block.pipeline, &block.bytes).unwrap(), data);
 }
 

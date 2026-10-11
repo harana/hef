@@ -108,3 +108,42 @@ Write-ahead log objects SHALL be gated on their fixed framing and their verified
 #### Scenario: Log object passes the framing and streaming gate
 - **WHEN** a log object is written and read forward against its pinned root
 - **THEN** its measured header plus trailer bytes, the bytes hashed before its first record, and the bytes hashed for the whole read are within the gate, and the gate fails when any of them is not
+
+### Requirement: Graph and time-series profile gates
+Every block the graph and time-series profiles add SHALL be held to a gate in `benchmarks.rs`, evaluated by a committed test that measures it, with the measured value recorded here beside the gate. Graph edge blocks SHALL cost at most 6 bytes per edge, forward and reverse copies together. A cold graph walk SHALL send at most one request per file of the subject in any one level. A graph file's event-id index SHALL cost at most 12 footer bytes per indexed event, its filter included, and the filter SHALL admit at most 2% of absent ids. Chain-cover labels SHALL add at most 4 edge-block bytes each (half their raw 8), and the chain-cover footer section SHALL cost at most 8 bytes per link (half its raw 16), chain ranges included. State events in a 100,000-member room SHALL write at most 16 KiB of new state chunks each on average. A lookup of one key in the state at an event (its state root, then the key) SHALL fetch at most one chunk per state-tree level when its chunk cache is empty, and SHALL spend at most 1 ms at the 99th percentile on its own work, beyond its object-store round trips when cold and in all when warm. Replaying a 100,000-member room's join history into state trees and graph files SHALL write at most 16 KiB of new state chunks per event, with its wall time and bytes written recorded. Chimp float blocks SHALL store a slowly varying full-precision gauge in fewer bytes than every earlier float encoding and in at most 3.5 bytes per value. A time-series aggregate over whole rollup buckets SHALL read no column block, and one whose range cuts a bucket at each end SHALL read at most 8, fewer than scanning the range. The measurements that build 100,000-event inputs in full (the walk, state lookups, state-chunk writes and the room replay) SHALL run as ignored release-mode tests, run by hand when the gates are re-baselined; the others run with every test run.
+
+#### Scenario: Graph edges stay compact
+- **WHEN** a room-shaped graph of 100,000 events is stored in 8192-row granules
+- **THEN** its edge blocks cost at most 6 bytes per edge (measured: 3.04, 1,243,418 bytes for 409,397 edges)
+
+#### Scenario: A cold walk sends at most one request per file per level
+- **WHEN** a cold walk goes back through a 100,000-event history held in four files of 8192-row granules
+- **THEN** no level sends more than one request per file (measured: 16 requests over 11,118 levels, 0.0014 per level, at most 1 in any level)
+
+#### Scenario: The event-id index stays small and selective
+- **WHEN** 100,000 protocol ids are indexed and 200,000 absent ids are probed against the filter
+- **THEN** the section costs at most 12 bytes per event and the filter admits at most 2% of the absent ids (measured: 10.01 bytes per event, 1.23 of them filter; 0.70% admitted)
+
+#### Scenario: Chain cover stays compact
+- **WHEN** the room-shaped graph carries a chain cover of 33 chains, one label per event
+- **THEN** labels add at most 4 bytes each and the section at most 8 bytes per link (measured: 1.76 bytes per label; 37,654 links in 114,323 bytes, 3.04 per link)
+
+#### Scenario: State events write little
+- **WHEN** a 100,000-member room takes 1,024 state events after its initial state
+- **THEN** the chunks new to each event's tree average at most 16 KiB (measured: 13,878 bytes and 3.00 chunks per event)
+
+#### Scenario: State at an event is read in one fetch per level
+- **WHEN** 1,000 lookups of a random member at a random one of those state events run through the graph's state reader, each cold against an empty chunk cache with a simulated 20 ms round trip per fetch and then warm against the cache it filled
+- **THEN** a cold lookup fetches at most one chunk per tree level and both percentiles stay within 1 ms of local work (measured: at most 3 fetches over 3 levels, cold p99 60.073 ms, warm p99 63 us)
+
+#### Scenario: Room replay recorded
+- **WHEN** a 100,000-member room's join history (create, power levels, then one join per member, each a state event with its own root) is replayed into full state-tree builds and graph files of 16,384 events
+- **THEN** its new state chunks average at most 16 KiB per event, and its wall time and bytes written are recorded (measured: 100,002 events in 234,229 ms; 9,650,717 bytes of graph files and 820,149,980 bytes of new state chunks, 8,201 per event; the time is dominated by the full state-tree build each event takes, so it grows with the square of the member count)
+
+#### Scenario: XOR floats beat earlier encodings
+- **WHEN** 8192 readings of a memory-utilization gauge are stored as a time-series float block
+- **THEN** Chimp stores them in fewer bytes than every earlier float encoding and in at most 3.5 bytes per value (measured: 2.957 bytes per value, against 3.067 for the best earlier encoding)
+
+#### Scenario: Rollups answer without scanning
+- **WHEN** a 2,000-reading time-series file with one-second rollups is aggregated over whole buckets, over a range cutting a bucket at each end, and over that range by scanning
+- **THEN** whole buckets read no column block and the cut range at most 8, fewer than the scan (measured: 0, 4 and 62 blocks)

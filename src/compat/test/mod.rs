@@ -32,7 +32,7 @@ fn unsupported_major_version_is_rejected() {
 }
 
 /// What a reader built before the graph bits existed implements: bits 0 to 22.
-const PRE_GRAPH_KNOWN: u64 = (1 << 23) - 1;
+pub(super) const PRE_GRAPH_KNOWN: u64 = (1 << 23) - 1;
 
 #[test]
 fn a_reader_from_before_the_graph_bits_refuses_a_graph_file_and_this_reader_accepts_it() {
@@ -62,7 +62,7 @@ fn a_reader_from_before_the_graph_bits_refuses_a_graph_file_and_this_reader_acce
 
 /// What a reader built before time-series files existed implements: required bits 0 to 29, optional bits 0 to 12, and
 /// pipeline transforms 0 to 13.
-const PRE_TIME_SERIES_REQUIRED_KNOWN: u64 = (1 << 30) - 1;
+pub(super) const PRE_TIME_SERIES_REQUIRED_KNOWN: u64 = (1 << 30) - 1;
 const PRE_TIME_SERIES_OPTIONAL_KNOWN: u64 = (1 << 13) - 1;
 const PRE_TIME_SERIES_TRANSFORMS: usize = 14;
 

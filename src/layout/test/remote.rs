@@ -1,6 +1,9 @@
 use super::*;
 use crate::artifacts::batch::{EventInput, PayloadInput};
-use crate::artifacts::state_chunk::{SealedStateChunk, build_state_tree};
+use crate::artifacts::state_chunk::{SealedStateChunk, StateChunk, build_state_tree, decode_state_chunk};
+use crate::benchmarks::{
+    GraphWalkRequestsMeasurement, StateLookupMeasurement, graph_walk_requests_gate_passes, state_lookup_gate_passes,
+};
 use crate::clock::FixedClock;
 use crate::columns::{FreetextDeclaration, PromotionPlan, column_ids};
 use crate::error::StorageError;
@@ -16,7 +19,7 @@ use crate::security::TenantDek;
 use crate::typed_id::TypedIdTestExt;
 use crate::writer::build::{BuildLifecycle, BuiltHef, HefBuildConfig, HefRow, build_hef_file};
 use crate::writer::source_form::tests::{source_form_config, source_form_row};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap as StdBTreeMap, HashMap as StdHashMap};
 use std::sync::{
     Mutex,
@@ -549,7 +552,13 @@ fn event_id(sn: u64) -> Vec<u8> {
 
 /// A graph file holding `graph`, one small row per event, four rows per granule, each row carrying its protocol id.
 fn build_graph(graph: GraphInput) -> BuiltHef {
-    let mut config = source_form_config(4);
+    build_graph_in_granules(graph, 4)
+}
+
+/// A graph file holding `graph`, one small row per event, `rows_per_granule` rows per granule, each row carrying its
+/// protocol id.
+fn build_graph_in_granules(graph: GraphInput, rows_per_granule: usize) -> BuiltHef {
+    let mut config = source_form_config(rows_per_granule);
     let sns = graph.first_sn..graph.first_sn + graph.rows.len() as u64;
     config.graph = Some(graph);
     config.profile = Profile::Graph;
@@ -635,19 +644,28 @@ fn a_walk_costs_at_most_one_request_per_file_per_level() {
     let opened = singles();
     let mut seen = 0;
     let mut previous = requests();
+    let mut measurement = GraphWalkRequestsMeasurement {
+        files: 2,
+        levels: 0,
+        max_level_requests: 0,
+        requests: 0,
+    };
     for level in graph.walk(b"room", 63, EdgeKind::Prev, 64) {
         let level = level.unwrap();
         let requests_now = requests();
-        assert!(
-            requests_now - previous <= 2,
-            "a level costs at most one request per file"
-        );
+        measurement.levels += 1;
+        measurement.max_level_requests = measurement.max_level_requests.max((requests_now - previous) as u64);
         for source in &sources {
             assert!(source.batches().iter().all(|batch| batch.len() == 1));
         }
         previous = requests_now;
         seen += level.len();
     }
+    measurement.requests = requests() as u64;
+    assert!(
+        graph_walk_requests_gate_passes(&measurement),
+        "a level costs at most one request per file: {measurement:?}"
+    );
     assert_eq!(seen, 63, "every ancestor of event 63 is reached once");
     assert!(requests() > 0);
     assert_eq!(singles(), opened, "no level fetches anything outside its batches");
@@ -990,4 +1008,176 @@ fn state_is_read_at_a_state_event_through_the_graph() {
     );
     assert!(state.state_diff(&roots[1], &roots[1]).unwrap().is_empty());
     assert_eq!(chunks.take_reads(), 0, "a state compared with itself reads nothing");
+}
+
+/// Requests per level of a cold walk back through a 100,000-event history held in four files of 25,000 events in
+/// 8192-row granules, each event pointing back at the one before and the one nine before. Prints the walk's levels,
+/// requests, mean requests per level and the most any level sent. Run by hand:
+/// `cargo test --release --features write --lib graph_walk_requests_per_level -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-mode graph walk benchmark"]
+fn graph_walk_requests_per_level() {
+    const FILES: u64 = 4;
+    const FILE_EVENTS: u64 = 25_000;
+    let built: Vec<BuiltHef> = (0..FILES)
+        .map(|file| build_graph_in_granules(graph_input(file * FILE_EVENTS, FILE_EVENTS, &[1, 9]), 8192))
+        .collect();
+    let sources: Vec<Arc<BatchSource>> = built.iter().map(|built| BatchSource::new(&built.bytes)).collect();
+    let files = sources
+        .iter()
+        .zip(&built)
+        .map(|(source, built)| open_graph_file(source, built))
+        .collect();
+    let graph = remote_graph(files, options(16));
+    let requests = || sources.iter().map(|source| source.batches().len() as u64).sum::<u64>();
+    let mut measurement = GraphWalkRequestsMeasurement {
+        files: FILES,
+        levels: 0,
+        max_level_requests: 0,
+        requests: 0,
+    };
+    let last = FILES * FILE_EVENTS - 1;
+    let mut seen = 0;
+    let mut previous = requests();
+    for level in graph.walk(b"room", last, EdgeKind::Prev, last as usize) {
+        seen += level.unwrap().len() as u64;
+        let now = requests();
+        measurement.levels += 1;
+        measurement.max_level_requests = measurement.max_level_requests.max(now - previous);
+        previous = now;
+    }
+    measurement.requests = requests();
+    println!(
+        "graph walk over {} events in {FILES} files: {} levels, {} requests, {:.5} requests per level, at most {} \
+         in one level",
+        FILES * FILE_EVENTS,
+        measurement.levels,
+        measurement.requests,
+        measurement.requests as f64 / measurement.levels as f64,
+        measurement.max_level_requests
+    );
+    assert_eq!(seen, last, "every ancestor is reached once");
+    assert!(graph_walk_requests_gate_passes(&measurement));
+}
+
+/// A tenant's state chunks in a simulated object store with a node-local cache in front: a read the cache misses is
+/// counted as a fetch, which the caller charges one simulated round trip, and the chunk is then held, so a repeated
+/// read is served locally.
+#[derive(Default)]
+struct CachedChunks {
+    cache: RefCell<StdHashMap<[u8; 32], Vec<u8>>>,
+    fetches: Cell<u64>,
+    remote: StdHashMap<[u8; 32], Vec<u8>>,
+}
+
+impl StateChunkStore for CachedChunks {
+    fn get(&self, address: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
+        if let Some(bytes) = self.cache.borrow().get(address) {
+            return Ok(Some(bytes.clone()));
+        }
+        self.fetches.set(self.fetches.get() + 1);
+        let bytes = self.remote.get(address).cloned();
+        if let Some(bytes) = &bytes {
+            self.cache.borrow_mut().insert(*address, bytes.clone());
+        }
+        Ok(bytes)
+    }
+}
+
+/// The 99th percentile of `samples`.
+fn p99(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() * 99 / 100]
+}
+
+/// The state at an event of a 100,000-member room, read through `RemoteGraph::state`: the state root from the event's
+/// file, then one member's entry. The room takes 1,024 state events (membership changes of random members) after its
+/// initial state, each with its own root, in two graph files. Each of 1,000 lookups at a random event runs cold, against
+/// an empty chunk cache with every fetch charged a simulated 20 ms object-store round trip, then warm, repeated against
+/// the cache its cold run filled. Prints the 99th percentiles and the most chunks a cold lookup fetched. Run by hand:
+/// `cargo test --release --features write --lib state_at_an_event_cold_and_warm -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-mode state lookup benchmark"]
+fn state_at_an_event_cold_and_warm() {
+    const MEMBERS: u64 = 100_000;
+    const STATE_EVENTS: u64 = 1_024;
+    const LOOKUPS: usize = 1_000;
+    const ROUND_TRIP_MICROS: f64 = 20_000.0;
+    let mut random = {
+        let mut state = 0x5EED_5EED_5EED_5EEDu64;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
+    };
+    let key = StateChunkKey::derive(&TenantDek::new([7; 32]));
+    let mut state: StdBTreeMap<StateKey, u64> = (0..MEMBERS as u32).map(|user| (member(user), 0)).collect();
+    let mut chunks = CachedChunks::default();
+    let mut roots = StdBTreeMap::new();
+    let mut tree_levels = 0;
+    for sn in 1..=STATE_EVENTS {
+        state.insert(member((random() % MEMBERS) as u32), sn);
+        let tree = build_state_tree(&key, &state).unwrap();
+        let root_chunk = tree
+            .chunks
+            .iter()
+            .find(|chunk| chunk.address == tree.root.address)
+            .unwrap();
+        let plaintext = key.open(&tree.root.address, &root_chunk.bytes).unwrap();
+        tree_levels = match decode_state_chunk(&plaintext).unwrap() {
+            StateChunk::Interior { level, .. } => u64::from(level) + 1,
+            StateChunk::Leaf(_) => 1,
+        };
+        roots.insert(sn, tree.root);
+        for chunk in tree.chunks {
+            chunks.remote.insert(chunk.address, chunk.bytes);
+        }
+    }
+    let half = (STATE_EVENTS + 1) / 2;
+    let mut first = graph_input(0, half, &[1]);
+    first.state_roots = roots.range(..half).map(|(sn, root)| (*sn, *root)).collect();
+    let mut second = graph_input(half, STATE_EVENTS + 1 - half, &[1]);
+    second.state_roots = roots.range(half..).map(|(sn, root)| (*sn, *root)).collect();
+    let (graph, _) = two_graph_files([first, second]);
+    let reader = graph.state(&chunks, &key);
+
+    let (mut cold, mut warm) = (Vec::with_capacity(LOOKUPS), Vec::with_capacity(LOOKUPS));
+    let mut cold_fetches_max = 0;
+    for _ in 0..LOOKUPS {
+        let sn = 1 + random() % STATE_EVENTS;
+        let user = member((random() % MEMBERS) as u32);
+        let lookup = || {
+            let root = reader.state_root(b"room", sn).unwrap().unwrap();
+            std::hint::black_box(reader.state_get(&root, user).unwrap());
+        };
+        chunks.cache.borrow_mut().clear();
+        chunks.fetches.set(0);
+        let started = std::time::Instant::now();
+        lookup();
+        let fetches = chunks.fetches.get();
+        cold.push(started.elapsed().as_secs_f64() * 1e6 + fetches as f64 * ROUND_TRIP_MICROS);
+        cold_fetches_max = cold_fetches_max.max(fetches);
+        let started = std::time::Instant::now();
+        lookup();
+        warm.push(started.elapsed().as_secs_f64() * 1e6);
+        assert_eq!(chunks.fetches.get(), fetches, "a warm lookup fetches nothing");
+    }
+    let measurement = StateLookupMeasurement {
+        cold_fetches_max,
+        cold_p99_micros: p99(cold),
+        round_trip_micros: ROUND_TRIP_MICROS,
+        tree_levels,
+        warm_p99_micros: p99(warm),
+    };
+    println!(
+        "state at an event, {MEMBERS} members, {LOOKUPS} lookups: cold p99 {:.3} ms (at most {} fetches, \
+         {ROUND_TRIP_MICROS} us round trip, {} tree levels), warm p99 {:.1} us",
+        measurement.cold_p99_micros / 1e3,
+        measurement.cold_fetches_max,
+        measurement.tree_levels,
+        measurement.warm_p99_micros
+    );
+    assert!(state_lookup_gate_passes(&measurement));
 }

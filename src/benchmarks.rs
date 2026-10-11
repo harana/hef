@@ -337,3 +337,175 @@ pub struct GraphEdgeBytesMeasurement {
 pub fn graph_edge_bytes_gate_passes(m: &GraphEdgeBytesMeasurement) -> bool {
     m.stored_bytes as f64 <= m.edges as f64 * GRAPH_EDGE_BYTES_TARGET
 }
+
+/// The gated ceiling on requests one level of a cold graph walk sends to each file of the subject.
+pub const GRAPH_WALK_REQUESTS_PER_FILE_TARGET: u64 = 1;
+
+/// The requests a cold graph walk sent, level by level, needed to evaluate the walk request gate.
+#[derive(Debug, Clone)]
+pub struct GraphWalkRequestsMeasurement {
+    /// Files of the walked subject, so a level may send at most this many requests.
+    pub files: u64,
+    pub levels: u64,
+    /// The most requests any one level sent.
+    pub max_level_requests: u64,
+    pub requests: u64,
+}
+
+/// Returns `true` when no level of a walk sent more than `GRAPH_WALK_REQUESTS_PER_FILE_TARGET` requests per file of
+/// the subject.
+pub fn graph_walk_requests_gate_passes(m: &GraphWalkRequestsMeasurement) -> bool {
+    m.max_level_requests <= m.files * GRAPH_WALK_REQUESTS_PER_FILE_TARGET
+}
+
+/// The gated ceiling on footer bytes a graph file's event-id index costs per indexed event, its filter included.
+pub const GRAPH_EVENT_ID_BYTES_TARGET: f64 = 12.0;
+
+/// The gated ceiling on the share of absent event ids the event-id filter lets through to a file.
+pub const GRAPH_EVENT_ID_FALSE_POSITIVE_TARGET: f64 = 0.02;
+
+/// A graph file's event-id index measured against the events it indexes and a set of ids it does not hold, needed to
+/// evaluate the event-id index gate.
+#[derive(Debug, Clone)]
+pub struct GraphEventIdIndexMeasurement {
+    /// Absent ids the filter admitted.
+    pub absent_admitted: u64,
+    pub absent_probes: u64,
+    pub events: u64,
+    /// The whole footer section, its filter included.
+    pub section_bytes: u64,
+}
+
+/// Returns `true` when the event-id index stays within `GRAPH_EVENT_ID_BYTES_TARGET` bytes per event and its filter
+/// admits at most `GRAPH_EVENT_ID_FALSE_POSITIVE_TARGET` of the absent ids probed.
+pub fn graph_event_id_index_gate_passes(m: &GraphEventIdIndexMeasurement) -> bool {
+    m.section_bytes as f64 <= m.events as f64 * GRAPH_EVENT_ID_BYTES_TARGET
+        && m.absent_admitted as f64 <= m.absent_probes as f64 * GRAPH_EVENT_ID_FALSE_POSITIVE_TARGET
+}
+
+/// The gated ceiling on edge-block bytes one event's chain-cover label adds: half its 8 raw bytes.
+pub const GRAPH_CHAIN_LABEL_BYTES_TARGET: f64 = 4.0;
+
+/// The gated ceiling on chain-cover footer bytes per link, each chain's range included: half a link's 16 raw bytes.
+pub const GRAPH_CHAIN_LINK_BYTES_TARGET: f64 = 8.0;
+
+/// A graph's chain-cover labels and links measured against the bytes they add to the file, needed to evaluate the
+/// chain-cover size gate.
+#[derive(Debug, Clone)]
+pub struct GraphChainCoverMeasurement {
+    /// Edge-block bytes with the labels, less the same blocks without them.
+    pub label_bytes: u64,
+    pub labels: u64,
+    /// The footer's chain-cover section.
+    pub link_bytes: u64,
+    pub links: u64,
+}
+
+/// Returns `true` when labels cost at most `GRAPH_CHAIN_LABEL_BYTES_TARGET` bytes each and the chain-cover section at
+/// most `GRAPH_CHAIN_LINK_BYTES_TARGET` bytes per link.
+pub fn graph_chain_cover_gate_passes(m: &GraphChainCoverMeasurement) -> bool {
+    m.label_bytes as f64 <= m.labels as f64 * GRAPH_CHAIN_LABEL_BYTES_TARGET
+        && m.link_bytes as f64 <= m.links as f64 * GRAPH_CHAIN_LINK_BYTES_TARGET
+}
+
+/// The gated ceiling on new state-chunk bytes one state event writes to a 100,000-member room's state: one 16 KiB
+/// chunk's worth.
+pub const STATE_CHUNK_BYTES_PER_EVENT_TARGET: f64 = 16_384.0;
+
+/// The state chunks a run of state events wrote, needed to evaluate the state-chunk write gate.
+#[derive(Debug, Clone)]
+pub struct StateChunkWriteMeasurement {
+    /// Chunks new to each event's tree, sealed, summed over the events.
+    pub bytes_written: u64,
+    pub events: u64,
+}
+
+/// Returns `true` when state events write at most `STATE_CHUNK_BYTES_PER_EVENT_TARGET` bytes of new chunks each on
+/// average.
+pub fn state_chunk_write_gate_passes(m: &StateChunkWriteMeasurement) -> bool {
+    m.bytes_written as f64 <= m.events as f64 * STATE_CHUNK_BYTES_PER_EVENT_TARGET
+}
+
+/// The gated ceiling on the 99th-percentile time a state lookup spends on the reader's own work: all of a warm lookup,
+/// and what a cold lookup takes beyond its object-store round trips.
+pub const STATE_LOOKUP_LOCAL_P99_MICROS_TARGET: f64 = 1_000.0;
+
+/// Point lookups of one key in the state at an event (state root, then state get), against an empty chunk cache and
+/// repeated against a cache holding their chunks, needed to evaluate the state lookup gate.
+#[derive(Debug, Clone)]
+pub struct StateLookupMeasurement {
+    /// The most chunks one cold lookup fetched; each fetch waits on the one before.
+    pub cold_fetches_max: u64,
+    /// Round trips included, at `round_trip_micros` each.
+    pub cold_p99_micros: f64,
+    pub round_trip_micros: f64,
+    /// Levels of the state tree, so a cold lookup may fetch at most this many chunks.
+    pub tree_levels: u64,
+    pub warm_p99_micros: f64,
+}
+
+/// Returns `true` when a cold lookup fetches at most one chunk per tree level and, beyond those round trips, the cold
+/// and warm 99th percentiles stay within `STATE_LOOKUP_LOCAL_P99_MICROS_TARGET`.
+pub fn state_lookup_gate_passes(m: &StateLookupMeasurement) -> bool {
+    m.cold_fetches_max <= m.tree_levels
+        && m.cold_p99_micros <= m.tree_levels as f64 * m.round_trip_micros + STATE_LOOKUP_LOCAL_P99_MICROS_TARGET
+        && m.warm_p99_micros <= STATE_LOOKUP_LOCAL_P99_MICROS_TARGET
+}
+
+/// Replaying a room's join history into graph files and state chunks, needed to evaluate the room replay gate.
+#[derive(Debug, Clone)]
+pub struct RoomReplayMeasurement {
+    pub events: u64,
+    pub graph_bytes: u64,
+    /// Every chunk new to some event's state tree, sealed, as uploads would store them.
+    pub state_chunk_bytes: u64,
+    pub wall_millis: f64,
+}
+
+/// Returns `true` when a replay writes at most `STATE_CHUNK_BYTES_PER_EVENT_TARGET` bytes of new state chunks per
+/// event. Wall time is recorded, not gated.
+pub fn room_replay_gate_passes(m: &RoomReplayMeasurement) -> bool {
+    m.state_chunk_bytes as f64 <= m.events as f64 * STATE_CHUNK_BYTES_PER_EVENT_TARGET
+}
+
+/// The gated ceiling on Chimp bytes per reading of a slowly varying full-precision gauge, against 8 raw bytes.
+pub const XOR_FLOAT_BYTES_PER_VALUE_TARGET: f64 = 3.5;
+
+/// One float column's readings stored as Chimp XOR floats and in the smallest encoding that predates Chimp, needed to
+/// evaluate the XOR float gate.
+#[derive(Debug, Clone)]
+pub struct XorFloatMeasurement {
+    pub best_existing_bytes: u64,
+    pub chimp_bytes: u64,
+    pub values: u64,
+}
+
+/// Returns `true` when Chimp stores the readings in fewer bytes than every earlier encoding and within
+/// `XOR_FLOAT_BYTES_PER_VALUE_TARGET` bytes per value.
+pub fn xor_float_gate_passes(m: &XorFloatMeasurement) -> bool {
+    m.chimp_bytes < m.best_existing_bytes && m.chimp_bytes as f64 <= m.values as f64 * XOR_FLOAT_BYTES_PER_VALUE_TARGET
+}
+
+/// The gated ceiling on column blocks a rollup aggregate reads for a range that cuts two buckets: each edge bucket's
+/// time and value blocks, in at most two granules.
+pub const TIME_SERIES_ROLLUP_EDGE_BLOCK_READS_TARGET: u64 = 8;
+
+/// Column blocks a time-series aggregate read through rollups and by scanning every row, needed to evaluate the rollup
+/// gate.
+#[derive(Debug, Clone)]
+pub struct TimeSeriesRollupMeasurement {
+    /// A range of whole buckets, answered through rollups.
+    pub aligned_block_reads: u64,
+    /// A range that cuts a bucket at each end, answered through rollups.
+    pub cut_block_reads: u64,
+    /// The same cut range answered by scanning every row.
+    pub scan_block_reads: u64,
+}
+
+/// Returns `true` when a range of whole buckets reads no column block and a cut range reads at most
+/// `TIME_SERIES_ROLLUP_EDGE_BLOCK_READS_TARGET` blocks, fewer than a scan of it.
+pub fn time_series_rollup_gate_passes(m: &TimeSeriesRollupMeasurement) -> bool {
+    m.aligned_block_reads == 0
+        && m.cut_block_reads <= TIME_SERIES_ROLLUP_EDGE_BLOCK_READS_TARGET
+        && m.cut_block_reads < m.scan_block_reads
+}

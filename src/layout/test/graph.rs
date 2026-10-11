@@ -1,6 +1,12 @@
 use super::*;
-use crate::benchmarks::{GraphEdgeBytesMeasurement, graph_edge_bytes_gate_passes};
+use crate::artifacts::state_chunk::{StateKey, StateTree, build_state_tree};
+use crate::benchmarks::{
+    GraphChainCoverMeasurement, GraphEdgeBytesMeasurement, GraphEventIdIndexMeasurement, RoomReplayMeasurement,
+    graph_chain_cover_gate_passes, graph_edge_bytes_gate_passes, graph_event_id_index_gate_passes,
+    room_replay_gate_passes,
+};
 use crate::layout::{Profile, required_features};
+use crate::security::{StateChunkKey, TenantDek};
 use crate::writer::build::{HefBuildConfig, build_hef_file};
 use crate::writer::source_form::tests::{plain_row, source_form_config};
 use std::collections::HashMap;
@@ -302,6 +308,10 @@ fn a_built_graph_file_records_the_state_root_after_each_state_event() {
 
 /// A deterministic stand-in for a chat room's history: mostly a linear prev chain with an occasional fork, each event
 /// authorized by the create event, the latest power-levels event, and its sender's latest membership.
+///
+/// It carries a stand-in chain cover too: the create event alone on chain 0 and each of the 32 senders' events on a
+/// chain of their own, with a link from an event to each auth parent on another chain unless an earlier event on its
+/// chain already links to that parent or a later event of that chain.
 fn room_graph(events: u64) -> GraphInput {
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let mut random = move || {
@@ -312,9 +322,14 @@ fn room_graph(events: u64) -> GraphInput {
     };
     let mut power_levels = 0;
     let mut membership = [0u64; 32];
+    let mut labels: Vec<ChainLabel> = Vec::new();
+    let mut links = Vec::new();
+    let mut chain_lengths = [0u32; 33];
+    let mut reached: HashMap<(u32, u32), u32> = HashMap::new();
     let rows = (0..events)
         .map(|sn| {
             if sn == 0 {
+                labels.push(ChainLabel { chain_id: 0, seq: 0 });
                 return RowEdges::default();
             }
             let sender = (random() % 32) as usize;
@@ -334,11 +349,30 @@ fn room_graph(events: u64) -> GraphInput {
                 1..=3 => membership[sender] = sn,
                 _ => {}
             }
+            let label = ChainLabel {
+                chain_id: sender as u32 + 1,
+                seq: chain_lengths[sender + 1],
+            };
+            chain_lengths[sender + 1] += 1;
+            for parent in &auth {
+                let target = labels[*parent as usize];
+                let linked = reached.get(&(label.chain_id, target.chain_id));
+                if target.chain_id != label.chain_id && linked.is_none_or(|seq| *seq < target.seq) {
+                    reached.insert((label.chain_id, target.chain_id), target.seq);
+                    links.push(ChainLink {
+                        from_chain: label.chain_id,
+                        from_seq: label.seq,
+                        to_chain: target.chain_id,
+                        to_seq: target.seq,
+                    });
+                }
+            }
+            labels.push(label);
             RowEdges { auth, prev }
         })
         .collect();
     GraphInput {
-        chain_cover: None,
+        chain_cover: Some(ChainCoverInput { labels, links }),
         first_sn: 0,
         inbound: Vec::new(),
         rows,
@@ -348,18 +382,26 @@ fn room_graph(events: u64) -> GraphInput {
     }
 }
 
+/// 8192-row granules over `events` rows.
+fn room_granules(events: u64) -> Vec<GranuleEntry> {
+    (0..events.div_ceil(8192))
+        .map(|index| {
+            let first = index * 8192;
+            granule(index as u32, first, (events - first).min(8192) as u32)
+        })
+        .collect()
+}
+
 /// Stored bytes per edge for a room-shaped graph in 8192-row granules, counting the forward and reverse copies both
 /// against the one edge they describe.
 #[test]
 fn a_room_graph_stores_few_bytes_per_edge() {
     let events = 100_000u64;
-    let graph = room_graph(events);
-    let granules: Vec<GranuleEntry> = (0..events.div_ceil(8192))
-        .map(|index| {
-            let first = index * 8192;
-            granule(index as u32, first, (events - first).min(8192) as u32)
-        })
-        .collect();
+    let graph = GraphInput {
+        chain_cover: None,
+        ..room_graph(events)
+    };
+    let granules = room_granules(events);
     let blocks = encode_graph_blocks(&graph, events, &granules).unwrap();
     let measurement = GraphEdgeBytesMeasurement {
         edges: graph
@@ -378,8 +420,130 @@ fn a_room_graph_stores_few_bytes_per_edge() {
     assert!(graph_edge_bytes_gate_passes(&measurement));
 }
 
+/// Bytes per chain-cover label and link for the same room-shaped graph: the labels as what they add to the edge
+/// blocks, the links as the footer section that holds them and each chain's range.
+#[test]
+fn a_room_graph_stores_few_bytes_per_chain_label_and_link() {
+    let events = 100_000u64;
+    let graph = room_graph(events);
+    let granules = room_granules(events);
+    let stored = |graph: &GraphInput| -> u64 {
+        let blocks = encode_graph_blocks(graph, events, &granules).unwrap();
+        blocks.values().map(|block| block.len() as u64).sum()
+    };
+    let bare = GraphInput {
+        chain_cover: None,
+        ..graph.clone()
+    };
+    let cover = ChainCover::build(graph.chain_cover.as_ref().unwrap());
+    let mut section = Writer::new();
+    cover.encode(&mut section);
+    let measurement = GraphChainCoverMeasurement {
+        label_bytes: stored(&graph) - stored(&bare),
+        labels: events,
+        link_bytes: section.into_bytes().len() as u64,
+        links: cover.links.len() as u64,
+    };
+    println!(
+        "chain cover: {} labels in {} bytes ({:.2} per label), {} links over {} chains in {} bytes ({:.2} per link)",
+        measurement.labels,
+        measurement.label_bytes,
+        measurement.label_bytes as f64 / measurement.labels as f64,
+        measurement.links,
+        cover.chains.len(),
+        measurement.link_bytes,
+        measurement.link_bytes as f64 / measurement.links as f64
+    );
+    assert!(graph_chain_cover_gate_passes(&measurement));
+}
+
 fn event_id(sn: u64) -> Vec<u8> {
     format!("$event{sn}:example.org").into_bytes()
+}
+
+/// Replays a 100,000-member room's join history: the create and power-levels events, then one join per member. Every
+/// event is a state event: its state tree is built in full, as the state chunk API builds it, and the chunks new to
+/// it counted as an upload would store them; the events are then written as graph files of 16,384 events in
+/// 8192-row granules, each joining event pointing back at the event before it and authorized by the first two, with
+/// its protocol id and state root. Prints wall time, events, and bytes written. Run by hand:
+/// `cargo test --release --features write --lib replaying_a_100k_member_room -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-mode room replay benchmark"]
+fn replaying_a_100k_member_room() {
+    const MEMBERS: u64 = 100_000;
+    const FILE_EVENTS: u64 = 16_384;
+    let events = MEMBERS + 2;
+    let key = StateChunkKey::derive(&TenantDek::new([9; 32]));
+    let started = std::time::Instant::now();
+    let mut state: BTreeMap<StateKey, u64> = BTreeMap::new();
+    let mut previous: Option<StateTree> = None;
+    let mut roots = BTreeMap::new();
+    let mut state_chunk_bytes = 0u64;
+    for sn in 0..events {
+        let state_key = match sn {
+            0 | 1 => StateKey {
+                state_key_id: 0,
+                type_id: sn as u32,
+            },
+            _ => StateKey {
+                state_key_id: (sn - 2) as u32,
+                type_id: 2,
+            },
+        };
+        state.insert(state_key, sn);
+        let tree = build_state_tree(&key, &state).unwrap();
+        let new = match &previous {
+            Some(previous) => tree.new_chunks(previous),
+            None => tree.chunks.clone(),
+        };
+        state_chunk_bytes += new.iter().map(|chunk| chunk.bytes.len() as u64).sum::<u64>();
+        roots.insert(sn, tree.root);
+        previous = Some(tree);
+    }
+    let mut graph_bytes = 0u64;
+    for first_sn in (0..events).step_by(FILE_EVENTS as usize) {
+        let end = (first_sn + FILE_EVENTS).min(events);
+        let graph = GraphInput {
+            chain_cover: None,
+            first_sn,
+            inbound: Vec::new(),
+            rows: (first_sn..end)
+                .map(|sn| RowEdges {
+                    auth: (0..sn.min(2)).collect(),
+                    prev: sn.checked_sub(1).into_iter().collect(),
+                })
+                .collect(),
+            state_roots: roots.range(first_sn..end).map(|(sn, root)| (*sn, *root)).collect(),
+            subject: b"!replay:example.org".to_vec(),
+            unresolved: Vec::new(),
+        };
+        let rows: Vec<_> = (first_sn..end)
+            .map(|sn| {
+                let mut row = plain_row(sn);
+                row.external_id = Some(event_id(sn));
+                row
+            })
+            .collect();
+        graph_bytes += build_hef_file(rows, &graph_config(8192, Some(graph)))
+            .unwrap()
+            .bytes
+            .len() as u64;
+    }
+    let measurement = RoomReplayMeasurement {
+        events,
+        graph_bytes,
+        state_chunk_bytes,
+        wall_millis: started.elapsed().as_secs_f64() * 1e3,
+    };
+    println!(
+        "room replay: {} events in {:.0} ms; {} B of graph files, {} B of new state chunks ({:.0} B per event)",
+        measurement.events,
+        measurement.wall_millis,
+        measurement.graph_bytes,
+        measurement.state_chunk_bytes,
+        measurement.state_chunk_bytes as f64 / measurement.events as f64
+    );
+    assert!(room_replay_gate_passes(&measurement));
 }
 
 #[test]
@@ -476,8 +640,12 @@ fn the_event_id_index_is_small_and_its_filter_rarely_admits_an_absent_id() {
         false_positive_rate
     );
     assert!(ids.iter().all(|id| event_id_filter_may_hold(&index.filter, id)));
-    assert!(section_bytes / (events as f64) < 12.0);
-    assert!(false_positive_rate < 0.02);
+    assert!(graph_event_id_index_gate_passes(&GraphEventIdIndexMeasurement {
+        absent_admitted: admitted as u64,
+        absent_probes: probes,
+        events,
+        section_bytes: section_bytes as u64,
+    }));
 }
 
 /// Labels for `rows` rows starting at row 0: rows alternate between chains 1 and 2, each chain's seq counting up from
