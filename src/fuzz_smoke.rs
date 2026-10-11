@@ -102,6 +102,7 @@ fn mutated_graph_edge_block_never_panics() {
                 .collect(),
             links: Vec::new(),
         }),
+        depth: None,
         first_sn: 10,
         inbound: Vec::new(),
         rows: (10..74u64)

@@ -84,3 +84,9 @@ A **jurisdiction erasure profile** SHALL declare the disposition per entity clas
 - **WHEN** a jurisdiction profile assigns `restrict_suppress` to an erased subject
 - **THEN** the subject's rows and fields are suppressed from all query results via deletion vectors and access-restricted, while the bytes are retained under an unshredded key
 
+### Requirement: Redaction rewrites bodies, never graphs
+A rewrite that redacts event bodies SHALL leave a graph file's graph untouched: its edges, inbound edges, unresolved parents, chain-cover labels and links, event-id index, depth range and state roots are never redacted. The rewrite SHALL rebuild the graph from the file it replaces, so each granule's edge block and the graph footer sections come back byte for byte; only where an edge block sits moves when the bodies before it shrink.
+
+#### Scenario: Redaction leaves graph blocks byte-identical
+- **WHEN** a graph file is rewritten with some events' bodies stripped
+- **THEN** every edge block, and the chain cover, event-id index, unresolved parents and depth range, are identical to the original's

@@ -10,6 +10,7 @@ pub mod compaction;
 pub mod constant;
 pub mod error;
 pub mod graph;
+pub mod graph_seal;
 pub mod pipeline;
 pub mod projection;
 pub mod publish;

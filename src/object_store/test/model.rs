@@ -16,6 +16,7 @@ fn entry(file_id: u128, part_state: PartState) -> HefFileEntry {
         file_type: FileType::HefFile,
         footer_len: Some(64),
         graph_event_id_filter: None,
+        graph_summary: None,
         optional_feature_flags: 0,
         part_index: 0,
         part_state,

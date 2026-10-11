@@ -16,7 +16,7 @@ use crate::error::{FormatError, PublishError, StorageError};
 use crate::events::{SequenceRange, TenantId};
 use crate::invariants::{EncodeExecutor, JournalStorage, MonotonicClock, PublishedSet, ShardId};
 use crate::layout::{MAX_PAGE_BYTES, required_features};
-use crate::lifecycle::{FileType, HefFileEntry, ManifestGeneration, PartState};
+use crate::lifecycle::{FileType, GraphFileSummary, HefFileEntry, ManifestGeneration, PartState};
 use crate::object_store::{ObjectStore, constant::MIN_MULTIPART_PART_BYTES, hef_object_key};
 
 /// The byte length of a BLAKE3 hash, as stored in a schema fingerprint or a segment chain anchor.
@@ -295,7 +295,8 @@ impl HefPublisher {
         {
             return Err(PublishFailure::Verification("range mismatch"));
         }
-        if built.footer.required_feature_flags != required_features::ALL {
+        // Every file declares the baseline set; a profile adds its own bits on top (a graph file's edges, say).
+        if built.footer.required_feature_flags & required_features::ALL != required_features::ALL {
             return Err(PublishFailure::Verification("feature directory incomplete"));
         }
         // No column block may exceed the reader's per-page read bound, or the reader rejects the whole file refuse
@@ -405,6 +406,7 @@ impl HefPublisher {
                 .as_ref()
                 .and_then(|graph| graph.event_ids.as_ref())
                 .map(|index| index.filter.clone()),
+            graph_summary: GraphFileSummary::of(&built.footer),
             optional_feature_flags: built.footer.optional_feature_flags,
             part_index: 0,
             part_state,

@@ -4068,6 +4068,7 @@ fn an_encrypted_footer_still_prunes_on_the_entity_hash_filters() {
 fn graph_chain(rows: u64) -> GraphInput {
     GraphInput {
         chain_cover: None,
+        depth: None,
         first_sn: 0,
         inbound: Vec::new(),
         rows: (0..rows)

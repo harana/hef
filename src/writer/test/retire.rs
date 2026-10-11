@@ -7,6 +7,7 @@ use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, SequencePoint, StreamId, TimestampValue};
 use crate::invariants::sim::SimulatedPublishedSet;
 use crate::layout::LayoutTargets;
+use crate::layout::graph::{DepthRange, GraphInput, RowEdges};
 use crate::layout::inbox::{AckWatermarks, Recipient};
 use crate::layout::reader::HefFile;
 use crate::object_store::sim::SimObjectStore;
@@ -103,6 +104,7 @@ fn entry(file_id: u128, first_sequence: u64, last_sequence: u64, part_state: Par
         file_type: FileType::HefFile,
         footer_len: None,
         graph_event_id_filter: None,
+        graph_summary: None,
         optional_feature_flags: 0,
         part_index: 0,
         part_state,
@@ -197,6 +199,72 @@ fn a_compaction_publishes_one_generation_that_adds_the_output_and_outdates_the_i
         Some(bytes)
     );
     assert_eq!(notices.published, vec![published.entry.file_id]);
+}
+
+#[test]
+fn a_compacted_graph_file_publishes_its_summary_in_the_manifest_entry() {
+    let mut set = SimulatedPublishedSet::new();
+    let mut inputs = vec![entry(101, 1, 2, PartState::Active), entry(102, 3, 4, PartState::Active)];
+    for input in &mut inputs {
+        input.profile = crate::layout::Profile::Graph;
+    }
+    publish_directly(
+        &mut set,
+        ManifestGeneration {
+            files: inputs,
+            generation: 1,
+            ..Default::default()
+        },
+    );
+    let mut config = build_config();
+    config.profile = crate::layout::Profile::Graph;
+    config.graph = Some(GraphInput {
+        depth: Some(DepthRange { max: 44, min: 41 }),
+        first_sn: 40,
+        rows: (40..44)
+            .map(|sn| RowEdges {
+                auth: Vec::new(),
+                prev: (sn > 40).then_some(sn - 1).into_iter().collect(),
+            })
+            .collect(),
+        subject: b"!room:example.org".to_vec(),
+        ..GraphInput::default()
+    });
+    let rows = (1..=4)
+        .map(|sequence| HefRow {
+            epoch: 1,
+            sequence,
+            event: event(sequence),
+        })
+        .collect();
+    let built = build_hef_file(rows, &config).unwrap();
+
+    let published = HefPublisher::new()
+        .publish_compaction(
+            built,
+            &config,
+            &[101, 102],
+            &mut set,
+            &SimObjectStore::new(),
+            &mut NoopPeerNotices::default(),
+            &FixedClock::at(START_NANOS),
+        )
+        .unwrap();
+
+    assert_eq!(
+        published.entry.graph_summary,
+        Some(GraphFileSummary {
+            chains: Vec::new(),
+            depth: Some(DepthRange { max: 44, min: 41 }),
+            max_event_sn: 43,
+            min_event_sn: 40,
+            subject: b"!room:example.org".to_vec(),
+        })
+    );
+    assert_eq!(
+        published.entry.graph_event_id_filter, None,
+        "these rows carry no protocol ids"
+    );
 }
 
 #[test]

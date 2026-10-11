@@ -218,6 +218,7 @@ fn entry(built: &BuiltHef) -> HefFileEntry {
         file_type: FileType::HefFile,
         footer_len: Some(built.footer_len),
         graph_event_id_filter: None,
+        graph_summary: None,
         optional_feature_flags: built.footer.optional_feature_flags,
         part_index: 0,
         part_state: PartState::Active,
@@ -523,6 +524,7 @@ impl RangeSource for BatchSource {
 fn graph_input(first_sn: u64, rows: u64, offsets: &[u64]) -> GraphInput {
     GraphInput {
         chain_cover: None,
+        depth: None,
         first_sn,
         inbound: Vec::new(),
         rows: (first_sn..first_sn + rows)

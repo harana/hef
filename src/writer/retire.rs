@@ -28,7 +28,7 @@ use crate::error::PublishError;
 use crate::events::{SequenceRange, TenantId};
 use crate::invariants::PublishedSet;
 use crate::layout::Profile;
-use crate::lifecycle::{FileType, HefFileEntry, ManifestGeneration, PartState, Retirement};
+use crate::lifecycle::{FileType, GraphFileSummary, HefFileEntry, ManifestGeneration, PartState, Retirement};
 use crate::object_store::{ObjectStore, constant::MIN_MULTIPART_PART_BYTES, hef_object_key};
 use hashbrown::HashSet;
 
@@ -192,6 +192,7 @@ fn publish_in_place_of(
             .as_ref()
             .and_then(|graph| graph.event_ids.as_ref())
             .map(|index| index.filter.clone()),
+        graph_summary: GraphFileSummary::of(&built.footer),
         optional_feature_flags: built.footer.optional_feature_flags,
         part_index: 0,
         part_state: PartState::Active,

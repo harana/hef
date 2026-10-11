@@ -7,7 +7,7 @@
 //! the feature it backs. Unknown section ids are ignorable extension blocks; whether the *file* is readable is governed
 //! by the required-feature flags in the preamble, which refuse.
 
-use super::graph::{ChainCover, EventIdIndex, UnresolvedEdge, decode_unresolved, encode_unresolved};
+use super::graph::{ChainCover, DepthRange, EventIdIndex, UnresolvedEdge, decode_unresolved, encode_unresolved};
 use super::snapshot::SnapshotKeyIndex;
 use super::time_series::TimeSeriesRollups;
 use super::{Profile, required_features};
@@ -58,6 +58,10 @@ pub mod sections {
     /// links between chains. Present exactly when the file declares `GRAPH_CHAIN_COVER`, and only beside
     /// `GRAPH_EDGES`; the per-row labels then end every edge block.
     pub const GRAPH_CHAIN_COVER: u32 = 33;
+    /// Optional: a graph-profile file's depth range ([`super::DepthRange`]): `min u64 | max u64`. Present when the
+    /// build recorded its events' depths, and only beside `GRAPH_EDGES`. Droppable pruning metadata, so no feature
+    /// bit guards it.
+    pub const GRAPH_DEPTH: u32 = 40;
     /// Optional: a graph-profile file's unresolved parents, the `prev` and `auth` references no sequence number was
     /// known for, sorted by child. Present, possibly empty, exactly when `GRAPH_EDGES` is.
     pub const GRAPH_UNRESOLVED: u32 = 37;
@@ -293,6 +297,8 @@ pub struct GraphDirectory {
     pub blocks: Vec<GraphBlockEntry>,
     /// Present when the file declares `GRAPH_CHAIN_COVER`.
     pub chain_cover: Option<ChainCover>,
+    /// Present when the build recorded its events' depths.
+    pub depth: Option<DepthRange>,
     /// Present when the file declares `GRAPH_EVENT_ID_INDEX`.
     pub event_ids: Option<EventIdIndex>,
     pub first_sn: u64,
@@ -1344,6 +1350,12 @@ fn encode_sections(footer: &Footer) -> SectionArea {
         if let Some(cover) = &graph.chain_cover {
             sections.push(sections::GRAPH_CHAIN_COVER, |out| cover.encode(out));
         }
+        if let Some(depth) = graph.depth {
+            sections.push(sections::GRAPH_DEPTH, |out| {
+                out.put_u64(depth.min);
+                out.put_u64(depth.max);
+            });
+        }
     }
 
     if !footer.state_roots.is_empty() {
@@ -2251,6 +2263,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
             Some(GraphDirectory {
                 blocks,
                 chain_cover: None,
+                depth: None,
                 event_ids: None,
                 first_sn,
                 subject,
@@ -2297,6 +2310,19 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
                 });
             }
             graph.chain_cover = chain_cover.map(ChainCover::decode).transpose()?;
+            if let Some(bytes) = decode_section(&directory, section_area, sections::GRAPH_DEPTH)? {
+                let mut r = Reader::new(bytes);
+                let depth = DepthRange {
+                    min: r.u64("graph min depth")?,
+                    max: r.u64("graph max depth")?,
+                };
+                if r.remaining() != 0 || depth.min > depth.max {
+                    return Err(FormatError::Structural {
+                        rule: "graph depth section holds a minimum then a maximum it does not pass",
+                    });
+                }
+                graph.depth = Some(depth);
+            }
         }
         None if declared != 0
             || required_feature_flags
@@ -2304,7 +2330,8 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
                 != 0
             || decode_section(&directory, section_area, sections::GRAPH_UNRESOLVED)?.is_some()
             || decode_section(&directory, section_area, sections::GRAPH_EVENT_IDS)?.is_some()
-            || decode_section(&directory, section_area, sections::GRAPH_CHAIN_COVER)?.is_some() =>
+            || decode_section(&directory, section_area, sections::GRAPH_CHAIN_COVER)?.is_some()
+            || decode_section(&directory, section_area, sections::GRAPH_DEPTH)?.is_some() =>
         {
             return Err(FormatError::Structural {
                 rule: "a file declaring graph edge features must carry the graph section",

@@ -35,6 +35,7 @@ fn graph() -> GraphInput {
     };
     GraphInput {
         chain_cover: None,
+        depth: None,
         first_sn: 100,
         inbound: vec![
             GraphEdge {
@@ -107,6 +108,10 @@ fn a_graph_that_breaks_a_rule_is_refused() {
         ("empty subject", Box::new(|g| g.subject.clear())),
         ("long subject", Box::new(|g| g.subject = vec![b'r'; 256])),
         ("overflow", Box::new(|g| g.first_sn = u64::MAX - 2)),
+        (
+            "reversed depth",
+            Box::new(|g| g.depth = Some(DepthRange { max: 4, min: 5 })),
+        ),
         ("inbound child inside", Box::new(|g| g.inbound[0].child = 105)),
         ("inbound parent outside", Box::new(|g| g.inbound[0].parent = 99)),
         (
@@ -217,6 +222,7 @@ fn graph_config(rows_per_granule: usize, graph: Option<GraphInput>) -> HefBuildC
 fn chain(first_sn: u64, rows: u64) -> GraphInput {
     GraphInput {
         chain_cover: None,
+        depth: None,
         first_sn,
         inbound: Vec::new(),
         rows: (first_sn..first_sn + rows)
@@ -302,7 +308,7 @@ fn a_built_graph_file_records_the_state_root_after_each_state_event() {
 
 /// A deterministic stand-in for a chat room's history: mostly a linear prev chain with an occasional fork, each event
 /// authorized by the create event, the latest power-levels event, and its sender's latest membership.
-fn room_graph(events: u64) -> GraphInput {
+pub(crate) fn room_graph(events: u64) -> GraphInput {
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let mut random = move || {
         state ^= state << 13;
@@ -339,6 +345,7 @@ fn room_graph(events: u64) -> GraphInput {
         .collect();
     GraphInput {
         chain_cover: None,
+        depth: None,
         first_sn: 0,
         inbound: Vec::new(),
         rows,
