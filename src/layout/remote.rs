@@ -101,6 +101,11 @@ impl HefFile {
         }
         let (tail_start, tail, opened) = open_tail(source.as_ref(), cache.as_deref(), entry, header, footer_dek)?;
         let footer = opened.footer().clone();
+        if footer.profile != entry.profile {
+            return Err(FormatError::Structural {
+                rule: "manifest entry profile must match footer profile",
+            });
+        }
         let usable_optional_features = opened.usable_optional_features();
         let remote = RemoteFile {
             cache,
@@ -256,6 +261,7 @@ fn remote_header(footer: &Footer, entry: &HefFileEntry, commitment: &HeaderCommi
             .min()
             .unwrap_or(0),
         min_sequence: granules.first().map_or(0, |granule| granule.first_sequence),
+        profile: footer.profile,
         projection_count: 1,
         row_count: footer.exact_counts.row_count,
         tenant_id: entry.tenant_id,

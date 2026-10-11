@@ -22,6 +22,7 @@ fn entry(file_id: u128) -> HefFileEntry {
         optional_feature_flags: 0,
         part_index: 0,
         part_state: PartState::Active,
+        profile: crate::layout::Profile::Event,
         required_feature_flags: 0,
         size_bytes: 1024,
         tenant_id: TenantId::new_test_id(9),

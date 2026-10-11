@@ -140,6 +140,7 @@ pub fn build_config() -> HefBuildConfig {
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: hef::layout::Profile::Event,
         promotion: hef::columns::PromotionPlan::default(),
         targets: small_targets(),
         tenant_id: tenant(),

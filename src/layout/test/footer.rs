@@ -49,6 +49,7 @@ fn minimal_footer() -> Footer {
         page_stats: Vec::new(),
         payload_granules: Vec::new(),
         presence: Vec::new(),
+        profile: crate::layout::Profile::Event,
         reference_filters: None,
         required_feature_flags: 0,
         schema_fingerprint: [0u8; 32],
@@ -956,4 +957,59 @@ fn page_directory_bounds_that_are_inverted_are_rejected_by_both_encodings() {
         footer.page_directory = vec![forged];
         assert!(decode_footer(&encode_footer(&footer)).is_err());
     }
+}
+
+#[test]
+fn every_profile_round_trips_through_the_footer() {
+    for profile in [
+        Profile::Audit,
+        Profile::Event,
+        Profile::Graph,
+        Profile::Inbox,
+        Profile::Log,
+        Profile::Snapshot,
+    ] {
+        let mut footer = minimal_footer();
+        footer.profile = profile;
+        assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().profile, profile);
+    }
+}
+
+#[test]
+fn an_event_footer_carries_no_profile_section() {
+    let event = encode_footer(&minimal_footer());
+    let mut graph = minimal_footer();
+    graph.profile = Profile::Graph;
+    let graph = encode_footer(&graph);
+    // One directory entry (52 B) plus the one profile byte: the event footer is byte-identical to one written before
+    // profiles existed.
+    assert_eq!(graph.len(), event.len() + 4 + 8 + 8 + 32 + 1);
+}
+
+#[test]
+fn an_unknown_footer_profile_code_is_a_structural_error() {
+    let mut footer = minimal_footer();
+    footer.profile = Profile::Graph;
+    let mut blob = encode_footer(&footer);
+    // The profile section is the only one-byte section, and the last byte of this footer's section area.
+    let last = blob.len() - 1;
+    assert_eq!(blob[last], Profile::Graph.code());
+    blob[last] = 0xEE;
+    // Re-seal the section checksum so the decoder reaches the profile code instead of failing on the hash.
+    let section_count = u32::from_le_bytes(blob[52..56].try_into().unwrap()) as usize;
+    let directory_end = 56 + section_count * 52;
+    for entry in 0..section_count {
+        let at = 56 + entry * 52;
+        if u32::from_le_bytes(blob[at..at + 4].try_into().unwrap()) == sections::PROFILE {
+            let offset = u64::from_le_bytes(blob[at + 4..at + 12].try_into().unwrap()) as usize;
+            let hash = crate::file::integrity::hash_tree(&blob[directory_end + offset..directory_end + offset + 1]);
+            blob[at + 20..at + 52].copy_from_slice(hash.as_bytes());
+        }
+    }
+    assert_eq!(
+        decode_footer(&blob).unwrap_err(),
+        FormatError::Structural {
+            rule: "unknown profile"
+        }
+    );
 }

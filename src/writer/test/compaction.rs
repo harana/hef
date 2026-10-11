@@ -202,6 +202,7 @@ fn config() -> HefBuildConfig {
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan {
             columns: vec![PromotedColumn {
                 name: "kind".to_owned(),

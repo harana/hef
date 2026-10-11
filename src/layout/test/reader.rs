@@ -27,6 +27,7 @@ fn minimal_header() -> HefHeader {
         min_ingested_at_physical: 0,
         min_occurred_at_physical: 0,
         min_sequence: 1,
+        profile: crate::layout::Profile::Event,
         projection_count: 1,
         row_count: 1,
         tenant_id: TenantId::new_test_id(1),
@@ -78,6 +79,7 @@ fn minimal_footer(mark: ColumnMark) -> Footer {
         page_stats: Vec::new(),
         payload_granules: Vec::new(),
         presence: Vec::new(),
+        profile: crate::layout::Profile::Event,
         reference_filters: None,
         // The current writer's full feature set: these fixtures hand-craft current-format blocks, so the footer
         // must declare the framing the blocks actually use (compressed presence in particular).
@@ -527,6 +529,7 @@ fn freetext_point_lookup_matches_whole_granule_decode_and_falls_back_identically
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 6,
@@ -595,6 +598,7 @@ fn payload_path_and_payload_agree_on_a_freetext_declared_field() {
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 6,
@@ -643,6 +647,7 @@ fn freetext_config() -> HefBuildConfig {
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 6,
@@ -837,6 +842,7 @@ fn cold_scan_never_initializes_the_search_cache_a_point_lookup_pays_for() {
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 6,
@@ -886,6 +892,7 @@ fn small_stripe_config(stripe_target_bytes: usize) -> HefBuildConfig {
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 4,
@@ -2006,6 +2013,7 @@ fn relationship_lookups_filter_threads_and_resolve_references() {
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 6,
@@ -2090,6 +2098,7 @@ fn link_lookups_match_whole_references_only() {
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 6,
@@ -2486,4 +2495,18 @@ fn cold_footer_locates_the_same_blocks_as_the_whole_file_reader() {
             }
         }
     }
+}
+
+#[test]
+fn a_graph_profile_build_opens_with_its_profile_in_header_and_footer() {
+    let rows: Vec<_> = (0..10).map(|i| freetext_row(i, None)).collect();
+    let config = HefBuildConfig {
+        profile: crate::layout::Profile::Graph,
+        ..freetext_config()
+    };
+    let built = build_hef_file(rows, &config).unwrap();
+    assert_eq!(built.header.profile, crate::layout::Profile::Graph);
+    let file = HefFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    assert_eq!(file.header().profile, crate::layout::Profile::Graph);
+    assert_eq!(file.footer().profile, crate::layout::Profile::Graph);
 }

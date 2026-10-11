@@ -82,6 +82,23 @@ HEF SHALL have one format with two automatic physical layout classes: `compact` 
 - **WHEN** the estimated file size is below `min_bytes_for_wide_part`
 - **THEN** the writer selects `layout_class = compact`
 
+### Requirement: File profile declared in header, footer, and manifest entry
+Every HEF file SHALL declare a `profile` naming what kind of data it holds: `event` (the default), `graph`, `snapshot`, `audit`, `log`, or `inbox`. The profile SHALL be stored as an explicit one-byte code (`event` = 0, `graph` = 1, `snapshot` = 2, `audit` = 3, `log` = 4, `inbox` = 5) that never follows enum declaration order, in the fixed header, in the footer (section `PROFILE`), and in the manifest entry. An `event` file SHALL keep the original header layout and carry no footer profile section, so its bytes are identical to a file written before profiles existed; every other profile SHALL use the header layout that adds the profile byte, whose different `header_len` makes a reader that predates profiles refuse the file. A reader SHALL treat an unknown profile code as a structural error and SHALL refuse a file whose header, footer, or manifest entry disagree on the profile. A manifest entry without a profile SHALL read as `event`. The profile is independent of `layout_class`; graph files are normally `compact`.
+
+Graph files SHALL declare the required feature bits for the graph blocks they carry: `graph_dense_ids` (bit 23), `graph_csr_forward` (24), `graph_csr_reverse` (25), `graph_event_id_index` (26), `graph_chain_cover` (27), and `graph_state_roots` (28). These bits are not part of the set every file declares, so a reader that predates them refuses a graph file rather than reading it as plain events.
+
+#### Scenario: Profile round-trips
+- **WHEN** a file is written with any profile and read back
+- **THEN** the header, footer, and manifest entry all report that profile
+
+#### Scenario: Unknown profile code
+- **WHEN** a reader decodes a header or footer whose profile code it does not know
+- **THEN** it fails the file with a structural error
+
+#### Scenario: Old reader refuses a graph file
+- **WHEN** a reader that predates the graph feature bits opens a file declaring any of them
+- **THEN** it refuses the file as declaring an unknown required feature
+
 ### Requirement: Feature directory governs capabilities
 An HEF file SHALL declare capabilities through a feature directory, not through lifecycle/freshness/archive labels. Every file SHALL include the required feature flags (envelope columns, payload arena, stripe/granule directories, per-column marks, page metadata, min/max/sequence/time skip indexes, exact counts, checksum/footer directories, layout class). Unknown required features SHALL refuse; unknown optional features SHALL be ignored. The planner SHALL use an optional feature only when the footer declares it and its block checksum verifies; absence of an optional feature SHALL leave the file valid with queries falling back to another valid plan.
 
@@ -105,7 +122,7 @@ The manifest MAY reference multiple projections (primary sequence-major plus opt
 - **THEN** the `QueryEngine` reads the column from the projection row-aligned by ordinal against the base scan, at the same deletion-vector and correction generations
 
 ### Requirement: Closed set of file shapes, open producers and queries
-The physical file shapes SHALL be a small closed set: (1) the base event file, (2) re-sorted horizontal projections, (3) extra-column vertical projection / derived-columns sibling files, (4) aggregated PreparedView materializations, and (5) membership interval records — plus indexes over any of them. New analytical capability SHALL NOT add new physical shapes or a catch-all auxiliary container; openness SHALL live in producers (any service MAY attach a derived-columns sibling against a base HEF, declared in the manifest with lineage, with zero format change) and in queries (graph and cause-chain queries via recursive self-join on parent-position columns, semantic queries via embedding columns plus vector indexes, and tenant-defined dimensions via automatic workload-driven promotion, with a re-sorted copy when a dimension becomes a hot grouping key).
+The physical file shapes SHALL be a small closed set: (1) the base event file (and the other declared file profiles, which reuse the same container — see "File profile declared in header, footer, and manifest entry"), (2) re-sorted horizontal projections, (3) extra-column vertical projection / derived-columns sibling files, (4) aggregated PreparedView materializations, and (5) membership interval records — plus indexes over any of them. New analytical capability SHALL NOT add new physical shapes or a catch-all auxiliary container; openness SHALL live in producers (any service MAY attach a derived-columns sibling against a base HEF, declared in the manifest with lineage, with zero format change) and in queries (graph and cause-chain queries via recursive self-join on parent-position columns, semantic queries via embedding columns plus vector indexes, and tenant-defined dimensions via automatic workload-driven promotion, with a re-sorted copy when a dimension becomes a hot grouping key).
 
 #### Scenario: New service attaches derived columns
 - **WHEN** a new analytical service wants to publish per-event model outputs

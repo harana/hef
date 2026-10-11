@@ -61,6 +61,7 @@ fn multi_stripe_file() -> BuiltHef {
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 8,

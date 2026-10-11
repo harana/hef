@@ -410,6 +410,7 @@ fn indexed_config() -> HefBuildConfig {
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 5,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan {
             columns: vec![PromotedColumn {
                 name: "amount_promoted".to_owned(),

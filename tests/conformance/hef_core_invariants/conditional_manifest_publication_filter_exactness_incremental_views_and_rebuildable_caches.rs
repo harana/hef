@@ -51,6 +51,7 @@ fn lost_manifest_cas_rebases_instead_of_overwriting() {
         optional_feature_flags: 0,
         part_index: 0,
         part_state: hef::lifecycle::PartState::Active,
+        profile: hef::layout::Profile::Event,
         required_feature_flags: 0,
         size_bytes: 1,
         tenant_id: support::tenant(),

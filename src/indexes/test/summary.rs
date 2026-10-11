@@ -54,6 +54,7 @@ fn footer_with(granules: Vec<GranuleEntry>, row_count: u64) -> Footer {
         page_stats: Vec::new(),
         payload_granules: Vec::new(),
         presence: Vec::new(),
+        profile: crate::layout::Profile::Event,
         reference_filters: None,
         required_feature_flags: 0,
         schema_fingerprint: [7u8; 32],

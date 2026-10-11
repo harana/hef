@@ -130,6 +130,7 @@ fn config(index_granularity: usize, granule_bytes: usize, stripe_target_bytes: u
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity,
@@ -206,6 +207,7 @@ fn entry(built: &BuiltHef) -> HefFileEntry {
         optional_feature_flags: built.footer.optional_feature_flags,
         part_index: 0,
         part_state: PartState::Active,
+        profile: crate::layout::Profile::Event,
         required_feature_flags: built.footer.required_feature_flags,
         size_bytes: built.bytes.len() as u64,
         tenant_id: TenantId::new_test_id(TENANT),

@@ -823,6 +823,11 @@ impl HefFooter {
                 rule: "header row_count must match exact counts",
             });
         }
+        if header.profile != opened.footer.profile {
+            return Err(FormatError::Structural {
+                rule: "header profile must match footer profile",
+            });
+        }
         Ok(opened)
     }
 
@@ -1864,6 +1869,11 @@ impl HefFile {
             usable_optional_features,
             ..
         } = opened_footer;
+        if header.profile != footer.profile {
+            return Err(FormatError::Structural {
+                rule: "header profile must match footer profile",
+            });
+        }
 
         // The manifest seal authenticates the header, exact segment geometry, stripe checksum leaves, gaps, and footer.
         // It is deliberately verified before reading the large stripes, then each stripe is hashed exactly once against

@@ -77,6 +77,7 @@ fn file(rows: u64, rows_per_granule: usize) -> HefFile {
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: rows_per_granule,

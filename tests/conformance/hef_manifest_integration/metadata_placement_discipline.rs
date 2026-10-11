@@ -32,6 +32,7 @@ fn large_rollup_not_in_manifest() {
         optional_feature_flags: 0,
         part_index: 0,
         part_state: PartState::Active,
+        profile: hef::layout::Profile::Event,
         required_feature_flags: 0,
         size_bytes: 1 << 30, // The file is 1 GiB on storage.
         tenant_id: tenant(),

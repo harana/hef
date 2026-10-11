@@ -62,7 +62,7 @@ An event SHALL be acknowledged only after the HEJ frame containing it is durable
 - **THEN** acknowledgement waits until the event is included in `visibility_watermark` (or fresh queries block until LiveOverlay replays that sequence), and acknowledged HEJ events not yet HEF-covered are never silently omitted from fresh queries
 
 ### Requirement: HEF is the immutable, self-describing query file
-HEF SHALL be the immutable, footer-indexed, range-readable query file selected by the manifest, columnar for envelope/promoted fields and payload-complete (every event row resolves to its canonical `harana_variant_v1` value). There SHALL be exactly one HEF file format; size, layout kind, and optional index/aggregate/context/acceleration blocks SHALL be declared in the file feature directory rather than creating separate formats. A reader SHALL NOT infer behavior from human lifecycle labels and SHALL inspect the HEF footer and feature directory.
+HEF SHALL be the immutable, footer-indexed, range-readable query file selected by the manifest, columnar for envelope/promoted fields and payload-complete (every event row resolves to its canonical `harana_variant_v1` value). There SHALL be exactly one HEF file format; size, layout kind, file profile (event, graph, snapshot, audit, log, inbox), and optional index/aggregate/context/acceleration blocks SHALL be declared in the file header, footer, and feature directory rather than creating separate formats. A reader SHALL NOT infer behavior from human lifecycle labels and SHALL inspect the HEF footer and feature directory.
 
 #### Scenario: Planner inspects feature directory
 - **WHEN** the planner selects an HEF file for a query

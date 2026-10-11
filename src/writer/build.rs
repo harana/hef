@@ -42,8 +42,8 @@ use crate::layout::footer::{
 };
 use crate::layout::reader::{HefFile, PayloadRead};
 use crate::layout::{
-    EMPTY_VALUE_ROW_OFFSET, HEADER_BLOCK_LEN, HefHeader, LayoutClass, LayoutTargets, MAX_PAGE_BYTES, encode_header,
-    optional_features, required_features,
+    EMPTY_VALUE_ROW_OFFSET, HEADER_BLOCK_LEN, HefHeader, LayoutClass, LayoutTargets, MAX_PAGE_BYTES, Profile,
+    encode_header, optional_features, required_features,
 };
 use crate::security::{AeadScheme, FooterEncryption};
 use crate::writer::projection::{RowKey, RowOrder};
@@ -474,6 +474,9 @@ pub struct HefBuildConfig {
     /// data into independently decodable pages and records per-page byte ranges in the PAGE_DIRECTORY footer section.
     /// Zero means one page per granule (current default).
     pub page_size_rows: usize,
+    /// What kind of file this is, stored in its header, footer, and manifest entry. [`Profile::Event`] for an
+    /// ordinary event file.
+    pub profile: Profile,
     pub promotion: PromotionPlan,
     pub targets: LayoutTargets,
     pub tenant_id: TenantId,
@@ -4934,6 +4937,7 @@ fn build_hef_file_sealed_in_order(
         page_stats,
         payload_granules,
         presence: presence_entries,
+        profile: config.profile,
         reference_filters: source_form_indexes.reference_filters,
         required_feature_flags: required_features::ALL,
         schema_fingerprint: *schema_hash.finalize().as_bytes(),
@@ -4998,6 +5002,7 @@ fn build_hef_file_sealed_in_order(
         max_epoch: last_key.0,
         min_sequence: first_key.1,
         max_sequence: last_key.1,
+        profile: config.profile,
         row_count: row_count as u64,
         // The footer-encryption bit rides the header's required features so a reader gates it before decoding the
         // (now ciphertext) footer; kept out of `required_features::ALL`, it is set only for an encrypted footer.

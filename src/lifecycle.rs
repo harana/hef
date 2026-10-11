@@ -6,6 +6,7 @@
 //! snapshot.
 
 use super::events::{SequenceRange, TenantId};
+use super::layout::Profile;
 use hashbrown::HashMap;
 
 /// The role a stored file plays in the published catalogue.
@@ -110,6 +111,10 @@ pub struct HefFileEntry {
     /// Zero-based index within a multi-part SuperHEF; always 0 for `HefFile` and `DerivedColumns` entries.
     pub part_index: u32,
     pub part_state: PartState,
+    /// The file's profile, copied from its footer so a planner can tell what kind of file it is without opening it.
+    /// Defaults to [`Profile::Event`] for entries written before profiles existed.
+    #[serde(default)]
+    pub profile: Profile,
     pub required_feature_flags: u64,
     pub size_bytes: u64,
     pub tenant_id: TenantId,

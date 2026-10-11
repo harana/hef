@@ -26,6 +26,7 @@ fn make_entry(file_id: u128, range: SequenceRange) -> HefFileEntry {
         optional_feature_flags: 0,
         part_index: 0,
         part_state: PartState::Active,
+        profile: hef::layout::Profile::Event,
         required_feature_flags: 0,
         size_bytes: 1024,
         tenant_id: tenant(),

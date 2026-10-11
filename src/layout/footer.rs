@@ -7,7 +7,7 @@
 //! the feature it backs. Unknown section ids are ignorable extension blocks; whether the *file* is readable is governed
 //! by the required-feature flags in the preamble, which refuse.
 
-use super::required_features;
+use super::{Profile, required_features};
 use crate::compat::EscapeHatch;
 use crate::encoding::{ColumnData, PipelineId, decode_block, encode_block};
 use crate::error::FormatError;
@@ -51,6 +51,9 @@ pub mod sections {
     pub const PAGE_STATS: u32 = 6;
     pub const PAYLOAD_GRANULES: u32 = 8;
     pub const PRESENCE: u32 = 9;
+    /// Optional: the file's one-byte [`super::Profile`] code. Absent in an event file, which reads as
+    /// [`super::Profile::Event`].
+    pub const PROFILE: u32 = 30;
     /// Optional: per-(relationship column, granule) membership filters over the stored references. Present in every
     /// file that carries relationship columns written since the filters existed; absent otherwise, and a reader then
     /// scans every granule.
@@ -517,6 +520,8 @@ pub struct Footer {
     pub page_stats: Vec<PageStats>,
     pub payload_granules: Vec<PayloadGranule>,
     pub presence: Vec<PresenceEntry>,
+    /// Stored only for a non-event profile, so an event footer stays byte-identical to one written before profiles.
+    pub profile: Profile,
     /// Per-(relationship column, granule) reference filters. `None` when the file predates them or carries no
     /// relationship columns, in which case a lookup scans every granule.
     pub reference_filters: Option<Vec<ReferenceFilterEntry>>,
@@ -1112,6 +1117,10 @@ fn encode_sections(footer: &Footer) -> SectionArea {
                 }
             }
         });
+    }
+
+    if footer.profile != Profile::Event {
+        sections.push(sections::PROFILE, |out| out.put_u8(footer.profile.code()));
     }
 
     // The sparse shredded key set: optional, emitted only when the writer stored sparse columns.
@@ -1875,6 +1884,20 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         }
     }
 
+    let profile = match decode_section(&directory, section_area, sections::PROFILE)? {
+        None => Profile::Event,
+        Some(bytes) => {
+            let mut r = Reader::new(bytes);
+            let profile = Profile::from_u8(r.u8("profile")?)?;
+            if r.remaining() != 0 {
+                return Err(FormatError::Structural {
+                    rule: "profile section has trailing bytes",
+                });
+            }
+            profile
+        }
+    };
+
     Ok(Footer {
         clustering,
         columns,
@@ -1900,6 +1923,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         page_stats,
         payload_granules,
         presence,
+        profile,
         reference_filters,
         required_feature_flags,
         schema_fingerprint,
