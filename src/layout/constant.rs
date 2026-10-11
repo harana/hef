@@ -59,6 +59,10 @@ pub const GRAPH_EDGE_KINDS: usize = 2;
 /// The longest subject name a graph-profile file records, in bytes; its length is stored in one byte.
 pub const MAX_GRAPH_SUBJECT_BYTES: usize = 255;
 
+/// The fewest bytes one entry of a graph file's unresolved-parent list takes: the child `u64`, the kind byte, and the
+/// reference length `u16`, before the reference itself.
+pub const UNRESOLVED_ENTRY_MIN_BYTES: usize = 11;
+
 /// A remote graph read bridges a gap of up to this many bytes between two ranges it needs, fetching the gap rather
 /// than paying for a second request.
 pub const GRAPH_FETCH_GAP_BYTES: u64 = 1024 * 1024;

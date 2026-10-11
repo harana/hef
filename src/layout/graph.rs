@@ -11,6 +11,10 @@
 //! - inbound: each event's children that live in later files, supplied by the compaction that rewrites the file, so
 //!   an old file is never rewritten per event.
 //!
+//! A parent the writer could not give a sequence number (an event not yet received, say) is not an edge: it stays as
+//! the reference its event declared, in the footer's list of unresolved parents, and the event reads as having
+//! unresolved edges.
+//!
 //! A table is `edge_count u32`, its offsets block, then (when it has edges) its targets block. Offsets are one entry
 //! per `(row, kind)` slot plus a final total, `prev` before `auth` within each row. A target is stored as
 //! `source_sn - target_sn`, positive for a parent and negative for a child. Both arrays go through the ordinary column
@@ -19,11 +23,12 @@
 //!
 //! See: hef-file-layout/spec.md
 
-use super::constant::{GRAPH_EDGE_KINDS, MAX_GRAPH_SUBJECT_BYTES};
+use super::constant::{GRAPH_EDGE_KINDS, MAX_GRAPH_SUBJECT_BYTES, UNRESOLVED_ENTRY_MIN_BYTES};
 use super::footer::GranuleEntry;
 use super::reader::HefFile;
 use crate::encoding::{ColumnData, PipelineId, decode_block, encode_block};
 use crate::error::FormatError;
+use crate::events::{RelationshipKind, RelationshipRef, TargetIdSpace};
 use crate::file::bytes::{Reader, Writer};
 use hashbrown::HashSet;
 use std::collections::BTreeMap;
@@ -47,6 +52,31 @@ impl EdgeKind {
             EdgeKind::Auth => 1,
         }
     }
+
+    fn from_slot(slot: u8) -> Option<Self> {
+        match slot {
+            0 => Some(EdgeKind::Prev),
+            1 => Some(EdgeKind::Auth),
+            _ => None,
+        }
+    }
+
+    /// The edge kind a reference of relationship `kind` records, or `None` for a relationship a graph does not store.
+    pub fn of(kind: RelationshipKind) -> Option<Self> {
+        match kind {
+            RelationshipKind::Auth => Some(EdgeKind::Auth),
+            RelationshipKind::Prev => Some(EdgeKind::Prev),
+            _ => None,
+        }
+    }
+
+    /// The relationship an edge of this kind records.
+    pub fn relationship(self) -> RelationshipKind {
+        match self {
+            EdgeKind::Auth => RelationshipKind::Auth,
+            EdgeKind::Prev => RelationshipKind::Prev,
+        }
+    }
 }
 
 /// The edges a build stores beside a graph-profile file's rows.
@@ -66,6 +96,10 @@ pub struct GraphInput {
     pub rows: Vec<RowEdges>,
     /// Whose graph this is, for example a room id: 1 to 255 bytes.
     pub subject: Vec<u8>,
+    /// Parents no sequence number is known for yet (an event not yet received, say), kept as the references their
+    /// events declared. Each names a child inside the file and a `prev` or `auth` reference in any space but
+    /// `subject_sequence`.
+    pub unresolved: Vec<UnresolvedEdge>,
 }
 
 /// One event's parents, as sequence numbers, in the order the caller wants them returned. No list may repeat a
@@ -82,6 +116,16 @@ pub struct GraphEdge {
     pub child: u64,
     pub kind: EdgeKind,
     pub parent: u64,
+}
+
+/// A parent an event named that has no sequence number yet: the child's sequence number and the `prev` or `auth`
+/// reference exactly as the event declared it.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnresolvedEdge {
+    pub child: u64,
+    pub parent: RelationshipRef,
 }
 
 /// One granule's decoded edges: parents and children for each of its events, as sequence numbers.
@@ -134,8 +178,9 @@ impl Csr {
 
 /// Checks `graph` against a file of `row_count` rows cut into `granules`, then builds each granule's edge block,
 /// keyed by granule id. Refuses a graph whose row list does not match the file, whose sequence numbers would
-/// overflow, or that names a parent not strictly earlier than its event, a repeated edge, or an inbound edge that does
-/// not run from a later file into this one.
+/// overflow, or that names a parent not strictly earlier than its event, a repeated edge, an inbound edge that does
+/// not run from a later file into this one, or an unresolved parent that is not a `prev` or `auth` reference by
+/// protocol id from an event in the file.
 pub fn encode_graph_blocks(
     graph: &GraphInput,
     row_count: u64,
@@ -171,6 +216,16 @@ pub fn encode_graph_blocks(
                     children.push(sn);
                 }
             }
+        }
+    }
+    for edge in &graph.unresolved {
+        if !(graph.first_sn..end_sn).contains(&edge.child) {
+            return Err(refuse("an unresolved graph edge's child lives in the file"));
+        }
+        if EdgeKind::of(edge.parent.kind).is_none() || edge.parent.space == TargetIdSpace::SubjectSequence {
+            return Err(refuse(
+                "an unresolved graph edge names a prev or auth parent by protocol id",
+            ));
         }
     }
     let mut inbound: Vec<[Vec<u64>; GRAPH_EDGE_KINDS]> = vec![Default::default(); graph.rows.len()];
@@ -252,6 +307,56 @@ fn put_block(out: &mut Writer, data: &ColumnData) {
     out.put_u32(encoded.pipeline.0);
     out.put_u32(encoded.bytes.len() as u32);
     out.put_slice(&encoded.bytes);
+}
+
+/// Writes the unresolved-parent list of footer section `GRAPH_UNRESOLVED`: `count u32`, then per entry the child's
+/// sequence number `u64`, the edge kind `u8` (0 `prev`, 1 `auth`), and the reference's column value (see
+/// [`RelationshipRef::column_value`]) as `length u16 | bytes`. `edges` must already be sorted by child.
+pub(super) fn encode_unresolved(out: &mut Writer, edges: &[UnresolvedEdge]) {
+    out.put_u32(edges.len() as u32);
+    for edge in edges {
+        let value = edge.parent.column_value();
+        out.put_u64(edge.child);
+        out.put_u8(EdgeKind::of(edge.parent.kind).map_or(u8::MAX, |kind| kind.slot() as u8));
+        out.put_u16(value.len() as u16);
+        out.put_slice(value.as_bytes());
+    }
+}
+
+/// Reads [`encode_unresolved`]'s bytes for a file whose events run from `first_sn` up to just before `end_sn`.
+/// Refuses an unknown kind, a reference that does not parse or is named by sequence number, a child outside the
+/// file, and a list not sorted by child.
+pub(super) fn decode_unresolved(bytes: &[u8], first_sn: u64, end_sn: u64) -> Result<Vec<UnresolvedEdge>, FormatError> {
+    let malformed = FormatError::Structural {
+        rule: "graph unresolved parents must be prev or auth references by protocol id, sorted by child",
+    };
+    let mut reader = Reader::new(bytes);
+    let count = reader.u32("graph unresolved count")? as usize;
+    let mut edges: Vec<UnresolvedEdge> = Vec::with_capacity(count.min(reader.remaining() / UNRESOLVED_ENTRY_MIN_BYTES));
+    for _ in 0..count {
+        let child = reader.u64("graph unresolved child")?;
+        let kind = EdgeKind::from_slot(reader.u8("graph unresolved kind")?).ok_or(malformed.clone())?;
+        let len = usize::from(reader.u16("graph unresolved reference length")?);
+        let value = std::str::from_utf8(reader.take(len, "graph unresolved reference")?).map_err(|_| {
+            FormatError::InvalidUtf8 {
+                what: "graph unresolved reference",
+            }
+        })?;
+        let parent = RelationshipRef::parse_column_value(kind.relationship(), value).map_err(|_| malformed.clone())?;
+        if parent.space == TargetIdSpace::SubjectSequence
+            || !(first_sn..end_sn).contains(&child)
+            || edges.last().is_some_and(|last| last.child > child)
+        {
+            return Err(malformed);
+        }
+        edges.push(UnresolvedEdge { child, parent });
+    }
+    if reader.remaining() != 0 {
+        return Err(FormatError::Structural {
+            rule: "graph unresolved section has trailing bytes",
+        });
+    }
+    Ok(edges)
 }
 
 fn take_block(reader: &mut Reader<'_>) -> Result<ColumnData, FormatError> {
@@ -369,6 +474,40 @@ impl HefFile {
             granule.row_count,
             first_sn.saturating_add(footer.exact_counts.row_count),
         )
+    }
+
+    /// The sequence number of the event at row `row_ordinal` of a graph-profile file, or `None` when the file carries
+    /// no graph or has no such row. Rows are numbered densely: row `i` is event `first_sn + i`.
+    pub fn graph_sn_of_row(&self, row_ordinal: u64) -> Option<u64> {
+        let footer = self.footer();
+        if row_ordinal >= footer.exact_counts.row_count {
+            return None;
+        }
+        footer.graph.as_ref()?.first_sn.checked_add(row_ordinal)
+    }
+
+    /// The row of a graph-profile file that holds event `sn`, or `None` when the file does not hold it.
+    pub fn graph_row_of(&self, sn: u64) -> Option<u64> {
+        let footer = self.footer();
+        let row = sn.checked_sub(footer.graph.as_ref()?.first_sn)?;
+        (row < footer.exact_counts.row_count).then_some(row)
+    }
+
+    /// Whether event `sn` named a parent that had no sequence number when the file was written, so some of its
+    /// edges are missing from [`Self::granule_edges`]. `false` for an event the file does not hold.
+    pub fn graph_has_unresolved_edges(&self, sn: u64) -> bool {
+        !self.graph_unresolved_parents(sn).is_empty()
+    }
+
+    /// The parents event `sn` named that had no sequence number when the file was written, as the references the
+    /// event declared, in the order it declared them. Empty for an event with none or one the file does not hold.
+    pub fn graph_unresolved_parents(&self, sn: u64) -> &[UnresolvedEdge] {
+        let Some(graph) = self.footer().graph.as_ref() else {
+            return &[];
+        };
+        let start = graph.unresolved.partition_point(|edge| edge.child < sn);
+        let end = graph.unresolved.partition_point(|edge| edge.child <= sn);
+        graph.unresolved.get(start..end).unwrap_or_default()
     }
 
     /// The granule of a graph-profile file that holds event `sn`, or `None` when the file does not hold it.

@@ -516,6 +516,7 @@ fn graph_input(first_sn: u64, rows: u64, offsets: &[u64]) -> GraphInput {
             })
             .collect(),
         subject: b"room".to_vec(),
+        unresolved: Vec::new(),
     }
 }
 

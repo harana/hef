@@ -93,6 +93,7 @@ fn mutated_graph_edge_block_never_panics() {
             })
             .collect(),
         subject: b"room".to_vec(),
+        unresolved: Vec::new(),
     };
     let granule = GranuleEntry {
         compressed_bytes_estimate: 0,

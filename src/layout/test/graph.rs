@@ -26,7 +26,7 @@ fn granule(granule_id: u32, first_row_ordinal: u64, row_count: u32) -> GranuleEn
 }
 
 /// Six events from sequence number 100 in two granules of three: a prev chain, every event authorized by the first,
-/// event 104 also naming 102, and one parent (90) in an earlier file.
+/// event 104 also naming 102, one parent (90) in an earlier file, and event 103 naming a prev not yet numbered.
 fn graph() -> GraphInput {
     let row = |prev: &[u64], auth: &[u64]| RowEdges {
         auth: auth.to_vec(),
@@ -55,6 +55,10 @@ fn graph() -> GraphInput {
             row(&[104], &[100, 103]),
         ],
         subject: b"!room:example.org".to_vec(),
+        unresolved: vec![UnresolvedEdge {
+            child: 103,
+            parent: RelationshipRef::to_external(RelationshipKind::Prev, b"$late:example.org").unwrap(),
+        }],
     }
 }
 
@@ -108,6 +112,15 @@ fn a_graph_that_breaks_a_rule_is_refused() {
                 let edge = g.inbound[0];
                 g.inbound.push(edge);
             }),
+        ),
+        ("unresolved child outside", Box::new(|g| g.unresolved[0].child = 106)),
+        (
+            "unresolved link",
+            Box::new(|g| g.unresolved[0].parent.kind = RelationshipKind::Link),
+        ),
+        (
+            "unresolved by sequence number",
+            Box::new(|g| g.unresolved[0].parent = RelationshipRef::to_subject_sequence(RelationshipKind::Prev, 1)),
         ),
     ];
     let granules = [granule(0, 0, 3), granule(1, 3, 3)];
@@ -206,6 +219,7 @@ fn chain(first_sn: u64, rows: u64) -> GraphInput {
             })
             .collect(),
         subject: b"room".to_vec(),
+        unresolved: Vec::new(),
     }
 }
 
@@ -213,7 +227,9 @@ fn chain(first_sn: u64, rows: u64) -> GraphInput {
 fn a_built_graph_file_declares_its_edges_and_reads_them_back() {
     let rows: Vec<_> = (0..20).map(plain_row).collect();
     let built = build_hef_file(rows, &graph_config(4, Some(chain(50, 20)))).unwrap();
-    let edge_flags = required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE;
+    let edge_flags = required_features::GRAPH_DENSE_IDS
+        | required_features::GRAPH_CSR_FORWARD
+        | required_features::GRAPH_CSR_REVERSE;
     assert_eq!(built.footer.required_feature_flags & edge_flags, edge_flags);
     assert_eq!(built.header.feature_flags & edge_flags, edge_flags);
     let directory = built.footer.graph.as_ref().unwrap();
@@ -277,6 +293,7 @@ fn room_graph(events: u64) -> GraphInput {
         inbound: Vec::new(),
         rows,
         subject: b"!bench:example.org".to_vec(),
+        unresolved: Vec::new(),
     }
 }
 

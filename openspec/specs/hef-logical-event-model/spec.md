@@ -92,7 +92,9 @@ the registry now also holds `prev` and `auth` for a federated protocol's
 registry-controlled tag naming the identifier space of `target_ref`; initially
 `event_id` for envelope identity and `protocol_event_id` for a signed
 protocol's own identifier space, plus `external_id` for a 1-to-255-byte
-external protocol id matching the event external-id column). Only `parent` and
+external protocol id matching the event external-id column, and
+`subject_sequence` for an event's dense sequence number within its subject as a
+graph-profile file numbers its rows, stored as 8 big-endian bytes). Only `parent` and
 `root` are limited to one per event; every other kind repeats freely. References SHALL be declared by the
 referencing event at ingest and SHALL be immutable with it; a sealed target
 SHALL never be rewritten to record later referrers. The family SHALL be

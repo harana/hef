@@ -9,6 +9,7 @@ pub mod build;
 pub mod compaction;
 pub mod constant;
 pub mod error;
+pub mod graph;
 pub mod pipeline;
 pub mod projection;
 pub mod publish;

@@ -4075,6 +4075,7 @@ fn graph_chain(rows: u64) -> GraphInput {
             })
             .collect(),
         subject: b"room".to_vec(),
+        unresolved: Vec::new(),
     }
 }
 
@@ -4087,7 +4088,9 @@ fn graph_edges_are_built_only_into_a_whole_graph_profile_file_in_sequence_order(
     let built = build_hef_file(rows.clone(), &graph).unwrap();
     assert_eq!(
         built.footer.required_feature_flags & required_features::GRAPH,
-        required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE
+        required_features::GRAPH_DENSE_IDS
+            | required_features::GRAPH_CSR_FORWARD
+            | required_features::GRAPH_CSR_REVERSE
     );
 
     let mut without_edges = graph.clone();

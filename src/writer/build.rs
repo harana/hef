@@ -5038,13 +5038,16 @@ fn build_hef_file_sealed_in_order(
         .collect();
 
     // An audit file declares its own required feature, so a reader or rewriter that predates audit files refuses it.
-    // A file with edges declares both edge features: the forward blocks and the reverse blocks built from them.
+    // A file with edges declares the dense sequence numbers its edges name and both edge features: the forward blocks
+    // and the reverse blocks built from them.
     let mut required_feature_flags = required_features::ALL;
     if audit.is_some() {
         required_feature_flags |= required_features::AUDIT_HASH_CHAIN;
     }
     if config.graph.is_some() {
-        required_feature_flags |= required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE;
+        required_feature_flags |= required_features::GRAPH_DENSE_IDS
+            | required_features::GRAPH_CSR_FORWARD
+            | required_features::GRAPH_CSR_REVERSE;
     }
     let footer = Footer {
         audit,
@@ -5067,6 +5070,11 @@ fn build_hef_file_sealed_in_order(
             blocks: graph_blocks,
             first_sn: graph.first_sn,
             subject: graph.subject.clone(),
+            unresolved: {
+                let mut unresolved = graph.unresolved.clone();
+                unresolved.sort_by_key(|edge| edge.child);
+                unresolved
+            },
         }),
         inbox_recipients,
         integrity_gaps,

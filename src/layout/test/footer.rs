@@ -1,4 +1,5 @@
 use super::*;
+use crate::events::{RelationshipKind, RelationshipRef};
 
 fn minimal_footer() -> Footer {
     Footer {
@@ -1073,7 +1074,9 @@ fn audit_footer(retention: Option<ObjectLockRetention>, legal_hold: bool) -> Foo
 fn graph_footer() -> Footer {
     let mut footer = minimal_footer();
     footer.profile = Profile::Graph;
-    footer.required_feature_flags |= required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE;
+    footer.required_feature_flags |= required_features::GRAPH_DENSE_IDS
+        | required_features::GRAPH_CSR_FORWARD
+        | required_features::GRAPH_CSR_REVERSE;
     footer.graph = Some(GraphDirectory {
         blocks: vec![GraphBlockEntry {
             granule_id: 0,
@@ -1082,6 +1085,10 @@ fn graph_footer() -> Footer {
         }],
         first_sn: 77,
         subject: b"!room:example.org".to_vec(),
+        unresolved: vec![UnresolvedEdge {
+            child: 77,
+            parent: RelationshipRef::to_external(RelationshipKind::Prev, b"$missing:example.org").unwrap(),
+        }],
     });
     footer
 }
@@ -1142,13 +1149,31 @@ fn graph_edges_and_their_feature_bits_come_together_on_a_graph_profile_file() {
     event_profile.profile = Profile::Event;
     let mut forward_only = graph_footer();
     forward_only.required_feature_flags &= !required_features::GRAPH_CSR_REVERSE;
+    let mut sparse_ids = graph_footer();
+    sparse_ids.required_feature_flags &= !required_features::GRAPH_DENSE_IDS;
     let mut bits_without_edges = graph_footer();
     bits_without_edges.graph = None;
     let mut overflowing = graph_footer();
     if let Some(graph) = &mut overflowing.graph {
         graph.first_sn = u64::MAX;
     }
-    for footer in [event_profile, forward_only, bits_without_edges, overflowing] {
+    let mut unresolved_outside = graph_footer();
+    if let Some(graph) = &mut unresolved_outside.graph {
+        graph.unresolved[0].child = 78;
+    }
+    let mut unresolved_by_sequence = graph_footer();
+    if let Some(graph) = &mut unresolved_by_sequence.graph {
+        graph.unresolved[0].parent = RelationshipRef::to_subject_sequence(RelationshipKind::Prev, 3);
+    }
+    for footer in [
+        event_profile,
+        forward_only,
+        sparse_ids,
+        bits_without_edges,
+        overflowing,
+        unresolved_outside,
+        unresolved_by_sequence,
+    ] {
         assert!(matches!(
             decode_footer(&encode_footer(&footer)),
             Err(FormatError::Structural { .. })
