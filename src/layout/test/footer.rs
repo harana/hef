@@ -1,4 +1,5 @@
 use super::*;
+use crate::events::{RelationshipKind, RelationshipRef};
 
 fn minimal_footer() -> Footer {
     Footer {
@@ -1075,15 +1076,23 @@ fn audit_footer(retention: Option<ObjectLockRetention>, legal_hold: bool) -> Foo
 fn graph_footer() -> Footer {
     let mut footer = minimal_footer();
     footer.profile = Profile::Graph;
-    footer.required_feature_flags |= required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE;
+    footer.required_feature_flags |= required_features::GRAPH_DENSE_IDS
+        | required_features::GRAPH_CSR_FORWARD
+        | required_features::GRAPH_CSR_REVERSE;
     footer.graph = Some(GraphDirectory {
+        chain_cover: None,
         blocks: vec![GraphBlockEntry {
             granule_id: 0,
             len: 300,
             offset: 4_096,
         }],
+        event_ids: None,
         first_sn: 77,
         subject: b"!room:example.org".to_vec(),
+        unresolved: vec![UnresolvedEdge {
+            child: 77,
+            parent: RelationshipRef::to_external(RelationshipKind::Prev, b"$missing:example.org").unwrap(),
+        }],
     });
     footer
 }
@@ -1138,19 +1147,142 @@ fn the_graph_edge_directory_round_trips_through_the_footer() {
     assert_eq!(decode_footer(&encode_footer(&minimal_footer())).unwrap().graph, None);
 }
 
+fn indexed_graph_footer() -> Footer {
+    let mut footer = graph_footer();
+    footer.required_feature_flags |= required_features::GRAPH_EVENT_ID_INDEX;
+    if let Some(graph) = &mut footer.graph {
+        graph.event_ids = crate::layout::graph::EventIdIndex::build([(&b"$a:example.org"[..], 77)]).unwrap();
+    }
+    footer
+}
+
+#[test]
+fn a_graph_event_id_index_round_trips_only_with_its_feature_bit() {
+    let footer = indexed_graph_footer();
+    assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().graph, footer.graph);
+
+    let mut no_bit = indexed_graph_footer();
+    no_bit.required_feature_flags &= !required_features::GRAPH_EVENT_ID_INDEX;
+    let mut no_index = indexed_graph_footer();
+    if let Some(graph) = &mut no_index.graph {
+        graph.event_ids = None;
+    }
+    let mut outside = indexed_graph_footer();
+    if let Some(index) = outside.graph.as_mut().and_then(|graph| graph.event_ids.as_mut()) {
+        index.sns[0] = 78;
+    }
+    let mut repeated = indexed_graph_footer();
+    if let Some(index) = repeated.graph.as_mut().and_then(|graph| graph.event_ids.as_mut()) {
+        index.hashes.push(index.hashes[0]);
+        index.sns.push(77);
+    }
+    let mut no_filter = indexed_graph_footer();
+    if let Some(index) = no_filter.graph.as_mut().and_then(|graph| graph.event_ids.as_mut()) {
+        index.filter.clear();
+    }
+    let mut no_graph = indexed_graph_footer();
+    no_graph.graph = None;
+    no_graph.required_feature_flags &= !required_features::GRAPH;
+    no_graph.required_feature_flags |= required_features::GRAPH_EVENT_ID_INDEX;
+    for footer in [no_bit, no_index, outside, repeated, no_filter, no_graph] {
+        assert!(decode_footer(&encode_footer(&footer)).is_err());
+    }
+}
+
+fn chain_cover_footer() -> Footer {
+    let mut footer = graph_footer();
+    footer.required_feature_flags |= required_features::GRAPH_CHAIN_COVER;
+    if let Some(graph) = &mut footer.graph {
+        graph.chain_cover = Some(crate::layout::graph::ChainCover::build(
+            &crate::layout::graph::ChainCoverInput {
+                labels: vec![crate::layout::graph::ChainLabel { chain_id: 4, seq: 9 }],
+                links: vec![
+                    crate::layout::graph::ChainLink {
+                        from_chain: 4,
+                        from_seq: 9,
+                        to_chain: 2,
+                        to_seq: 3,
+                    },
+                    crate::layout::graph::ChainLink {
+                        from_chain: 1,
+                        from_seq: 5,
+                        to_chain: 0,
+                        to_seq: 1,
+                    },
+                ],
+            },
+        ));
+    }
+    footer
+}
+
+#[test]
+fn a_graph_chain_cover_round_trips_only_with_its_feature_bit() {
+    let footer = chain_cover_footer();
+    assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().graph, footer.graph);
+
+    let mut no_bit = chain_cover_footer();
+    no_bit.required_feature_flags &= !required_features::GRAPH_CHAIN_COVER;
+    let mut no_cover = chain_cover_footer();
+    if let Some(graph) = &mut no_cover.graph {
+        graph.chain_cover = None;
+    }
+    let mut unsorted_links = chain_cover_footer();
+    if let Some(cover) = unsorted_links
+        .graph
+        .as_mut()
+        .and_then(|graph| graph.chain_cover.as_mut())
+    {
+        cover.links.swap(0, 1);
+    }
+    let mut inverted_range = chain_cover_footer();
+    if let Some(cover) = inverted_range
+        .graph
+        .as_mut()
+        .and_then(|graph| graph.chain_cover.as_mut())
+    {
+        cover.chains[0].min_seq = 10;
+    }
+    let mut no_graph = chain_cover_footer();
+    no_graph.graph = None;
+    no_graph.required_feature_flags &= !required_features::GRAPH;
+    no_graph.required_feature_flags |= required_features::GRAPH_CHAIN_COVER;
+    for footer in [no_bit, no_cover, unsorted_links, inverted_range, no_graph] {
+        assert!(decode_footer(&encode_footer(&footer)).is_err());
+    }
+}
+
 #[test]
 fn graph_edges_and_their_feature_bits_come_together_on_a_graph_profile_file() {
     let mut event_profile = graph_footer();
     event_profile.profile = Profile::Event;
     let mut forward_only = graph_footer();
     forward_only.required_feature_flags &= !required_features::GRAPH_CSR_REVERSE;
+    let mut sparse_ids = graph_footer();
+    sparse_ids.required_feature_flags &= !required_features::GRAPH_DENSE_IDS;
     let mut bits_without_edges = graph_footer();
     bits_without_edges.graph = None;
     let mut overflowing = graph_footer();
     if let Some(graph) = &mut overflowing.graph {
         graph.first_sn = u64::MAX;
     }
-    for footer in [event_profile, forward_only, bits_without_edges, overflowing] {
+    let mut unresolved_outside = graph_footer();
+    if let Some(graph) = &mut unresolved_outside.graph {
+        graph.unresolved[0].child = 78;
+    }
+    let mut unresolved_by_sequence = graph_footer();
+    if let Some(graph) = &mut unresolved_by_sequence.graph {
+        graph.unresolved[0].parent = RelationshipRef::to_subject_sequence(RelationshipKind::Prev, 3);
+    }
+    for footer in [
+        event_profile,
+        forward_only,
+        sparse_ids,
+        bits_without_edges,
+        overflowing,
+        unresolved_outside,
+        unresolved_by_sequence,
+    ] {
         assert!(matches!(
             decode_footer(&encode_footer(&footer)),
             Err(FormatError::Structural { .. })

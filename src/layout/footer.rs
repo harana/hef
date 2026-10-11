@@ -7,6 +7,7 @@
 //! the feature it backs. Unknown section ids are ignorable extension blocks; whether the *file* is readable is governed
 //! by the required-feature flags in the preamble, which refuse.
 
+use super::graph::{ChainCover, EventIdIndex, UnresolvedEdge, decode_unresolved, encode_unresolved};
 use super::snapshot::SnapshotKeyIndex;
 use super::time_series::TimeSeriesRollups;
 use super::{Profile, required_features};
@@ -45,8 +46,20 @@ pub mod sections {
     pub const FREETEXT_ROW_OFFSETS: u32 = 18;
     pub const GRANULES: u32 = 3;
     /// Optional: a graph-profile file's subject, first sequence number, and the stripe-relative byte range of each
-    /// granule's edge block. Present exactly when the file declares `GRAPH_CSR_FORWARD` and `GRAPH_CSR_REVERSE`.
+    /// granule's edge block. Present exactly when the file declares `GRAPH_DENSE_IDS`, `GRAPH_CSR_FORWARD` and
+    /// `GRAPH_CSR_REVERSE`.
     pub const GRAPH_EDGES: u32 = 31;
+    /// Optional: a graph-profile file's event-id index ([`super::EventIdIndex`]): sorted `(id hash, sequence number)`
+    /// pairs and a binary fuse filter over the hashes. Present exactly when the file declares `GRAPH_EVENT_ID_INDEX`,
+    /// and only beside `GRAPH_EDGES`.
+    pub const GRAPH_EVENT_IDS: u32 = 32;
+    /// Optional: a graph-profile file's chain-cover summary ([`super::ChainCover`]): each chain's `seq` range and the
+    /// links between chains. Present exactly when the file declares `GRAPH_CHAIN_COVER`, and only beside
+    /// `GRAPH_EDGES`; the per-row labels then end every edge block.
+    pub const GRAPH_CHAIN_COVER: u32 = 33;
+    /// Optional: a graph-profile file's unresolved parents, the `prev` and `auth` references no sequence number was
+    /// known for, sorted by child. Present, possibly empty, exactly when `GRAPH_EDGES` is.
+    pub const GRAPH_UNRESOLVED: u32 = 37;
     /// Optional: an inbox file's recipient directory, one entry per recipient. Absent in files that do not declare
     /// `INBOX_RECIPIENT_DIRECTORY`.
     pub const INBOX_RECIPIENTS: u32 = 36;
@@ -268,15 +281,21 @@ pub struct EntityHashFilterEntry {
 }
 
 /// Where a graph-profile file's edges live: whose graph it is, the sequence number of its first row (row `i` is event
-/// `first_sn + i`), and one edge block per granule.
+/// `first_sn + i`), one edge block per granule, and the parents that had no sequence number when it was written.
 ///
 /// See: hef-file-layout/spec.md
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphDirectory {
     pub blocks: Vec<GraphBlockEntry>,
+    /// Present when the file declares `GRAPH_CHAIN_COVER`.
+    pub chain_cover: Option<ChainCover>,
+    /// Present when the file declares `GRAPH_EVENT_ID_INDEX`.
+    pub event_ids: Option<EventIdIndex>,
     pub first_sn: u64,
     /// 1 to 255 bytes.
     pub subject: Vec<u8>,
+    /// Sorted by child.
+    pub unresolved: Vec<UnresolvedEdge>,
 }
 
 /// The byte range of one granule's edge block. `offset` is stripe-relative, like every other data-area offset the
@@ -1299,6 +1318,15 @@ fn encode_sections(footer: &Footer) -> SectionArea {
                 out.put_u64(entry.len);
             }
         });
+        sections.push(sections::GRAPH_UNRESOLVED, |out| {
+            encode_unresolved(out, &graph.unresolved)
+        });
+        if let Some(index) = &graph.event_ids {
+            sections.push(sections::GRAPH_EVENT_IDS, |out| index.encode(out));
+        }
+        if let Some(cover) = &graph.chain_cover {
+            sections.push(sections::GRAPH_CHAIN_COVER, |out| cover.encode(out));
+        }
     }
 
     if let Some(index) = &footer.snapshot_keys {
@@ -2167,7 +2195,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         });
     }
     // The graph edge directory: optional. Fixed entry size: 4 (granule) + 8+8 (offset/len) = 20 bytes.
-    let graph = match decode_section(&directory, section_area, sections::GRAPH_EDGES)? {
+    let mut graph = match decode_section(&directory, section_area, sections::GRAPH_EDGES)? {
         None => None,
         Some(bytes) => {
             let mut r = Reader::new(bytes);
@@ -2194,27 +2222,62 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
             }
             Some(GraphDirectory {
                 blocks,
+                chain_cover: None,
+                event_ids: None,
                 first_sn,
                 subject,
+                unresolved: Vec::new(),
             })
         }
     };
-    let graph_flags = required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE;
+    let graph_flags = required_features::GRAPH_DENSE_IDS
+        | required_features::GRAPH_CSR_FORWARD
+        | required_features::GRAPH_CSR_REVERSE;
     let declared = required_feature_flags & graph_flags;
-    match &graph {
+    match &mut graph {
         Some(graph) => {
             if declared != graph_flags || profile != Profile::Graph {
                 return Err(FormatError::Structural {
-                    rule: "graph edges ride only a graph-profile file declaring both edge features",
+                    rule: "graph edges ride only a graph-profile file declaring the dense id and both edge features",
                 });
             }
-            if graph.first_sn.checked_add(exact_counts.row_count).is_none() {
-                return Err(FormatError::Structural {
+            let end_sn = graph
+                .first_sn
+                .checked_add(exact_counts.row_count)
+                .ok_or(FormatError::Structural {
                     rule: "graph sequence numbers overflow",
+                })?;
+            let unresolved = decode_section(&directory, section_area, sections::GRAPH_UNRESOLVED)?.ok_or(
+                FormatError::Structural {
+                    rule: "a graph edge section comes with its unresolved-parent section",
+                },
+            )?;
+            graph.unresolved = decode_unresolved(unresolved, graph.first_sn, end_sn)?;
+            let event_ids = decode_section(&directory, section_area, sections::GRAPH_EVENT_IDS)?;
+            if event_ids.is_some() != (required_feature_flags & required_features::GRAPH_EVENT_ID_INDEX != 0) {
+                return Err(FormatError::Structural {
+                    rule: "a graph event id index and the graph_event_id_index feature appear together",
                 });
             }
+            graph.event_ids = event_ids
+                .map(|bytes| EventIdIndex::decode(bytes, graph.first_sn, end_sn))
+                .transpose()?;
+            let chain_cover = decode_section(&directory, section_area, sections::GRAPH_CHAIN_COVER)?;
+            if chain_cover.is_some() != (required_feature_flags & required_features::GRAPH_CHAIN_COVER != 0) {
+                return Err(FormatError::Structural {
+                    rule: "a graph chain cover and the graph_chain_cover feature appear together",
+                });
+            }
+            graph.chain_cover = chain_cover.map(ChainCover::decode).transpose()?;
         }
-        None if declared != 0 => {
+        None if declared != 0
+            || required_feature_flags
+                & (required_features::GRAPH_EVENT_ID_INDEX | required_features::GRAPH_CHAIN_COVER)
+                != 0
+            || decode_section(&directory, section_area, sections::GRAPH_UNRESOLVED)?.is_some()
+            || decode_section(&directory, section_area, sections::GRAPH_EVENT_IDS)?.is_some()
+            || decode_section(&directory, section_area, sections::GRAPH_CHAIN_COVER)?.is_some() =>
+        {
             return Err(FormatError::Structural {
                 rule: "a file declaring graph edge features must carry the graph section",
             });

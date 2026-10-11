@@ -43,7 +43,7 @@ use crate::layout::footer::{
     SharedDictionaryEntry, ShredEntry, SortDirection, SortednessProof, StripeEntry, StripeNdvEntry, StripeProofEntry,
     TextTokenEntry, TextTokenOffsetsEntry, encode_stripe_marks_pages,
 };
-use crate::layout::graph::{GraphInput, encode_graph_blocks};
+use crate::layout::graph::{ChainCover, EventIdIndex, GraphInput, encode_graph_blocks};
 use crate::layout::reader::{HefFile, PayloadRead};
 use crate::layout::snapshot::SnapshotKeyIndex;
 use crate::layout::time_series::{FloatAggregate, RollupBucket, TimeSeriesRollups};
@@ -2868,6 +2868,15 @@ fn build_hef_file_sealed_in_order(
         previous = Some(last);
     }
     let audit = audit_trail(&rows, config, order)?;
+    // A graph file indexes each row's protocol id by its sequence number, so a reader finds an event without a scan.
+    let graph_event_ids = match &config.graph {
+        Some(graph) => EventIdIndex::build(
+            rows.iter()
+                .zip(graph.first_sn..)
+                .filter_map(|(row, sn)| Some((row.external_id.as_deref()?, sn))),
+        )?,
+        None => None,
+    };
     let inbox_recipients = if config.profile == Profile::Inbox {
         if order != RowOrder::Entity || sparse.is_some_and(|plan| !plan.rows_cover_file) {
             return Err(FormatError::Structural {
@@ -5172,13 +5181,22 @@ fn build_hef_file_sealed_in_order(
         .collect();
 
     // An audit file declares its own required feature, so a reader or rewriter that predates audit files refuses it.
-    // A file with edges declares both edge features: the forward blocks and the reverse blocks built from them.
+    // A file with edges declares the dense sequence numbers its edges name and both edge features: the forward blocks
+    // and the reverse blocks built from them.
     let mut required_feature_flags = required_features::ALL;
     if audit.is_some() {
         required_feature_flags |= required_features::AUDIT_HASH_CHAIN;
     }
     if config.graph.is_some() {
-        required_feature_flags |= required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE;
+        required_feature_flags |= required_features::GRAPH_DENSE_IDS
+            | required_features::GRAPH_CSR_FORWARD
+            | required_features::GRAPH_CSR_REVERSE;
+    }
+    if graph_event_ids.is_some() {
+        required_feature_flags |= required_features::GRAPH_EVENT_ID_INDEX;
+    }
+    if config.graph.as_ref().is_some_and(|graph| graph.chain_cover.is_some()) {
+        required_feature_flags |= required_features::GRAPH_CHAIN_COVER;
     }
     if xor_float_blocks {
         required_feature_flags |= required_features::XOR_FLOAT_BLOCKS;
@@ -5202,8 +5220,15 @@ fn build_hef_file_sealed_in_order(
         granules: granules.iter().map(|granule| granule.entry).collect(),
         graph: config.graph.as_ref().map(|graph| GraphDirectory {
             blocks: graph_blocks,
+            chain_cover: graph.chain_cover.as_ref().map(ChainCover::build),
+            event_ids: graph_event_ids,
             first_sn: graph.first_sn,
             subject: graph.subject.clone(),
+            unresolved: {
+                let mut unresolved = graph.unresolved.clone();
+                unresolved.sort_by_key(|edge| edge.child);
+                unresolved
+            },
         }),
         inbox_recipients,
         integrity_gaps,

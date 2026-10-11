@@ -4072,6 +4072,13 @@ impl HefFile {
                 }
                 Ok(rows)
             }
+            // A graph-profile file numbers its rows by sequence number, so the target names its row directly; any
+            // other file holds no sequence numbers and so cannot hold the target.
+            TargetIdSpace::SubjectSequence => Ok(<[u8; 8]>::try_from(reference.target_ref.as_slice())
+                .ok()
+                .and_then(|target| self.graph_row_of(u64::from_be_bytes(target)))
+                .into_iter()
+                .collect()),
         }
     }
 }

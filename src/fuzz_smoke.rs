@@ -15,7 +15,9 @@ use super::encoding::{
 };
 use super::events::variant::VariantRef;
 use super::layout::footer::{GranuleEntry, decode_footer};
-use super::layout::graph::{GraphInput, RowEdges, decode_granule_edges, encode_graph_blocks};
+use super::layout::graph::{
+    ChainCoverInput, ChainLabel, GraphInput, RowEdges, decode_granule_edges, encode_graph_blocks,
+};
 use super::layout::time_series::TimeSeriesRollups;
 use super::layout::{decode_header, reader::HefFile};
 
@@ -47,7 +49,7 @@ fn exercise_all(bytes: &[u8]) {
     let _ = decode_footer(bytes);
     let _ = decode_header(bytes);
     let _ = HefFile::open(bytes.to_vec(), None);
-    let _ = decode_granule_edges(bytes, 1_000, 64, 2_000);
+    let _ = decode_granule_edges(bytes, 1_000, 64, 2_000, false);
     let _ = decode_block(xor_float_pipeline(), bytes);
     let _ = TimeSeriesRollups::decode(bytes);
     if bytes.len() >= 4 {
@@ -85,11 +87,20 @@ fn mutated_valid_frame_never_panics() {
     }
 }
 
-/// Flips bytes across a valid graph edge block, and its offset and target arrays in particular, and truncates it: the
-/// decoder refuses or answers, never panics.
+/// Flips bytes across a valid graph edge block, and its offset, target, and chain label arrays in particular, and
+/// truncates it: the decoder refuses or answers, never panics.
 #[test]
 fn mutated_graph_edge_block_never_panics() {
     let graph = GraphInput {
+        chain_cover: Some(ChainCoverInput {
+            labels: (0..64u32)
+                .map(|row| ChainLabel {
+                    chain_id: row % 3,
+                    seq: row,
+                })
+                .collect(),
+            links: Vec::new(),
+        }),
         first_sn: 10,
         inbound: Vec::new(),
         rows: (10..74u64)
@@ -99,6 +110,7 @@ fn mutated_graph_edge_block_never_panics() {
             })
             .collect(),
         subject: b"room".to_vec(),
+        unresolved: Vec::new(),
     };
     let granule = GranuleEntry {
         compressed_bytes_estimate: 0,
@@ -116,16 +128,16 @@ fn mutated_graph_edge_block_never_panics() {
         stripe_id: 0,
     };
     let block = encode_graph_blocks(&graph, 64, &[granule]).unwrap().remove(&0).unwrap();
-    assert!(decode_granule_edges(&block, 10, 64, 74).is_ok());
+    assert!(decode_granule_edges(&block, 10, 64, 74, true).is_ok());
     let mut rng = XorShift(23);
     // A spread of positions rather than every byte: a flipped bit width can make one block decode millions of values.
     for position in (0..block.len()).step_by(29) {
         let mut mutated = block.clone();
         mutated[position] ^= (rng.next() as u8) | 1;
-        let _ = decode_granule_edges(&mutated, 10, 64, 74);
+        let _ = decode_granule_edges(&mutated, 10, 64, 74, true);
     }
     for cut in 0..block.len() {
-        assert!(decode_granule_edges(&block[..cut], 10, 64, 74).is_err());
+        assert!(decode_granule_edges(&block[..cut], 10, 64, 74, true).is_err());
     }
 }
 

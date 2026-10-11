@@ -91,6 +91,7 @@ fn built_tail(tenant: u128) -> (u128, Vec<u8>, HefFileEntry) {
         file_id: built.file_id,
         file_type: FileType::HefFile,
         footer_len: Some(built.footer_len),
+        graph_event_id_filter: None,
         optional_feature_flags: built.footer.optional_feature_flags,
         part_index: 0,
         part_state: PartState::Active,

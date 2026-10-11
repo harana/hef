@@ -13,6 +13,7 @@ fn entry(file_id: u128, first_sequence: u64, size_bytes: u64, part_state: PartSt
         file_id,
         file_type: FileType::HefFile,
         footer_len: None,
+        graph_event_id_filter: None,
         optional_feature_flags: 0,
         part_index: 0,
         part_state,
@@ -263,6 +264,35 @@ fn coverage_index_agrees_with_covers_including_overlapping_entries() {
         },
         TenantId::new_test_id(999)
     ));
+}
+
+#[test]
+fn a_graph_event_id_filter_in_the_entry_prunes_files_that_cannot_hold_an_event() {
+    let ids: Vec<Vec<u8>> = (0..50u64)
+        .map(|sn| format!("$held{sn}:example.org").into_bytes())
+        .collect();
+    let index = crate::layout::graph::EventIdIndex::build(ids.iter().map(Vec::as_slice).zip(0..))
+        .unwrap()
+        .unwrap();
+    let mut graph = entry(1, 1, 100, PartState::Active);
+    graph.profile = Profile::Graph;
+    graph.graph_event_id_filter = Some(index.filter);
+    assert!(ids.iter().all(|id| graph.may_hold_graph_event(id)));
+    let pruned = (0..1_000u64)
+        .filter(|n| !graph.may_hold_graph_event(format!("$absent{n}:example.org").as_bytes()))
+        .count();
+    assert!(pruned > 900, "only {pruned} of 1000 absent ids pruned");
+
+    let json = serde_json::to_value(&graph).unwrap();
+    assert_eq!(serde_json::from_value::<HefFileEntry>(json.clone()).unwrap(), graph);
+    let mut legacy = json;
+    legacy.as_object_mut().unwrap().remove("graph_event_id_filter");
+    let legacy: HefFileEntry = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.graph_event_id_filter, None);
+    assert!(
+        legacy.may_hold_graph_event(b"$absent0:example.org"),
+        "no filter, no pruning"
+    );
 }
 
 #[test]

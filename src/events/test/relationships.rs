@@ -87,6 +87,40 @@ fn registry_tags_round_trip_and_unknown_tags_refuse() {
 }
 
 #[test]
+fn every_target_space_is_listed_in_alphabetical_order_and_round_trips() {
+    // An exhaustive match, so a new space fails to compile here until it is listed.
+    let listed = |space: TargetIdSpace| match space {
+        TargetIdSpace::EventId
+        | TargetIdSpace::ExternalId
+        | TargetIdSpace::ProtocolEventId
+        | TargetIdSpace::SubjectSequence => TargetIdSpace::ALL.contains(&space),
+    };
+    let names: Vec<String> = TargetIdSpace::ALL.iter().map(|space| format!("{space:?}")).collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted);
+    for space in TargetIdSpace::ALL {
+        assert!(listed(space));
+        assert_eq!(TargetIdSpace::from_str(space.as_str()), Some(space));
+    }
+}
+
+#[test]
+fn a_subject_sequence_target_is_eight_big_endian_bytes() {
+    let reference = RelationshipRef::to_subject_sequence(RelationshipKind::Prev, 0x0102);
+    assert_eq!(reference.target_ref, [0, 0, 0, 0, 0, 0, 1, 2]);
+    assert_eq!(reference.column_value(), "subject_sequence:0000000000000102");
+    assert_eq!(
+        RelationshipRef::parse_column_value(RelationshipKind::Prev, &reference.column_value()),
+        Ok(reference)
+    );
+    assert_eq!(
+        RelationshipRef::new(RelationshipKind::Prev, TargetIdSpace::SubjectSequence, vec![1; 4]),
+        Err(RelationshipError::WrongTargetLength)
+    );
+}
+
+#[test]
 fn prev_and_auth_references_repeat_and_round_trip() {
     let mut refs: Vec<RelationshipRef> = (0..20u8)
         .map(|i| RelationshipRef::to_external(RelationshipKind::Prev, format!("$prev{i}").as_bytes()).unwrap())

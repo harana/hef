@@ -213,6 +213,7 @@ fn entry(built: &BuiltHef) -> HefFileEntry {
         file_id: built.file_id,
         file_type: FileType::HefFile,
         footer_len: Some(built.footer_len),
+        graph_event_id_filter: None,
         optional_feature_flags: built.footer.optional_feature_flags,
         part_index: 0,
         part_state: PartState::Active,
@@ -508,6 +509,7 @@ impl RangeSource for BatchSource {
 /// before it that exist, and authorized by event 0.
 fn graph_input(first_sn: u64, rows: u64, offsets: &[u64]) -> GraphInput {
     GraphInput {
+        chain_cover: None,
         first_sn,
         inbound: Vec::new(),
         rows: (first_sn..first_sn + rows)
@@ -517,6 +519,7 @@ fn graph_input(first_sn: u64, rows: u64, offsets: &[u64]) -> GraphInput {
             })
             .collect(),
         subject: b"room".to_vec(),
+        unresolved: Vec::new(),
     }
 }
 
