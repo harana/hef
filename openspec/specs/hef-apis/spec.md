@@ -53,3 +53,17 @@ The reader SHALL read any stored row back as its event (the full envelope and th
 - **WHEN** one of the entity's events has a replacement correction
 - **THEN** the scan serves the correcting event in the original's place, never the original, and does not serve the correcting event a second time
 
+### Requirement: Graph read API
+The reader SHALL expose an `EventGraph` API over graph-profile files: `parents(subject, sn, kind)` and `children(subject, sn, kind)` for `kind` `prev` or `auth`, their batch forms over many events, and `walk(subject, start, kind, limit)`, a breadth-first stream that yields each next level of ancestors not seen before and stops after `limit` events. Children SHALL be those stored with the parent's file: in-file children and inbound children folded in by its last compaction. The remote implementation SHALL gather every edge block one step needs across the subject's files, prove each against the file's authenticated checksums, join ranges whose gap is at most 1 MiB into requests of at most 8 MiB, send at most the caller's in-flight cap of requests per batch, send a duplicate batch when one runs past the 95th percentile of recent batch latencies (never sooner than the caller's floor, and only when both copies fit under the cap) and take the first successful answer, and hold fetched blocks so a later step needing the same granule sends nothing.
+
+#### Scenario: One request per file per walk level
+- **WHEN** a walk reaches a level whose events span several granules of two files
+- **THEN** that level costs at most one request per file, each covering every edge block it needs
+
+#### Scenario: In-flight cap splits a step
+- **WHEN** one step needs more separate requests than the in-flight cap
+- **THEN** they are sent in successive batches of at most the cap
+
+#### Scenario: Slow batch hedged
+- **WHEN** a batch has not answered within the hedge delay
+- **THEN** an identical batch is sent and the first successful answer is used

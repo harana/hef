@@ -46,6 +46,12 @@ path = "fuzz_targets/column_block.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "graph_block"
+path = "fuzz_targets/graph_block.rs"
+test = false
+doc = false
+
 [dependencies]
 hef = { path = "..", features = ["write"] }
 libfuzzer-sys = "0.4"

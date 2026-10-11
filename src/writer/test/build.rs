@@ -6,6 +6,7 @@ use crate::events::sim::{SimulatedEventAuthor, signed_event_payload};
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TimestampValue};
 use crate::invariants::io::ThreadPoolEncodeExecutor;
+use crate::layout::graph::RowEdges;
 use crate::layout::reader::{HefFile, HefFooter, PayloadRead, SpeculativeTail, tail_range};
 use crate::typed_id::TypedIdTestExt;
 
@@ -388,6 +389,7 @@ fn config() -> HefBuildConfig {
         },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
@@ -4059,4 +4061,56 @@ fn an_encrypted_footer_still_prunes_on_the_entity_hash_filters() {
         "row 70 sits in granule 4 and no other granule's filter admits its hash",
     );
     assert!(file.granules_for_entity_hash(1_000).is_empty());
+}
+
+/// A prev chain over events `0..rows`.
+fn graph_chain(rows: u64) -> GraphInput {
+    GraphInput {
+        first_sn: 0,
+        inbound: Vec::new(),
+        rows: (0..rows)
+            .map(|sn| RowEdges {
+                auth: Vec::new(),
+                prev: sn.checked_sub(1).into_iter().collect(),
+            })
+            .collect(),
+        subject: b"room".to_vec(),
+    }
+}
+
+#[test]
+fn graph_edges_are_built_only_into_a_whole_graph_profile_file_in_sequence_order() {
+    let rows: Vec<HefRow> = (0..4).map(row).collect();
+    let mut graph = config();
+    graph.profile = Profile::Graph;
+    graph.graph = Some(graph_chain(4));
+    let built = build_hef_file(rows.clone(), &graph).unwrap();
+    assert_eq!(
+        built.footer.required_feature_flags & required_features::GRAPH,
+        required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE
+    );
+
+    let mut without_edges = graph.clone();
+    without_edges.graph = None;
+    let built = build_hef_file(rows.clone(), &without_edges).unwrap();
+    assert_eq!(built.footer.required_feature_flags & required_features::GRAPH, 0);
+    assert!(built.footer.graph.is_none());
+
+    let mut event_profile = graph.clone();
+    event_profile.profile = Profile::Event;
+    let mut short = graph.clone();
+    short.graph = Some(graph_chain(3));
+    for refused in [event_profile, short] {
+        assert!(matches!(
+            build_hef_file(rows.clone(), &refused),
+            Err(FormatError::Structural { .. })
+        ));
+    }
+    let entity_order = build_hef_file_in_order(
+        HefRow::into_build_rows(rows),
+        &graph,
+        &SerialEncodeExecutor,
+        RowOrder::Entity,
+    );
+    assert!(matches!(entity_order, Err(FormatError::Structural { .. })));
 }

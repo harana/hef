@@ -36,11 +36,12 @@ use crate::invariants::EncodeExecutor;
 use crate::invariants::sim::SerialEncodeExecutor;
 use crate::layout::footer::{
     ClusteringEntry, ColumnDescriptor, ColumnKind, ColumnMark, EntityHashFilterEntry, ExactCounts, FileDictionaries,
-    Footer, FreetextEntry, FreetextRowOffsets, GranuleEntry, InboxRecipientEntry, MarksPageEntry, PageDirectoryEntry,
-    PageMinMax, PageStats, PayloadGranule, PresenceEntry, ResidualCompression, SharedDictionaryEntry, ShredEntry,
-    SortDirection, SortednessProof, StripeEntry, StripeNdvEntry, StripeProofEntry, TextTokenEntry,
-    TextTokenOffsetsEntry, encode_stripe_marks_pages,
+    Footer, FreetextEntry, FreetextRowOffsets, GranuleEntry, GraphBlockEntry, GraphDirectory, InboxRecipientEntry,
+    MarksPageEntry, PageDirectoryEntry, PageMinMax, PageStats, PayloadGranule, PresenceEntry, ResidualCompression,
+    SharedDictionaryEntry, ShredEntry, SortDirection, SortednessProof, StripeEntry, StripeNdvEntry, StripeProofEntry,
+    TextTokenEntry, TextTokenOffsetsEntry, encode_stripe_marks_pages,
 };
+use crate::layout::graph::{GraphInput, encode_graph_blocks};
 use crate::layout::reader::{HefFile, PayloadRead};
 use crate::layout::{
     EMPTY_VALUE_ROW_OFFSET, HEADER_BLOCK_LEN, HefHeader, LayoutClass, LayoutTargets, MAX_PAGE_BYTES, Profile,
@@ -467,6 +468,9 @@ pub struct HefBuildConfig {
     /// value.
     pub freetext_row_offset_index: bool,
     pub generation_id: u64,
+    /// The edges to store beside the rows of a [`Profile::Graph`] file, or `None` for a file without edges. Only a
+    /// whole build in sequence order takes one.
+    pub graph: Option<GraphInput>,
     /// IO alignment for column block boundaries in bytes. When non-zero, the writer pads each column block to a
     /// multiple of this value and records it in the footer, enabling aligned `O_DIRECT` reads of individual pages.
     /// Zero disables alignment recording and uses the default 64-byte padding.
@@ -2766,6 +2770,14 @@ fn build_hef_file_sealed_in_order(
             }
         }
     };
+    // Graph edges name rows by their position in sequence order, so only a whole build in that order stores them.
+    if config.graph.is_some()
+        && (config.profile != Profile::Graph || update_reuse.is_some() || order != RowOrder::Sequence)
+    {
+        return Err(FormatError::Structural {
+            rule: "graph edges are built only into a whole graph-profile file in sequence order",
+        });
+    }
     // A row is a few hundred bytes, so a pass over a file's worth of them streams tens of megabytes: the order and
     // tenant checks make one pass, on the worker pool, and only the chunk boundaries are compared in sequence.
     let checked: Vec<Result<Option<(RowKey, RowKey)>, &'static str>> = rows
@@ -4396,6 +4408,7 @@ fn build_hef_file_sealed_in_order(
         crc: crate::file::integrity::StreamingCrc64Nvme,
         entity_hash_filters: Vec<EntityHashFilterEntry>,
         freetext_row_offsets: Vec<FreetextRowOffsets>,
+        graph_blocks: Vec<GraphBlockEntry>,
         integrity: crate::file::integrity::BuiltOutboard,
         marks: Vec<ColumnMark>,
         marks_page_offsets: Vec<MarksPageEntry>,
@@ -4413,6 +4426,7 @@ fn build_hef_file_sealed_in_order(
         block_alignment: usize,
         entity_hash_filters_by_granule: &'a BTreeMap<u32, Vec<u8>>,
         granule_by_id: &'a BTreeMap<u32, &'a GranuleEntry>,
+        graph_blocks_by_granule: &'a BTreeMap<u32, Vec<u8>>,
         hot_columns: Range<u32>,
         payload_geometry: &'a [PayloadGeometry<'p>],
         payload_idx_by_stripe: &'a BTreeMap<u32, Vec<usize>>,
@@ -4498,6 +4512,7 @@ fn build_hef_file_sealed_in_order(
                 Vec::with_capacity(geometry.iter().map(|g| g.freetext_row_offsets.len()).sum());
             let mut text_token_offsets: Vec<TextTokenOffsetsEntry> = Vec::with_capacity(text_token_count);
             let mut entity_hash_filters: Vec<EntityHashFilterEntry> = Vec::with_capacity(entity_filter_count);
+            let mut graph_blocks: Vec<GraphBlockEntry> = Vec::new();
             let mut aliased_block_bytes = 0u64;
             // Byte-identical blocks within one stripe are stored once: later marks alias the first extent (marks are
             // `(offset, len)` pairs, so aliasing is already representable). Keyed by a fast non-cryptographic hash,
@@ -4676,6 +4691,18 @@ fn build_hef_file_sealed_in_order(
                         offsets_offset,
                     });
                 }
+                // A graph file's edge block for the granule, right after its payload so one range read returns the
+                // granule's rows and their edges. Stripe-relative like the arenas above.
+                if let Some(block) = self.graph_blocks_by_granule.get(&geometry.granule_id) {
+                    data.pad_to(self.block_alignment);
+                    let offset = data.len() as u64;
+                    data.put_slice(block);
+                    graph_blocks.push(GraphBlockEntry {
+                        granule_id: geometry.granule_id,
+                        len: block.len() as u64,
+                        offset,
+                    });
+                }
             }
 
             // The stripe's text-token filters, grouped at the stripe tail — not scattered per granule between the
@@ -4748,6 +4775,7 @@ fn build_hef_file_sealed_in_order(
                 crc,
                 entity_hash_filters,
                 freetext_row_offsets,
+                graph_blocks,
                 integrity,
                 marks,
                 marks_page_offsets,
@@ -4761,6 +4789,14 @@ fn build_hef_file_sealed_in_order(
         }
     }
 
+    let graph_blocks_by_granule = match &config.graph {
+        Some(graph) => {
+            let entries: Vec<GranuleEntry> = granules.iter().map(|granule| granule.entry).collect();
+            encode_graph_blocks(graph, row_count as u64, &entries)?
+        }
+        None => BTreeMap::new(),
+    };
+
     // One job per stripe on the injected executor: stripes are independent once their offsets are stripe-relative,
     // so each is laid out, its marks pages encoded, and its checksum taken beside the others instead of one after
     // another on this thread. The serial executor runs the same jobs in turn and builds the same bytes.
@@ -4768,6 +4804,7 @@ fn build_hef_file_sealed_in_order(
         block_alignment,
         entity_hash_filters_by_granule,
         granule_by_id: &granule_by_id,
+        graph_blocks_by_granule: &graph_blocks_by_granule,
         hot_columns: hot_columns.clone(),
         payload_geometry: &payload_geometry,
         payload_idx_by_stripe: &payload_idx_by_stripe,
@@ -4845,6 +4882,7 @@ fn build_hef_file_sealed_in_order(
     let mut entity_hash_filters: Vec<EntityHashFilterEntry> = Vec::with_capacity(entity_hash_filters_by_granule.len());
     let mut marks_page_offsets: Vec<MarksPageEntry> =
         Vec::with_capacity(laid_out.iter().map(|laid| laid.marks_page_offsets.len()).sum());
+    let mut graph_blocks: Vec<GraphBlockEntry> = Vec::with_capacity(graph_blocks_by_granule.len());
     for ((stripe_id, _), laid) in stripe_piece_ranges.iter().zip(laid_out) {
         let (first_row, row_count) = stripe_rows.get(stripe_id).copied().unwrap_or((u64::MAX, 0));
         stripes.push(StripeEntry {
@@ -4876,6 +4914,7 @@ fn build_hef_file_sealed_in_order(
         text_token_offsets.extend(laid.text_token_offsets);
         entity_hash_filters.extend(laid.entity_hash_filters);
         marks_page_offsets.extend(laid.marks_page_offsets);
+        graph_blocks.extend(laid.graph_blocks);
         stripe_bytes.push(laid.bytes);
     }
 
@@ -4966,11 +5005,14 @@ fn build_hef_file_sealed_in_order(
         .collect();
 
     // An audit file declares its own required feature, so a reader or rewriter that predates audit files refuses it.
-    let required_feature_flags = if audit.is_some() {
-        required_features::ALL | required_features::AUDIT_HASH_CHAIN
-    } else {
-        required_features::ALL
-    };
+    // A file with edges declares both edge features: the forward blocks and the reverse blocks built from them.
+    let mut required_feature_flags = required_features::ALL;
+    if audit.is_some() {
+        required_feature_flags |= required_features::AUDIT_HASH_CHAIN;
+    }
+    if config.graph.is_some() {
+        required_feature_flags |= required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE;
+    }
     let footer = Footer {
         audit,
         clustering,
@@ -4988,6 +5030,11 @@ fn build_hef_file_sealed_in_order(
         freetext: freetext_entries,
         freetext_row_offsets,
         granules: granules.iter().map(|granule| granule.entry).collect(),
+        graph: config.graph.as_ref().map(|graph| GraphDirectory {
+            blocks: graph_blocks,
+            first_sn: graph.first_sn,
+            subject: graph.subject.clone(),
+        }),
         inbox_recipients,
         integrity_gaps,
         // The real applied alignment: the IO granularity the caller declared (and the writer padded every block to),

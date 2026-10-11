@@ -38,6 +38,7 @@ fn minimal_footer() -> Footer {
             row_count: 1,
             stripe_id: 0,
         }],
+        graph: None,
         inbox_recipients: Vec::new(),
         integrity_gaps: Vec::new(),
         io_alignment_bytes: 0,
@@ -1068,6 +1069,22 @@ fn audit_footer(retention: Option<ObjectLockRetention>, legal_hold: bool) -> Foo
     footer
 }
 
+fn graph_footer() -> Footer {
+    let mut footer = minimal_footer();
+    footer.profile = Profile::Graph;
+    footer.required_feature_flags |= required_features::GRAPH_CSR_FORWARD | required_features::GRAPH_CSR_REVERSE;
+    footer.graph = Some(GraphDirectory {
+        blocks: vec![GraphBlockEntry {
+            granule_id: 0,
+            len: 300,
+            offset: 4_096,
+        }],
+        first_sn: 77,
+        subject: b"!room:example.org".to_vec(),
+    });
+    footer
+}
+
 #[test]
 fn an_audit_trail_round_trips_through_the_footer() {
     for (retention, legal_hold) in [
@@ -1109,4 +1126,31 @@ fn an_audit_section_without_its_feature_or_profile_is_refused() {
     let mut no_section = audit_footer(None, false);
     no_section.audit = None;
     assert_eq!(decode_footer(&encode_footer(&no_section)), refused);
+}
+
+#[test]
+fn the_graph_edge_directory_round_trips_through_the_footer() {
+    let footer = graph_footer();
+    assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().graph, footer.graph);
+    assert_eq!(decode_footer(&encode_footer(&minimal_footer())).unwrap().graph, None);
+}
+
+#[test]
+fn graph_edges_and_their_feature_bits_come_together_on_a_graph_profile_file() {
+    let mut event_profile = graph_footer();
+    event_profile.profile = Profile::Event;
+    let mut forward_only = graph_footer();
+    forward_only.required_feature_flags &= !required_features::GRAPH_CSR_REVERSE;
+    let mut bits_without_edges = graph_footer();
+    bits_without_edges.graph = None;
+    let mut overflowing = graph_footer();
+    if let Some(graph) = &mut overflowing.graph {
+        graph.first_sn = u64::MAX;
+    }
+    for footer in [event_profile, forward_only, bits_without_edges, overflowing] {
+        assert!(matches!(
+            decode_footer(&encode_footer(&footer)),
+            Err(FormatError::Structural { .. })
+        ));
+    }
 }

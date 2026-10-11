@@ -86,6 +86,7 @@ fn config(generation_id: u64) -> HefBuildConfig {
         freetext: FreetextDeclaration { fields: Vec::new() },
         freetext_row_offset_index: false,
         generation_id,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::RewriteOrCompaction,
         page_size_rows: 0,
