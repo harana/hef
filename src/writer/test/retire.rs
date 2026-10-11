@@ -2,14 +2,18 @@ use super::*;
 use crate::artifacts::batch::{EventInput, PayloadInput};
 use crate::clock::FixedClock;
 use crate::columns::{FreetextDeclaration, PromotionPlan};
+use crate::error::InboxError;
 use crate::events::variant::VariantValue;
-use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TimestampValue};
+use crate::events::{EventEnvelope, EventFlags, EventId, SequencePoint, StreamId, TimestampValue};
 use crate::invariants::sim::SimulatedPublishedSet;
 use crate::layout::LayoutTargets;
+use crate::layout::inbox::{AckWatermarks, Recipient};
+use crate::layout::reader::HefFile;
 use crate::object_store::sim::SimObjectStore;
 use crate::typed_id::TypedIdTestExt;
 use crate::writer::build::{BuildLifecycle, HefRow, build_hef_file};
 use crate::writer::publish::NoopPeerNotices;
+use hashbrown::HashMap;
 
 const START_NANOS: i64 = 1_700_000_000_000_000_000;
 
@@ -356,4 +360,131 @@ fn a_retired_file_without_a_record_starts_its_clock_instead_of_being_swept() {
         }]
     );
     assert_eq!(objects.keys().len(), 1);
+}
+
+/// Acknowledgement watermarks held in memory.
+#[derive(Default)]
+struct Acks(HashMap<Recipient, SequencePoint>);
+
+impl AckWatermarks for Acks {
+    fn acked_through(&self, _tenant_id: TenantId, recipient: Recipient) -> Result<Option<SequencePoint>, InboxError> {
+        Ok(self.0.get(&recipient).copied())
+    }
+}
+
+fn recipient(entity_id_hash_low: u64) -> Recipient {
+    Recipient {
+        entity_id_hash_high: 0,
+        entity_id_hash_low,
+    }
+}
+
+/// An inbox file of sequences 1 through 4 for two recipients: 1 and 3 to recipient 1, 2 and 4 to recipient 0.
+fn inbox_file() -> HefFile {
+    let rows = (1..=4)
+        .map(|sequence| {
+            let mut event = event(sequence);
+            event.envelope.entity_id_hash_low = sequence % 2;
+            HefRow {
+                epoch: 1,
+                event,
+                sequence,
+            }
+        })
+        .collect();
+    let config = HefBuildConfig {
+        profile: Profile::Inbox,
+        ..build_config()
+    };
+    let built = build_hef_file(rows, &config).unwrap();
+    HefFile::open(built.bytes, Some(&built.file_seal)).unwrap()
+}
+
+#[test]
+fn an_inbox_file_is_retired_once_every_recipient_acks_it_and_then_swept_like_any_replaced_file() {
+    let file = inbox_file();
+    let file_id = file.header().file_id;
+    let inbox = HefFileEntry {
+        file_id,
+        profile: Profile::Inbox,
+        ..entry(file_id, 1, 4, PartState::Active)
+    };
+    let objects = SimObjectStore::new();
+    objects
+        .put_if_absent(&hef_object_key(tenant(), file_id), b"hef")
+        .unwrap();
+    let mut set = SimulatedPublishedSet::new();
+    publish_directly(
+        &mut set,
+        ManifestGeneration {
+            files: vec![inbox.clone()],
+            generation: 1,
+            ..Default::default()
+        },
+    );
+    let clock = FixedClock::at(START_NANOS);
+
+    let mut acks = Acks::default();
+    acks.0.insert(recipient(1), SequencePoint { epoch: 1, sequence: 3 });
+    assert!(!file.fully_acked(&acks).unwrap(), "recipient 0 has not acknowledged");
+    acks.0.insert(recipient(0), SequencePoint { epoch: 1, sequence: 2 });
+    assert!(
+        !file.fully_acked(&acks).unwrap(),
+        "recipient 0's sequence 4 is unacknowledged"
+    );
+    acks.0.insert(recipient(0), SequencePoint { epoch: 1, sequence: 4 });
+    assert!(file.fully_acked(&acks).unwrap());
+
+    assert_eq!(retire_acked_inbox_files(&mut set, &[file_id], &clock).unwrap(), Some(2));
+    let (_, head) = set.head().unwrap();
+    assert_eq!(
+        head.files,
+        vec![HefFileEntry {
+            part_state: PartState::Outdated,
+            ..inbox
+        }]
+    );
+    assert_eq!(head.snapshot_files().count(), 0);
+    assert_eq!(
+        head.retirements,
+        vec![Retirement {
+            file_id,
+            generation: 2,
+            since_nanos: START_NANOS
+        }]
+    );
+    assert_eq!(
+        retire_acked_inbox_files(&mut set, &[file_id], &clock).unwrap(),
+        None,
+        "an already retired file is skipped"
+    );
+
+    let policy = SweepPolicy {
+        in_flight_query_horizon_nanos: 100,
+        safety_window_nanos: 1_000,
+    };
+    clock.advance(100);
+    let report = sweep_retired_files(&mut set, &objects, &policy, 2, &clock).unwrap();
+    assert_eq!(report.unreferenced, vec![file_id]);
+    clock.advance(1_000);
+    let report = sweep_retired_files(&mut set, &objects, &policy, 3, &clock).unwrap();
+    assert_eq!(report.deleted, vec![file_id]);
+    assert!(objects.keys().is_empty());
+    assert!(set.head().unwrap().1.files.is_empty());
+}
+
+#[test]
+fn only_inbox_files_retire_by_acknowledgement() {
+    let mut set = SimulatedPublishedSet::new();
+    publish_directly(
+        &mut set,
+        ManifestGeneration {
+            files: vec![entry(101, 1, 2, PartState::Active)],
+            generation: 1,
+            ..Default::default()
+        },
+    );
+    let result = retire_acked_inbox_files(&mut set, &[101], &FixedClock::at(START_NANOS));
+    assert!(matches!(result, Err(PublishFailure::Verification(_))));
+    assert_eq!(set.head().unwrap().0, 1);
 }

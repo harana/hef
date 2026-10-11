@@ -99,6 +99,25 @@ Graph files SHALL declare the required feature bits for the graph blocks they ca
 - **WHEN** a reader that predates the graph feature bits opens a file declaring any of them
 - **THEN** it refuses the file as declaring an unknown required feature
 
+### Requirement: Inbox files group rows by recipient and carry a recipient directory
+An `inbox` file holds per-recipient queues (to-device messages, device inboxes, an outgoing federation queue). Its recipient SHALL be the row's entity, identified by `(entity_id_hash_low, entity_id_hash_high)`, and the writer SHALL sort its rows by `(entity_id_hash_low, entity_id_hash_high, epoch, sequence)` whatever order they arrive in, so each recipient's rows are one contiguous run in queue order. The footer SHALL carry section `INBOX_RECIPIENTS` (id 36) under optional feature `inbox_recipient_directory` (bit 12): one 48-byte entry per recipient, sorted by recipient, giving its first row ordinal, row count, and newest `(epoch, sequence)` point. The directory is droppable acceleration: a reader without it SHALL find a recipient's rows through the entity hash bounds and return the identical rows. Each recipient's acknowledgement watermark (the newest point it has acknowledged) is durable application state read through an interface the application backs with its own storage. Reading a recipient's queue SHALL never return a row at or below that recipient's watermark, nor a row a deletion vector deletes. An inbox file is built only from all of its rows; a sparse update that holds only some of them is refused.
+
+#### Scenario: Recipient directory locates each queue
+- **WHEN** an inbox file is built from interleaved rows for several recipients
+- **THEN** each recipient's rows are contiguous in queue order and the directory records each recipient's row range and newest point
+
+#### Scenario: Acknowledged rows are never returned
+- **WHEN** a recipient has acknowledged through a point and its queue is read
+- **THEN** only its rows after that point are returned, and none once it has acknowledged its newest row
+
+#### Scenario: Deleted inbox rows are skipped
+- **WHEN** a deletion vector deletes some of a recipient's unacknowledged rows
+- **THEN** reading the queue omits them
+
+#### Scenario: Missing directory gives the same queue
+- **WHEN** the same rows are read from a file that carries no recipient directory
+- **THEN** the queue read returns the identical rows
+
 ### Requirement: Feature directory governs capabilities
 An HEF file SHALL declare capabilities through a feature directory, not through lifecycle/freshness/archive labels. Every file SHALL include the required feature flags (envelope columns, payload arena, stripe/granule directories, per-column marks, page metadata, min/max/sequence/time skip indexes, exact counts, checksum/footer directories, layout class). Unknown required features SHALL refuse; unknown optional features SHALL be ignored. The planner SHALL use an optional feature only when the footer declares it and its block checksum verifies; absence of an optional feature SHALL leave the file valid with queries falling back to another valid plan.
 

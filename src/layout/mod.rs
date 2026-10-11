@@ -18,6 +18,7 @@ pub mod constant;
 pub mod entity_scan;
 pub mod event;
 pub mod footer;
+pub mod inbox;
 pub mod mirror;
 pub mod reader;
 mod remote;
@@ -574,8 +575,15 @@ pub mod optional_features {
     /// never rules out a granule that holds the id, so a confirmed match is never lost.
     pub const ENTITY_HASH_POINT_FILTERS: u64 = 1 << 10;
 
+    /// An inbox file's footer carries a recipient directory: each recipient's row range and newest queue position, so
+    /// a reader fetches one recipient's rows directly and the lifecycle tells from the footer alone whether every
+    /// recipient has acknowledged the whole file. Droppable acceleration state: a reader that does not declare it finds
+    /// a recipient's rows through the entity hash bounds and returns the identical rows; only acknowledgement
+    /// retirement needs the directory, and a file without one is simply never retired by it.
+    pub const INBOX_RECIPIENT_DIRECTORY: u64 = 1 << 12;
+
     /// Optional features this reader knows how to validate and use.
-    pub const KNOWN: u64 = (1 << 11) - 1;
+    pub const KNOWN: u64 = (1 << 13) - 1;
 }
 
 /// The decoded fixed file header. A coarse rejection accelerator, not the authoritative aggregate source.

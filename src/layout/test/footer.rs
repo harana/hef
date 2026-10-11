@@ -37,6 +37,7 @@ fn minimal_footer() -> Footer {
             row_count: 1,
             stripe_id: 0,
         }],
+        inbox_recipients: Vec::new(),
         integrity_gaps: Vec::new(),
         io_alignment_bytes: 0,
         marks: Vec::new(),
@@ -205,6 +206,45 @@ fn external_id_index_and_reference_filters_round_trip_through_encode_decode() {
     let decoded = decode_footer(&encode_footer(&minimal_footer())).expect("footer decodes without error");
     assert_eq!(decoded.reference_filters, None);
     assert!(decoded.external_ids.is_empty());
+}
+
+#[test]
+fn inbox_recipient_directory_round_trips_and_rejects_a_forged_count() {
+    let mut footer = minimal_footer();
+    footer.inbox_recipients = vec![
+        InboxRecipientEntry {
+            entity_id_hash_high: 2,
+            entity_id_hash_low: 1,
+            first_row_ordinal: 0,
+            last_epoch: 1,
+            last_sequence: 9,
+            row_count: 3,
+        },
+        InboxRecipientEntry {
+            entity_id_hash_high: 2,
+            entity_id_hash_low: 5,
+            first_row_ordinal: 3,
+            last_epoch: 2,
+            last_sequence: 4,
+            row_count: 1,
+        },
+    ];
+    let mut bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).expect("footer decodes without error");
+    assert_eq!(decoded.inbox_recipients, footer.inbox_recipients);
+    let decoded = decode_footer(&encode_footer(&minimal_footer())).expect("footer decodes without error");
+    assert!(decoded.inbox_recipients.is_empty());
+
+    let (entry_start, section_offset, section_len) = find_directory_entry(&bytes, sections::INBOX_RECIPIENTS);
+    bytes[section_offset..section_offset + 4].copy_from_slice(&3u32.to_le_bytes());
+    let section_bytes = bytes[section_offset..section_offset + section_len].to_vec();
+    write_checksum_at(&mut bytes, entry_start, &section_bytes);
+    assert_eq!(
+        decode_footer(&bytes),
+        Err(FormatError::Structural {
+            rule: "inbox recipient count exceeds input"
+        })
+    );
 }
 
 #[test]

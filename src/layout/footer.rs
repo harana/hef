@@ -38,6 +38,9 @@ pub mod sections {
     /// `TYPED_COLUMN_ROW_OFFSETS`.
     pub const FREETEXT_ROW_OFFSETS: u32 = 18;
     pub const GRANULES: u32 = 3;
+    /// Optional: an inbox file's recipient directory, one entry per recipient. Absent in files that do not declare
+    /// `INBOX_RECIPIENT_DIRECTORY`.
+    pub const INBOX_RECIPIENTS: u32 = 36;
     /// Exact commitments for non-stripe byte ranges between the fixed header and footer. These are normally alignment
     /// padding; recording their roots lets a cold reader authenticate the complete segment partition without fetching
     /// padding bytes.
@@ -259,6 +262,23 @@ pub struct ExternalIdEntry {
     /// [`stable_hash`](crate::indexes::stable_hash) of the id's bytes.
     pub id_hash: u64,
     pub row_ordinal: u64,
+}
+
+/// One recipient's rows in an inbox file: where they start, how many there are, and the newest queue position among
+/// them. An inbox file stores each recipient's rows side by side, so this is all a reader needs to fetch one
+/// recipient's queue, and all the retirement check needs to tell whether the recipient has acknowledged everything in
+/// the file. The footer keeps the entries sorted by `(entity_id_hash_low, entity_id_hash_high)`, the file's row order.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboxRecipientEntry {
+    pub entity_id_hash_high: u64,
+    pub entity_id_hash_low: u64,
+    pub first_row_ordinal: u64,
+    /// With `last_sequence`, the recipient's newest `(epoch, sequence)` point in this file.
+    pub last_epoch: u64,
+    pub last_sequence: u64,
+    pub row_count: u64,
 }
 
 /// A small filter that says whether one granule might hold a given reference in one relationship column, so a "who
@@ -492,6 +512,9 @@ pub struct Footer {
     /// empty in files that read free-text at granule granularity only.
     pub freetext_row_offsets: Vec<FreetextRowOffsets>,
     pub granules: Vec<GranuleEntry>,
+    /// An inbox file's recipient directory. Present when `INBOX_RECIPIENT_DIRECTORY` is declared; empty otherwise, and
+    /// a reader then finds a recipient's rows through the entity hash bounds instead.
+    pub inbox_recipients: Vec<InboxRecipientEntry>,
     /// Authenticated commitments for the padding ranges between stripes.
     pub integrity_gaps: Vec<IntegrityGapEntry>,
     /// Byte alignment for column block boundaries, enabling aligned `O_DIRECT` reads of individual pages. Zero means
@@ -1073,6 +1096,21 @@ fn encode_sections(footer: &Footer) -> SectionArea {
             for entry in &footer.external_ids {
                 out.put_u64(entry.id_hash);
                 out.put_u64(entry.row_ordinal);
+            }
+        });
+    }
+
+    // The inbox recipient directory: optional, emitted only for an inbox file.
+    if !footer.inbox_recipients.is_empty() {
+        sections.push(sections::INBOX_RECIPIENTS, |out| {
+            out.put_u32(footer.inbox_recipients.len() as u32);
+            for entry in &footer.inbox_recipients {
+                out.put_u64(entry.entity_id_hash_low);
+                out.put_u64(entry.entity_id_hash_high);
+                out.put_u64(entry.first_row_ordinal);
+                out.put_u64(entry.row_count);
+                out.put_u64(entry.last_epoch);
+                out.put_u64(entry.last_sequence);
             }
         });
     }
@@ -1786,6 +1824,31 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         }
     }
 
+    // The inbox recipient directory: optional. Fixed entry size: six u64s = 48 bytes.
+    let mut inbox_recipients = Vec::new();
+    if let Some(directory_bytes) = decode_section(&directory, section_area, sections::INBOX_RECIPIENTS)? {
+        let mut r = Reader::new(directory_bytes);
+        let count = r.u32("inbox recipient count")? as usize;
+        let count = bounded_count(count, 48, &r, "inbox recipient count exceeds input")?;
+        inbox_recipients = Vec::with_capacity(count);
+        for _ in 0..count {
+            let entity_id_hash_low = r.u64("inbox recipient hash low")?;
+            let entity_id_hash_high = r.u64("inbox recipient hash high")?;
+            let first_row_ordinal = r.u64("inbox recipient first row")?;
+            let row_count = r.u64("inbox recipient row count")?;
+            let last_epoch = r.u64("inbox recipient last epoch")?;
+            let last_sequence = r.u64("inbox recipient last sequence")?;
+            inbox_recipients.push(InboxRecipientEntry {
+                entity_id_hash_high,
+                entity_id_hash_low,
+                first_row_ordinal,
+                last_epoch,
+                last_sequence,
+                row_count,
+            });
+        }
+    }
+
     // Reference filters: optional. Minimum entry size: 4+4 (ids) + 4 (filter length) = 12 bytes.
     let mut reference_filters = None;
     if let Some(filter_bytes) = decode_section(&directory, section_area, sections::REFERENCE_FILTERS)? {
@@ -1911,6 +1974,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         freetext,
         freetext_row_offsets,
         granules,
+        inbox_recipients,
         integrity_gaps,
         io_alignment_bytes,
         marks,

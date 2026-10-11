@@ -197,3 +197,17 @@ pub enum EntityScanError {
     #[error("deletes and corrections store failed: {detail}")]
     Store { detail: String },
 }
+
+/// Why reading a recipient's inbox, or checking whether an inbox file is fully acknowledged, failed: a stored file was
+/// malformed, or the application's store of acknowledgement watermarks or of deletes could not answer.
+///
+/// See: hef-file-lifecycle/spec.md
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum InboxError {
+    #[error(transparent)]
+    Deletes(#[from] EntityScanError),
+    #[error(transparent)]
+    Format(#[from] FormatError),
+    #[error("acknowledgement watermark store failed: {detail}")]
+    Watermarks { detail: String },
+}
