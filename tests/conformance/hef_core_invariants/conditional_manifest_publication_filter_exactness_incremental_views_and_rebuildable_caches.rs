@@ -48,6 +48,7 @@ fn lost_manifest_cas_rebases_instead_of_overwriting() {
         file_id: 7,
         file_type: hef::lifecycle::FileType::HefFile,
         footer_len: None,
+        graph_event_id_filter: None,
         optional_feature_flags: 0,
         part_index: 0,
         part_state: hef::lifecycle::PartState::Active,

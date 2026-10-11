@@ -43,6 +43,7 @@ simdutf8 = "0.1.5"
 thiserror = "2"
 type-safe-id = { version = "0.3.3", features = ["serde"] }
 uuid = "1"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 zeekstd = "0.6.2"
 zeroize = "1"
 zstd = "0.13.3"

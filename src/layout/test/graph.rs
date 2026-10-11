@@ -3,6 +3,7 @@ use crate::benchmarks::{GraphEdgeBytesMeasurement, graph_edge_bytes_gate_passes}
 use crate::layout::{Profile, required_features};
 use crate::writer::build::{HefBuildConfig, build_hef_file};
 use crate::writer::source_form::tests::{plain_row, source_form_config};
+use std::collections::HashMap;
 
 /// One way to break a valid graph input.
 type GraphBreak = Box<dyn Fn(&mut GraphInput)>;
@@ -325,4 +326,106 @@ fn a_room_graph_stores_few_bytes_per_edge() {
         measurement.stored_bytes as f64 / measurement.edges as f64
     );
     assert!(graph_edge_bytes_gate_passes(&measurement));
+}
+
+fn event_id(sn: u64) -> Vec<u8> {
+    format!("$event{sn}:example.org").into_bytes()
+}
+
+#[test]
+fn an_event_id_finds_its_sequence_number_and_a_missing_one_does_not() {
+    let rows: Vec<_> = (0..20)
+        .map(|i| {
+            let mut row = plain_row(i);
+            // Row 7 carries no protocol id, so the index leaves it out.
+            row.external_id = (i != 7).then(|| event_id(50 + i));
+            row
+        })
+        .collect();
+    let built = build_hef_file(rows, &graph_config(4, Some(chain(50, 20)))).unwrap();
+    assert_ne!(
+        built.footer.required_feature_flags & required_features::GRAPH_EVENT_ID_INDEX,
+        0
+    );
+    let file = HefFile::open(built.bytes.clone(), Some(&built.file_seal)).unwrap();
+    let index = file.footer().graph.as_ref().unwrap().event_ids.as_ref().unwrap();
+    assert_eq!(index.sns.len(), 19);
+    for sn in (50..70).filter(|&sn| sn != 57) {
+        assert_eq!(file.graph_sn_of(&event_id(sn)).unwrap(), Some(sn));
+        assert!(event_id_filter_may_hold(&index.filter, &event_id(sn)));
+    }
+    assert_eq!(file.graph_sn_of(&event_id(57)).unwrap(), None);
+    assert_eq!(file.graph_sn_of(b"$elsewhere:example.org").unwrap(), None);
+
+    let unindexed = build_hef_file(
+        (0..20).map(plain_row).collect::<Vec<_>>(),
+        &graph_config(4, Some(chain(50, 20))),
+    )
+    .unwrap();
+    assert_eq!(
+        unindexed.footer.required_feature_flags & required_features::GRAPH_EVENT_ID_INDEX,
+        0,
+        "rows without protocol ids get no index"
+    );
+}
+
+#[test]
+fn a_forced_hash_collision_resolves_to_the_event_holding_the_id() {
+    // Events 5 and 9 are stored under the same hash; only event 9's row holds the id asked for.
+    let hash = event_id_hash(b"$wanted");
+    let index = EventIdIndex {
+        filter: Vec::new(),
+        hashes: vec![hash, hash],
+        sns: vec![5, 9],
+    };
+    let stored: HashMap<u64, &[u8]> = HashMap::from([(5, &b"$collides"[..]), (9, &b"$wanted"[..])]);
+    let stored_id = |sn: u64| Ok(stored.get(&sn).map(|id| id.to_vec()));
+    assert_eq!(index.sn_of(b"$wanted", stored_id).unwrap(), Some(9));
+
+    let only_collider = EventIdIndex {
+        filter: Vec::new(),
+        hashes: vec![hash],
+        sns: vec![5],
+    };
+    assert_eq!(
+        only_collider.sn_of(b"$wanted", stored_id).unwrap(),
+        None,
+        "a hash match whose stored id differs never answers"
+    );
+}
+
+/// The event-id index's stored bytes per event and its filter's false-positive rate, for 100,000 Matrix-shaped ids.
+#[test]
+fn the_event_id_index_is_small_and_its_filter_rarely_admits_an_absent_id() {
+    let events = 100_000u64;
+    let ids: Vec<Vec<u8>> = (0..events)
+        .map(|sn| {
+            format!(
+                "${:043x}",
+                u128::from(sn).wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835)
+            )
+            .into_bytes()
+        })
+        .collect();
+    let index = EventIdIndex::build(ids.iter().map(Vec::as_slice).zip(0..))
+        .unwrap()
+        .unwrap();
+    let mut section = Writer::new();
+    index.encode(&mut section);
+    let section_bytes = section.into_bytes().len() as f64;
+    let filter_bytes = index.filter.len() as f64;
+    let probes = 200_000u64;
+    let admitted = (0..probes)
+        .filter(|probe| event_id_filter_may_hold(&index.filter, format!("$absent{probe}").as_bytes()))
+        .count();
+    let false_positive_rate = admitted as f64 / probes as f64;
+    println!(
+        "event id index: {:.2} bytes per event in the footer section ({:.2} of them filter), false-positive rate {:.4}",
+        section_bytes / events as f64,
+        filter_bytes / events as f64,
+        false_positive_rate
+    );
+    assert!(ids.iter().all(|id| event_id_filter_may_hold(&index.filter, id)));
+    assert!(section_bytes / (events as f64) < 12.0);
+    assert!(false_positive_rate < 0.02);
 }

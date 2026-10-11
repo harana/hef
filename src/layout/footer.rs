@@ -7,7 +7,7 @@
 //! the feature it backs. Unknown section ids are ignorable extension blocks; whether the *file* is readable is governed
 //! by the required-feature flags in the preamble, which refuse.
 
-use super::graph::{UnresolvedEdge, decode_unresolved, encode_unresolved};
+use super::graph::{EventIdIndex, UnresolvedEdge, decode_unresolved, encode_unresolved};
 use super::snapshot::SnapshotKeyIndex;
 use super::{Profile, required_features};
 use crate::compat::EscapeHatch;
@@ -48,6 +48,10 @@ pub mod sections {
     /// granule's edge block. Present exactly when the file declares `GRAPH_DENSE_IDS`, `GRAPH_CSR_FORWARD` and
     /// `GRAPH_CSR_REVERSE`.
     pub const GRAPH_EDGES: u32 = 31;
+    /// Optional: a graph-profile file's event-id index ([`super::EventIdIndex`]): sorted `(id hash, sequence number)`
+    /// pairs and a binary fuse filter over the hashes. Present exactly when the file declares `GRAPH_EVENT_ID_INDEX`,
+    /// and only beside `GRAPH_EDGES`.
+    pub const GRAPH_EVENT_IDS: u32 = 32;
     /// Optional: a graph-profile file's unresolved parents, the `prev` and `auth` references no sequence number was
     /// known for, sorted by child. Present, possibly empty, exactly when `GRAPH_EDGES` is.
     pub const GRAPH_UNRESOLVED: u32 = 37;
@@ -275,6 +279,8 @@ pub struct EntityHashFilterEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphDirectory {
     pub blocks: Vec<GraphBlockEntry>,
+    /// Present when the file declares `GRAPH_EVENT_ID_INDEX`.
+    pub event_ids: Option<EventIdIndex>,
     pub first_sn: u64,
     /// 1 to 255 bytes.
     pub subject: Vec<u8>,
@@ -1302,6 +1308,9 @@ fn encode_sections(footer: &Footer) -> SectionArea {
         sections.push(sections::GRAPH_UNRESOLVED, |out| {
             encode_unresolved(out, &graph.unresolved)
         });
+        if let Some(index) = &graph.event_ids {
+            sections.push(sections::GRAPH_EVENT_IDS, |out| index.encode(out));
+        }
     }
 
     if let Some(index) = &footer.snapshot_keys {
@@ -2193,6 +2202,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
             }
             Some(GraphDirectory {
                 blocks,
+                event_ids: None,
                 first_sn,
                 subject,
                 unresolved: Vec::new(),
@@ -2222,8 +2232,21 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
                 },
             )?;
             graph.unresolved = decode_unresolved(unresolved, graph.first_sn, end_sn)?;
+            let event_ids = decode_section(&directory, section_area, sections::GRAPH_EVENT_IDS)?;
+            if event_ids.is_some() != (required_feature_flags & required_features::GRAPH_EVENT_ID_INDEX != 0) {
+                return Err(FormatError::Structural {
+                    rule: "a graph event id index and the graph_event_id_index feature appear together",
+                });
+            }
+            graph.event_ids = event_ids
+                .map(|bytes| EventIdIndex::decode(bytes, graph.first_sn, end_sn))
+                .transpose()?;
         }
-        None if declared != 0 || decode_section(&directory, section_area, sections::GRAPH_UNRESOLVED)?.is_some() => {
+        None if declared != 0
+            || required_feature_flags & required_features::GRAPH_EVENT_ID_INDEX != 0
+            || decode_section(&directory, section_area, sections::GRAPH_UNRESOLVED)?.is_some()
+            || decode_section(&directory, section_area, sections::GRAPH_EVENT_IDS)?.is_some() =>
+        {
             return Err(FormatError::Structural {
                 rule: "a file declaring graph edge features must carry the graph section",
             });

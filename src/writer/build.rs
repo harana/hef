@@ -41,7 +41,7 @@ use crate::layout::footer::{
     SharedDictionaryEntry, ShredEntry, SortDirection, SortednessProof, StripeEntry, StripeNdvEntry, StripeProofEntry,
     TextTokenEntry, TextTokenOffsetsEntry, encode_stripe_marks_pages,
 };
-use crate::layout::graph::{GraphInput, encode_graph_blocks};
+use crate::layout::graph::{EventIdIndex, GraphInput, encode_graph_blocks};
 use crate::layout::reader::{HefFile, PayloadRead};
 use crate::layout::snapshot::SnapshotKeyIndex;
 use crate::layout::{
@@ -2796,6 +2796,15 @@ fn build_hef_file_sealed_in_order(
         previous = Some(last);
     }
     let audit = audit_trail(&rows, config, order)?;
+    // A graph file indexes each row's protocol id by its sequence number, so a reader finds an event without a scan.
+    let graph_event_ids = match &config.graph {
+        Some(graph) => EventIdIndex::build(
+            rows.iter()
+                .zip(graph.first_sn..)
+                .filter_map(|(row, sn)| Some((row.external_id.as_deref()?, sn))),
+        )?,
+        None => None,
+    };
     let inbox_recipients = if config.profile == Profile::Inbox {
         if order != RowOrder::Entity || sparse.is_some_and(|plan| !plan.rows_cover_file) {
             return Err(FormatError::Structural {
@@ -5049,6 +5058,9 @@ fn build_hef_file_sealed_in_order(
             | required_features::GRAPH_CSR_FORWARD
             | required_features::GRAPH_CSR_REVERSE;
     }
+    if graph_event_ids.is_some() {
+        required_feature_flags |= required_features::GRAPH_EVENT_ID_INDEX;
+    }
     let footer = Footer {
         audit,
         clustering,
@@ -5068,6 +5080,7 @@ fn build_hef_file_sealed_in_order(
         granules: granules.iter().map(|granule| granule.entry).collect(),
         graph: config.graph.as_ref().map(|graph| GraphDirectory {
             blocks: graph_blocks,
+            event_ids: graph_event_ids,
             first_sn: graph.first_sn,
             subject: graph.subject.clone(),
             unresolved: {

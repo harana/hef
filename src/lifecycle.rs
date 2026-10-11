@@ -7,6 +7,7 @@
 
 use super::events::{SequenceRange, TenantId};
 use super::layout::Profile;
+use super::layout::graph::event_id_filter_may_hold;
 use hashbrown::HashMap;
 
 /// The role a stored file plays in the published catalogue.
@@ -107,6 +108,12 @@ pub struct HefFileEntry {
     /// remote reader that knows `size_bytes` fetches the footer in one exact-range GET. Additive: `None` on entries
     /// written before tail geometry was recorded, which drop the reader to a speculative tail fetch rather than fail.
     pub footer_len: Option<u64>,
+    /// A graph file's event-id filter, copied from its footer
+    /// ([`EventIdIndex::filter`](crate::layout::graph::EventIdIndex::filter)) so a planner looking for an event by
+    /// protocol id can skip files that cannot hold it without opening them. `None` for every other file, and on entries
+    /// written before the filter existed.
+    #[serde(default)]
+    pub graph_event_id_filter: Option<Vec<u8>>,
     pub optional_feature_flags: u64,
     /// Zero-based index within a multi-part SuperHEF; always 0 for `HefFile` and `DerivedColumns` entries.
     pub part_index: u32,
@@ -130,6 +137,15 @@ impl HefFileEntry {
     /// fetch that may need one exact retry (see [`crate::layout::reader::HefFooter::open_speculative`]).
     pub fn tail_range(&self) -> crate::layout::reader::TailRange {
         crate::layout::reader::tail_range(self.size_bytes, self.footer_len, self.tree_len)
+    }
+
+    /// Whether this file may hold the graph event whose protocol id is `event_id`, from the entry alone. `false` is
+    /// certain and lets a planner skip the file; `true` may be wrong. Always `true` for an entry without an event-id
+    /// filter.
+    pub fn may_hold_graph_event(&self, event_id: &[u8]) -> bool {
+        self.graph_event_id_filter
+            .as_deref()
+            .is_none_or(|filter| event_id_filter_may_hold(filter, event_id))
     }
 
     /// True when the `feature_metadata` placement satisfies the spec rule: day-scoped feature metadata is valid only on

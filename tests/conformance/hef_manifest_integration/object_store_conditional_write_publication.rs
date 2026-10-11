@@ -23,6 +23,7 @@ fn make_entry(file_id: u128, range: SequenceRange) -> HefFileEntry {
         file_id,
         file_type: FileType::HefFile,
         footer_len: None,
+        graph_event_id_filter: None,
         optional_feature_flags: 0,
         part_index: 0,
         part_state: PartState::Active,

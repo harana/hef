@@ -15,6 +15,9 @@
 //! the reference its event declared, in the footer's list of unresolved parents, and the event reads as having
 //! unresolved edges.
 //!
+//! A file may also index its events' protocol ids (a Matrix `$...` id, say), so a reader finds an event's sequence
+//! number without reading a granule and a planner skips files that cannot hold it (see [`EventIdIndex`]).
+//!
 //! A table is `edge_count u32`, its offsets block, then (when it has edges) its targets block. Offsets are one entry
 //! per `(row, kind)` slot plus a final total, `prev` before `auth` within each row. A target is stored as
 //! `source_sn - target_sn`, positive for a parent and negative for a child. Both arrays go through the ordinary column
@@ -30,8 +33,10 @@ use crate::encoding::{ColumnData, PipelineId, decode_block, encode_block};
 use crate::error::FormatError;
 use crate::events::{RelationshipKind, RelationshipRef, TargetIdSpace};
 use crate::file::bytes::{Reader, Writer};
+use crate::indexes::probabilistic::BinaryFuseFilter;
 use hashbrown::HashSet;
 use std::collections::BTreeMap;
+use xxhash_rust::xxh3::xxh3_64;
 
 /// Which relationship an edge records between two events of one subject.
 ///
@@ -126,6 +131,24 @@ pub struct GraphEdge {
 pub struct UnresolvedEdge {
     pub child: u64,
     pub parent: RelationshipRef,
+}
+
+/// Finds an event's sequence number from its protocol id (a Matrix `$...` id, say) without reading a granule, and lets
+/// a planner skip files that cannot hold the id.
+///
+/// It keeps one `(event_id_hash(id), sn)` pair per event that carries an id, sorted, so a lookup is a binary search.
+/// Two ids can share a hash, so every candidate is confirmed against the id stored in its row before it answers. A
+/// binary fuse filter over the same hashes travels with it and is copied into the file's manifest entry.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventIdIndex {
+    /// An encoded [`BinaryFuseFilter`] over `hashes`.
+    pub filter: Vec<u8>,
+    /// [`event_id_hash`] of each indexed id, ascending.
+    pub hashes: Vec<u64>,
+    /// `sns[i]` is the event whose id hashed to `hashes[i]`; ascending within a run of equal hashes.
+    pub sns: Vec<u64>,
 }
 
 /// One granule's decoded edges: parents and children for each of its events, as sequence numbers.
@@ -309,6 +332,90 @@ fn put_block(out: &mut Writer, data: &ColumnData) {
     out.put_slice(&encoded.bytes);
 }
 
+/// The hash a graph file's event-id index and its filter key a protocol id by: 64-bit XXH3.
+pub fn event_id_hash(event_id: &[u8]) -> u64 {
+    xxh3_64(event_id)
+}
+
+/// Whether a file whose event-id filter is `filter` (the bytes [`EventIdIndex::filter`] holds) may hold the event
+/// with protocol id `event_id`. `false` is certain; `true` may be wrong, and is the answer for bytes that do not
+/// decode as a filter.
+pub fn event_id_filter_may_hold(filter: &[u8], event_id: &[u8]) -> bool {
+    BinaryFuseFilter::decode(filter).map_or(true, |filter| filter.contains(event_id_hash(event_id)))
+}
+
+impl EventIdIndex {
+    /// The index over `ids`, each an event's protocol id and sequence number, or `None` when there are none. Fails only
+    /// when the filter cannot be built, which takes a pathological set of hashes.
+    pub fn build<'a>(ids: impl IntoIterator<Item = (&'a [u8], u64)>) -> Result<Option<Self>, FormatError> {
+        let mut pairs: Vec<(u64, u64)> = ids.into_iter().map(|(id, sn)| (event_id_hash(id), sn)).collect();
+        if pairs.is_empty() {
+            return Ok(None);
+        }
+        pairs.sort_unstable();
+        let (hashes, sns): (Vec<u64>, Vec<u64>) = pairs.into_iter().unzip();
+        let filter = BinaryFuseFilter::build(&hashes)?.encode();
+        Ok(Some(Self { filter, hashes, sns }))
+    }
+
+    /// The sequence number of the event whose protocol id is `event_id`, or `None` when no indexed event has it. Each
+    /// event whose hash matches is confirmed through `stored_id`, which reads the id stored for a sequence number, so
+    /// an event whose id only shares the hash never answers.
+    fn sn_of(
+        &self,
+        event_id: &[u8],
+        mut stored_id: impl FnMut(u64) -> Result<Option<Vec<u8>>, FormatError>,
+    ) -> Result<Option<u64>, FormatError> {
+        let hash = event_id_hash(event_id);
+        let start = self.hashes.partition_point(|&stored| stored < hash);
+        let end = self.hashes.partition_point(|&stored| stored <= hash);
+        for &sn in self.sns.get(start..end).unwrap_or_default() {
+            if stored_id(sn)?.as_deref() == Some(event_id) {
+                return Ok(Some(sn));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Writes footer section `GRAPH_EVENT_IDS`: the hashes, then the sequence numbers, each through the ordinary column
+    /// block encoder as `pipeline u32 | byte length u32 | bytes`, then the filter as `length u32 | bytes`.
+    pub(super) fn encode(&self, out: &mut Writer) {
+        put_block(out, &ColumnData::U64(self.hashes.clone()));
+        put_block(out, &ColumnData::U64(self.sns.clone()));
+        out.put_u32(self.filter.len() as u32);
+        out.put_slice(&self.filter);
+    }
+
+    /// Reads [`Self::encode`]'s bytes for a file whose events run from `first_sn` up to just before `end_sn`. Refuses
+    /// an empty index, arrays of different lengths, pairs out of order or repeated, a sequence number outside the file,
+    /// and a filter that does not decode.
+    pub(super) fn decode(bytes: &[u8], first_sn: u64, end_sn: u64) -> Result<Self, FormatError> {
+        let mut reader = Reader::new(bytes);
+        let hashes = take_block(&mut reader)?;
+        let sns = take_block(&mut reader)?;
+        let filter_len = reader.u32("graph event id filter length")? as usize;
+        let filter = reader.take(filter_len, "graph event id filter")?.to_vec();
+        BinaryFuseFilter::decode(&filter)?;
+        let (ColumnData::U64(hashes), ColumnData::U64(sns)) = (hashes, sns) else {
+            return Err(FormatError::Structural {
+                rule: "graph event id hashes and sequence numbers must decode to u64 columns",
+            });
+        };
+        let pairs: Vec<(u64, u64)> = hashes.iter().copied().zip(sns.iter().copied()).collect();
+        if reader.remaining() != 0
+            || hashes.is_empty()
+            || hashes.len() != sns.len()
+            || pairs.windows(2).any(|pair| pair.first() >= pair.last())
+            || sns.iter().any(|sn| !(first_sn..end_sn).contains(sn))
+        {
+            return Err(FormatError::Structural {
+                rule: "graph event id index must hold sorted, distinct pairs naming events in the file",
+            });
+        }
+        Ok(Self { filter, hashes, sns })
+    }
+}
+
 /// Writes the unresolved-parent list of footer section `GRAPH_UNRESOLVED`: `count u32`, then per entry the child's
 /// sequence number `u64`, the edge kind `u8` (0 `prev`, 1 `auth`), and the reference's column value (see
 /// [`RelationshipRef::column_value`]) as `length u16 | bytes`. `edges` must already be sorted by child.
@@ -474,6 +581,19 @@ impl HefFile {
             granule.row_count,
             first_sn.saturating_add(footer.exact_counts.row_count),
         )
+    }
+
+    /// The sequence number of the event in this graph-profile file whose protocol id (its external id) is `event_id`,
+    /// found through the file's event-id index and confirmed against the row's stored id. `None` when the file does
+    /// not hold the event or carries no index.
+    pub fn graph_sn_of(&self, event_id: &[u8]) -> Result<Option<u64>, FormatError> {
+        let Some(index) = self.footer().graph.as_ref().and_then(|graph| graph.event_ids.as_ref()) else {
+            return Ok(None);
+        };
+        index.sn_of(event_id, |sn| match self.graph_row_of(sn) {
+            Some(row) => self.external_id(row),
+            None => Ok(None),
+        })
     }
 
     /// The sequence number of the event at row `row_ordinal` of a graph-profile file, or `None` when the file carries

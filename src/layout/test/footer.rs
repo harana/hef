@@ -1083,6 +1083,7 @@ fn graph_footer() -> Footer {
             len: 300,
             offset: 4_096,
         }],
+        event_ids: None,
         first_sn: 77,
         subject: b"!room:example.org".to_vec(),
         unresolved: vec![UnresolvedEdge {
@@ -1141,6 +1142,48 @@ fn the_graph_edge_directory_round_trips_through_the_footer() {
     let footer = graph_footer();
     assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().graph, footer.graph);
     assert_eq!(decode_footer(&encode_footer(&minimal_footer())).unwrap().graph, None);
+}
+
+fn indexed_graph_footer() -> Footer {
+    let mut footer = graph_footer();
+    footer.required_feature_flags |= required_features::GRAPH_EVENT_ID_INDEX;
+    if let Some(graph) = &mut footer.graph {
+        graph.event_ids = crate::layout::graph::EventIdIndex::build([(&b"$a:example.org"[..], 77)]).unwrap();
+    }
+    footer
+}
+
+#[test]
+fn a_graph_event_id_index_round_trips_only_with_its_feature_bit() {
+    let footer = indexed_graph_footer();
+    assert_eq!(decode_footer(&encode_footer(&footer)).unwrap().graph, footer.graph);
+
+    let mut no_bit = indexed_graph_footer();
+    no_bit.required_feature_flags &= !required_features::GRAPH_EVENT_ID_INDEX;
+    let mut no_index = indexed_graph_footer();
+    if let Some(graph) = &mut no_index.graph {
+        graph.event_ids = None;
+    }
+    let mut outside = indexed_graph_footer();
+    if let Some(index) = outside.graph.as_mut().and_then(|graph| graph.event_ids.as_mut()) {
+        index.sns[0] = 78;
+    }
+    let mut repeated = indexed_graph_footer();
+    if let Some(index) = repeated.graph.as_mut().and_then(|graph| graph.event_ids.as_mut()) {
+        index.hashes.push(index.hashes[0]);
+        index.sns.push(77);
+    }
+    let mut no_filter = indexed_graph_footer();
+    if let Some(index) = no_filter.graph.as_mut().and_then(|graph| graph.event_ids.as_mut()) {
+        index.filter.clear();
+    }
+    let mut no_graph = indexed_graph_footer();
+    no_graph.graph = None;
+    no_graph.required_feature_flags &= !required_features::GRAPH;
+    no_graph.required_feature_flags |= required_features::GRAPH_EVENT_ID_INDEX;
+    for footer in [no_bit, no_index, outside, repeated, no_filter, no_graph] {
+        assert!(decode_footer(&encode_footer(&footer)).is_err());
+    }
 }
 
 #[test]
