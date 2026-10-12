@@ -1,8 +1,12 @@
 use super::*;
 use crate::encoding::StringColumn;
 use crate::events::relationships::{EventRelationships, RelationshipKind, RelationshipRef, TargetIdSpace};
-use crate::writer::build::{BuildRow, build_hef_file};
-use crate::writer::source_form::tests::{plain_row, source_form_config};
+use crate::events::variant::VariantValue;
+use crate::layout::LayoutTargets;
+use crate::writer::build::{BuildLifecycle, BuildRow, build_hef_file};
+use crate::writer::source_form::tests::{plain_row, source_form_config, source_form_row};
+use std::collections::BTreeMap;
+use std::time::Instant;
 
 fn with_id(i: u64, id: &[u8]) -> BuildRow {
     let mut row = plain_row(i);
@@ -154,4 +158,188 @@ fn string_at_reads_dense_and_presence_gated_blocks() {
     assert_eq!(string_at(&read, 4, 0), None);
     assert_eq!(string_at(&read, 4, 1), Some("b"));
     assert_eq!(string_at(&read, 4, 3), Some("d"));
+}
+
+/// A Matrix-shaped event id for row `i`: `$`, 43 url-safe characters derived from `i`, and a server name.
+fn matrix_event_id(i: u64) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut state = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut id = vec![b'$'];
+    for _ in 0..43 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        id.push(ALPHABET[(state & 63) as usize]);
+    }
+    id.extend_from_slice(b":example.org");
+    id
+}
+
+/// Row `i` of the lookup benchmark: a chat message with a sender, a room, an external id and a small body.
+fn message_row(i: u64) -> BuildRow {
+    let body = format!("message number {i} in a room with a few words of text");
+    let mut row = source_form_row(
+        i,
+        VariantValue::Object(BTreeMap::from([
+            ("body".to_owned(), VariantValue::String(body)),
+            ("msgtype".to_owned(), VariantValue::String("m.text".to_owned())),
+        ])),
+    );
+    row.envelope.actor_id = Some(format!("@user{}:example.org", i % 5_000));
+    row.envelope.entity_id = Some(format!("!room{}:example.org", i % 2_000));
+    row.external_id = Some(matrix_event_id(i));
+    row
+}
+
+/// Compares fetching one whole event by its external id in a 1,000,000-event file against SQLite holding the same
+/// events in a table with a unique index on the external id, and prints time per lookup. Both answer random ids from
+/// the whole file, one at a time: HEF from one open file whose bytes are in memory, SQLite from one open connection
+/// over a database file in the OS page cache, through a prepared statement. Run by hand:
+/// `cargo test --release --all-features --lib external_id_lookup_against_sqlite -- --ignored --nocapture`.
+#[test]
+#[ignore = "release-mode external-id lookup benchmark"]
+fn external_id_lookup_against_sqlite() {
+    let events = 1_000_000u64;
+    let probes = 20_000usize;
+    let rows: Vec<BuildRow> = (0..events).map(message_row).collect();
+    let mut config = source_form_config(8192);
+    config.targets = LayoutTargets::default();
+    for lifecycle in [BuildLifecycle::FreshPublication, BuildLifecycle::RewriteOrCompaction] {
+        config.lifecycle = lifecycle;
+        let started = Instant::now();
+        let built = build_hef_file(rows.clone(), &config).unwrap();
+        let build_time = started.elapsed();
+        let size = built.bytes.len();
+        let file = HefFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let ids: Vec<(u64, Vec<u8>)> = (0..probes)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let i = state % events;
+                (i, matrix_event_id(i))
+            })
+            .collect();
+        let started = Instant::now();
+        for (i, id) in &ids {
+            assert_eq!(file.row_by_external_id(id).unwrap(), Some(*i));
+        }
+        let probe = started.elapsed() / probes as u32;
+        let started = Instant::now();
+        for (i, _) in &ids {
+            std::hint::black_box(file.envelope(*i).unwrap());
+        }
+        let envelope = started.elapsed() / probes as u32;
+        let started = Instant::now();
+        for (i, _) in &ids {
+            std::hint::black_box(file.payload(*i).unwrap());
+        }
+        let payload = started.elapsed() / probes as u32;
+        let started = Instant::now();
+        for (_, id) in &ids {
+            let row = file.row_by_external_id(id).unwrap().unwrap();
+            std::hint::black_box(file.event(row).unwrap());
+        }
+        let whole = started.elapsed() / probes as u32;
+        println!(
+            "hef {lifecycle:?}: {size} B, built in {build_time:?}; per lookup: id probe {probe:?}, envelope \
+             {envelope:?}, payload {payload:?}, whole event {whole:?}"
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.db");
+    let mut db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         CREATE TABLE events (
+             id INTEGER PRIMARY KEY, external_id BLOB NOT NULL, event_id BLOB NOT NULL, occurred_at INTEGER,
+             ingested_at INTEGER, source TEXT, event_type TEXT, entity_type TEXT, entity_id TEXT, actor_id TEXT,
+             account_id TEXT, stream_id INTEGER, stream_sequence INTEGER, flags INTEGER, schema_version INTEGER,
+             entity_hash_low INTEGER, entity_hash_high INTEGER, actor_hash INTEGER, account_hash INTEGER,
+             trace_hash INTEGER, dedupe_low INTEGER, dedupe_high INTEGER, payload BLOB);
+         CREATE UNIQUE INDEX events_external_id ON events (external_id);",
+    )
+    .unwrap();
+    let started = Instant::now();
+    let transaction = db.transaction().unwrap();
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO events VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                 ?18, ?19, ?20, ?21, ?22, ?23)",
+            )
+            .unwrap();
+        for (i, row) in rows.iter().enumerate() {
+            let envelope = &row.envelope;
+            let payload = format!(
+                "{{\"body\":\"message number {i} in a room with a few words of text\",\"msgtype\":\"m.text\"}}"
+            );
+            insert
+                .execute(rusqlite::params![
+                    i as i64,
+                    row.external_id.as_deref().unwrap(),
+                    envelope.event_id.to_string(),
+                    envelope.occurred_at.physical_nanos(),
+                    envelope.ingested_at.physical_nanos(),
+                    &*envelope.source,
+                    &*envelope.event_type,
+                    &*envelope.entity_type,
+                    envelope.entity_id,
+                    envelope.actor_id,
+                    envelope.account_id,
+                    envelope.stream_id.0 as i64,
+                    envelope.stream_sequence as i64,
+                    i64::from(envelope.flags.0),
+                    envelope.schema_version,
+                    envelope.entity_id_hash_low as i64,
+                    envelope.entity_id_hash_high as i64,
+                    envelope.actor_id_hash_low as i64,
+                    envelope.account_id_hash_low as i64,
+                    envelope.trace_id_hash_low as i64,
+                    envelope.dedupe_hash_low as i64,
+                    envelope.dedupe_hash_high as i64,
+                    payload.as_bytes(),
+                ])
+                .unwrap();
+        }
+    }
+    transaction.commit().unwrap();
+    let build_time = started.elapsed();
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    let size = std::fs::metadata(&path).unwrap().len();
+    let mut select = db
+        .prepare_cached("SELECT * FROM events WHERE external_id = ?1")
+        .unwrap();
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let ids: Vec<Vec<u8>> = (0..probes)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            matrix_event_id(state % events)
+        })
+        .collect();
+    let mut fetch = |id: &[u8]| {
+        select
+            .query_row([id], |row| {
+                let mut owned = Vec::with_capacity(23);
+                for column in 0..23 {
+                    owned.push(row.get::<_, rusqlite::types::Value>(column)?);
+                }
+                Ok(owned)
+            })
+            .unwrap()
+    };
+    // One pass loads the database file into the OS page cache, as the in-memory HEF bytes are.
+    for id in &ids {
+        fetch(id);
+    }
+    let started = Instant::now();
+    for id in &ids {
+        std::hint::black_box(fetch(id));
+    }
+    let lookup = started.elapsed() / probes as u32;
+    println!("sqlite: {size} B, built in {build_time:?}; per lookup: whole row {lookup:?}");
 }

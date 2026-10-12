@@ -50,6 +50,7 @@ zstd = "0.13.3"
 
 [dev-dependencies]
 rkyv = "0.8.18"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 tempfile = "3"
 
 [lints.rust]
