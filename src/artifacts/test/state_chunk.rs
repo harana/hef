@@ -386,6 +386,121 @@ fn a_missing_altered_or_malformed_chunk_is_refused() {
     }
 }
 
+#[test]
+fn a_cache_answers_as_state_get_and_fetches_each_chunk_once() {
+    let state = room(100_000);
+    let tree = build(&state);
+    let mut store = CountingChunks::default();
+    store.store(&tree.chunks);
+    let depth = {
+        state_get(&store, &key(), &tree.root, member(0)).unwrap();
+        store.take_reads()
+    };
+    assert!(depth >= 2, "depth {depth}");
+    let cache = StateChunkCache::new(key(), u64::MAX);
+
+    assert_eq!(cache.state_get(&store, &tree.root, member(0)).unwrap(), Some(2));
+    assert_eq!(store.take_reads(), depth);
+    assert_eq!(cache.state_get(&store, &tree.root, member(0)).unwrap(), Some(2));
+    assert_eq!(store.take_reads(), 0);
+    // Another leaf under the same root: the root is not fetched again.
+    assert_eq!(
+        cache.state_get(&store, &tree.root, member(99_999)).unwrap(),
+        Some(100_001)
+    );
+    let reads = store.take_reads();
+    assert!((1..depth).contains(&reads), "{reads} chunk reads");
+
+    for user in [1, 4_095, 50_000, 99_999] {
+        assert_eq!(
+            cache.state_get(&store, &tree.root, member(user)).unwrap(),
+            state_get(&store, &key(), &tree.root, member(user)).unwrap()
+        );
+    }
+    for absent in [member(100_000), StateKey::default()] {
+        assert_eq!(cache.state_get(&store, &tree.root, absent).unwrap(), None);
+    }
+
+    // A later state shares every chunk but the ones its change rewrote, so only those are fetched.
+    let mut changed = state;
+    changed.insert(member(42_000), 5);
+    let after = build(&changed);
+    let new_chunks = after.new_chunks(&tree);
+    store.store(&new_chunks);
+    store.take_reads();
+    assert_eq!(cache.state_get(&store, &after.root, member(42_000)).unwrap(), Some(5));
+    assert_eq!(store.take_reads(), new_chunks.len());
+    assert_eq!(cache.state_get(&store, &after.root, member(0)).unwrap(), Some(2));
+    assert_eq!(store.take_reads(), 0);
+}
+
+#[test]
+fn a_cache_keeps_no_more_than_its_budget() {
+    let tree = build(&room(100_000));
+    let mut store = CountingChunks::default();
+    store.store(&tree.chunks);
+    let depth = {
+        state_get(&store, &key(), &tree.root, member(0)).unwrap();
+        store.take_reads()
+    };
+    assert!(depth >= 2, "depth {depth}");
+    // With no budget it keeps only the chunk read last, so each lookup fetches every level again.
+    let cache = StateChunkCache::new(key(), 0);
+    for _ in 0..3 {
+        assert_eq!(cache.state_get(&store, &tree.root, member(7)).unwrap(), Some(9));
+        assert_eq!(store.take_reads(), depth);
+    }
+}
+
+#[test]
+fn a_cache_refuses_what_state_get_refuses() {
+    let tree = build(&room(10_000));
+    let mut store = CountingChunks::default();
+    store.store(&tree.chunks);
+    let mut missing = CountingChunks::default();
+    missing.store(tree.chunks.split_last().unwrap().1);
+    assert!(matches!(
+        StateChunkCache::new(key(), u64::MAX).state_get(&missing, &tree.root, member(1)),
+        Err(StateChunkError::Missing { .. })
+    ));
+    let other_tenant = StateChunkKey::derive(&TenantDek::new([8; 32]));
+    assert!(matches!(
+        StateChunkCache::new(other_tenant, u64::MAX).state_get(&store, &tree.root, member(1)),
+        Err(StateChunkError::Unauthentic { .. })
+    ));
+
+    // A kept leaf named as a child one level above a leaf is refused, as an unkept one is.
+    let seal = |level: u8, entry: &[u8]| {
+        let mut out = Writer::new();
+        out.put_slice(&STATE_CHUNK_MAGIC);
+        out.put_u8(level);
+        out.put_slice(&[0; 3]);
+        out.put_u32(1);
+        out.put_u32(MEMBER);
+        out.put_u32(1);
+        out.put_slice(entry);
+        out.put_u64(crc64_nvme(out.bytes()));
+        key().seal(out.bytes()).unwrap()
+    };
+    let (leaf, leaf_bytes) = seal(0, &1u64.to_le_bytes());
+    let (interior, interior_bytes) = seal(2, &leaf);
+    let mut store = CountingChunks::default();
+    store.chunks.insert(leaf, leaf_bytes);
+    store.chunks.insert(interior, interior_bytes);
+    let root = |address| StateRoot {
+        address,
+        entry_count: 1,
+    };
+    let cache = StateChunkCache::new(key(), u64::MAX);
+    assert_eq!(cache.state_get(&store, &root(leaf), member(1)).unwrap(), Some(1));
+    for answer in [
+        cache.state_get(&store, &root(interior), member(1)),
+        state_get(&store, &key(), &root(interior), member(1)),
+    ] {
+        assert!(matches!(answer, Err(StateChunkError::Format(_))));
+    }
+}
+
 /// Checkpointed delta chains, the alternative the prolly tree is measured against: frame `k` stores the full map when
 /// `k` is a multiple of 64 and otherwise only the keys that changed since frame `k - 1`. Each frame is one object,
 /// framed and sealed like a leaf chunk so both designs carry the same per-object overhead.
