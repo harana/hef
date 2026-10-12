@@ -35,9 +35,13 @@ use crate::file::integrity::crc64_nvme;
 use crate::indexes::stable_hash;
 use crate::object_store::{ObjectStore, state_chunk_object_key};
 use crate::security::StateChunkKey;
+use dashmap::DashMap;
 use hashbrown::{HashMap, HashSet};
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{self, AtomicU64};
 
 /// One key of a subject's state: the kind of state and which instance of it, as interned ids. Keys sort by type id,
 /// then by state key id.
@@ -165,6 +169,120 @@ impl StateChunk {
             StateChunk::Interior { level, .. } => *level,
             StateChunk::Leaf(_) => 0,
         }
+    }
+
+    /// Heap bytes the decoded entries hold, for a cache's budget.
+    fn decoded_bytes(&self) -> u64 {
+        match self {
+            StateChunk::Interior { children, .. } => (children.len() * size_of::<(StateKey, [u8; 32])>()) as u64,
+            StateChunk::Leaf(entries) => (entries.len() * size_of::<(StateKey, u64)>()) as u64,
+        }
+    }
+}
+
+/// Keeps one tenant's recently read state chunks opened and decoded, so a lookup that lands in chunks read before (the
+/// current state asked again and again, or earlier states that share most of their chunks) skips fetching, opening
+/// and decoding them again.
+///
+/// A chunk never changes once written, so a kept chunk is never stale: the store stays the source of truth and the
+/// cache only saves work. It keeps up to a byte budget of decoded entries and drops the least recently read chunk past
+/// it. It holds the tenant's key and opens every chunk it keeps with it, so one tenant's lookups never reach another
+/// tenant's chunks.
+///
+/// See: hef-physical-artifacts/spec.md
+pub struct StateChunkCache {
+    budget_bytes: u64,
+    chunks: DashMap<[u8; 32], CachedStateChunk, ahash::RandomState>,
+    key: StateChunkKey,
+    kept_bytes: AtomicU64,
+    reads: AtomicU64,
+}
+
+/// One chunk a [`StateChunkCache`] keeps: its decoded entries, what they cost against the budget, and the read count
+/// when it was last read, for eviction.
+struct CachedStateChunk {
+    bytes: u64,
+    chunk: Arc<StateChunk>,
+    last_used: u64,
+}
+
+impl StateChunkCache {
+    /// An empty cache for the tenant whose state chunk key is `key`, keeping up to `budget_bytes` of decoded entries.
+    /// The chunk read last is always kept, whatever the budget.
+    pub fn new(key: StateChunkKey, budget_bytes: u64) -> Self {
+        Self {
+            budget_bytes,
+            chunks: DashMap::default(),
+            key,
+            kept_bytes: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+        }
+    }
+
+    /// The event sequence number `state_key` holds in the state at `root`, or `None` when the state lacks it: the
+    /// answer [`state_get`] gives. Fetches from `store` only the chunks along the way the cache does not hold yet, and
+    /// fails as [`state_get`] does.
+    pub fn state_get(
+        &self,
+        store: &dyn StateChunkStore,
+        root: &StateRoot,
+        state_key: StateKey,
+    ) -> Result<Option<u64>, StateChunkError> {
+        lookup(root, state_key, |address, level| self.chunk(store, address, level))
+    }
+
+    /// The decoded chunk at `address`, kept from an earlier read or fetched, opened and kept now, checked to sit at
+    /// `level` when the caller knows it.
+    fn chunk(
+        &self,
+        store: &dyn StateChunkStore,
+        address: &[u8; 32],
+        level: Option<u8>,
+    ) -> Result<Arc<StateChunk>, StateChunkError> {
+        let tick = self.reads.fetch_add(1, atomic::Ordering::Relaxed);
+        let kept = self.chunks.get_mut(address).map(|mut slot| {
+            slot.last_used = tick;
+            Arc::clone(&slot.chunk)
+        });
+        let chunk = match kept {
+            Some(chunk) => chunk,
+            None => self.keep(*address, read_state_chunk(store, &self.key, address, None)?, tick),
+        };
+        check_level(&chunk, level)?;
+        Ok(chunk)
+    }
+
+    /// Keeps `chunk`, read at `tick`, under `address`, then drops the least recently read chunks other than it until
+    /// the cache fits its budget. Returns the chunk now kept, which is another thread's copy when one landed first.
+    fn keep(&self, address: [u8; 32], chunk: StateChunk, tick: u64) -> Arc<StateChunk> {
+        let decoded = Arc::new(chunk);
+        let bytes = decoded.decoded_bytes();
+        let kept = {
+            let slot = self.chunks.entry(address).or_insert(CachedStateChunk {
+                bytes,
+                chunk: Arc::clone(&decoded),
+                last_used: tick,
+            });
+            if Arc::ptr_eq(&slot.chunk, &decoded) {
+                self.kept_bytes.fetch_add(bytes, atomic::Ordering::Relaxed);
+            }
+            Arc::clone(&slot.chunk)
+        };
+        while self.kept_bytes.load(atomic::Ordering::Relaxed) > self.budget_bytes && self.chunks.len() > 1 {
+            let Some(evict) = self
+                .chunks
+                .iter()
+                .filter(|slot| *slot.key() != address)
+                .min_by_key(|slot| slot.last_used)
+                .map(|slot| *slot.key())
+            else {
+                break;
+            };
+            if let Some((_, evicted)) = self.chunks.remove(&evict) {
+                self.kept_bytes.fetch_sub(evicted.bytes, atomic::Ordering::Relaxed);
+            }
+        }
+        kept
     }
 }
 
@@ -553,12 +671,18 @@ pub(crate) fn read_state_chunk(
         .open(address, &sealed)
         .ok_or_else(|| StateChunkError::Unauthentic { address: hex() })?;
     let chunk = decode_state_chunk(&plaintext)?;
+    check_level(&chunk, level)?;
+    Ok(chunk)
+}
+
+/// Refuses `chunk` when the caller knows the level it must sit at and it sits at another.
+fn check_level(chunk: &StateChunk, level: Option<u8>) -> Result<(), StateChunkError> {
     if level.is_some_and(|level| level != chunk.level()) {
         return Err(StateChunkError::Format(FormatError::Structural {
             rule: "a state chunk sits one level below its parent",
         }));
     }
-    Ok(chunk)
+    Ok(())
 }
 
 /// The event sequence number `state_key` holds in the state at `root`, or `None` when the state lacks it. Reads one
@@ -569,10 +693,23 @@ pub fn state_get(
     root: &StateRoot,
     state_key: StateKey,
 ) -> Result<Option<u64>, StateChunkError> {
+    lookup(root, state_key, |address, level| {
+        read_state_chunk(store, key, address, level)
+    })
+}
+
+/// Walks the tree at `root` down to the leaf that would hold `state_key`, reading each chunk on the way through `read`
+/// (given the chunk's address and, below the root, the level it must sit at), and returns the key's value there.
+fn lookup<C: Borrow<StateChunk>>(
+    root: &StateRoot,
+    state_key: StateKey,
+    mut read: impl FnMut(&[u8; 32], Option<u8>) -> Result<C, StateChunkError>,
+) -> Result<Option<u64>, StateChunkError> {
     let mut address = root.address;
     let mut level = None;
     loop {
-        match read_state_chunk(store, key, &address, level)? {
+        let chunk = read(&address, level)?;
+        match chunk.borrow() {
             StateChunk::Leaf(entries) => {
                 let found = entries
                     .binary_search_by(|(entry_key, _)| entry_key.cmp(&state_key))
