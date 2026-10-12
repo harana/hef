@@ -126,12 +126,67 @@ fn prev_and_auth_references_round_trip_and_reverse_lookups_skip_granules() {
 }
 
 #[test]
+fn external_id_reads_decode_each_granule_once() {
+    // Every row of the first file carries an id, so each block holds a value for every row; only even rows of the
+    // second do, so its values sit behind a presence bitmap.
+    for every_row in [true, false] {
+        let carries = |i: u64| every_row || i % 2 == 0;
+        let rows: Vec<BuildRow> = (0..6u64)
+            .map(|i| {
+                if carries(i) {
+                    with_id(i, format!("$id-{i}").as_bytes())
+                } else {
+                    plain_row(i)
+                }
+            })
+            .collect();
+        let built = build_hef_file(rows, &source_form_config(3)).unwrap();
+        let file = HefFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+        for i in 0..6u64 {
+            assert_eq!(
+                file.external_id(i).unwrap(),
+                carries(i).then(|| format!("$id-{i}").into_bytes())
+            );
+        }
+        let before = file.column_block_reads();
+        for i in 0..6u64 {
+            file.external_id(i).unwrap();
+        }
+        assert_eq!(
+            file.column_block_reads(),
+            before,
+            "every granule's block is already decoded"
+        );
+    }
+}
+
+#[test]
 fn a_file_without_reference_filters_scans_every_granule() {
     let built = build_hef_file((0..4).map(plain_row).collect::<Vec<_>>(), &source_form_config(2)).unwrap();
     assert_eq!(
         reference_may_be_in(&built.footer, column_ids::AUTH_REFS, 0, "external_id:00"),
         Ok(true)
     );
+}
+
+/// The text at granule row `row` of a string block, whether the block stores a value per row or only the present
+/// rows' values behind a presence bitmap.
+fn string_at(read: &ColumnRead, row_count: usize, row: usize) -> Option<&str> {
+    let ColumnData::Strings(values) = &read.data else {
+        return None;
+    };
+    if values.len() == row_count {
+        return values.get(row).flatten();
+    }
+    let present = |row: usize| {
+        read.presence
+            .get(row / 8)
+            .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
+    };
+    if !present(row) {
+        return None;
+    }
+    values.get((0..row).filter(|&before| present(before)).count()).flatten()
 }
 
 #[test]

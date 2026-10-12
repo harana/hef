@@ -48,6 +48,7 @@ use std::fs::{File, OpenOptions};
 use std::hint::black_box;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
@@ -660,12 +661,12 @@ impl HefRoom {
         self.payloads(&refs)
     }
 
-    /// The decoded edges of the granule holding `sn`, decoded once per walk.
-    fn edges<'a>(&self, cache: &'a mut HashMap<u32, GranuleEdges>, sn: u64) -> &'a GranuleEdges {
+    /// The decoded edges of the granule holding `sn`, taken from the reader's decoded-edge cache once per walk.
+    fn edges<'a>(&self, cache: &'a mut HashMap<u32, Arc<GranuleEdges>>, sn: u64) -> &'a GranuleEdges {
         let granule = self.file.graph_granule_of(sn).unwrap();
         cache
             .entry(granule)
-            .or_insert_with(|| self.file.granule_edges(granule).unwrap())
+            .or_insert_with(|| self.file.cached_granule_edges(granule).unwrap())
     }
 
     /// Walks `prev` edges breadth first from `from`, newest parent first, collecting up to `limit` events, and returns

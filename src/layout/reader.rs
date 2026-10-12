@@ -3415,7 +3415,7 @@ impl HefFile {
 
     /// The decoded edges of granule `granule_id` of a graph-profile file, decoded on first touch and cached per
     /// granule so later steps of a walk, and later walks, reuse the decode. Fails as [`Self::granule_edges`] does.
-    pub(super) fn cached_granule_edges(&self, granule_id: u32) -> Result<Arc<GranuleEdges>, FormatError> {
+    pub fn cached_granule_edges(&self, granule_id: u32) -> Result<Arc<GranuleEdges>, FormatError> {
         let tick = self.cache_access_counter.fetch_add(1, Ordering::Relaxed);
         if let Some(mut slot) = self.graph_edges.get_mut(&granule_id) {
             slot.last_used = tick;
@@ -3634,6 +3634,32 @@ impl HefFile {
             }
         }
         Ok((low < end && values.get(low).flatten() == Some(key)).then_some(low))
+    }
+
+    /// The text granule row `row` holds in string block `(column_id, granule_id)`, a block of `row_count` rows, or
+    /// `None` when the row has no value. Decodes the block once into the decoded-block cache, so later reads into the
+    /// same granule cost a lookup instead of a decode.
+    pub(super) fn cached_string_at(
+        &self,
+        column_id: u32,
+        granule_id: u32,
+        row_count: u32,
+        row: u64,
+    ) -> Result<Option<String>, FormatError> {
+        let column = self.cached_column(column_id, granule_id)?;
+        let ColumnData::Strings(values) = &column.data else {
+            return Ok(None);
+        };
+        // A dense block stores one slot per row; a presence-gated one stores only the present rows' values.
+        let position = if values.len() == row_count as usize {
+            Some(row)
+        } else {
+            let (before, present) = column.rank.rank_and_contains(row);
+            present.then_some(before)
+        };
+        Ok(position
+            .and_then(|position| values.get(position as usize).flatten())
+            .map(str::to_owned))
     }
 
     /// Sizes the decoded-block cache budget, replacing [`DECODED_CACHE_BUDGET_BYTES`]. A caller-supplied working-set
