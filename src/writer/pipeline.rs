@@ -389,13 +389,13 @@ impl WorkerCommitPipeline {
         // could have voided these ranges yet. Accept the already-durable frames rather than voiding ranges that already
         // hold real event frames.
         for frame in &frames {
-            if let Err(error) = allocator.harden(frame.lease_id, clock.monotonic_nanos()) {
-                if error != LeaseError::Expired || allocator.accept_late(frame.lease_id).is_err() {
-                    for claimed in &frames {
-                        self.queue.abort_flush(claimed.region);
-                    }
-                    return Err(FlushError::Lease(error));
+            if let Err(error) = allocator.harden(frame.lease_id, clock.monotonic_nanos())
+                && (error != LeaseError::Expired || allocator.accept_late(frame.lease_id).is_err())
+            {
+                for claimed in &frames {
+                    self.queue.abort_flush(claimed.region);
                 }
+                return Err(FlushError::Lease(error));
             }
         }
         for frame in &frames {

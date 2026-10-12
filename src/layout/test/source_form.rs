@@ -130,7 +130,7 @@ fn external_id_reads_decode_each_granule_once() {
     // Every row of the first file carries an id, so each block holds a value for every row; only even rows of the
     // second do, so its values sit behind a presence bitmap.
     for every_row in [true, false] {
-        let carries = |i: u64| every_row || i % 2 == 0;
+        let carries = |i: u64| every_row || i.is_multiple_of(2);
         let rows: Vec<BuildRow> = (0..6u64)
             .map(|i| {
                 if carries(i) {

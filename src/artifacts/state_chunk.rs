@@ -344,20 +344,19 @@ pub fn update_state_tree(
     })
 }
 
-/// The chunks (first key and address, in key order) of every level of the tree at `root`, the leaves first and the
-/// root last, and every interior chunk's entries by address. Reads every interior chunk, and the root even when it is
-/// a leaf, but no other leaf.
+/// One level's chunks, or one interior chunk's children: each one's first key and address, in key order.
+type ChunkList = Vec<(StateKey, [u8; 32])>;
+
+/// Every interior chunk's children, by the chunk's address.
+type InteriorChunks = HashMap<[u8; 32], ChunkList>;
+
+/// The chunks of every level of the tree at `root`, the leaves first and the root last, and every interior chunk's
+/// entries by address. Reads every interior chunk, and the root even when it is a leaf, but no other leaf.
 fn read_levels(
     store: &dyn StateChunkStore,
     key: &StateChunkKey,
     root: &StateRoot,
-) -> Result<
-    (
-        Vec<Vec<(StateKey, [u8; 32])>>,
-        HashMap<[u8; 32], Vec<(StateKey, [u8; 32])>>,
-    ),
-    StateChunkError,
-> {
+) -> Result<(Vec<ChunkList>, InteriorChunks), StateChunkError> {
     let mut interior = HashMap::new();
     let mut top_down = vec![vec![(StateKey::default(), root.address)]];
     // The level the chunks of the last list sit at; unknown until the root is read.
@@ -398,7 +397,7 @@ fn update_level<const N: usize>(
     mut entries_of: impl FnMut(&[u8; 32]) -> Result<Vec<(StateKey, [u8; N])>, StateChunkError>,
     changes: &BTreeMap<StateKey, Option<[u8; N]>>,
     sealed: &mut Vec<SealedStateChunk>,
-) -> Result<(Vec<(StateKey, [u8; 32])>, i64), StateChunkError> {
+) -> Result<(ChunkList, i64), StateChunkError> {
     let entry_len = 8 + N;
     let mut chunks = Vec::with_capacity(old.len());
     let mut added = 0i64;

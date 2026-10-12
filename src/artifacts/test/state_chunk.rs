@@ -159,7 +159,7 @@ fn an_update_in_place_matches_a_full_build() {
         let mut changes: BTreeMap<StateKey, Option<u64>> = (0..1 + random() % 60)
             .map(|_| {
                 let user = (random() % 125_000) as u32;
-                (member(user), (random() % 3 != 0).then_some(round + 10))
+                (member(user), (!random().is_multiple_of(3)).then_some(round + 10))
             })
             .collect();
         changes.insert(StateKey::default(), (round % 2 == 0).then_some(round));
