@@ -37,6 +37,9 @@ pub mod sections {
     /// bytes. Absent in files that do not declare `ENTITY_HASH_POINT_FILTERS`.
     pub const ENTITY_HASH_FILTERS: u32 = 27;
     pub const ESCAPE_HATCHES: u32 = 13;
+    /// Optional: the stripe-relative byte range of each granule's event record block, so one event's envelope and
+    /// external id read from one place. Absent in files that do not declare `EVENT_RECORDS`.
+    pub const EVENT_RECORDS: u32 = 41;
     pub const EXACT_COUNTS: u32 = 7;
     /// Optional: the file's external-id index, sorted `(id hash, row ordinal)` pairs. Absent in files whose rows carry
     /// no external id.
@@ -325,6 +328,18 @@ pub struct GraphBlockEntry {
 pub struct StateRootEntry {
     pub root: StateRoot,
     pub row_ordinal: u64,
+}
+
+/// Where one granule's event records sit: every row's envelope and external id stored together, so reading one event
+/// touches only its own bytes instead of a whole block per envelope column. `offset` is stripe-relative, like every
+/// other data-area offset the footer records.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventRecordsEntry {
+    pub granule_id: u32,
+    pub len: u64,
+    pub offset: u64,
 }
 
 /// One row's entry in the file's external-id index: a stable hash of the id and the row that carries it. The footer
@@ -644,6 +659,9 @@ pub struct Footer {
     /// Forward-compatibility notes: how an older reader may still read an optional block it predates, via a portable
     /// decoder the fleet trusts.
     pub escape_hatches: Vec<EscapeHatch>,
+    /// Byte ranges of the per-granule event record blocks, sorted by granule. Present when `EVENT_RECORDS` is
+    /// declared; empty otherwise, and a reader then assembles an event from its envelope columns.
+    pub event_records: Vec<EventRecordsEntry>,
     pub exact_counts: ExactCounts,
     /// The external-id index, sorted by `(id_hash, row_ordinal)`. Empty in files whose rows carry no external id.
     pub external_ids: Vec<ExternalIdEntry>,
@@ -1248,6 +1266,18 @@ fn encode_sections(footer: &Footer) -> SectionArea {
             for entry in &footer.external_ids {
                 out.put_u64(entry.id_hash);
                 out.put_u64(entry.row_ordinal);
+            }
+        });
+    }
+
+    // The event record directory: optional, emitted only when the file stores event records.
+    if !footer.event_records.is_empty() {
+        sections.push(sections::EVENT_RECORDS, |out| {
+            out.put_u32(footer.event_records.len() as u32);
+            for entry in &footer.event_records {
+                out.put_u32(entry.granule_id);
+                out.put_u64(entry.offset);
+                out.put_u64(entry.len);
             }
         });
     }
@@ -2084,6 +2114,30 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         }
     }
 
+    // The event record directory: optional. Fixed entry size: 4 (granule id) + 8 (offset) + 8 (len) = 20 bytes.
+    let mut event_records = Vec::new();
+    if let Some(directory_bytes) = decode_section(&directory, section_area, sections::EVENT_RECORDS)? {
+        let mut r = Reader::new(directory_bytes);
+        let count = r.u32("event record count")? as usize;
+        let count = bounded_count(count, 20, &r, "event record count exceeds input")?;
+        event_records = Vec::with_capacity(count);
+        for _ in 0..count {
+            let granule_id = r.u32("event record granule")?;
+            let offset = r.u64("event record offset")?;
+            let len = r.u64("event record len")?;
+            event_records.push(EventRecordsEntry {
+                granule_id,
+                len,
+                offset,
+            });
+        }
+        if !event_records.is_sorted_by(|a, b| a.granule_id < b.granule_id) {
+            return Err(FormatError::Structural {
+                rule: "event record blocks are sorted by granule",
+            });
+        }
+    }
+
     // The inbox recipient directory: optional. Fixed entry size: six u64s = 48 bytes.
     let mut inbox_recipients = Vec::new();
     if let Some(directory_bytes) = decode_section(&directory, section_area, sections::INBOX_RECIPIENTS)? {
@@ -2425,6 +2479,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         embedding_row_offsets,
         entity_hash_filters,
         escape_hatches,
+        event_records,
         exact_counts,
         external_ids,
         format_version,

@@ -20,6 +20,7 @@ fn minimal_footer() -> Footer {
         embedding_row_offsets: Vec::new(),
         entity_hash_filters: Vec::new(),
         escape_hatches: Vec::new(),
+        event_records: Vec::new(),
         exact_counts: ExactCounts {
             row_count: 1,
             ..ExactCounts::default()

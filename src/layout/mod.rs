@@ -21,6 +21,7 @@ pub mod clustering;
 pub mod constant;
 pub mod entity_scan;
 pub mod event;
+pub mod event_record;
 pub mod footer;
 pub mod graph;
 pub mod inbox;
@@ -622,8 +623,14 @@ pub mod optional_features {
     /// range and returns the identical answer.
     pub const TIME_SERIES_ROLLUPS: u64 = 1 << 13;
 
+    /// Every granule stores its rows' envelopes and external ids again, one record per row in a block with a row
+    /// offset table, so reading one event touches only that row's bytes instead of decoding a whole block of every
+    /// envelope column. Droppable acceleration state: a reader that does not declare it assembles the event from the
+    /// envelope columns and returns the identical envelope.
+    pub const EVENT_RECORDS: u64 = 1 << 14;
+
     /// Optional features this reader knows how to validate and use.
-    pub const KNOWN: u64 = (1 << 14) - 1;
+    pub const KNOWN: u64 = (1 << 15) - 1;
 }
 
 /// The decoded fixed file header. A coarse rejection accelerator, not the authoritative aggregate source.

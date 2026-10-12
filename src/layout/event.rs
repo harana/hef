@@ -21,6 +21,9 @@ impl HefFile {
     /// The envelope of the event stored at `row_ordinal` - its identity, times, source, type, entity, and flags -
     /// exactly as it was written.
     pub fn envelope(&self, row_ordinal: u64) -> Result<EventEnvelope, FormatError> {
+        if let Some(record) = self.event_record(row_ordinal)? {
+            return self.record_envelope(&record);
+        }
         let granule = self.granule_for_row(row_ordinal)?;
         let index = row_ordinal - granule.first_row_ordinal;
         self.granule_envelopes(granule.granule_id)?

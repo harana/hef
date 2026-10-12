@@ -58,8 +58,13 @@ impl HefFile {
             .iter()
             .take_while(|entry| entry.id_hash == id_hash)
         {
-            // Two ids can share a hash, so every candidate is confirmed against the stored id.
-            if self.external_id(entry.row_ordinal)?.as_deref() == Some(external_id) {
+            // Two ids can share a hash, so every candidate is confirmed against the stored id: the row's event
+            // record when the file keeps one, which reads only that row's bytes, and the column block otherwise.
+            let confirmed = match self.event_record(entry.row_ordinal)? {
+                Some(record) => record.external_id == Some(external_id),
+                None => self.external_id(entry.row_ordinal)?.as_deref() == Some(external_id),
+            };
+            if confirmed {
                 rows.push(entry.row_ordinal);
             }
         }

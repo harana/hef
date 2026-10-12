@@ -4215,3 +4215,59 @@ fn a_time_series_build_refuses_rows_that_go_back_in_time_and_widths_it_cannot_us
         }
     );
 }
+
+/// A sparse update over a file whose events carry external ids keeps every granule's event records: a granule it does
+/// not build borrows its source's block, and one it builds writes in the dedupe hashes the change set changed, so the
+/// file is byte-for-byte what the ordinary update builds from every row.
+#[test]
+fn a_sparse_update_keeps_event_records_with_the_changed_dedupe_hashes() {
+    let cfg = sparse_config();
+    let with_id = |i: u64| {
+        let mut row = SharedStrings::default().build_row(row(i));
+        row.external_id = Some(format!("$event-{i}").into_bytes());
+        row
+    };
+    let before: Vec<BuildRow> = (0..400).map(with_id).collect();
+    let source = build_hef_file(before.clone(), &cfg).unwrap();
+    let mut after = before.clone();
+    let ordinals = [5usize, 130, 131, 390];
+    for &ordinal in &ordinals {
+        after[ordinal].envelope.dedupe_hash_low = 9_000 + ordinal as u64;
+    }
+    let changes: Vec<HefRowChange<BuildRow>> = ordinals
+        .iter()
+        .map(|&ordinal| HefRowChange {
+            after: after[ordinal].clone(),
+            before: before[ordinal].clone(),
+            row_ordinal: ordinal as u64,
+        })
+        .collect();
+    let reuse = plan_change_set_reuse(&source, &after, &changes, &cfg);
+    assert!(
+        reuse.as_ref().is_some_and(|reuse| reuse.sparse.is_some()),
+        "a dedupe-only change set plans a sparse update"
+    );
+    let ordinary = build_hef_file_sealed(
+        after.clone(),
+        &cfg,
+        &SerialEncodeExecutor,
+        None,
+        None,
+        reuse.map(|reuse| UpdateReuse { sparse: None, ..reuse }).as_ref(),
+    )
+    .unwrap();
+    let updated =
+        update_hef_file_from_changes_with_executor(&source, after.clone(), &changes, &cfg, &SerialEncodeExecutor)
+            .unwrap();
+    assert_eq!(updated.bytes, ordinary.bytes);
+    let from_source =
+        update_hef_file_from_source_changes_with_executor(&source, &changes, &cfg, &SerialEncodeExecutor).unwrap();
+    assert_eq!(from_source.bytes, ordinary.bytes);
+
+    let file = HefFile::open(updated.bytes, Some(&updated.file_seal)).unwrap();
+    assert_eq!(file.footer().event_records.len(), file.footer().granules.len());
+    for &ordinal in &ordinals {
+        let record = file.event_record(ordinal as u64).unwrap().unwrap();
+        assert_eq!(record.dedupe_hash_low, 9_000 + ordinal as u64);
+    }
+}

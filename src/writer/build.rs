@@ -36,12 +36,13 @@ use crate::indexes::probabilistic::SplitBlockBloomFilter;
 use crate::indexes::text_token::TextTokenIndex;
 use crate::invariants::EncodeExecutor;
 use crate::invariants::sim::SerialEncodeExecutor;
+use crate::layout::event_record::{EventRecord, EventRecordBlock, with_dedupe_hashes};
 use crate::layout::footer::{
-    ClusteringEntry, ColumnDescriptor, ColumnKind, ColumnMark, EntityHashFilterEntry, ExactCounts, FileDictionaries,
-    Footer, FreetextEntry, FreetextRowOffsets, GranuleEntry, GraphBlockEntry, GraphDirectory, InboxRecipientEntry,
-    MarksPageEntry, PageDirectoryEntry, PageMinMax, PageStats, PayloadGranule, PresenceEntry, ResidualCompression,
-    SharedDictionaryEntry, ShredEntry, SortDirection, SortednessProof, StripeEntry, StripeNdvEntry, StripeProofEntry,
-    TextTokenEntry, TextTokenOffsetsEntry, encode_stripe_marks_pages,
+    ClusteringEntry, ColumnDescriptor, ColumnKind, ColumnMark, EntityHashFilterEntry, EventRecordsEntry, ExactCounts,
+    FileDictionaries, Footer, FreetextEntry, FreetextRowOffsets, GranuleEntry, GraphBlockEntry, GraphDirectory,
+    InboxRecipientEntry, MarksPageEntry, PageDirectoryEntry, PageMinMax, PageStats, PayloadGranule, PresenceEntry,
+    ResidualCompression, SharedDictionaryEntry, ShredEntry, SortDirection, SortednessProof, StripeEntry,
+    StripeNdvEntry, StripeProofEntry, TextTokenEntry, TextTokenOffsetsEntry, encode_stripe_marks_pages,
 };
 use crate::layout::graph::{ChainCover, EventIdIndex, GraphInput, encode_graph_blocks, state_root_entries};
 use crate::layout::reader::{HefFile, PayloadRead};
@@ -707,6 +708,16 @@ fn plan_sparse_update(
 
 /// The stored bytes at `offset..offset + len` within the stripe holding source granule `granule_id` — how the footer
 /// addresses every per-granule extent.
+/// The event record block `source` stores for the granule `entry` names, or `None` when it stores none.
+fn source_event_records<'a>(source: &'a BuiltHef, entry: &GranuleEntry) -> Option<&'a [u8]> {
+    let records = source
+        .footer
+        .event_records
+        .iter()
+        .find(|records| records.granule_id == entry.granule_id)?;
+    source_extent(source, entry.granule_id, records.offset, records.len)
+}
+
 fn source_extent(source: &BuiltHef, granule_id: u32, offset: u64, len: u64) -> Option<&[u8]> {
     let granule = source
         .footer
@@ -1458,6 +1469,9 @@ struct GranulePieces {
     by_source: Vec<u64>,
     dictionary_bytes: Vec<u8>,
     entry: GranuleEntry,
+    /// The granule's event record block, or empty when the file stores no event records or the granule borrows its
+    /// block from a sparse update's source.
+    event_records: Vec<u8>,
     /// Per indexed free-text column, this granule's per-row byte-offset index: the column id, the raw concatenated row
     /// bytes, and the row-indexed `(offset, len)` offsets table over them (same shape as `offsets_bytes`/`residual_bytes`
     /// below, scoped to one free-text column instead of the whole granule). Empty unless the build opted into the index.
@@ -1479,6 +1493,7 @@ impl GranulePieces {
             by_source: Vec::new(),
             dictionary_bytes: Vec::new(),
             entry,
+            event_records: Vec::new(),
             freetext_row_offsets: Vec::new(),
             has_internal_late_event: false,
             offsets_bytes: Vec::new(),
@@ -3357,6 +3372,11 @@ fn build_hef_file_sealed_in_order(
         Some(source) => (Vec::new(), SourceFormIndexes::from_footer(&source.footer)),
         None => source_form::build(&rows, &granule_row_ranges, &source_form_columns)?,
     };
+    // A file whose events carry external ids is one read an event at a time by id, so it also stores each granule's
+    // event records. A sparse update keeps its source's records instead, rewriting only the dedupe hashes it changed.
+    let event_records = source_form_columns
+        .iter()
+        .any(|spec| spec.column_id == column_ids::EXTERNAL_ID);
 
     // Build per-granule pieces, one job per granule fanned out through the injected executor. The ranges partition the
     // rows, so peeling each granule's slice off the front hands every job a disjoint view no other job can see, and a
@@ -3403,6 +3423,7 @@ fn build_hef_file_sealed_in_order(
                     config.freetext_row_offset_index,
                     carries_provenance,
                     carries_relationships,
+                    event_records && wanted.is_none(),
                     wanted,
                     residual,
                 )
@@ -3419,7 +3440,17 @@ fn build_hef_file_sealed_in_order(
                             Some(columns),
                             rebuild_residual,
                         )
-                        .map(|mut pieces| {
+                        .and_then(|mut pieces| {
+                            // No change touched an envelope beyond its dedupe hashes, so the granule keeps the
+                            // source's event records with this build's dedupe hashes written in.
+                            if let Some(records) = source.and_then(|source| source_event_records(source, source_entry))
+                            {
+                                let dedupe: Vec<(u64, u64)> = granule_rows
+                                    .iter()
+                                    .map(|row| (row.envelope.dedupe_hash_high, row.envelope.dedupe_hash_low))
+                                    .collect();
+                                pieces.event_records = with_dedupe_hashes(records, &dedupe)?;
+                            }
                             // No change touched an envelope, so the granule's bounds are the source's — and so is
                             // its residual size unless the arena was rebuilt.
                             pieces.entry = GranuleEntry {
@@ -3430,7 +3461,7 @@ fn build_hef_file_sealed_in_order(
                                 },
                                 ..*source_entry
                             };
-                            pieces
+                            Ok(pieces)
                         })
                     }
                 },
@@ -3657,6 +3688,8 @@ fn build_hef_file_sealed_in_order(
 
     struct PayloadGeometry<'a> {
         dictionary: Cow<'a, [u8]>,
+        /// Empty when the file stores no event records.
+        event_records: Cow<'a, [u8]>,
         /// Per indexed free-text column, this granule's per-row byte-offset index: `(column_id, raw row bytes,
         /// offsets table)`, borrowed from the source when an update left the column alone. Empty when the file
         /// declares no free-text fields, and when the build did not opt into the index.
@@ -4339,6 +4372,13 @@ fn build_hef_file_sealed_in_order(
             .get_mut(granule_index)
             .map(std::mem::take)
             .unwrap_or_default();
+        // A granule a sparse update did not build has no records of its own: it borrows its source's block.
+        let event_records = match std::mem::take(&mut granule.event_records) {
+            records if records.is_empty() => sparse_reuse
+                .and_then(|reuse| source_event_records(reuse.source, &granule.entry))
+                .map_or(Cow::Owned(Vec::new()), Cow::Borrowed),
+            records => Cow::Owned(records),
+        };
         let reused_geometry = update_reuse.and_then(|reuse| {
             if reuse.changed_payload_granules.contains(&granule.entry.granule_id) {
                 return None;
@@ -4361,6 +4401,7 @@ fn build_hef_file_sealed_in_order(
             payload_geometry.push(PayloadGeometry {
                 granule_id: granule.entry.granule_id,
                 dictionary: Cow::Borrowed(dictionary),
+                event_records,
                 freetext_row_offsets,
                 offsets: Cow::Borrowed(offsets),
                 residual: Cow::Borrowed(residual),
@@ -4380,6 +4421,7 @@ fn build_hef_file_sealed_in_order(
         payload_geometry.push(PayloadGeometry {
             granule_id: granule.entry.granule_id,
             dictionary: Cow::Owned(std::mem::take(&mut granule.dictionary_bytes)),
+            event_records,
             freetext_row_offsets,
             offsets: Cow::Owned(std::mem::take(&mut granule.offsets_bytes)),
             residual: Cow::Owned(residual),
@@ -4577,6 +4619,7 @@ fn build_hef_file_sealed_in_order(
         bytes: Vec<u8>,
         crc: crate::file::integrity::StreamingCrc64Nvme,
         entity_hash_filters: Vec<EntityHashFilterEntry>,
+        event_records: Vec<EventRecordsEntry>,
         freetext_row_offsets: Vec<FreetextRowOffsets>,
         graph_blocks: Vec<GraphBlockEntry>,
         integrity: crate::file::integrity::BuiltOutboard,
@@ -4638,7 +4681,7 @@ fn build_hef_file_sealed_in_order(
             let estimated: usize = pieces.iter().map(EncodedPiece::len).sum::<usize>().saturating_add(
                 geometry
                     .iter()
-                    .map(|g| g.dictionary.len() + g.offsets.len() + g.residual.len())
+                    .map(|g| g.dictionary.len() + g.event_records.len() + g.offsets.len() + g.residual.len())
                     .sum::<usize>(),
             );
             let filter_bytes: usize = geometry
@@ -4683,6 +4726,7 @@ fn build_hef_file_sealed_in_order(
             let mut text_token_offsets: Vec<TextTokenOffsetsEntry> = Vec::with_capacity(text_token_count);
             let mut entity_hash_filters: Vec<EntityHashFilterEntry> = Vec::with_capacity(entity_filter_count);
             let mut graph_blocks: Vec<GraphBlockEntry> = Vec::new();
+            let mut event_records: Vec<EventRecordsEntry> = Vec::with_capacity(geometry.len());
             let mut aliased_block_bytes = 0u64;
             // Byte-identical blocks within one stripe are stored once: later marks alias the first extent (marks are
             // `(offset, len)` pairs, so aliasing is already representable). Keyed by a fast non-cryptographic hash,
@@ -4861,6 +4905,17 @@ fn build_hef_file_sealed_in_order(
                         offsets_offset,
                     });
                 }
+                // The granule's event records, right after its payload arenas. Stripe-relative like the arenas above.
+                if !geometry.event_records.is_empty() {
+                    data.pad_to(self.block_alignment);
+                    let offset = data.len() as u64;
+                    data.put_slice(&geometry.event_records);
+                    event_records.push(EventRecordsEntry {
+                        granule_id: geometry.granule_id,
+                        len: geometry.event_records.len() as u64,
+                        offset,
+                    });
+                }
                 // A graph file's edge block for the granule, right after its payload so one range read returns the
                 // granule's rows and their edges. Stripe-relative like the arenas above.
                 if let Some(block) = self.graph_blocks_by_granule.get(&geometry.granule_id) {
@@ -4944,6 +4999,7 @@ fn build_hef_file_sealed_in_order(
                 bytes,
                 crc,
                 entity_hash_filters,
+                event_records,
                 freetext_row_offsets,
                 graph_blocks,
                 integrity,
@@ -5057,6 +5113,8 @@ fn build_hef_file_sealed_in_order(
     let mut marks_page_offsets: Vec<MarksPageEntry> =
         Vec::with_capacity(laid_out.iter().map(|laid| laid.marks_page_offsets.len()).sum());
     let mut graph_blocks: Vec<GraphBlockEntry> = Vec::with_capacity(graph_blocks_by_granule.len());
+    let mut event_records: Vec<EventRecordsEntry> =
+        Vec::with_capacity(laid_out.iter().map(|laid| laid.event_records.len()).sum());
     for ((stripe_id, _), laid) in stripe_piece_ranges.iter().zip(laid_out) {
         let (first_row, row_count) = stripe_rows.get(stripe_id).copied().unwrap_or((u64::MAX, 0));
         stripes.push(StripeEntry {
@@ -5089,6 +5147,7 @@ fn build_hef_file_sealed_in_order(
         entity_hash_filters.extend(laid.entity_hash_filters);
         marks_page_offsets.extend(laid.marks_page_offsets);
         graph_blocks.extend(laid.graph_blocks);
+        event_records.extend(laid.event_records);
         stripe_bytes.push(laid.bytes);
     }
 
@@ -5158,6 +5217,9 @@ fn build_hef_file_sealed_in_order(
     if !entity_hash_filters.is_empty() {
         optional_flags |= optional_features::ENTITY_HASH_POINT_FILTERS;
     }
+    if !event_records.is_empty() {
+        optional_flags |= optional_features::EVENT_RECORDS;
+    }
     if !inbox_recipients.is_empty() {
         optional_flags |= optional_features::INBOX_RECIPIENT_DIRECTORY;
     }
@@ -5219,6 +5281,7 @@ fn build_hef_file_sealed_in_order(
         // The writer emits only natively-known encodings, so no optional block needs a forward-compatibility escape
         // hatch.
         escape_hatches: Vec::new(),
+        event_records,
         exact_counts,
         external_ids: source_form_indexes.external_ids,
         format_version: (1, 0),
@@ -5570,6 +5633,7 @@ fn build_granule(
     freetext_row_offset_index: bool,
     carries_provenance: bool,
     carries_relationships: bool,
+    event_records: bool,
     wanted: Option<&HashSet<u32>>,
     build_residual: bool,
 ) -> Result<GranulePieces, FormatError> {
@@ -5633,6 +5697,7 @@ fn build_granule(
     let mut dedupe_low = Vec::with_capacity(row_count);
     let mut dedupe_high = Vec::with_capacity(row_count);
     let mut payload_flags = Vec::with_capacity(row_count);
+    let mut event_records = event_records.then(EventRecordBlock::default);
 
     // Promoted (copies), shredded and free-text (moves) columns.
     let mut promoted_values: Vec<(Vec<u8>, TypedColumn)> = promotion
@@ -5753,6 +5818,31 @@ fn build_granule(
         flags.push(u64::from(envelope.flags.0));
         schema_version.push(u64::from(envelope.schema_version));
         event_id.push(envelope.event_id.uuid().as_u128());
+        if let Some(records) = event_records.as_mut() {
+            records.push(&EventRecord {
+                account_id: envelope.account_id.as_deref(),
+                account_id_hash_low: envelope.account_id_hash_low,
+                actor_id: envelope.actor_id.as_deref(),
+                actor_id_hash_low: envelope.actor_id_hash_low,
+                dedupe_hash_high: envelope.dedupe_hash_high,
+                dedupe_hash_low: envelope.dedupe_hash_low,
+                entity_id: envelope.entity_id.as_deref(),
+                entity_id_hash_high: envelope.entity_id_hash_high,
+                entity_id_hash_low: envelope.entity_id_hash_low,
+                entity_type_id: this_entity_type_id,
+                event_id: envelope.event_id.uuid().as_u128(),
+                event_type_id: this_event_type_id,
+                external_id: row.external_id.as_deref(),
+                flags: envelope.flags.0,
+                ingested_at: envelope.ingested_at.physical_nanos(),
+                occurred_at: envelope.occurred_at.physical_nanos(),
+                schema_version: envelope.schema_version,
+                source_id: this_source_id,
+                stream_id: envelope.stream_id.0,
+                stream_sequence: envelope.stream_sequence,
+                trace_id_hash_low: envelope.trace_id_hash_low,
+            });
+        }
         // Moved, not cloned: the rows are owned by the build, nothing reads these identity strings after this loop,
         // and the precomputed identity hashes stay behind for the later passes. A block that is not wanted leaves
         // its strings in place, for a build that may yet start over from the rows.
@@ -6232,6 +6322,7 @@ fn build_granule(
         by_event_type,
         by_source,
         dictionary_bytes,
+        event_records: event_records.map(EventRecordBlock::finish).unwrap_or_default(),
         freetext_row_offsets,
         has_internal_late_event,
         offsets_bytes,
