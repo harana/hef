@@ -830,9 +830,9 @@ impl HefJournal {
         }
     }
 
-    /// Appends `events` and returns once all of them are synced. Events are queued one at a time and a frame is
-    /// flushed whenever the pipeline reaches its flush target, as the writer does under load, so a large batch lands
-    /// as several synced frames; whatever is left is flushed at the end.
+    /// Appends `events` and returns once all of them are synced. The events are queued, then flushed together as a
+    /// federation transaction or a backfill response is persisted: a large batch lands as several frames of up to the
+    /// flush target, made durable by one sync.
     fn append(&mut self, first_sn: u64, events: &[Event]) {
         self.nonce += 1;
         for (event, sn) in events.iter().zip(first_sn..) {
@@ -840,13 +840,8 @@ impl HefJournal {
             self.pipeline
                 .submit(input, self.allocator.epoch(), &mut self.retry, &self.clock)
                 .unwrap();
-            if self.pipeline.should_flush(&self.clock) == Some(FlushReason::Target) {
-                self.flush(FlushReason::Target);
-            }
         }
-        if self.pipeline.queue().pending_bytes() > 0 {
-            self.flush(FlushReason::ForceCommit);
-        }
+        self.flush(FlushReason::ForceCommit);
         // Published frames stay readable from the overlay until a file covers them; the benchmark never publishes,
         // so it drops them here to keep memory flat across iterations.
         if self.overlay.segment_count() > 1024 {
