@@ -161,7 +161,7 @@ fn copy_matching_prefix_splits_at_the_epoch_boundary() {
     queue.push(&record(1, 1)).unwrap();
     queue.push(&record(2, 2)).unwrap();
 
-    let (prefix, records) = queue.copy_matching_prefix(tenant, 1).unwrap();
+    let (prefix, records) = queue.copy_matching_prefix(tenant, 1, u64::MAX).unwrap();
     assert_eq!(records.len(), 2);
     assert!(records.iter().all(|record| record.epoch == 1));
     assert!(queue.claim_for_flush(prefix));
@@ -173,9 +173,27 @@ fn copy_matching_prefix_splits_at_the_epoch_boundary() {
     assert_eq!(remaining[0].epoch, 2);
 
     // A front record of another epoch yields an empty prefix: nothing to claim, nothing dropped.
-    let (empty, none) = queue.copy_matching_prefix(tenant, 1).unwrap();
+    let (empty, none) = queue.copy_matching_prefix(tenant, 1, u64::MAX).unwrap();
     assert!(none.is_empty());
     assert_eq!(empty.start, empty.end);
+}
+
+#[test]
+fn copy_matching_prefix_stops_once_it_reaches_the_byte_limit() {
+    let tenant = TenantId::new_test_id(9);
+    let mut queue = CommitQueue::new(1 << 16);
+    for i in 0..4 {
+        queue.push(&record(i, 1)).unwrap();
+    }
+    let (one, _) = queue.copy_matching_prefix(tenant, 1, 1).unwrap();
+    let record_bytes = one.end - one.start;
+
+    // The record that reaches the limit is the last one copied.
+    let (prefix, records) = queue.copy_matching_prefix(tenant, 1, record_bytes + 1).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(prefix.end - prefix.start, 2 * record_bytes);
+    let (_, all) = queue.copy_matching_prefix(tenant, 1, u64::MAX).unwrap();
+    assert_eq!(all.len(), 4);
 }
 
 /// A batch admitted in one step lands exactly what pushing its records one by one would, and a batch too large for

@@ -141,6 +141,96 @@ fn a_one_key_change_rewrites_one_to_three_chunks() {
 }
 
 #[test]
+fn an_update_in_place_matches_a_full_build() {
+    let mut random = xorshift(0x0DD5_EED5);
+    let mut state = BTreeMap::new();
+    let mut tree = build(&state);
+    let mut store = CountingChunks::default();
+    store.store(&tree.chunks);
+    let set = |user: u32, sn: u64| (member(user), Some(sn));
+    let mut rounds: Vec<BTreeMap<StateKey, Option<u64>>> = vec![
+        // Grow from the empty leaf to one leaf, then two levels, then three.
+        (0..20).map(|user| set(user, 1)).collect(),
+        (20..2_000).map(|user| set(user, 2)).collect(),
+        (2_000..120_000).map(|user| set(user, 3)).collect(),
+    ];
+    // Churn: values changed, keys inserted and removed (present or not), and keys before and after every other.
+    for round in 0..12u64 {
+        let mut changes: BTreeMap<StateKey, Option<u64>> = (0..1 + random() % 60)
+            .map(|_| {
+                let user = (random() % 125_000) as u32;
+                (member(user), (!random().is_multiple_of(3)).then_some(round + 10))
+            })
+            .collect();
+        changes.insert(StateKey::default(), (round % 2 == 0).then_some(round));
+        changes.insert(
+            StateKey {
+                state_key_id: u32::MAX,
+                type_id: u32::MAX,
+            },
+            (round % 3 == 0).then_some(round),
+        );
+        rounds.push(changes);
+    }
+    // Shrink back down a level, then to the empty map, then remove a key the empty map lacks.
+    rounds.push((1_000..125_000).map(|user| (member(user), None)).collect());
+    rounds.push(
+        (0..1_000)
+            .map(member)
+            .chain([
+                StateKey::default(),
+                StateKey {
+                    state_key_id: u32::MAX,
+                    type_id: u32::MAX,
+                },
+            ])
+            .map(|state_key| (state_key, None))
+            .collect(),
+    );
+    rounds.push(BTreeMap::from([(member(5), None)]));
+
+    for changes in rounds {
+        let update = update_state_tree(&store, &key(), &tree.root, &changes).unwrap();
+        for (state_key, sn) in &changes {
+            match sn {
+                Some(sn) => drop(state.insert(*state_key, *sn)),
+                None => drop(state.remove(state_key)),
+            }
+        }
+        let full = build(&state);
+        assert_eq!(update.root, full.root);
+        assert_eq!(update.new_chunks, full.new_chunks(&tree));
+        store.store(&update.new_chunks);
+        tree = full;
+    }
+    assert_eq!(tree.root.entry_count, 0);
+}
+
+#[test]
+fn an_update_reads_every_interior_chunk_and_only_the_leaf_it_changes() {
+    let tree = build(&room(100_000));
+    let mut store = CountingChunks::default();
+    store.store(&tree.chunks);
+    let interior = tree
+        .chunks
+        .iter()
+        .filter(|chunk| {
+            let plaintext = key().open(&chunk.address, &chunk.bytes).unwrap();
+            decode_state_chunk(&plaintext).unwrap().level() > 0
+        })
+        .count();
+    assert!(interior < 5, "{interior} interior chunks");
+
+    let update = update_state_tree(&store, &key(), &tree.root, &BTreeMap::from([(member(51_234), Some(7))])).unwrap();
+    assert_eq!(store.take_reads(), interior + 1);
+    assert!(
+        (2..=3).contains(&update.new_chunks.len()),
+        "{} chunks",
+        update.new_chunks.len()
+    );
+}
+
+#[test]
 fn state_get_reads_one_chunk_per_level() {
     let state = room(100_000);
     let tree = build(&state);

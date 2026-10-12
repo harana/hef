@@ -8,7 +8,8 @@
 //! entry once it holds at least 4 KiB of entries and a hash of the entry's key and level hits a fixed pattern (a
 //! rolling hash whose window is one entry), or before an entry that would take it past 16 KiB. A changed value never
 //! moves a boundary and an inserted or removed key only moves the boundaries next to it, so the same map always builds
-//! the same tree and a one-key change rewrites one leaf and its ancestors.
+//! the same tree and a one-key change rewrites one leaf and its ancestors. [`update_state_tree`] makes such a change
+//! to a stored tree in place, resealing only the chunks it rewrites.
 //!
 //! A chunk's plaintext, every integer little-endian:
 //!
@@ -34,7 +35,7 @@ use crate::file::integrity::crc64_nvme;
 use crate::indexes::stable_hash;
 use crate::object_store::{ObjectStore, state_chunk_object_key};
 use crate::security::StateChunkKey;
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -99,6 +100,17 @@ impl StateTree {
             .cloned()
             .collect()
     }
+}
+
+/// A stored state tree after a change made in place: the new root, and only the chunks the tree it was changed from
+/// lacks, which is all an upload has to store.
+///
+/// See: hef-physical-artifacts/spec.md
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateTreeUpdate {
+    /// Children before their parents and the root last, as [`StateTree::chunks`] orders them.
+    pub new_chunks: Vec<SealedStateChunk>,
+    pub root: StateRoot,
 }
 
 /// One key whose value differs between two states. The side that lacks the key holds `None`.
@@ -196,9 +208,7 @@ fn seal_level<const N: usize>(
     let mut bytes = 0;
     for (end, (entry_key, _)) in (1..).zip(entries) {
         bytes += entry_len;
-        let full = bytes + entry_len > STATE_CHUNK_MAX_BYTES;
-        if end == entries.len() || full || (bytes >= STATE_CHUNK_MIN_BYTES && is_boundary(level, *entry_key, entry_len))
-        {
+        if end == entries.len() || ends_chunk(level, *entry_key, entry_len, bytes) {
             parents.push(seal_chunk(
                 key,
                 level,
@@ -213,6 +223,14 @@ fn seal_level<const N: usize>(
         parents.push(seal_chunk(key, level, entries, chunks)?);
     }
     Ok(parents)
+}
+
+/// Whether a chunk at `level` holding `bytes` of entries, the entry keyed `entry_key` last, ends after that entry: when
+/// one more entry would take it past the maximum, or once it holds the minimum and the key hits the boundary pattern.
+/// The last entry of a level ends its chunk too, which the callers handle.
+fn ends_chunk(level: u8, entry_key: StateKey, entry_len: usize, bytes: usize) -> bool {
+    bytes + entry_len > STATE_CHUNK_MAX_BYTES
+        || (bytes >= STATE_CHUNK_MIN_BYTES && is_boundary(level, entry_key, entry_len))
 }
 
 /// Whether a chunk at `level` may end after the entry keyed `entry_key`: a hash of the level and key hits the pattern
@@ -247,6 +265,216 @@ fn seal_chunk<const N: usize>(
     chunks.push(SealedStateChunk { address, bytes });
     let first = entries.first().map(|(entry_key, _)| *entry_key).unwrap_or_default();
     Ok((first, address))
+}
+
+/// Applies `changes` to the stored state at `root`: `Some(sn)` sets a key to `sn` and `None` removes it. Returns the
+/// same root [`build_state_tree`] gives for the changed map, with the chunks that tree holds and the old one lacks, in
+/// storing order. Reads every interior chunk of the old tree from `store` but only the leaves the changes fall in (and
+/// any next to them that a moved boundary reaches), so changing a few keys costs a few chunks whatever the state's
+/// size. Fails when a chunk it reads is missing, does not open or is malformed, or when the state would pass
+/// `u32::MAX` keys.
+pub fn update_state_tree(
+    store: &dyn StateChunkStore,
+    key: &StateChunkKey,
+    root: &StateRoot,
+    changes: &BTreeMap<StateKey, Option<u64>>,
+) -> Result<StateTreeUpdate, StateChunkError> {
+    let (levels, interior) = read_levels(store, key, root)?;
+    let old: HashSet<&[u8; 32]> = levels.iter().flatten().map(|(_, address)| address).collect();
+    let leaf_changes: BTreeMap<StateKey, Option<[u8; 8]>> = changes
+        .iter()
+        .map(|(state_key, sn)| (*state_key, sn.map(u64::to_le_bytes)))
+        .collect();
+    let read_leaf = |address: &[u8; 32]| match read_state_chunk(store, key, address, Some(0))? {
+        StateChunk::Leaf(entries) => Ok(entries
+            .into_iter()
+            .map(|(entry_key, sn)| (entry_key, sn.to_le_bytes()))
+            .collect()),
+        StateChunk::Interior { .. } => Err(StateChunkError::Format(FormatError::Structural {
+            rule: "a state chunk sits one level below its parent",
+        })),
+    };
+    let mut sealed = Vec::new();
+    let (mut chunks, added) = update_level(
+        key,
+        0,
+        levels.first().map(Vec::as_slice).unwrap_or_default(),
+        read_leaf,
+        &leaf_changes,
+        &mut sealed,
+    )?;
+    let entry_count = u32::try_from(i64::from(root.entry_count) + added).map_err(|_| FormatError::Structural {
+        rule: "a state map holds at most u32::MAX keys",
+    })?;
+    if entry_count == 0 {
+        sealed = build_state_tree(key, &BTreeMap::new())?.chunks;
+        chunks = sealed
+            .iter()
+            .map(|chunk| (StateKey::default(), chunk.address))
+            .collect();
+    }
+    let mut level = 0u8;
+    while chunks.len() > 1 {
+        let below = levels.get(usize::from(level));
+        level += 1;
+        chunks = match (below, levels.get(usize::from(level))) {
+            (Some(below), Some(above)) => {
+                let read_interior = |address: &[u8; 32]| {
+                    interior.get(address).cloned().ok_or_else(|| StateChunkError::Missing {
+                        address: hex_simd::encode_to_string(address, hex_simd::AsciiCase::Lower),
+                    })
+                };
+                let changes = changed_children(below, &chunks);
+                update_level(key, level, above, read_interior, &changes, &mut sealed)?.0
+            }
+            _ => seal_level(key, level, &chunks, &mut sealed)?,
+        };
+    }
+    let (_, address) = chunks.first().ok_or(FormatError::Structural {
+        rule: "a state tree has a root",
+    })?;
+    let root = StateRoot {
+        address: *address,
+        entry_count,
+    };
+    sealed.retain(|chunk| !old.contains(&chunk.address));
+    Ok(StateTreeUpdate {
+        new_chunks: sealed,
+        root,
+    })
+}
+
+/// One level's chunks, or one interior chunk's children: each one's first key and address, in key order.
+type ChunkList = Vec<(StateKey, [u8; 32])>;
+
+/// Every interior chunk's children, by the chunk's address.
+type InteriorChunks = HashMap<[u8; 32], ChunkList>;
+
+/// The chunks of every level of the tree at `root`, the leaves first and the root last, and every interior chunk's
+/// entries by address. Reads every interior chunk, and the root even when it is a leaf, but no other leaf.
+fn read_levels(
+    store: &dyn StateChunkStore,
+    key: &StateChunkKey,
+    root: &StateRoot,
+) -> Result<(Vec<ChunkList>, InteriorChunks), StateChunkError> {
+    let mut interior = HashMap::new();
+    let mut top_down = vec![vec![(StateKey::default(), root.address)]];
+    // The level the chunks of the last list sit at; unknown until the root is read.
+    let mut level = None;
+    while level != Some(0) {
+        let mut below = Vec::new();
+        let mut below_level = None;
+        for (_, address) in top_down.last().map(Vec::as_slice).unwrap_or_default() {
+            if let StateChunk::Interior {
+                children,
+                level: parent,
+            } = read_state_chunk(store, key, address, level)?
+            {
+                below_level = Some(parent - 1);
+                below.extend_from_slice(&children);
+                interior.insert(*address, children);
+            }
+        }
+        if below.is_empty() {
+            break;
+        }
+        top_down.push(below);
+        level = below_level;
+    }
+    top_down.reverse();
+    Ok((top_down, interior))
+}
+
+/// Applies `changes` to one level of a tree, whose chunks are `old` (first key and address, in key order) and whose
+/// chunks' entries `entries_of` reads by address. Cuts the level again from the chunk the next change falls in until
+/// a new chunk ends where an old one did, then keeps the old chunks up to the next change, so the result is the cut
+/// of the whole changed level. Seals every chunk it cuts into `sealed` and returns the level's chunks, with how many
+/// entries the level gained less how many it lost.
+fn update_level<const N: usize>(
+    key: &StateChunkKey,
+    level: u8,
+    old: &[(StateKey, [u8; 32])],
+    mut entries_of: impl FnMut(&[u8; 32]) -> Result<Vec<(StateKey, [u8; N])>, StateChunkError>,
+    changes: &BTreeMap<StateKey, Option<[u8; N]>>,
+    sealed: &mut Vec<SealedStateChunk>,
+) -> Result<(ChunkList, i64), StateChunkError> {
+    let entry_len = 8 + N;
+    let mut chunks = Vec::with_capacity(old.len());
+    let mut added = 0i64;
+    let mut pending = changes.iter().peekable();
+    // The first old chunk neither kept nor cut again yet.
+    let mut next = 0;
+    while let Some(&(&first_change, _)) = pending.peek() {
+        let start = old
+            .partition_point(|(first, _)| *first <= first_change)
+            .saturating_sub(1)
+            .max(next);
+        chunks.extend_from_slice(old.get(next..start).unwrap_or_default());
+        next = start;
+        let mut open: Vec<(StateKey, [u8; N])> = Vec::new();
+        let mut bytes = 0;
+        loop {
+            // Chunk `next` holds the keys before the next chunk's first key; merge in the changes that fall there.
+            let bound = old.get(next + 1).map(|(first, _)| *first);
+            let stored = match old.get(next) {
+                Some((_, address)) => entries_of(address)?,
+                None => Vec::new(),
+            };
+            next += 1;
+            let mut merged = Vec::with_capacity(stored.len());
+            let mut stored = stored.into_iter().peekable();
+            while let Some((&change_key, &value)) =
+                pending.next_if(|(change_key, _)| bound.is_none_or(|bound| **change_key < bound))
+            {
+                while let Some(entry) = stored.next_if(|(stored_key, _)| *stored_key < change_key) {
+                    merged.push(entry);
+                }
+                let replaced = stored.next_if(|(stored_key, _)| *stored_key == change_key).is_some();
+                added += i64::from(value.is_some()) - i64::from(replaced);
+                merged.extend(value.map(|value| (change_key, value)));
+            }
+            merged.extend(stored);
+            for (entry_key, value) in merged {
+                open.push((entry_key, value));
+                bytes += entry_len;
+                if ends_chunk(level, entry_key, entry_len, bytes) {
+                    chunks.push(seal_chunk(key, level, &open, sealed)?);
+                    open.clear();
+                    bytes = 0;
+                }
+            }
+            if next >= old.len() {
+                if !open.is_empty() {
+                    chunks.push(seal_chunk(key, level, &open, sealed)?);
+                }
+                break;
+            }
+            if open.is_empty() {
+                break;
+            }
+        }
+    }
+    chunks.extend_from_slice(old.get(next..).unwrap_or_default());
+    Ok((chunks, added))
+}
+
+/// The entries of the level above that change when a level's chunks go from `old` to `new`: each first key that
+/// gains or changes its address maps to the new address, and each one that is gone maps to `None`.
+fn changed_children(
+    old: &[(StateKey, [u8; 32])],
+    new: &[(StateKey, [u8; 32])],
+) -> BTreeMap<StateKey, Option<[u8; 32]>> {
+    let firsts: HashSet<&StateKey> = new.iter().map(|(first, _)| first).collect();
+    let before: HashSet<&(StateKey, [u8; 32])> = old.iter().collect();
+    let gone = old
+        .iter()
+        .filter(|(first, _)| !firsts.contains(first))
+        .map(|(first, _)| (*first, None));
+    let added = new
+        .iter()
+        .filter(|child| !before.contains(child))
+        .map(|(first, address)| (*first, Some(*address)));
+    gone.chain(added).collect()
 }
 
 /// Decodes one chunk's plaintext, refusing a bad magic, a nonzero reserved byte, a CRC mismatch, entries that do not

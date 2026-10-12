@@ -48,11 +48,12 @@ use std::fs::{File, OpenOptions};
 use std::hint::black_box;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
 /// Room sizes measured, in events. A 1,000,000-event room is left out: its fixture rebuilds the whole state tree after
-/// every state event (HEF has no incremental state-tree update), which takes far longer than the benchmarks themselves.
+/// every state event, which takes far longer than the benchmarks themselves.
 const ROOM_SIZES: [u64; 3] = [1_000, 10_000, 100_000];
 /// Events a `/messages` page, a sync timeline and a batch event fetch return.
 const PAGE: u64 = 50;
@@ -660,12 +661,12 @@ impl HefRoom {
         self.payloads(&refs)
     }
 
-    /// The decoded edges of the granule holding `sn`, decoded once per walk.
-    fn edges<'a>(&self, cache: &'a mut HashMap<u32, GranuleEdges>, sn: u64) -> &'a GranuleEdges {
+    /// The decoded edges of the granule holding `sn`, taken from the reader's decoded-edge cache once per walk.
+    fn edges<'a>(&self, cache: &'a mut HashMap<u32, Arc<GranuleEdges>>, sn: u64) -> &'a GranuleEdges {
         let granule = self.file.graph_granule_of(sn).unwrap();
         cache
             .entry(granule)
-            .or_insert_with(|| self.file.granule_edges(granule).unwrap())
+            .or_insert_with(|| self.file.cached_granule_edges(granule).unwrap())
     }
 
     /// Walks `prev` edges breadth first from `from`, newest parent first, collecting up to `limit` events, and returns
@@ -829,9 +830,9 @@ impl HefJournal {
         }
     }
 
-    /// Appends `events` and returns once all of them are synced. Events are queued one at a time and a frame is
-    /// flushed whenever the pipeline reaches its flush target, as the writer does under load, so a large batch lands
-    /// as several synced frames; whatever is left is flushed at the end.
+    /// Appends `events` and returns once all of them are synced. The events are queued, then flushed together as a
+    /// federation transaction or a backfill response is persisted: a large batch lands as several frames of up to the
+    /// flush target, made durable by one sync.
     fn append(&mut self, first_sn: u64, events: &[Event]) {
         self.nonce += 1;
         for (event, sn) in events.iter().zip(first_sn..) {
@@ -839,13 +840,8 @@ impl HefJournal {
             self.pipeline
                 .submit(input, self.allocator.epoch(), &mut self.retry, &self.clock)
                 .unwrap();
-            if self.pipeline.should_flush(&self.clock) == Some(FlushReason::Target) {
-                self.flush(FlushReason::Target);
-            }
         }
-        if self.pipeline.queue().pending_bytes() > 0 {
-            self.flush(FlushReason::ForceCommit);
-        }
+        self.flush(FlushReason::ForceCommit);
         // Published frames stay readable from the overlay until a file covers them; the benchmark never publishes,
         // so it drops them here to keep memory flat across iterations.
         if self.overlay.segment_count() > 1024 {
@@ -1485,20 +1481,19 @@ fn update(criterion: &mut Criterion, fixtures: &[Fixture]) {
         };
         group.bench_function(fixture.id(HEF), |b| {
             let mut journal = HefJournal::open();
-            let mut chunks = ChunkStore::default();
-            let mut state = room.current.clone();
-            let mut previous = fixture.hef.state.latest.clone();
+            let mut chunks = ChunkStore(fixture.hef.state.chunks.0.clone());
+            let mut root = fixture.hef.state.latest.root;
             let mut appended = 0;
             b.iter(|| {
                 let event = change(appended);
                 let sn = next + appended;
                 journal.append(sn, std::slice::from_ref(&event));
-                state.insert(event.state().unwrap(), sn);
-                let tree = build_state_tree(&fixture.hef.state.key, &state).unwrap();
-                for chunk in tree.new_chunks(&previous) {
+                let changes = BTreeMap::from([(event.state().unwrap(), Some(sn))]);
+                let update = update_state_tree(&chunks, &fixture.hef.state.key, &root, &changes).unwrap();
+                for chunk in update.new_chunks {
                     chunks.0.insert(chunk.address, chunk.bytes);
                 }
-                previous = tree;
+                root = update.root;
                 appended += 1;
             });
         });

@@ -104,14 +104,19 @@ impl HefFile {
     }
 
     /// One row's text in a source-form column, or `None` when the file has no such column or the row has no value.
+    /// The granule's block is decoded once and kept in the reader's decoded-block cache, so a run of point reads (an
+    /// event-id lookup confirming each candidate, say) pays one decode per granule.
     fn source_form_text(&self, column_id: u32, row_ordinal: u64) -> Result<Option<String>, FormatError> {
         if !has_column(self.footer(), column_id) {
             return Ok(None);
         }
         let granule = granule_holding(self.footer(), row_ordinal)?;
-        let read = self.read_column(column_id, granule.granule_id)?;
-        let row = (row_ordinal - granule.first_row_ordinal) as usize;
-        Ok(string_at(&read, granule.row_count as usize, row).map(str::to_owned))
+        self.cached_string_at(
+            column_id,
+            granule.granule_id,
+            granule.row_count,
+            row_ordinal - granule.first_row_ordinal,
+        )
     }
 }
 
@@ -153,26 +158,6 @@ fn granule_holding(footer: &Footer, row_ordinal: u64) -> Result<&GranuleEntry, F
         .ok_or(FormatError::RefOutOfRange {
             what: "row ordinal past the file's last row",
         })
-}
-
-/// The text at granule row `row` of a string block, whether the block stores a value per row or only the present
-/// rows' values behind a presence bitmap.
-fn string_at(read: &ColumnRead, row_count: usize, row: usize) -> Option<&str> {
-    let ColumnData::Strings(values) = &read.data else {
-        return None;
-    };
-    if values.len() == row_count {
-        return values.get(row).flatten();
-    }
-    let present = |row: usize| {
-        read.presence
-            .get(row / 8)
-            .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
-    };
-    if !present(row) {
-        return None;
-    }
-    values.get((0..row).filter(|&before| present(before)).count()).flatten()
 }
 
 /// Every present value of a string block with its granule row, in row order, in one walk over the block.
