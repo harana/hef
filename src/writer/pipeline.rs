@@ -337,7 +337,7 @@ impl WorkerCommitPipeline {
         // decides whether its range may be voided, so each offset is read back to tell them apart: bytes that are not
         // there cannot become durable, and the frame's region is released with its lease left to expire into a void
         // record; bytes that are there may still be persisted by a later sync, so the frame is abandoned as possibly
-        // durable. Only a read that succeeds and returns *other* bytes proves a frame absent — a failed read proves
+        // durable. Only a read that succeeds and returns *other* bytes proves a frame absent; a failed read proves
         // nothing, so an unreadable offset counts as present. Either way the failure is reported so the caller does not
         // acknowledge.
         if let Err(error) = storage.sync(self.shard) {
@@ -501,7 +501,7 @@ impl WorkerCommitPipeline {
 
     /// Gives up on `frames`, whose bytes were appended but never verified durable: each lease is consumed as
     /// possibly durable, so its range is never voided under a frame that may yet land; each event gets an
-    /// `Indeterminate` receipt — never an acknowledgement — so a client retry of the same delivery is recognised
+    /// `Indeterminate` receipt, never an acknowledgement, so a client retry of the same delivery is recognised
     /// instead of appending a second copy; and each claimed region is released.
     fn abandon_possibly_durable(
         &mut self,
