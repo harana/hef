@@ -53,7 +53,7 @@ use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
 /// Room sizes measured, in events. A 1,000,000-event room is left out: its fixture rebuilds the whole state tree after
-/// every state event (HEF has no incremental state-tree update), which takes far longer than the benchmarks themselves.
+/// every state event, which takes far longer than the benchmarks themselves.
 const ROOM_SIZES: [u64; 3] = [1_000, 10_000, 100_000];
 /// Events a `/messages` page, a sync timeline and a batch event fetch return.
 const PAGE: u64 = 50;
@@ -1486,20 +1486,19 @@ fn update(criterion: &mut Criterion, fixtures: &[Fixture]) {
         };
         group.bench_function(fixture.id(HEF), |b| {
             let mut journal = HefJournal::open();
-            let mut chunks = ChunkStore::default();
-            let mut state = room.current.clone();
-            let mut previous = fixture.hef.state.latest.clone();
+            let mut chunks = ChunkStore(fixture.hef.state.chunks.0.clone());
+            let mut root = fixture.hef.state.latest.root;
             let mut appended = 0;
             b.iter(|| {
                 let event = change(appended);
                 let sn = next + appended;
                 journal.append(sn, std::slice::from_ref(&event));
-                state.insert(event.state().unwrap(), sn);
-                let tree = build_state_tree(&fixture.hef.state.key, &state).unwrap();
-                for chunk in tree.new_chunks(&previous) {
+                let changes = BTreeMap::from([(event.state().unwrap(), Some(sn))]);
+                let update = update_state_tree(&chunks, &fixture.hef.state.key, &root, &changes).unwrap();
+                for chunk in update.new_chunks {
                     chunks.0.insert(chunk.address, chunk.bytes);
                 }
-                previous = tree;
+                root = update.root;
                 appended += 1;
             });
         });
