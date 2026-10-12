@@ -35,7 +35,7 @@ use hef::events::*;
 use hef::invariants::io::{SystemClock, ThreadPoolEncodeExecutor};
 use hef::invariants::{JournalStorage, ShardAtomicity, ShardId};
 use hef::layout::graph::{DepthRange, EdgeKind, GranuleEdges, GraphInput, RowEdges};
-use hef::layout::reader::{HefFile, PayloadRead, PayloadRef};
+use hef::layout::reader::{DECODED_CACHE_BUDGET_BYTES, HefFile, PayloadRead, PayloadRef};
 use hef::layout::{LayoutTargets, Profile};
 use hef::security::{FooterEncryption, StateChunkKey, TenantDek};
 use hef::writer::build::*;
@@ -606,6 +606,9 @@ struct HefRoom {
     file: HefFile,
     file_bytes: u64,
     state: HefState,
+    /// The room's state chunks opened and decoded once read, within the budget the file reader gives its own decoded
+    /// caches.
+    state_cache: StateChunkCache,
 }
 
 impl HefRoom {
@@ -615,10 +618,12 @@ impl HefRoom {
         let built = build_hef_file_with_executor(rows, &config, &ThreadPoolEncodeExecutor).unwrap();
         let file_bytes = built.bytes.len() as u64;
         let file = HefFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+        let state_cache = StateChunkCache::new(state.key.clone(), DECODED_CACHE_BUDGET_BYTES);
         HefRoom {
             file,
             file_bytes,
             state,
+            state_cache,
         }
     }
 
@@ -711,7 +716,10 @@ impl HefRoom {
 
     fn children(&self, sn: u64) -> Vec<u64> {
         let granule = self.file.graph_granule_of(sn).unwrap();
-        self.file.granule_edges(granule).unwrap().children(sn, EdgeKind::Prev)
+        self.file
+            .cached_granule_edges(granule)
+            .unwrap()
+            .children(sn, EdgeKind::Prev)
     }
 
     /// The state root in force right after event `sn`: the root of the latest state event at or before it.
@@ -722,7 +730,7 @@ impl HefRoom {
     }
 
     fn state_get(&self, root: &StateRoot, state_key: StateKey) -> Option<u64> {
-        state_get(&self.state.chunks, &self.state.key, root, state_key).unwrap()
+        self.state_cache.state_get(&self.state.chunks, root, state_key).unwrap()
     }
 
     fn state_diff(&self, before: &StateRoot, after: &StateRoot) -> Vec<StateChange> {
@@ -1531,10 +1539,15 @@ fn update(criterion: &mut Criterion, fixtures: &[Fixture]) {
             let mut next = cycle(&targets);
             b.iter(|| {
                 // The redacted form is appended as the row that replaces the original, and the original's row is
-                // marked deleted so the file never serves it again.
+                // marked deleted so the file never serves it again. An event already redacted would get the same
+                // redacted form again, so nothing is written, as SQLite writes nothing for an UPDATE that leaves the
+                // row unchanged.
                 let sn = next();
-                journal.append(sn, std::slice::from_ref(&redacted(sn)));
-                deleted.mark_deleted(fixture.hef.file.graph_row_of(sn).unwrap());
+                let row = fixture.hef.file.graph_row_of(sn).unwrap();
+                if !deleted.is_deleted(row) {
+                    journal.append(sn, std::slice::from_ref(&redacted(sn)));
+                    deleted.mark_deleted(row);
+                }
             });
         });
         group.bench_function(fixture.id(SQLITE), |b| {
