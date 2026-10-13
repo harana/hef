@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The naive, fully-materialized intersection, used as an oracle to check that the compressed-form intersection agrees
 /// with the true set intersection.
@@ -410,4 +410,119 @@ fn from_ranges_merges_overlapping_touching_and_drops_empty() {
     ]);
     assert_eq!(bitmap.ranges(), &[r(0, 5), r(10, 20), r(u64::MAX - 1, u64::MAX)]);
     assert!(RoaringRangeBitmap::from_ranges([r(4, 4), r(9, 2)]).is_empty());
+}
+
+/// A run list written as `(start, end)` pairs.
+type Runs<'a> = &'a [(u64, u64)];
+
+fn bitmap_of(runs: &[(u64, u64)]) -> RoaringRangeBitmap {
+    RoaringRangeBitmap::from_ranges(runs.iter().map(|&(start, end)| RowRange { end, start }))
+}
+
+/// How a repeated insert merged a value's rows before the linear union: concatenate both run lists and normalise them
+/// with a general sort.
+fn reference_union(a: &RoaringRangeBitmap, b: &RoaringRangeBitmap) -> RoaringRangeBitmap {
+    RoaringRangeBitmap::from_ranges(a.ranges().iter().copied().chain(b.ranges().iter().copied()))
+}
+
+#[test]
+fn union_matches_the_sorting_reference_and_set_union() {
+    let cases: &[(Runs<'_>, Runs<'_>)] = &[
+        // Disjoint.
+        (&[(0, 2)], &[(5, 7)]),
+        // Interleaved.
+        (&[(0, 2), (10, 12), (20, 22)], &[(4, 6), (14, 16)]),
+        // Equal starts.
+        (&[(0, 5), (10, 12)], &[(0, 3), (10, 20)]),
+        // Contained.
+        (&[(0, 100)], &[(10, 20), (30, 40)]),
+        // Identical.
+        (&[(1, 4), (8, 9)], &[(1, 4), (8, 9)]),
+        // A touching chain that collapses into one run.
+        (&[(0, 2), (4, 6), (8, 10)], &[(2, 4), (6, 8)]),
+        // One run on one side bridging several on the other.
+        (&[(3, 5), (7, 9), (11, 13)], &[(4, 12)]),
+        // Empty sides.
+        (&[], &[(1, 2)]),
+        (&[], &[]),
+        // Runs ending at the top of the row-id space.
+        (&[(u64::MAX - 5, u64::MAX)], &[(u64::MAX - 10, u64::MAX - 5)]),
+        (&[(0, 1), (u64::MAX - 1, u64::MAX)], &[(u64::MAX - 3, u64::MAX)]),
+    ];
+    for &(a, b) in cases {
+        let (a, b) = (bitmap_of(a), bitmap_of(b));
+        let expected = reference_union(&a, &b);
+        assert_eq!(a.union(&b), expected, "{a:?} | {b:?}");
+        assert_eq!(b.union(&a), expected, "{b:?} | {a:?}");
+        let rows: BTreeSet<u64> = rows_of(&a).union(&rows_of(&b)).copied().collect();
+        assert_eq!(rows_of(&expected), rows, "{a:?} | {b:?}");
+    }
+}
+
+#[test]
+fn repeated_inserts_match_the_sorting_reference() {
+    // A fixed-seed linear congruential generator, so a failure reproduces.
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move |bound: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) % bound
+    };
+    for case in 0..300 {
+        let mut index = BitmapIndex::new();
+        let mut reference: BTreeMap<u64, RoaringRangeBitmap> = BTreeMap::new();
+        for _ in 0..next(12) {
+            let value = next(4);
+            let rows: Vec<u64> = (0..next(10)).map(|_| next(64)).collect();
+            index.insert(value, rows.iter().copied());
+            let added = RoaringRangeBitmap::from_rows(rows);
+            let merged = match reference.get(&value) {
+                Some(existing) => reference_union(existing, &added),
+                None => added,
+            };
+            reference.insert(value, merged);
+        }
+        let expected = BitmapIndex {
+            entries: reference.into_iter().collect(),
+        };
+        assert_eq!(index, expected, "case {case}");
+        assert_eq!(index.encode(), expected.encode(), "case {case}");
+        assert_eq!(index.len(), expected.len(), "case {case}");
+        for value in 0..4 {
+            let (got, want) = (index.bitmap(value), expected.bitmap(value));
+            assert_eq!(got.map(|b| b.count()), want.map(|b| b.count()), "case {case}");
+            for row in 0..70 {
+                assert_eq!(
+                    got.is_some_and(|b| b.contains(row)),
+                    want.is_some_and(|b| b.contains(row)),
+                    "case {case}: value {value}, row {row}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_insert_leaves_an_existing_bitmap_untouched() {
+    let mut index = BitmapIndex::new();
+    index.insert(3, [1, 2, 3, 10]);
+    let before = index.bitmap(3).unwrap().clone();
+    let storage = index.bitmap(3).unwrap().ranges().as_ptr();
+    index.insert(3, Vec::<u64>::new());
+    assert_eq!(index.bitmap(3), Some(&before));
+    // Same backing storage: the bitmap was not rebuilt.
+    assert_eq!(index.bitmap(3).unwrap().ranges().as_ptr(), storage);
+    assert_eq!(index.len(), 1);
+}
+
+#[test]
+fn value_first_recorded_with_no_rows_takes_later_rows() {
+    let mut index = BitmapIndex::new();
+    index.insert(4, Vec::<u64>::new());
+    assert_eq!(index.len(), 1);
+    assert!(index.bitmap(4).unwrap().is_empty());
+    index.insert(4, [6, 5, 5]);
+    assert_eq!(index.bitmap(4).unwrap().ranges(), &[RowRange { end: 7, start: 5 }]);
+    assert_eq!(index.len(), 1);
 }

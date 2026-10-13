@@ -12,7 +12,7 @@
 
 use super::Profile;
 use super::optional_features;
-use super::reader::HefFile;
+use super::reader::{HefFile, granules_overlapping_rows};
 use crate::columns::column_ids;
 use crate::encoding::ColumnData;
 use crate::error::FormatError;
@@ -275,7 +275,8 @@ impl HefFile {
     }
 
     /// Adds the values of `column_id` in the rows of `rows` whose `occurred_at` falls in `range` to their buckets,
-    /// reading only the granules that overlap both.
+    /// reading only the granules that overlap both. The granules overlapping `rows` are found by binary search, so an
+    /// edge bucket's few rows never walk the whole granule directory.
     fn scan_buckets(
         &self,
         column_id: u32,
@@ -284,7 +285,7 @@ impl HefFile {
         bucket_nanos: i64,
         buckets: &mut BTreeMap<i64, FloatAggregate>,
     ) -> Result<(), FormatError> {
-        for granule in &self.footer().granules {
+        for granule in granules_overlapping_rows(&self.footer().granules, rows) {
             let first = granule.first_row_ordinal;
             let granule_rows = first..first + u64::from(granule.row_count);
             if granule_rows.end <= rows.start

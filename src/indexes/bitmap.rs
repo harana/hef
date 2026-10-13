@@ -244,6 +244,37 @@ impl RoaringRangeBitmap {
         Self { runs }
     }
 
+    /// Merges two bitmaps into the rows present in either, in one linear walk over both run lists. Both sides are
+    /// already canonical, so taking the run with the lower start from either side at each step visits runs in start
+    /// order, and coalescing each into the last emitted run yields the canonical form with no sort.
+    fn union(&self, other: &Self) -> Self {
+        let mut runs: Vec<RowRange> = Vec::with_capacity(self.runs.len() + other.runs.len());
+        let mut a = 0usize;
+        let mut b = 0usize;
+        loop {
+            let next = match (self.runs.get(a), other.runs.get(b)) {
+                (Some(left), Some(right)) if left.start <= right.start => {
+                    a += 1;
+                    *left
+                }
+                (_, Some(right)) => {
+                    b += 1;
+                    *right
+                }
+                (Some(left), None) => {
+                    a += 1;
+                    *left
+                }
+                (None, None) => break,
+            };
+            match runs.last_mut() {
+                Some(last) if next.start <= last.end => last.end = last.end.max(next.end),
+                _ => runs.push(next),
+            }
+        }
+        Self { runs }
+    }
+
     /// Serializes the bitmap to bytes: a run count followed by each run's `start` and `end`. Round-trips exactly with
     /// [`decode`](Self::decode).
     pub fn encode(&self) -> Vec<u8> {
@@ -307,16 +338,18 @@ impl BitmapIndex {
     }
 
     /// Records that `rows` carry `value`. Any rows already mapped to that value are merged in, so calling this
-    /// repeatedly for the same value accumulates its row set.
+    /// repeatedly for the same value accumulates its row set. A value seen for the first time is recorded even when
+    /// `rows` is empty; an empty `rows` for a value already recorded leaves it untouched.
     pub fn insert<I: IntoIterator<Item = u64>>(&mut self, value: u64, rows: I) {
         let added = RoaringRangeBitmap::from_rows(rows);
         match self.entries.binary_search_by_key(&value, |(v, _)| *v) {
             Ok(idx) => {
                 if let Some((_, existing)) = self.entries.get_mut(idx) {
-                    let merged = RoaringRangeBitmap::from_ranges(
-                        existing.ranges().iter().copied().chain(added.ranges().iter().copied()),
-                    );
-                    *existing = merged;
+                    if existing.is_empty() {
+                        *existing = added;
+                    } else if !added.is_empty() {
+                        *existing = existing.union(&added);
+                    }
                 }
             }
             Err(idx) => self.entries.insert(idx, (value, added)),

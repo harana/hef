@@ -52,6 +52,7 @@ use memchr::memmem;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use zeekstd::SeekTable;
@@ -437,6 +438,22 @@ fn owned_utf8(bytes: &[u8], what: &'static str) -> Result<String, FormatError> {
     simdutf8::basic::from_utf8(bytes)
         .map(str::to_owned)
         .map_err(|_| FormatError::InvalidUtf8 { what })
+}
+
+/// The granules of `granules` whose rows overlap `rows`, as one borrowed run in directory order, found with two binary
+/// searches instead of a pass over the whole directory: from the first granule ending after `rows.start` up to the
+/// first starting at or past `rows.end`.
+///
+/// A granule is in the run exactly when it starts before `rows.end` and ends after `rows.start`, the test a pass over
+/// every granule would apply, so gaps and zero-row granules need no special case, and an empty or reversed range
+/// finds only a granule spanning both of its ends. `granules` must be a directory [`HefFile::open`] accepted,
+/// ascending by `first_row_ordinal` with no overlap, so granule ends never go down and both searches are sound.
+pub(super) fn granules_overlapping_rows<'a>(granules: &'a [GranuleEntry], rows: &Range<u64>) -> &'a [GranuleEntry] {
+    let first = granules.partition_point(|granule| {
+        granule.first_row_ordinal.saturating_add(u64::from(granule.row_count)) <= rows.start
+    });
+    let last = granules.partition_point(|granule| granule.first_row_ordinal < rows.end);
+    granules.get(first..last).unwrap_or_default()
 }
 
 /// How many trailing bytes to read when the manifest entry does not record `footer_len`: a fixed speculative fetch that
@@ -1766,6 +1783,9 @@ pub struct HefFile {
     /// bytes per frame, so a whole file's worth costs far less than the decoded blocks `column_cache` budgets, and is
     /// bounded by the file's own granule count.
     residual_seek_tables: DashMap<u32, Arc<SeekTable>, ahash::RandomState>,
+    /// True when the footer's snapshot key index stores its granule first keys in order, checked once at open so a
+    /// snapshot lookup can binary-search them. False when there is no such index.
+    pub(super) snapshot_first_keys_in_order: bool,
     /// Where each stripe id sits in the footer's stripe directory, built once at open so a lookup by id never scans
     /// the directory. When an id repeats, the first entry wins, as a front-to-back scan would.
     stripe_position_by_id: HashMap<u32, usize>,
@@ -2085,6 +2105,10 @@ impl HefFile {
         for (position, stripe) in footer.stripes.iter().enumerate() {
             stripe_position_by_id.entry(stripe.stripe_id).or_insert(position);
         }
+        let snapshot_first_keys_in_order = footer
+            .snapshot_keys
+            .as_ref()
+            .is_some_and(|index| index.first_keys_in_order());
         let stripe_relative = footer.required_feature_flags & required_features::STRIPE_RELATIVE_MARKS != 0;
         // Under stripe-relative marks, a granule's offsets are measured from its stripe's base. A granule whose stripe
         // id is missing from the directory has no base to add back, so its reads would silently fall back to file
@@ -2163,6 +2187,7 @@ impl HefFile {
             residual_seek_tables: DashMap::default(),
             shared_alphabets,
             shared_string_views: DashMap::default(),
+            snapshot_first_keys_in_order,
             stripe_position_by_id,
             stripe_relative,
             text_token_cache: DashMap::default(),

@@ -137,6 +137,7 @@ fn file_with_mark(mark: ColumnMark, bytes: Vec<u8>, usable_optional_features: u6
         residual_seek_tables: DashMap::default(),
         shared_alphabets: HashMap::new(),
         shared_string_views: DashMap::new(),
+        snapshot_first_keys_in_order: false,
         stripe_position_by_id: HashMap::new(),
         stripe_relative: false,
         text_token_cache: DashMap::default(),
@@ -1119,6 +1120,74 @@ fn open_rejects_a_granule_directory_entry_whose_row_range_overflows_instead_of_p
             rule: "granule directory must be strictly ascending by first_row_ordinal with no overlap",
         }
     );
+}
+
+fn granule_at(granule_id: u32, first_row_ordinal: u64, row_count: u32) -> GranuleEntry {
+    GranuleEntry {
+        compressed_bytes_estimate: 0,
+        first_epoch: 1,
+        first_row_ordinal,
+        first_sequence: 0,
+        granule_id,
+        last_epoch: 1,
+        last_sequence: 0,
+        max_ingested_at_physical: 0,
+        max_occurred_at_physical: 0,
+        min_ingested_at_physical: 0,
+        min_occurred_at_physical: 0,
+        row_count,
+        stripe_id: 0,
+    }
+}
+
+/// The binary-searched run of granules overlapping a row range is exactly what a pass over every granule finds, in
+/// the same order, for ranges starting and ending at, between, before and after every granule bound, empty and
+/// reversed ranges, and directories that are empty, a single granule, or full of gaps, zero-row granules and rows
+/// near `u64::MAX`.
+#[test]
+fn granules_overlapping_rows_matches_a_full_directory_scan() {
+    let directories = [
+        Vec::new(),
+        vec![granule_at(0, 5, 10)],
+        vec![granule_at(0, 0, 0)],
+        vec![
+            granule_at(0, 0, 4),
+            granule_at(1, 4, 0),
+            granule_at(2, 4, 4),
+            granule_at(3, 10, 0),
+            granule_at(4, 10, 5),
+            granule_at(5, 20, 1),
+            granule_at(6, 21, 0),
+            granule_at(7, u64::MAX - 3, 3),
+        ],
+    ];
+    for directory in &directories {
+        let mut bounds = vec![0, u64::MAX];
+        for granule in directory {
+            let end = granule.first_row_ordinal + u64::from(granule.row_count);
+            for bound in [granule.first_row_ordinal, end] {
+                bounds.extend([bound.saturating_sub(1), bound, bound.saturating_add(1)]);
+            }
+        }
+        for &start in &bounds {
+            for &end in &bounds {
+                let rows = start..end;
+                let scanned: Vec<u32> = directory
+                    .iter()
+                    .filter(|granule| {
+                        granule.first_row_ordinal < rows.end
+                            && rows.start < granule.first_row_ordinal + u64::from(granule.row_count)
+                    })
+                    .map(|granule| granule.granule_id)
+                    .collect();
+                let searched: Vec<u32> = granules_overlapping_rows(directory, &rows)
+                    .iter()
+                    .map(|granule| granule.granule_id)
+                    .collect();
+                assert_eq!(searched, scanned, "rows {rows:?} over {directory:?}");
+            }
+        }
+    }
 }
 
 /// Whether an extent is shared by more than one mark (mark aliasing) is a fact about the whole stripe, so a reader

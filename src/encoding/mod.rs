@@ -38,7 +38,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use zstd::{bulk::Compressor as ZstdCompressor, zstd_safe::compress_bound};
 
-use chimp::{decode_chimp, encode_chimp};
+use chimp::{decode_chimp, decode_chimp_range, encode_chimp};
 pub(crate) use presence::{PresenceRank, count_present_before, count_set_bits, present_position};
 use scratch::{with_arena_buffer, with_unpack_buffer};
 use sidecar::{PrefixKey, StringFingerprint};
@@ -981,6 +981,13 @@ fn delta_size(values: &[u64], block_len: usize) -> usize {
 /// Fixed positions keep selection deterministic, so byte-identical encodes across nodes hold unchanged. Requirement:
 /// "Stratified sampling through one shared statistics pass".
 fn transform_sample<T: Copy>(values: &[T]) -> Option<Vec<T>> {
+    transform_sample_mapped(values, |value| value)
+}
+
+/// [`transform_sample`] with `map` applied to each drawn value as it is copied: the same `None` for a short block and
+/// the same runs, in the same order, for a long one — so a caller that scores the sample in another domain (zigzag
+/// codes for `i64`) fills one buffer instead of drawing the sample and then mapping a second copy of it.
+fn transform_sample_mapped<T: Copy, U>(values: &[T], map: impl Fn(T) -> U) -> Option<Vec<U>> {
     if values.len() <= TRANSFORM_SAMPLE_SIZE {
         return None;
     }
@@ -990,7 +997,7 @@ fn transform_sample<T: Copy>(values: &[T]) -> Option<Vec<T>> {
     for i in 0..TRANSFORM_SAMPLE_RUNS {
         let start = span * i / (TRANSFORM_SAMPLE_RUNS - 1);
         if let Some(window) = values.get(start..start + run) {
-            sample.extend_from_slice(window);
+            sample.extend(window.iter().map(|value| map(*value)));
         }
     }
     Some(sample)
@@ -1043,11 +1050,10 @@ fn score_u64_candidates(sample: &[u64], block_len: usize, strategy: CascadeStrat
 
 /// [`choose_u64_transform`] for `i64` values: only the (bounded [`TRANSFORM_SAMPLE_SIZE`]) sample is zigzag-mapped
 /// to score candidates, instead of the whole column — the full mapping happens only once, in [`encode_i64_with`],
-/// for whichever transform wins.
+/// for whichever transform wins. The sample is drawn straight into zigzag codes, so no signed copy is made first.
 fn choose_i64_transform(values: &[i64], strategy: CascadeStrategy) -> Transform {
-    let sample = transform_sample(values);
-    let sample: &[i64] = sample.as_deref().unwrap_or(values);
-    let mapped: Vec<u64> = sample.iter().map(|value| zigzag(*value)).collect();
+    let mapped =
+        transform_sample_mapped(values, zigzag).unwrap_or_else(|| values.iter().map(|value| zigzag(*value)).collect());
     score_u64_candidates(&mapped, values.len(), strategy)
 }
 
@@ -1455,15 +1461,6 @@ fn write_byte_stream_split(values: &[f64], out: &mut [u8]) {
     }
 }
 
-/// The bytes of `values`, regrouped into 8 same-significance planes (see [`write_byte_stream_split`]) — for a caller
-/// that needs them as a standalone buffer rather than written into a [`Writer`] in place, as
-/// [`choose_float_fallback`]'s sample trial does.
-fn byte_stream_split_bytes(values: &[f64]) -> Vec<u8> {
-    let mut out = vec![0u8; values.len() * 8];
-    write_byte_stream_split(values, &mut out);
-    out
-}
-
 /// Picks the transform for a float column ALP rejected: ALP-RD, byte-stream-split, or plain, whichever the sample says
 /// stores smallest. Byte-stream-split regroups bytes by significance so the high-order planes (sign/exponent) form
 /// long runs deflate can shrink; plain interleaves all 8 bytes of every value, which defeats deflate's small window on
@@ -1475,10 +1472,15 @@ fn choose_float_fallback(values: &[f64]) -> Transform {
     if sample.is_empty() {
         return Transform::PlainF64;
     }
-    let plain_bytes: Vec<u8> = sample.iter().flat_map(|value| value.to_le_bytes()).collect();
-    let bss_bytes = byte_stream_split_bytes(sample);
-    let plain_compressed = deflate::compress(&plain_bytes).len();
-    let bss_compressed = deflate::compress(&bss_bytes).len();
+    // The two trials run one after the other and keep only a compressed length, so they share one raw buffer: plain
+    // little-endian bytes first, then overwritten in full by the byte-stream-split planes.
+    let mut trial = vec![0u8; sample.len() * 8];
+    for (bytes, value) in trial.chunks_exact_mut(8).zip(sample) {
+        bytes.copy_from_slice(&value.to_le_bytes());
+    }
+    let plain_compressed = deflate::compress(&trial).len();
+    write_byte_stream_split(sample, &mut trial);
+    let bss_compressed = deflate::compress(&trial).len();
     let (_, _, alp_rd_estimate) = alp_rd_choose_split(sample);
     if alp_rd_estimate < plain_compressed.min(bss_compressed) {
         Transform::AlpRd
@@ -1498,9 +1500,9 @@ fn encode_byte_stream_split(values: &[f64], out: &mut Writer) {
 
 fn decode_byte_stream_split(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
     let count = reader.u32("byte-stream-split count")? as usize;
-    let mut planes: Vec<&[u8]> = Vec::with_capacity(8);
-    for _ in 0..8 {
-        planes.push(reader.take(count, "byte-stream-split plane")?);
+    let mut planes: [&[u8]; 8] = [&[]; 8];
+    for plane in planes.iter_mut() {
+        *plane = reader.take(count, "byte-stream-split plane")?;
     }
     // Each plane is exactly `count` bytes, so eight linear passes reassemble every value without a per-value bounds
     // check: pass `p` ORs each row's plane-`p` byte into bit position `8 * p`.
@@ -4538,7 +4540,9 @@ fn decode_string_framed_range(
     }
     let present_start = header.nulls.present_before(start);
     let present_end = header.nulls.present_before(effective_end);
-    let mut offsets = decode_offsets(&window.read(
+    // The offsets, then the arena bytes, lie ever further into the body, so both are read walking forward: each is
+    // borrowed from its frame when it fits in one, and the offsets are decoded before the arena is reached.
+    let mut offsets = decode_offsets(&window.read_forward(
         header.offsets_start + present_start * 4,
         (present_end - present_start + 1) * 4,
     )?);
@@ -4551,7 +4555,7 @@ fn decode_string_framed_range(
         }
     };
     let arena_start = header.offsets_start + (header.present_count + 1) * 4;
-    let data = window.read(arena_start + first, last - first)?;
+    let data = window.read_forward(arena_start + first, last - first)?;
     // The values were read out of the middle of the arena, so their offsets are rebased onto what was read.
     for offset in &mut offsets {
         *offset = offset.saturating_sub(first);
@@ -4599,8 +4603,8 @@ fn decode_plain_framed_range(
     // any block whose body length disagrees with that header, so a range read can never surface phantom rows a full
     // decode would silently drop.
     let count = {
-        let header = window.read(0, 4)?;
-        u32::from_le_bytes(header.as_slice().try_into().unwrap_or([0; 4])) as usize
+        let header = window.read_forward(0, 4)?;
+        u32::from_le_bytes(header[..].try_into().unwrap_or([0; 4])) as usize
     };
     let expected_plain_len = count.checked_mul(8).and_then(|body| body.checked_add(4));
     if expected_plain_len != Some(window.plain_len()) {
@@ -4613,7 +4617,8 @@ fn decode_plain_framed_range(
         return Ok(plain_rows(kind, &[]));
     }
     let byte_start = 4 + start * 8;
-    let row_bytes = window.read(byte_start, (effective_end - start) * 8)?;
+    // Borrowed straight out of the frame when the rows sit inside one; only a range straddling frames is gathered.
+    let row_bytes = window.read_forward(byte_start, (effective_end - start) * 8)?;
     Ok(plain_rows(kind, &row_bytes))
 }
 
@@ -4684,8 +4689,8 @@ fn decode_byte_stream_split_framed_range(bytes: &[u8], start: usize, end: usize)
     // One window for all 8 plane reads: a frame two planes share is decompressed once.
     let mut window = seekable_zstd::Window::open(bytes)?;
     let count = {
-        let header = window.read(0, 4)?;
-        u32::from_le_bytes(header.as_slice().try_into().unwrap_or([0; 4])) as usize
+        let header = window.read_forward(0, 4)?;
+        u32::from_le_bytes(header[..].try_into().unwrap_or([0; 4])) as usize
     };
     let expected_plain_len = count.checked_mul(8).and_then(|body| body.checked_add(4));
     if expected_plain_len != Some(window.plain_len()) {
@@ -4698,21 +4703,18 @@ fn decode_byte_stream_split_framed_range(bytes: &[u8], start: usize, end: usize)
         return Ok(ColumnData::F64(Vec::new()));
     }
     let row_span = effective_end - start;
-    let mut planes: Vec<Vec<u8>> = Vec::with_capacity(8);
-    for plane in 0..8 {
-        planes.push(window.read(4 + plane * count + start, row_span)?);
-    }
-    let mut values = Vec::with_capacity(row_span);
-    for index in 0..row_span {
-        let mut le = [0u8; 8];
-        for (slot, plane) in le.iter_mut().zip(planes.iter()) {
-            *slot = *plane.get(index).ok_or(FormatError::Truncated {
-                what: "byte-stream-split plane",
-            })?;
+    // The planes lie one after another in the body, so they are read walking forward and each is folded into the
+    // output before the next is reached: a plane inside one frame is borrowed from it, and at most one plane gathered
+    // across frames is held at a time. A frame two adjacent planes share stays inflated until the later one is read.
+    let mut bits = vec![0u64; row_span];
+    for plane_index in 0..8 {
+        let plane = window.read_forward(4 + plane_index * count + start, row_span)?;
+        let shift = (8 * plane_index) as u32;
+        for (slot, byte) in bits.iter_mut().zip(plane.iter()) {
+            *slot |= u64::from(*byte) << shift;
         }
-        values.push(f64::from_le_bytes(le));
     }
-    Ok(ColumnData::F64(values))
+    Ok(ColumnData::F64(bytemuck::cast_vec(bits)))
 }
 
 /// Narrows an owned value vector to rows `[start, end)` in place — dropping the tail, then shifting the kept rows down
@@ -4743,8 +4745,9 @@ fn slice_column_data(data: ColumnData, start: usize, end: usize) -> ColumnData {
 /// For ALP float blocks and FSST or raw string blocks this loads only the bytes that cover the requested rows: the
 /// FastLanes vectors that span `[start, end)` for ALP, and the value slice identified by the offset table for the two
 /// string arenas. Under the seekable Zstandard family those blocks go further and decompress only the frames that slice
-/// falls in, leaving the rest of the page compressed. All other encodings fall back to a full decode followed by a
-/// slice, since their formats do not carry per-row offsets.
+/// falls in, leaving the rest of the page compressed. Chimp float blocks still decode every value in order, but keep
+/// only the requested rows. All other encodings fall back to a full decode followed by a slice, since their formats do
+/// not carry per-row offsets.
 ///
 /// The result equals `decode_block(pipeline, bytes)[start..end]` in every case.
 pub fn decode_block_range(
@@ -4802,6 +4805,10 @@ pub fn decode_block_range_shared(
                     start,
                     end,
                 )?))
+            }
+            (ValueKind::F64, Transform::Chimp) => {
+                let mut reader = Reader::new(body);
+                Ok(ColumnData::F64(decode_chimp_range(&mut reader, start, end)?))
             }
             (ValueKind::String, Transform::DictionaryString) => Ok(ColumnData::Strings(
                 decode_dictionary_string_range(body, pipeline.side_stream()?, shared, start, end)?,

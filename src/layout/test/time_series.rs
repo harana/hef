@@ -413,3 +413,51 @@ fn rollup_answers_equal_full_scan_answers_for_empty_reversed_and_extreme_ranges(
         }
     }
 }
+
+/// An edge-bucket scan that finds its granules by binary search over the granule directory adds the same values to
+/// the same buckets, bit for bit, as a pass over every row would, for row ranges starting and ending at, between,
+/// before and after granule bounds, empty and reversed row ranges, and both a whole and a cut time range.
+#[test]
+fn a_row_bounded_scan_matches_every_row_of_its_range() {
+    let file = open(&build(Profile::TimeSeries, Some(BUCKET_NANOS)));
+    let samples = samples();
+    let granules = &file.footer().granules;
+    assert!(granules.len() > 8);
+    let mut bounds = vec![0, ROWS, u64::MAX];
+    for index in [0, 1, granules.len() / 2, granules.len() - 1] {
+        let granule = granules[index];
+        let end = granule.first_row_ordinal + u64::from(granule.row_count);
+        for bound in [granule.first_row_ordinal, end] {
+            bounds.extend([bound.saturating_sub(1), bound, bound + 1]);
+        }
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+    let cut = samples[100].at..samples[ROWS as usize - 100].at;
+    for range in [i64::MIN..i64::MAX, cut] {
+        for &start in &bounds {
+            for &end in &bounds {
+                let rows = start..end;
+                let mut by_row: BTreeMap<i64, FloatAggregate> = BTreeMap::new();
+                for (row, sample) in samples.iter().enumerate() {
+                    if let Some(value) = sample.temperature
+                        && rows.contains(&(row as u64))
+                        && range.contains(&sample.at)
+                    {
+                        by_row.entry(sample.at.div_euclid(BUCKET_NANOS)).or_default().add(value);
+                    }
+                }
+                let mut scanned = BTreeMap::new();
+                file.scan_buckets(TEMPERATURE, &rows, &range, BUCKET_NANOS, &mut scanned)
+                    .unwrap();
+                let bits_of = |buckets: BTreeMap<i64, FloatAggregate>| -> Vec<(i64, (u64, u64, u64, u64))> {
+                    buckets
+                        .into_iter()
+                        .map(|(bucket, aggregate)| (bucket, bits(aggregate)))
+                        .collect()
+                };
+                assert_eq!(bits_of(scanned), bits_of(by_row), "rows {rows:?}, time {range:?}");
+            }
+        }
+    }
+}
