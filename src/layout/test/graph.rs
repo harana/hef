@@ -107,6 +107,22 @@ fn edges_round_trip_through_granule_blocks() {
 }
 
 #[test]
+fn borrowed_children_match_the_collected_children() {
+    let granules = decoded(&graph());
+    for granule in &granules {
+        for sn in 95..210 {
+            for kind in [EdgeKind::Auth, EdgeKind::Prev] {
+                assert_eq!(
+                    granule.children_iter(sn, kind).collect::<Vec<_>>(),
+                    granule.children(sn, kind),
+                    "event {sn} {kind:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn a_graph_that_breaks_a_rule_is_refused() {
     let cases: Vec<(&str, GraphBreak)> = vec![
         ("parent not earlier", Box::new(|g| g.rows[2].prev = vec![102])),
@@ -505,11 +521,13 @@ fn replaying_a_100k_member_room() {
         };
         state.insert(state_key, sn);
         let tree = build_state_tree(&key, &state).unwrap();
-        let new = match &previous {
-            Some(previous) => tree.new_chunks(previous),
-            None => tree.chunks.clone(),
+        state_chunk_bytes += match &previous {
+            Some(previous) => tree
+                .new_chunks_iter(previous)
+                .map(|chunk| chunk.bytes.len() as u64)
+                .sum::<u64>(),
+            None => tree.chunks.iter().map(|chunk| chunk.bytes.len() as u64).sum::<u64>(),
         };
-        state_chunk_bytes += new.iter().map(|chunk| chunk.bytes.len() as u64).sum::<u64>();
         roots.insert(sn, tree.root);
         previous = Some(tree);
     }

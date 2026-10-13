@@ -14,7 +14,7 @@ use crate::columns::{ColumnSpec, SOURCE_FORM_COLUMNS, column_ids};
 use crate::encoding::{ColumnData, StringColumn};
 use crate::error::FormatError;
 use crate::events::constant::EXTERNAL_ID_MAX_BYTES;
-use crate::events::provenance::{SignerSignature, hex_lower};
+use crate::events::provenance::{SignerSignature, hex_lower_into};
 use crate::events::relationships::RelationshipKind;
 use crate::indexes::probabilistic::SplitBlockBloomFilter;
 use crate::indexes::stable_hash;
@@ -97,15 +97,6 @@ fn carries(row: &BuildRow, column_id: u32) -> bool {
 /// One row's stored text for a source-form column, or `None` when the row carries no value for it.
 fn stored_text(row: &BuildRow, column_id: u32) -> Result<Option<Cow<'_, str>>, FormatError> {
     Ok(match column_id {
-        column_ids::EXTERNAL_ID => match &row.external_id {
-            Some(id) if id.is_empty() || id.len() > EXTERNAL_ID_MAX_BYTES => {
-                return Err(FormatError::Structural {
-                    rule: "an external id is 1 to 255 bytes",
-                });
-            }
-            Some(id) => Some(Cow::Owned(hex_lower(id))),
-            None => None,
-        },
         column_ids::MATRIX_ROOM_VERSION => row
             .matrix_provenance
             .as_ref()
@@ -127,6 +118,24 @@ fn stored_text(row: &BuildRow, column_id: u32) -> Result<Option<Cow<'_, str>>, F
 fn column_block(rows: &[BuildRow], column_id: u32) -> Result<SourceFormBlock, FormatError> {
     let mut presence = vec![0u8; rows.len().div_ceil(8)];
     let mut values = StringColumn::new();
+    if column_id == column_ids::EXTERNAL_ID {
+        let mut scratch = String::new();
+        for (index, row) in rows.iter().enumerate() {
+            let Some(id) = &row.external_id else { continue };
+            if id.is_empty() || id.len() > EXTERNAL_ID_MAX_BYTES {
+                return Err(FormatError::Structural {
+                    rule: "an external id is 1 to 255 bytes",
+                });
+            }
+            scratch.clear();
+            hex_lower_into(id, &mut scratch);
+            if let Some(byte) = presence.get_mut(index / 8) {
+                *byte |= 1 << (index % 8);
+            }
+            values.push(Some(&scratch));
+        }
+        return Ok((column_id, presence, ColumnData::Strings(values)));
+    }
     for (index, row) in rows.iter().enumerate() {
         if let Some(text) = stored_text(row, column_id)? {
             if let Some(byte) = presence.get_mut(index / 8) {

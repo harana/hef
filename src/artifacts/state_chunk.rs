@@ -97,12 +97,14 @@ impl StateTree {
     /// The chunks of this tree that `previous` does not have, in storing order: all an upload has to store when
     /// `previous` is already stored.
     pub fn new_chunks(&self, previous: &StateTree) -> Vec<SealedStateChunk> {
+        self.new_chunks_iter(previous).cloned().collect()
+    }
+
+    /// The same chunks as [`StateTree::new_chunks`], in the same order, borrowed from this tree instead of copied, so
+    /// an upload or a count never duplicates their bytes.
+    pub fn new_chunks_iter<'a>(&'a self, previous: &'a StateTree) -> impl Iterator<Item = &'a SealedStateChunk> {
         let stored: HashSet<&[u8; 32]> = previous.chunks.iter().map(|chunk| &chunk.address).collect();
-        self.chunks
-            .iter()
-            .filter(|chunk| !stored.contains(&chunk.address))
-            .cloned()
-            .collect()
+        self.chunks.iter().filter(move |chunk| !stored.contains(&chunk.address))
     }
 }
 

@@ -122,21 +122,24 @@ impl RewritePlan {
 pub fn plan_stripe_reuse(changes: &[StripeChange], _header_identical_len: u64) -> RewritePlan {
     let dispositions: Vec<StripeDisposition> = changes
         .iter()
-        .map(|change| {
-            if change.changed || change.uncertain {
-                StripeDisposition::Rebuild {
-                    stripe_id: change.stripe.stripe_id,
-                }
-            } else {
-                StripeDisposition::Reuse {
-                    byte_len: change.stripe.byte_len,
-                    source_offset: change.stripe.file_offset,
-                }
-            }
-        })
+        .map(|change| disposition(&change.stripe, !(change.changed || change.uncertain)))
         .collect();
 
     RewritePlan { dispositions }
+}
+
+/// Copies `stripe`'s bytes from its own offset when `reusable`, otherwise rebuilds it.
+fn disposition(stripe: &StripeEntry, reusable: bool) -> StripeDisposition {
+    if reusable {
+        StripeDisposition::Reuse {
+            byte_len: stripe.byte_len,
+            source_offset: stripe.file_offset,
+        }
+    } else {
+        StripeDisposition::Rebuild {
+            stripe_id: stripe.stripe_id,
+        }
+    }
 }
 
 /// The byte range a stripe occupies in a built file, or `None` if the footer's offsets fall outside the bytes.
@@ -170,7 +173,7 @@ pub fn plan_rewrite(source: &BuiltHef, replacement: &BuiltHef) -> Result<Rewrite
         source_by_checksum.entry(*checksum).or_insert(stripe);
     }
 
-    let changes: Vec<StripeChange> = replacement
+    let dispositions: Vec<StripeDisposition> = replacement
         .footer
         .stripes
         .iter()
@@ -190,22 +193,14 @@ pub fn plan_rewrite(source: &BuiltHef, replacement: &BuiltHef) -> Result<Rewrite
                     }
                 });
             match reused {
-                // Carry the *source* stripe so `Reuse.source_offset` points at where the bytes live in the source.
-                Some(source_stripe) => StripeChange {
-                    changed: false,
-                    stripe: **source_stripe,
-                    uncertain: false,
-                },
-                None => StripeChange {
-                    changed: true,
-                    stripe: *replacement_stripe,
-                    uncertain: false,
-                },
+                // Copy from the *source* stripe so `Reuse.source_offset` points at where the bytes live in the source.
+                Some(source_stripe) => disposition(source_stripe, true),
+                None => disposition(replacement_stripe, false),
             }
         })
         .collect();
 
-    Ok(plan_stripe_reuse(&changes, 0))
+    Ok(RewritePlan { dispositions })
 }
 
 /// The graph to build a rewritten graph file with: `sources`, one subject's files in order, each starting right after
@@ -285,7 +280,7 @@ pub fn rebuild_graph_input(sources: &[HefFile], later: &[HefFile]) -> Result<Gra
                     );
                 }
                 for kind in [EdgeKind::Auth, EdgeKind::Prev] {
-                    for child in edges.children(sn, kind) {
+                    for child in edges.children_iter(sn, kind) {
                         if child >= end_sn {
                             inbound.push(GraphEdge {
                                 child,
