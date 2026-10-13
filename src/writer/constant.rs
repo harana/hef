@@ -12,6 +12,10 @@ pub(crate) const AUDIT_REWRITE_REFUSED: FormatError = FormatError::Structural {
 };
 
 /// Why a compaction publish refuses an audit input or output.
+/// Rows an audit build digests at once before folding them into the hash chain, which bounds the digest scratch
+/// whatever the file's size.
+pub(crate) const AUDIT_DIGEST_BATCH_ROWS: usize = 4096;
+
 pub(crate) const AUDIT_COMPACTION_REFUSED: &str = "an audit file is never compacted";
 
 /// The width of a time-series file's rollup buckets when the build configuration names none: one minute of

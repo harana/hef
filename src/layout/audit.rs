@@ -74,6 +74,66 @@ impl<'a> From<&'a PayloadRead> for DigestPayload<'a> {
     }
 }
 
+/// One row's envelope as its digest covers it, borrowed from wherever the row lives, so neither the writer nor the
+/// verifier copies the envelope's text to hash it.
+///
+/// Text fields borrow; everything else is the plain scalar the digest encodes.
+///
+/// See: hef-file-layout/spec.md
+pub(crate) struct DigestEnvelope<'a> {
+    pub(crate) account_id: Option<&'a str>,
+    pub(crate) account_id_hash_low: u64,
+    pub(crate) actor_id: Option<&'a str>,
+    pub(crate) actor_id_hash_low: u64,
+    pub(crate) dedupe_hash_high: u64,
+    pub(crate) dedupe_hash_low: u64,
+    pub(crate) entity_id: Option<&'a str>,
+    pub(crate) entity_id_hash_high: u64,
+    pub(crate) entity_id_hash_low: u64,
+    pub(crate) entity_type: &'a str,
+    pub(crate) event_id: u128,
+    pub(crate) event_type: &'a str,
+    pub(crate) flags: u32,
+    /// Physical nanoseconds.
+    pub(crate) ingested_at: i64,
+    /// Physical nanoseconds.
+    pub(crate) occurred_at: i64,
+    pub(crate) schema_version: u32,
+    pub(crate) source: &'a str,
+    pub(crate) stream_id: u64,
+    pub(crate) stream_sequence: u64,
+    pub(crate) tenant_id: u128,
+    pub(crate) trace_id_hash_low: u64,
+}
+
+impl<'a> From<&'a EventEnvelope> for DigestEnvelope<'a> {
+    fn from(envelope: &'a EventEnvelope) -> Self {
+        DigestEnvelope {
+            account_id: envelope.account_id.as_deref(),
+            account_id_hash_low: envelope.account_id_hash_low,
+            actor_id: envelope.actor_id.as_deref(),
+            actor_id_hash_low: envelope.actor_id_hash_low,
+            dedupe_hash_high: envelope.dedupe_hash_high,
+            dedupe_hash_low: envelope.dedupe_hash_low,
+            entity_id: envelope.entity_id.as_deref(),
+            entity_id_hash_high: envelope.entity_id_hash_high,
+            entity_id_hash_low: envelope.entity_id_hash_low,
+            entity_type: &envelope.entity_type,
+            event_id: envelope.event_id.uuid().as_u128(),
+            event_type: &envelope.event_type,
+            flags: envelope.flags.0,
+            ingested_at: envelope.ingested_at.physical_nanos(),
+            occurred_at: envelope.occurred_at.physical_nanos(),
+            schema_version: envelope.schema_version,
+            source: &envelope.source,
+            stream_id: envelope.stream_id.0,
+            stream_sequence: envelope.stream_sequence,
+            tenant_id: envelope.tenant_id.uuid().as_u128(),
+            trace_id_hash_low: envelope.trace_id_hash_low,
+        }
+    }
+}
+
 /// The digest of one row's contents, the half of its hash that does not depend on the rows before it. A function of
 /// the row alone, so the writer and a verifier reading the row back out of the file compute the same digest.
 pub(crate) fn row_digest(
@@ -82,29 +142,39 @@ pub(crate) fn row_digest(
     envelope: &EventEnvelope,
     payload: DigestPayload<'_>,
 ) -> Result<[u8; 32], FormatError> {
+    envelope_row_digest(epoch, sequence, &envelope.into(), payload)
+}
+
+/// [`row_digest`] over a borrowed envelope: the one encoder every row digest goes through.
+pub(crate) fn envelope_row_digest(
+    epoch: u64,
+    sequence: u64,
+    envelope: &DigestEnvelope<'_>,
+    payload: DigestPayload<'_>,
+) -> Result<[u8; 32], FormatError> {
     let mut out = Writer::with_capacity(ROW_DIGEST_INPUT_CAPACITY);
     out.put_u64(epoch);
     out.put_u64(sequence);
-    put_optional_text(&mut out, envelope.account_id.as_deref());
+    put_optional_text(&mut out, envelope.account_id);
     out.put_u64(envelope.account_id_hash_low);
-    put_optional_text(&mut out, envelope.actor_id.as_deref());
+    put_optional_text(&mut out, envelope.actor_id);
     out.put_u64(envelope.actor_id_hash_low);
     out.put_u64(envelope.dedupe_hash_high);
     out.put_u64(envelope.dedupe_hash_low);
-    put_optional_text(&mut out, envelope.entity_id.as_deref());
+    put_optional_text(&mut out, envelope.entity_id);
     out.put_u64(envelope.entity_id_hash_high);
     out.put_u64(envelope.entity_id_hash_low);
-    put_text(&mut out, &envelope.entity_type);
-    out.put_u128(envelope.event_id.uuid().as_u128());
-    put_text(&mut out, &envelope.event_type);
-    out.put_u32(envelope.flags.0);
-    out.put_i64(envelope.ingested_at.physical_nanos());
-    out.put_i64(envelope.occurred_at.physical_nanos());
+    put_text(&mut out, envelope.entity_type);
+    out.put_u128(envelope.event_id);
+    put_text(&mut out, envelope.event_type);
+    out.put_u32(envelope.flags);
+    out.put_i64(envelope.ingested_at);
+    out.put_i64(envelope.occurred_at);
     out.put_u32(envelope.schema_version);
-    put_text(&mut out, &envelope.source);
-    out.put_u64(envelope.stream_id.0);
+    put_text(&mut out, envelope.source);
+    out.put_u64(envelope.stream_id);
     out.put_u64(envelope.stream_sequence);
-    out.put_u128(envelope.tenant_id.uuid().as_u128());
+    out.put_u128(envelope.tenant_id);
     out.put_u64(envelope.trace_id_hash_low);
     match payload {
         DigestPayload::None => out.put_u8(0),

@@ -1,7 +1,9 @@
 use super::*;
 use crate::benchmarks::{AuditFileOverheadMeasurement, audit_file_overhead_gate_passes};
+use crate::events::EventEnvelope;
 use crate::invariants::sim::SerialEncodeExecutor;
 use crate::layout::LayoutTargets;
+use crate::layout::audit::row_digest;
 use crate::layout::constant::AUDIT_GENESIS;
 use crate::layout::footer::RetentionMode;
 use crate::writer::build::{
@@ -11,7 +13,7 @@ use crate::writer::build::{
     update_hef_file_with_executor,
 };
 use crate::writer::compaction::plan_rewrite;
-use crate::writer::constant::AUDIT_REWRITE_REFUSED;
+use crate::writer::constant::{AUDIT_DIGEST_BATCH_ROWS, AUDIT_REWRITE_REFUSED};
 use crate::writer::projection::build_entity_projection;
 use crate::writer::source_form::tests::{plain_row, source_form_config};
 use std::time::Instant;
@@ -181,6 +183,81 @@ fn an_audit_file_chains_from_the_supplied_start() {
     // The same rows chained from a different start end somewhere else.
     assert_ne!(next_trail.chain_end, trail.chain_end);
     assert_eq!(next_trail.retention, settings().retention);
+}
+
+/// The chain end of `rows` the old way: an owned envelope per row, every digest collected, then one fold.
+fn reference_chain_end(rows: &[BuildRow], chain_start: [u8; 32]) -> [u8; 32] {
+    rows.iter().fold(chain_start, |hash, row| {
+        let envelope = &row.envelope;
+        let owned = EventEnvelope {
+            account_id: envelope.account_id.clone(),
+            account_id_hash_low: envelope.account_id_hash_low,
+            actor_id: envelope.actor_id.clone(),
+            actor_id_hash_low: envelope.actor_id_hash_low,
+            dedupe_hash_high: envelope.dedupe_hash_high,
+            dedupe_hash_low: envelope.dedupe_hash_low,
+            entity_id: envelope.entity_id.clone(),
+            entity_id_hash_high: envelope.entity_id_hash_high,
+            entity_id_hash_low: envelope.entity_id_hash_low,
+            entity_type: envelope.entity_type.to_string(),
+            event_id: envelope.event_id,
+            event_type: envelope.event_type.to_string(),
+            flags: envelope.flags,
+            ingested_at: envelope.ingested_at,
+            occurred_at: envelope.occurred_at,
+            schema_version: envelope.schema_version,
+            source: envelope.source.to_string(),
+            stream_id: envelope.stream_id,
+            stream_sequence: envelope.stream_sequence,
+            tenant_id: envelope.tenant_id,
+            trace_id_hash_low: envelope.trace_id_hash_low,
+        };
+        let fields: Vec<(&str, &VariantValue)>;
+        let payload = match &row.payload {
+            BuildPayload::None => DigestPayload::None,
+            BuildPayload::Object(object) => {
+                fields = object.iter().map(|(name, value)| (&**name, value)).collect();
+                DigestPayload::Object(&fields)
+            }
+            BuildPayload::Whole(value) => DigestPayload::Value(value),
+            _ => panic!("the reference covers empty, object and whole payloads only"),
+        };
+        row_hash(&hash, &row_digest(row.epoch, row.sequence, &owned, payload).unwrap())
+    })
+}
+
+#[test]
+fn batched_chain_matches_one_fold_over_owned_envelopes() {
+    let batch = 3;
+    for count in [0, 1, batch - 1, batch, batch + 1, 2 * batch + 1] {
+        let rows: Vec<BuildRow> = (0..count as u64).map(plain_row).collect();
+        let start = [7u8; 32];
+        assert_eq!(
+            chain_end(&rows, start, batch).unwrap(),
+            reference_chain_end(&rows, start),
+            "{count} rows"
+        );
+    }
+}
+
+#[test]
+fn the_production_batch_size_matches_one_fold() {
+    let batch = AUDIT_DIGEST_BATCH_ROWS;
+    for count in [0, 1, batch - 1, batch, batch + 1, 2 * batch + 1] {
+        let rows: Vec<BuildRow> = (0..count as u64).map(plain_row).collect();
+        assert_eq!(
+            chain_end(&rows, AUDIT_GENESIS, batch).unwrap(),
+            reference_chain_end(&rows, AUDIT_GENESIS),
+            "{count} rows"
+        );
+    }
+}
+
+#[test]
+fn a_bad_row_in_a_later_batch_fails_the_chain() {
+    let mut rows: Vec<BuildRow> = (0..7).map(plain_row).collect();
+    rows[5].external_id = Some(b"x".to_vec());
+    assert!(chain_end(&rows, AUDIT_GENESIS, 3).is_err());
 }
 
 fn footer_len(built: &BuiltHef) -> usize {
