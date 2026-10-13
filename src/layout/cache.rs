@@ -72,19 +72,27 @@ pub struct BlockCache {
 }
 
 /// The in-memory tier: least-recently-used pieces are dropped once the held bytes pass the budget.
+///
+/// Recency is a doubly linked list threaded through `slots` by index, so a hit moves its piece to the front and an
+/// eviction takes the back without searching every entry. Slots freed by eviction or removal are reused.
 #[derive(Debug)]
 struct MemoryTier {
     budget_bytes: u64,
-    entries: HashMap<BlockKey, MemoryEntry>,
+    entries: HashMap<BlockKey, usize>,
+    free_slots: Vec<usize>,
     held_bytes: u64,
-    /// Monotonic access counter; each hit or insert stamps the entry it touched.
-    tick: u64,
+    least_recent: Option<usize>,
+    most_recent: Option<usize>,
+    slots: Vec<MemorySlot>,
 }
 
+/// One position in the memory tier's recency list; `bytes` is `None` while the slot is free.
 #[derive(Debug)]
-struct MemoryEntry {
-    bytes: Arc<[u8]>,
-    last_used: u64,
+struct MemorySlot {
+    bytes: Option<Arc<[u8]>>,
+    key: BlockKey,
+    newer: Option<usize>,
+    older: Option<usize>,
 }
 
 impl std::fmt::Debug for BlockCache {
@@ -105,8 +113,11 @@ impl BlockCache {
             memory: Mutex::new(MemoryTier {
                 budget_bytes: memory_budget_bytes,
                 entries: HashMap::new(),
+                free_slots: Vec::new(),
                 held_bytes: 0,
-                tick: 0,
+                least_recent: None,
+                most_recent: None,
+                slots: Vec::new(),
             }),
         }
     }
@@ -121,11 +132,8 @@ impl BlockCache {
     pub(crate) fn get(&self, key: &BlockKey) -> Option<Arc<[u8]>> {
         {
             let mut memory = self.memory.lock().unwrap_or_else(PoisonError::into_inner);
-            memory.tick += 1;
-            let tick = memory.tick;
-            if let Some(entry) = memory.entries.get_mut(key) {
-                entry.last_used = tick;
-                return Some(Arc::clone(&entry.bytes));
+            if let Some(bytes) = memory.get(key) {
+                return Some(bytes);
             }
         }
         let bytes: Arc<[u8]> = self.disk.as_ref()?.get(key).ok().flatten()?.into();
@@ -152,8 +160,8 @@ impl BlockCache {
     pub(crate) fn remove(&self, key: &BlockKey) {
         {
             let mut memory = self.memory.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(entry) = memory.entries.remove(key) {
-                memory.held_bytes -= entry.bytes.len() as u64;
+            if let Some(slot) = memory.entries.remove(key) {
+                memory.release(slot);
             }
         }
         if let Some(disk) = &self.disk {
@@ -163,34 +171,88 @@ impl BlockCache {
 }
 
 impl MemoryTier {
+    fn get(&mut self, key: &BlockKey) -> Option<Arc<[u8]>> {
+        let slot = *self.entries.get(key)?;
+        self.unlink(slot);
+        self.push_most_recent(slot);
+        self.slots[slot].bytes.clone()
+    }
+
     fn insert(&mut self, key: BlockKey, bytes: Arc<[u8]>) {
         let len = bytes.len() as u64;
         if len > self.budget_bytes {
             return;
         }
-        self.tick += 1;
-        let entry = MemoryEntry {
-            bytes,
-            last_used: self.tick,
+        let slot = match self.entries.get(&key) {
+            Some(&slot) => {
+                self.unlink(slot);
+                let replaced = self.slots[slot].bytes.replace(bytes);
+                self.held_bytes -= replaced.map_or(0, |replaced| replaced.len() as u64);
+                slot
+            }
+            None => {
+                let fresh = MemorySlot {
+                    bytes: Some(bytes),
+                    key,
+                    newer: None,
+                    older: None,
+                };
+                let slot = match self.free_slots.pop() {
+                    Some(slot) => {
+                        self.slots[slot] = fresh;
+                        slot
+                    }
+                    None => {
+                        self.slots.push(fresh);
+                        self.slots.len() - 1
+                    }
+                };
+                self.entries.insert(key, slot);
+                slot
+            }
         };
-        if let Some(replaced) = self.entries.insert(key, entry) {
-            self.held_bytes -= replaced.bytes.len() as u64;
-        }
+        self.push_most_recent(slot);
         self.held_bytes += len;
         while self.held_bytes > self.budget_bytes {
-            let Some(evict) = self
-                .entries
-                .iter()
-                .filter(|(candidate, _)| **candidate != key)
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(candidate, _)| *candidate)
-            else {
+            // The piece just admitted is the most recent, so it is the oldest only once it is all that is left.
+            let Some(oldest) = self.least_recent.filter(|&oldest| oldest != slot) else {
                 break;
             };
-            if let Some(evicted) = self.entries.remove(&evict) {
-                self.held_bytes -= evicted.bytes.len() as u64;
-            }
+            let oldest_key = self.slots[oldest].key;
+            self.entries.remove(&oldest_key);
+            self.release(oldest);
         }
+    }
+
+    /// Unlinks a slot already removed from `entries`, gives back its bytes and keeps it for reuse.
+    fn release(&mut self, slot: usize) {
+        self.unlink(slot);
+        let bytes = self.slots[slot].bytes.take();
+        self.held_bytes -= bytes.map_or(0, |bytes| bytes.len() as u64);
+        self.free_slots.push(slot);
+    }
+
+    fn unlink(&mut self, slot: usize) {
+        let MemorySlot { newer, older, .. } = self.slots[slot];
+        match newer {
+            Some(newer) => self.slots[newer].older = older,
+            None => self.most_recent = older,
+        }
+        match older {
+            Some(older) => self.slots[older].newer = newer,
+            None => self.least_recent = newer,
+        }
+        self.slots[slot].newer = None;
+        self.slots[slot].older = None;
+    }
+
+    fn push_most_recent(&mut self, slot: usize) {
+        self.slots[slot].older = self.most_recent;
+        match self.most_recent {
+            Some(previous) => self.slots[previous].newer = Some(slot),
+            None => self.least_recent = Some(slot),
+        }
+        self.most_recent = Some(slot);
     }
 }
 
