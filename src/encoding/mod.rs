@@ -1747,32 +1747,11 @@ struct NullStream {
     row_count: usize,
 }
 
-/// Sets bits `[start, end)` in a packed little-endian bitmap, byte-filling whole bytes and masking only the two
-/// partial edge bytes rather than setting one bit at a time.
-fn set_bit_range(bits: &mut [u8], start: usize, end: usize) {
-    if start >= end {
-        return;
-    }
-    let start_byte = start / 8;
-    let end_byte = (end - 1) / 8;
-    let low = start % 8;
-    let high = (end - 1) % 8;
-    if start_byte == end_byte {
-        bits[start_byte] |= (0xFFu8 << low) & (0xFFu8 >> (7 - high));
-        return;
-    }
-    bits[start_byte] |= 0xFFu8 << low;
-    for byte in &mut bits[start_byte + 1..end_byte] {
-        *byte = 0xFF;
-    }
-    bits[end_byte] |= 0xFFu8 >> (7 - high);
-}
-
 /// Calls `emit(start, end)` for each maximal `[start, end)` run of present rows, in row order.
-fn each_present_run(values: &StringColumn, mut emit: impl FnMut(usize, usize)) {
+fn each_present_run(presence: &[bool], mut emit: impl FnMut(usize, usize)) {
     let mut run_start: Option<usize> = None;
-    for (index, value) in values.iter().enumerate() {
-        match (value.is_some(), run_start) {
+    for (index, &present) in presence.iter().enumerate() {
+        match (present, run_start) {
             (true, None) => run_start = Some(index),
             (false, Some(start)) => {
                 emit(start, index);
@@ -1782,7 +1761,7 @@ fn each_present_run(values: &StringColumn, mut emit: impl FnMut(usize, usize)) {
         }
     }
     if let Some(start) = run_start {
-        emit(start, values.len());
+        emit(start, presence.len());
     }
 }
 
@@ -1792,18 +1771,14 @@ impl NullStream {
     /// byte-identical encodes across nodes hold unchanged.
     fn from_values(values: &StringColumn) -> Self {
         // First pass counts only, so the run list or bitmap is allocated once, for the form actually chosen.
-        let row_count = values.len();
+        let presence = values.presence();
+        let row_count = presence.len();
         let mut present_count = 0usize;
         let mut run_count = 0usize;
         let mut previous_present = false;
-        for value in values.iter() {
-            let present = value.is_some();
-            if present {
-                present_count += 1;
-                if !previous_present {
-                    run_count += 1;
-                }
-            }
+        for &present in presence {
+            present_count += usize::from(present);
+            run_count += usize::from(present && !previous_present);
             previous_present = present;
         }
         let form = if present_count == 0 {
@@ -1812,11 +1787,17 @@ impl NullStream {
             NullStreamForm::AllPresent
         } else if 4 + run_count * 8 < row_count.div_ceil(8) {
             let mut runs: Vec<(u32, u32)> = Vec::with_capacity(run_count);
-            each_present_run(values, |start, end| runs.push((start as u32, end as u32)));
+            each_present_run(presence, |start, end| runs.push((start as u32, end as u32)));
             NullStreamForm::Runs(runs)
         } else {
+            // LSB-0: row `8 * byte + bit` is bit `bit` of byte `byte`.
             let mut raw = vec![0u8; row_count.div_ceil(8)];
-            each_present_run(values, |start, end| set_bit_range(&mut raw, start, end));
+            for (byte, rows) in raw.iter_mut().zip(presence.chunks(8)) {
+                *byte = rows
+                    .iter()
+                    .enumerate()
+                    .fold(0u8, |bits, (bit, &present)| bits | (u8::from(present) << bit));
+            }
             NullStreamForm::Raw(raw)
         };
         Self { form, row_count }
