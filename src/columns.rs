@@ -10,6 +10,7 @@ use super::error::FormatError;
 use super::events::variant::VariantValue;
 use super::layout::footer::ColumnKind;
 use hashbrown::{HashMap, HashSet};
+use std::cmp::Ordering;
 
 /// Stable ids for the required physical columns.
 pub mod column_ids {
@@ -630,27 +631,19 @@ impl PathStatistics {
         if self.rows == 0 {
             return Vec::new();
         }
-        let mut candidates: Vec<(u64, String, ColumnKind)> = Vec::new();
-        for (field_id, observation) in self.field_observations() {
-            let Some(path) = field_names.get(field_id as usize) else {
-                continue;
-            };
+        select_sparse(self.field_observations().filter_map(|(field_id, observation)| {
+            let path = field_names.get(field_id as usize)?;
             if excluded.contains(&field_id) || path.len() > u16::MAX as usize {
-                continue;
+                return None;
             }
             let present = observation.present * PERCENT_SCALE;
             if present < self.rows * u64::from(SPARSE_SHRED_MIN_PRESENCE_PERCENT)
                 || present >= self.rows * u64::from(SHRED_MIN_PRESENCE_PERCENT)
             {
-                continue;
+                return None;
             }
-            if let Some(kind) = consensus_kind(observation) {
-                candidates.push((observation.present, path.clone(), kind));
-            }
-        }
-        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        candidates.truncate(SPARSE_KEYS_PER_FILE_MAX);
-        candidates.into_iter().map(|(_, path, kind)| (path, kind)).collect()
+            consensus_kind(observation).map(|kind| (observation.present, path.as_str(), kind))
+        }))
     }
 
     fn field_observations(&self) -> Box<dyn Iterator<Item = (u32, &PathObservation)> + '_> {
@@ -697,27 +690,50 @@ impl PathStatistics {
         if self.rows == 0 {
             return Vec::new();
         }
-        let mut candidates: Vec<(u64, String, ColumnKind)> = Vec::new();
-        for (path, observation) in &self.paths {
+        select_sparse(self.paths.iter().filter_map(|(path, observation)| {
             // The footer's key-set section stores each path behind a u16 length prefix; a longer path cannot be
             // represented, so it stays residual.
             if excluded.contains(&path.as_str()) || path.len() > u16::MAX as usize {
-                continue;
+                return None;
             }
             let present = observation.present * PERCENT_SCALE;
             if present < self.rows * u64::from(SPARSE_SHRED_MIN_PRESENCE_PERCENT)
                 || present >= self.rows * u64::from(SHRED_MIN_PRESENCE_PERCENT)
             {
-                continue;
+                return None;
             }
-            if let Some(kind) = consensus_kind(observation) {
-                candidates.push((observation.present, path.clone(), kind));
+            consensus_kind(observation).map(|kind| (observation.present, path.as_str(), kind))
+        }))
+    }
+}
+
+/// Keeps the best [`SPARSE_KEYS_PER_FILE_MAX`] of `candidates` (present count, path, kind), densest first and ties by
+/// path, cloning only the paths it returns. Matches a stable full sort followed by truncation, so among exactly equal
+/// entries the earlier one wins.
+fn select_sparse<'a>(candidates: impl Iterator<Item = (u64, &'a str, ColumnKind)>) -> Vec<(String, ColumnKind)> {
+    let mut top: Vec<(u64, &str, ColumnKind)> = Vec::new();
+    for candidate in candidates {
+        let sorts_first = |kept: &(u64, &str, ColumnKind)| sparse_order(kept, &candidate) != Ordering::Greater;
+        if top.len() >= SPARSE_KEYS_PER_FILE_MAX {
+            match top.last() {
+                Some(worst) if !sorts_first(worst) => {
+                    top.pop();
+                }
+                _ => continue,
             }
         }
-        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        candidates.truncate(SPARSE_KEYS_PER_FILE_MAX);
-        candidates.into_iter().map(|(_, path, kind)| (path, kind)).collect()
+        let position = top.partition_point(sorts_first);
+        if top.capacity() == 0 {
+            top.reserve_exact(SPARSE_KEYS_PER_FILE_MAX);
+        }
+        top.insert(position, candidate);
     }
+    top.into_iter().map(|(_, path, kind)| (path.to_owned(), kind)).collect()
+}
+
+/// The sparse selection order: higher present count first, then the lexicographically smaller path.
+fn sparse_order(a: &(u64, &str, ColumnKind), b: &(u64, &str, ColumnKind)) -> Ordering {
+    b.0.cmp(&a.0).then(a.1.cmp(b.1))
 }
 
 /// The single kind a path's observations agree on past the consensus bar, or `None` when the path is too mixed to

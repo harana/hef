@@ -142,3 +142,91 @@ fn very_wide_field_id_statistics_use_the_sparse_fallback() {
         vec![("wide_tail".to_owned(), ColumnKind::I64)]
     );
 }
+
+/// The original selection: a stable full sort densest first, ties by path, truncated to the budget.
+fn reference_select_sparse(candidates: &[(u64, &str, ColumnKind)]) -> Vec<(String, ColumnKind)> {
+    let mut owned: Vec<(u64, String, ColumnKind)> = candidates
+        .iter()
+        .map(|&(present, path, kind)| (present, path.to_owned(), kind))
+        .collect();
+    owned.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    owned.truncate(SPARSE_KEYS_PER_FILE_MAX);
+    owned.into_iter().map(|(_, path, kind)| (path, kind)).collect()
+}
+
+#[test]
+fn bounded_sparse_selection_matches_the_full_sort() {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let kinds = [ColumnKind::I64, ColumnKind::String, ColumnKind::F64];
+    let names: Vec<String> = (0..5000)
+        .map(|i| format!("p\u{00e9}{:04}", (i * 7919) % 5000))
+        .collect();
+    for count in [0usize, 1, 15, 16, 17, 40, 5000] {
+        for present_range in [1u64, 3, 1000] {
+            let mut candidates: Vec<(u64, &str, ColumnKind)> = names
+                .iter()
+                .take(count)
+                .map(|name| {
+                    let kind = kinds.get((next() % 3) as usize).copied().unwrap_or(ColumnKind::I64);
+                    (next() % present_range, name.as_str(), kind)
+                })
+                .collect();
+            candidates.push((0, "", ColumnKind::String));
+            assert_eq!(
+                select_sparse(candidates.iter().copied()),
+                reference_select_sparse(&candidates),
+                "count {count}, present range {present_range}"
+            );
+            candidates.reverse();
+            assert_eq!(
+                select_sparse(candidates.iter().copied()),
+                reference_select_sparse(&candidates)
+            );
+        }
+    }
+    // Exactly equal entries keep their input order, as the stable sort did.
+    let duplicates: Vec<(u64, &str, ColumnKind)> = (0..20)
+        .map(|i| {
+            (
+                5,
+                "same",
+                if i % 2 == 0 {
+                    ColumnKind::I64
+                } else {
+                    ColumnKind::String
+                },
+            )
+        })
+        .collect();
+    assert_eq!(
+        select_sparse(duplicates.iter().copied()),
+        reference_select_sparse(&duplicates)
+    );
+}
+
+#[test]
+fn sparse_candidates_break_presence_ties_at_the_budget_by_path() {
+    let mut stats = PathStatistics::new();
+    for row in 0..100 {
+        let mut fields: Vec<(String, VariantValue)> = Vec::new();
+        if row < 10 {
+            for path in 0..20 {
+                fields.push((format!("tie{path:02}"), VariantValue::Int(row)));
+            }
+        }
+        if row < 20 {
+            fields.push(("dense_sparse".to_owned(), VariantValue::Int(row)));
+        }
+        let fields: Vec<(&str, VariantValue)> = fields.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        stats.observe(Some(&object(&fields)));
+    }
+    let mut expected = vec![("dense_sparse".to_owned(), ColumnKind::I64)];
+    expected.extend((0..15).map(|path| (format!("tie{path:02}"), ColumnKind::I64)));
+    assert_eq!(stats.sparse_candidates(&[]), expected);
+}
