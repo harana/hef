@@ -629,10 +629,10 @@ pub fn build_path_presence_artifact(
                 collect_payload_paths(&mut path, &value, &mut path_hashes);
             }
         }
-        let hashes: Vec<u64> = path_hashes.into_iter().collect();
+        let hash_count = path_hashes.len();
         extend_granule_ranges(&mut granule_ranges, granule.granule_id);
         pages.push(ArtifactPage {
-            bytes: PathPresenceIndex::build(&hashes).encode(),
+            bytes: PathPresenceIndex::build_from_hashes(path_hashes, hash_count).encode(),
             first_granule: granule.granule_id,
             last_granule: granule.granule_id,
         });

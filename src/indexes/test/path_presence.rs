@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use super::*;
 
 #[test]
@@ -86,5 +88,33 @@ fn build_from_hashes_and_paths_agree() {
             from_paths.might_contain_path(path),
             from_hashes.might_contain_path(path),
         );
+    }
+}
+
+#[test]
+fn encoding_matches_the_collect_and_copy_reference_byte_for_byte() {
+    for count in [0usize, 1, 25, 26, 51, 52, 300] {
+        let owned: Vec<String> = (0..count)
+            .map(|i| format!("attributes.\u{00e9}v\u{00e9}nement.{}.{}", i % 7, "x".repeat(i % 40)))
+            .collect();
+        let mut paths: Vec<&str> = owned.iter().map(String::as_str).collect();
+        paths.extend(owned.iter().take(count / 3).map(String::as_str));
+        let hashes: Vec<u64> = paths.iter().map(|&p| hash_path(p)).collect();
+        let mut reference = PATH_PRESENCE_MAGIC.to_le_bytes().to_vec();
+        reference.extend(SplitBlockBloomFilter::build(&hashes, BITS_PER_PATH).encode());
+
+        assert_eq!(PathPresenceIndex::build_from_paths(&paths).encode(), reference);
+        assert_eq!(PathPresenceIndex::build(&hashes).encode(), reference);
+
+        let distinct: HashSet<u64> = hashes.iter().copied().collect();
+        let mut sorted: Vec<u64> = distinct.iter().copied().collect();
+        sorted.sort_unstable();
+        let mut set_reference = PATH_PRESENCE_MAGIC.to_le_bytes().to_vec();
+        set_reference.extend(SplitBlockBloomFilter::build(&sorted, BITS_PER_PATH).encode());
+        let from_set = PathPresenceIndex::build_from_hashes(distinct.iter().copied(), distinct.len()).encode();
+        assert_eq!(from_set, set_reference);
+        sorted.reverse();
+        let reversed = PathPresenceIndex::build_from_hashes(sorted.iter().copied(), sorted.len()).encode();
+        assert_eq!(reversed, from_set);
     }
 }
