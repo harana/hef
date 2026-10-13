@@ -195,6 +195,27 @@ fn every_stored_key_returns_its_own_value_and_absent_keys_return_none() {
     }
 }
 
+#[test]
+fn each_granule_resolves_the_same_stripe_a_directory_scan_finds() {
+    let built = snapshot(&user_keys(2_000), 64);
+    let file = local(&built);
+    let stripes = &built.footer.stripes;
+    assert!(stripes.len() > 1);
+    for granule in &built.footer.granules {
+        let scanned = stripes
+            .iter()
+            .find(|stripe| stripe.stripe_id == granule.stripe_id)
+            .unwrap();
+        let resolved = file.stripe_by_id(granule.stripe_id).unwrap();
+        assert_eq!(
+            (resolved.file_offset, resolved.byte_len),
+            (scanned.file_offset, scanned.byte_len)
+        );
+    }
+    let missing = stripes.iter().map(|stripe| stripe.stripe_id).max().unwrap() + 1;
+    assert!(file.stripe_by_id(missing).is_none());
+}
+
 /// Keys whose model bytes repeat for a run longer than a granule widen the window by the run; the granules' first keys
 /// then pick the one holding the key (the lookups themselves are checked above).
 #[test]
