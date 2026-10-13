@@ -9,7 +9,7 @@
 use super::envelope::TimestampValue;
 use super::variant::{MAX_DEPTH, VariantValue};
 use crate::error::FormatError;
-use prost_reflect::{DynamicMessage, FieldDescriptor, MapKey, MessageDescriptor, ReflectMessage, Value};
+use prost_reflect::{DynamicMessage, EnumDescriptor, MapKey, MessageDescriptor, ReflectMessage, Value};
 use serde::de::{Deserialize, DeserializeSeed, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -58,7 +58,7 @@ pub fn transcode_with_scratch(
             let message = DynamicMessage::decode(descriptor.clone(), body).map_err(|_| FormatError::Structural {
                 rule: "declared-Protobuf ingest body did not decode against its registered schema",
             })?;
-            protobuf_message(&message)
+            protobuf_message(message)
         }
         SourceFormat::RawBytes => Ok(VariantValue::Binary(body.to_vec())),
     }
@@ -68,79 +68,83 @@ pub fn transcode_with_scratch(
 /// message are kept; unknown fields (numbers the schema does not declare) are dropped. A
 /// `google.protobuf.Timestamp` becomes a timestamp value rather than an object. Nesting needs no bound here: the
 /// Protobuf decoder already refuses messages nested past 100 levels, under the canonical format's limit.
-fn protobuf_message(message: &DynamicMessage) -> Result<VariantValue, FormatError> {
+fn protobuf_message(mut message: DynamicMessage) -> Result<VariantValue, FormatError> {
     if message.descriptor().full_name() == "google.protobuf.Timestamp" {
-        return protobuf_timestamp(message);
+        return protobuf_timestamp(&message);
     }
     let mut fields = BTreeMap::new();
-    for (field, value) in message.fields() {
+    // Drains the decoded values so strings and map keys move into the canonical tree instead of being cloned.
+    for (field, value) in message.take_fields() {
+        // Resolved once per field, not once per repeated item or map value. For a map field the enum comes from the
+        // entry's value field.
+        let enum_kind = match field.kind().as_message() {
+            Some(entry) if field.is_map() => entry.map_entry_value_field().kind(),
+            _ => field.kind(),
+        }
+        .as_enum()
+        .cloned();
+        let enum_kind = enum_kind.as_ref();
         let value = match value {
             Value::List(items) => {
                 let mut array = Vec::with_capacity(items.len());
                 for item in items {
-                    array.push(protobuf_value(&field, item)?);
+                    array.push(protobuf_value(enum_kind, item)?);
                 }
                 VariantValue::Array(array)
             }
             Value::Map(entries) => {
                 let mut object = BTreeMap::new();
                 for (key, item) in entries {
-                    object.insert(protobuf_map_key(key), protobuf_value(&field, item)?);
+                    object.insert(protobuf_map_key(key), protobuf_value(enum_kind, item)?);
                 }
                 VariantValue::Object(object)
             }
-            other => protobuf_value(&field, other)?,
+            other => protobuf_value(enum_kind, other)?,
         };
         fields.insert(field.name().to_owned(), value);
     }
     Ok(VariantValue::Object(fields))
 }
 
-/// Converts one scalar, enum, or nested-message value. For a map field the value kind comes from the entry's value
-/// field, so enum names resolve against the right enum.
-fn protobuf_value(field: &FieldDescriptor, value: &Value) -> Result<VariantValue, FormatError> {
+/// Converts one scalar, enum, or nested-message value. `enum_kind` is the field's enum, if it holds one, which names
+/// the enum numbers.
+fn protobuf_value(enum_kind: Option<&EnumDescriptor>, value: Value) -> Result<VariantValue, FormatError> {
     Ok(match value {
-        Value::Bool(value) => VariantValue::Bool(*value),
+        Value::Bool(value) => VariantValue::Bool(value),
         Value::Bytes(value) => VariantValue::Binary(value.to_vec()),
-        Value::EnumNumber(number) => {
-            let kind = match field.kind().as_message() {
-                Some(entry) if field.is_map() => entry.map_entry_value_field().kind(),
-                _ => field.kind(),
-            };
-            match kind.as_enum().and_then(|kind| kind.get_value(*number)) {
-                Some(known) => VariantValue::String(known.name().to_owned()),
-                None => VariantValue::Int(i64::from(*number)),
-            }
-        }
-        Value::F32(value) => VariantValue::Float(*value),
-        Value::F64(value) => VariantValue::Double(*value),
-        Value::I32(value) => VariantValue::Int(i64::from(*value)),
-        Value::I64(value) => VariantValue::Int(*value),
+        Value::EnumNumber(number) => match enum_kind.and_then(|kind| kind.get_value(number)) {
+            Some(known) => VariantValue::String(known.name().to_owned()),
+            None => VariantValue::Int(i64::from(number)),
+        },
+        Value::F32(value) => VariantValue::Float(value),
+        Value::F64(value) => VariantValue::Double(value),
+        Value::I32(value) => VariantValue::Int(i64::from(value)),
+        Value::I64(value) => VariantValue::Int(value),
         Value::List(_) | Value::Map(_) => {
             return Err(FormatError::Structural {
                 rule: "declared-Protobuf ingest body nests a repeated or map value directly",
             });
         }
         Value::Message(message) => protobuf_message(message)?,
-        Value::String(value) => VariantValue::String(value.clone()),
-        Value::U32(value) => VariantValue::Int(i64::from(*value)),
-        Value::U64(value) => match i64::try_from(*value) {
+        Value::String(value) => VariantValue::String(value),
+        Value::U32(value) => VariantValue::Int(i64::from(value)),
+        Value::U64(value) => match i64::try_from(value) {
             Ok(value) => VariantValue::Int(value),
             // Beyond i64: preserved losslessly as a scale-0 decimal, as JSON does.
             Err(_) => VariantValue::Decimal {
-                unscaled: i128::from(*value),
+                unscaled: i128::from(value),
                 scale: 0,
             },
         },
     })
 }
 
-fn protobuf_map_key(key: &MapKey) -> String {
+fn protobuf_map_key(key: MapKey) -> String {
     match key {
         MapKey::Bool(value) => value.to_string(),
         MapKey::I32(value) => value.to_string(),
         MapKey::I64(value) => value.to_string(),
-        MapKey::String(value) => value.clone(),
+        MapKey::String(value) => value,
         MapKey::U32(value) => value.to_string(),
         MapKey::U64(value) => value.to_string(),
     }
