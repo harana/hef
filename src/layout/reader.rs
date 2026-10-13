@@ -40,7 +40,6 @@ use crate::events::variant::{KeyDictionary, PathSegment, VariantRef, VariantValu
 use crate::file::bytes::{Reader, slice};
 use crate::file::constant::{TREE_TRAILER_LEN, TREE_TRAILER_MAGIC};
 use crate::file::integrity::RangeFault;
-use crate::indexes::bitmap::RoaringRangeBitmap;
 use crate::indexes::probabilistic::SplitBlockBloomFilter;
 use crate::indexes::rank_select::RankSelect;
 use crate::indexes::text_token::TextTokenIndex;
@@ -3562,7 +3561,7 @@ impl HefFile {
         // is pinned in the rank_select tests), never by collecting one row id per set bit.
         let read = self.read_column(column_id, granule_id)?;
         let bytes = column_data_bytes(&read.data);
-        let rank = RankSelect::from_bitmap(&RoaringRangeBitmap::from_packed_bits(&read.presence));
+        let rank = RankSelect::from_packed_bits(&read.presence);
         let decoded = Arc::new(CachedColumn { data: read.data, rank });
         let column = {
             let slot = self.column_cache.entry(key).or_insert(CachedColumnSlot {

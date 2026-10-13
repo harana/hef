@@ -146,6 +146,11 @@ impl RoaringRangeBitmap {
         &self.runs
     }
 
+    /// Consumes the bitmap and hands back its sorted `[start, end)` runs without copying them.
+    pub(crate) fn into_ranges(self) -> Vec<RowRange> {
+        self.runs
+    }
+
     /// Whether this bitmap holds no rows at all.
     pub fn is_empty(&self) -> bool {
         self.runs.is_empty()
