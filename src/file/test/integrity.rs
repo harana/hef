@@ -38,6 +38,27 @@ fn flat_segment_hashing_matches_the_single_threaded_hash_for_every_piece_shape()
 }
 
 #[test]
+fn a_single_segment_hashes_the_same_through_hash_tree_and_hash_segments() {
+    const PIECE: usize = PARALLEL_HASH_MIN_LEN;
+    for len in [
+        0usize,
+        1,
+        1023,
+        1024,
+        1025,
+        PIECE - 1,
+        PIECE,
+        PIECE + 1,
+        3 * PIECE,
+        3 * PIECE + 7,
+    ] {
+        let bytes = pattern(len);
+        assert_eq!(hash_tree(&bytes), hash_segments(&[&bytes])[0], "len {len}");
+        assert_eq!(hash_tree(&bytes), blake3::hash(&bytes), "len {len}");
+    }
+}
+
+#[test]
 fn crc64_locks_the_nvme_variant_and_detects_change() {
     // The CRC-64/NVME check value for the canonical "123456789" input.
     assert_eq!(crc64_nvme(b"123456789"), 0xae8b_1486_0a79_9888);

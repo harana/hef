@@ -1090,9 +1090,7 @@ impl HefFooter {
         }
         if fetched_start == 0 && fetched_end == stripe.byte_len {
             // The whole stripe is in hand: its checksum is the seal-authenticated root itself, so hash it directly.
-            let matches = crate::file::integrity::hash_segments(&[fetched])
-                .first()
-                .is_some_and(|root| root.as_bytes() == checksum);
+            let matches = crate::file::integrity::hash_tree(fetched).as_bytes() == checksum;
             if !matches {
                 return Err(RangeFault::Corrupt);
             }
@@ -1652,11 +1650,7 @@ impl StripeVerification {
             Some(matches) => *matches,
             None => {
                 let stripe_bytes = slice(bytes, stripe.file_offset as usize, stripe.byte_len as usize, "stripe")?;
-                *slot.get_or_init(|| {
-                    crate::file::integrity::hash_segments(&[stripe_bytes])
-                        .first()
-                        .is_some_and(|root| root.as_bytes() == checksum)
-                })
+                *slot.get_or_init(|| crate::file::integrity::hash_tree(stripe_bytes).as_bytes() == checksum)
             }
         };
         if matches {
