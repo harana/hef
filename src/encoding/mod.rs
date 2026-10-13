@@ -1498,9 +1498,9 @@ fn encode_byte_stream_split(values: &[f64], out: &mut Writer) {
 
 fn decode_byte_stream_split(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
     let count = reader.u32("byte-stream-split count")? as usize;
-    let mut planes: Vec<&[u8]> = Vec::with_capacity(8);
-    for _ in 0..8 {
-        planes.push(reader.take(count, "byte-stream-split plane")?);
+    let mut planes: [&[u8]; 8] = [&[]; 8];
+    for plane in planes.iter_mut() {
+        *plane = reader.take(count, "byte-stream-split plane")?;
     }
     // Each plane is exactly `count` bytes, so eight linear passes reassemble every value without a per-value bounds
     // check: pass `p` ORs each row's plane-`p` byte into bit position `8 * p`.
@@ -4538,7 +4538,9 @@ fn decode_string_framed_range(
     }
     let present_start = header.nulls.present_before(start);
     let present_end = header.nulls.present_before(effective_end);
-    let mut offsets = decode_offsets(&window.read(
+    // The offsets, then the arena bytes, lie ever further into the body, so both are read walking forward: each is
+    // borrowed from its frame when it fits in one, and the offsets are decoded before the arena is reached.
+    let mut offsets = decode_offsets(&window.read_forward(
         header.offsets_start + present_start * 4,
         (present_end - present_start + 1) * 4,
     )?);
@@ -4551,7 +4553,7 @@ fn decode_string_framed_range(
         }
     };
     let arena_start = header.offsets_start + (header.present_count + 1) * 4;
-    let data = window.read(arena_start + first, last - first)?;
+    let data = window.read_forward(arena_start + first, last - first)?;
     // The values were read out of the middle of the arena, so their offsets are rebased onto what was read.
     for offset in &mut offsets {
         *offset = offset.saturating_sub(first);
@@ -4599,8 +4601,8 @@ fn decode_plain_framed_range(
     // any block whose body length disagrees with that header, so a range read can never surface phantom rows a full
     // decode would silently drop.
     let count = {
-        let header = window.read(0, 4)?;
-        u32::from_le_bytes(header.as_slice().try_into().unwrap_or([0; 4])) as usize
+        let header = window.read_forward(0, 4)?;
+        u32::from_le_bytes(header[..].try_into().unwrap_or([0; 4])) as usize
     };
     let expected_plain_len = count.checked_mul(8).and_then(|body| body.checked_add(4));
     if expected_plain_len != Some(window.plain_len()) {
@@ -4613,7 +4615,8 @@ fn decode_plain_framed_range(
         return Ok(plain_rows(kind, &[]));
     }
     let byte_start = 4 + start * 8;
-    let row_bytes = window.read(byte_start, (effective_end - start) * 8)?;
+    // Borrowed straight out of the frame when the rows sit inside one; only a range straddling frames is gathered.
+    let row_bytes = window.read_forward(byte_start, (effective_end - start) * 8)?;
     Ok(plain_rows(kind, &row_bytes))
 }
 
@@ -4684,8 +4687,8 @@ fn decode_byte_stream_split_framed_range(bytes: &[u8], start: usize, end: usize)
     // One window for all 8 plane reads: a frame two planes share is decompressed once.
     let mut window = seekable_zstd::Window::open(bytes)?;
     let count = {
-        let header = window.read(0, 4)?;
-        u32::from_le_bytes(header.as_slice().try_into().unwrap_or([0; 4])) as usize
+        let header = window.read_forward(0, 4)?;
+        u32::from_le_bytes(header[..].try_into().unwrap_or([0; 4])) as usize
     };
     let expected_plain_len = count.checked_mul(8).and_then(|body| body.checked_add(4));
     if expected_plain_len != Some(window.plain_len()) {
@@ -4698,21 +4701,18 @@ fn decode_byte_stream_split_framed_range(bytes: &[u8], start: usize, end: usize)
         return Ok(ColumnData::F64(Vec::new()));
     }
     let row_span = effective_end - start;
-    let mut planes: Vec<Vec<u8>> = Vec::with_capacity(8);
-    for plane in 0..8 {
-        planes.push(window.read(4 + plane * count + start, row_span)?);
-    }
-    let mut values = Vec::with_capacity(row_span);
-    for index in 0..row_span {
-        let mut le = [0u8; 8];
-        for (slot, plane) in le.iter_mut().zip(planes.iter()) {
-            *slot = *plane.get(index).ok_or(FormatError::Truncated {
-                what: "byte-stream-split plane",
-            })?;
+    // The planes lie one after another in the body, so they are read walking forward and each is folded into the
+    // output before the next is reached: a plane inside one frame is borrowed from it, and at most one plane gathered
+    // across frames is held at a time. A frame two adjacent planes share stays inflated until the later one is read.
+    let mut bits = vec![0u64; row_span];
+    for plane_index in 0..8 {
+        let plane = window.read_forward(4 + plane_index * count + start, row_span)?;
+        let shift = (8 * plane_index) as u32;
+        for (slot, byte) in bits.iter_mut().zip(plane.iter()) {
+            *slot |= u64::from(*byte) << shift;
         }
-        values.push(f64::from_le_bytes(le));
     }
-    Ok(ColumnData::F64(values))
+    Ok(ColumnData::F64(bytemuck::cast_vec(bits)))
 }
 
 /// Narrows an owned value vector to rows `[start, end)` in place — dropping the tail, then shifting the kept rows down
