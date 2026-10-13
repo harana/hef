@@ -309,6 +309,153 @@ fn the_index_round_trips_and_refuses_damaged_bytes() {
     assert!(SnapshotKeyIndex::decode(&trailing).is_err());
 }
 
+/// The granule choice before first keys were binary-searched: walk the candidate granules from the last one back to
+/// the first whose first key is at or before `key`.
+fn reverse_scan(index: &SnapshotKeyIndex, key: &str, granules: &[GranuleEntry]) -> Option<(usize, u64, u64)> {
+    if !key.as_bytes().starts_with(&index.common_prefix) {
+        return None;
+    }
+    let window = index
+        .model
+        .estimate_position(model_key(key.as_bytes(), index.common_prefix.len()));
+    let from = window.search_from;
+    let to = window.search_to.saturating_add(index.longest_run.saturating_sub(1));
+    let first = granules.partition_point(|granule| granule.first_row_ordinal + u64::from(granule.row_count) <= from);
+    let end = granules.partition_point(|granule| granule.first_row_ordinal <= to);
+    (first..end)
+        .rev()
+        .find(|&position| {
+            index
+                .granule_first_keys
+                .get(position)
+                .is_some_and(|first_key| first_key.as_str() <= key)
+        })
+        .map(|position| (position, from, to))
+}
+
+/// Every stored key, and for each granule first key the key itself, keys just before and just after it, and keys
+/// that miss the shared prefix or sort before or after everything.
+fn probes(keys: &[String], index: &SnapshotKeyIndex) -> Vec<String> {
+    let mut probes = keys.to_vec();
+    for first_key in &index.granule_first_keys {
+        let mut shorter = first_key.clone();
+        shorter.pop();
+        probes.extend([
+            first_key.clone(),
+            shorter,
+            format!("{first_key}\0"),
+            format!("{first_key}~"),
+        ]);
+    }
+    probes.extend(["", "@", "~", "\u{10FFFF}"].map(str::to_owned));
+    probes
+}
+
+/// Asserts that `locate` picks the granule the walk from the last candidate back picks, for every probe and for
+/// directories cut short so the candidate window can come out empty.
+fn assert_matches_reverse_scan(index: &SnapshotKeyIndex, keys: &[String], granules: &[GranuleEntry]) {
+    let in_order = index.first_keys_in_order();
+    for cut in [0, 1, granules.len() / 2, granules.len()] {
+        let granules = granules.get(..cut).unwrap_or_default();
+        for probe in probes(keys, index) {
+            assert_eq!(
+                index.locate(&probe, granules, in_order),
+                reverse_scan(index, &probe, granules),
+                "{probe:?}, {cut} granules"
+            );
+            assert_eq!(
+                index.locate(&probe, granules, false),
+                reverse_scan(index, &probe, granules),
+                "{probe:?}, {cut} granules, walked"
+            );
+        }
+    }
+}
+
+#[test]
+fn binary_searched_granules_match_the_walk_from_the_last_candidate() {
+    for (keys, index_granularity) in [(user_keys(2_000), 64), (device_keys(), 64), (device_keys(), 16)] {
+        let built = snapshot(&keys, index_granularity);
+        let index = built.footer.snapshot_keys.as_ref().unwrap();
+        assert!(index.first_keys_in_order());
+        assert!(local(&built).snapshot_first_keys_in_order);
+        assert_matches_reverse_scan(index, &keys, &built.footer.granules);
+    }
+}
+
+/// First keys a decoder accepts but a writer never stores (out of order, repeated, fewer than the granules) still
+/// pick the same granule as before: out of order falls back to the walk.
+#[test]
+fn unusual_first_keys_pick_the_same_granule_as_the_walk() {
+    let keys = device_keys();
+    let built = snapshot(&keys, 16);
+    let index = built.footer.snapshot_keys.as_ref().unwrap();
+    let granules = &built.footer.granules;
+
+    let mut swapped = index.clone();
+    swapped.granule_first_keys.swap(3, 4);
+    swapped.granule_first_keys.swap(20, 40);
+    assert!(!swapped.first_keys_in_order());
+    assert_eq!(SnapshotKeyIndex::decode(&swapped.encode()).unwrap(), swapped);
+    assert_matches_reverse_scan(&swapped, &keys, granules);
+
+    let mut repeated = index.clone();
+    repeated.granule_first_keys[5] = repeated.granule_first_keys[4].clone();
+    repeated.granule_first_keys[6] = repeated.granule_first_keys[4].clone();
+    assert!(repeated.first_keys_in_order());
+    assert_matches_reverse_scan(&repeated, &keys, granules);
+
+    let mut fewer = index.clone();
+    fewer.granule_first_keys.truncate(granules.len() / 3);
+    assert!(fewer.first_keys_in_order());
+    assert_matches_reverse_scan(&fewer, &keys, granules);
+}
+
+/// The encoder as it stood before it wrote the model in place: the model encoded on its own, then copied in after
+/// its length.
+fn encode_with_model_copy(index: &SnapshotKeyIndex) -> Vec<u8> {
+    let model = index.model.encode();
+    let mut out = Writer::new();
+    out.put_u32(index.common_prefix.len() as u32);
+    out.put_slice(&index.common_prefix);
+    out.put_u32(index.granule_first_keys.len() as u32);
+    for key in &index.granule_first_keys {
+        out.put_u32(key.len() as u32);
+        out.put_slice(key.as_bytes());
+    }
+    out.put_u64(index.longest_run);
+    out.put_u32(model.len() as u32);
+    out.put_slice(&model);
+    out.into_bytes()
+}
+
+#[test]
+fn the_index_encodes_the_same_bytes_as_copying_the_model_in() {
+    let long_prefix: Vec<String> = (0..300)
+        .map(|i| format!("{}{i:04}", "tenant-0042/partition-0007/devices/".repeat(2)))
+        .collect();
+    let utf8 = ["ключ-α", "ключ-β", "ключ-γ", "ключ-γ✓", "ключ-δ"].map(str::to_owned);
+    let cases: [(Vec<String>, Vec<usize>); 6] = [
+        (vec!["only".to_owned()], vec![0]),
+        (vec!["apple".to_owned(), "zebra".to_owned()], vec![0, 1]),
+        (user_keys(500), vec![0, 200, 400]),
+        (device_keys(), (0..1_200).step_by(64).collect()),
+        (long_prefix, vec![0, 100, 299]),
+        (utf8.to_vec(), vec![0, 2]),
+    ];
+    for (keys, granule_first_rows) in cases {
+        let borrowed: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let index = SnapshotKeyIndex::build(&borrowed, &granule_first_rows).unwrap();
+        let bytes = index.encode();
+        assert_eq!(bytes, encode_with_model_copy(&index), "{keys:?}");
+        assert_eq!(SnapshotKeyIndex::decode(&bytes).unwrap(), index);
+    }
+    let mut empty = SnapshotKeyIndex::build(&["a"], &[]).unwrap();
+    empty.common_prefix.clear();
+    assert!(empty.granule_first_keys.is_empty());
+    assert_eq!(empty.encode(), encode_with_model_copy(&empty));
+}
+
 #[test]
 fn the_index_refuses_keys_out_of_order_or_repeated() {
     assert!(SnapshotKeyIndex::build(&["b", "a"], &[0]).is_err());

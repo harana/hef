@@ -14,6 +14,13 @@ use crate::layout::footer::SortDirection;
 /// Format tag at the front of an encoded [`LearnedPositionIndex`], so a decoder rejects bytes that are not one.
 const LEARNED_POSITION_MAGIC: u32 = 0x4C50_5831; // "LPX1"
 
+/// Bytes an encoded [`LearnedPositionIndex`] spends before its segments: the magic, column, projection, direction, error
+/// bound, row count and segment count.
+const LEARNED_POSITION_HEADER_BYTES: usize = 33;
+
+/// Bytes each encoded segment takes: its intercept, first key and slope.
+const LEARNED_POSITION_SEGMENT_BYTES: usize = 24;
+
 /// One linear segment of the piecewise model.
 ///
 /// Maps keys in the range `[key_lo, next_segment.key_lo)` to approximate row positions via `intercept + slope * (key -
@@ -117,7 +124,19 @@ impl LearnedPositionIndex {
     /// Serializes the index to bytes (magic, identity fields, then the segment list, floats stored as their exact IEEE
     /// bits). Pairs with [`LearnedPositionIndex::decode`] and round-trips exactly.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Writer::with_capacity(40 + self.segments.len() * 24);
+        let mut out = Writer::with_capacity(self.encoded_len());
+        self.encode_into(&mut out);
+        out.into_bytes()
+    }
+
+    /// How many bytes [`Self::encode`] produces, so a caller can size its buffer or a length prefix up front.
+    pub(crate) fn encoded_len(&self) -> usize {
+        LEARNED_POSITION_HEADER_BYTES + self.segments.len() * LEARNED_POSITION_SEGMENT_BYTES
+    }
+
+    /// Appends exactly the bytes of [`Self::encode`] to `out`, so a caller framing the index inside a larger buffer
+    /// writes it in place instead of copying a separate encoding in.
+    pub(crate) fn encode_into(&self, out: &mut Writer) {
         out.put_u32(LEARNED_POSITION_MAGIC);
         out.put_u32(self.column_id);
         out.put_u32(self.projection_id);
@@ -133,7 +152,6 @@ impl LearnedPositionIndex {
             out.put_i64(segment.key_lo);
             out.put_u64(segment.slope.to_bits());
         }
-        out.into_bytes()
     }
 
     /// Rebuilds an index from [`LearnedPositionIndex::encode`] output. Refuses on a wrong tag, an unknown sort

@@ -97,3 +97,10 @@ pub const GRAPH_HEDGE_MIN_SAMPLES: usize = 20;
 /// either side of the estimate (plus one, see `LearnedPositionIndex::build`), plus the longest run of keys sharing a
 /// model key. Small next to a granule, so the window almost always falls inside one.
 pub const SNAPSHOT_KEY_ERROR_BOUND: u64 = 32;
+
+/// Bytes an encoded snapshot key index spends on its own framing, apart from the prefix, keys and model it carries:
+/// the prefix length, key count, longest run and model length.
+pub const SNAPSHOT_KEY_INDEX_FRAMING_BYTES: usize = 20;
+
+/// Bytes of the length written before each granule first key in an encoded snapshot key index.
+pub const SNAPSHOT_KEY_LENGTH_BYTES: usize = 4;

@@ -1783,6 +1783,9 @@ pub struct HefFile {
     /// bytes per frame, so a whole file's worth costs far less than the decoded blocks `column_cache` budgets, and is
     /// bounded by the file's own granule count.
     residual_seek_tables: DashMap<u32, Arc<SeekTable>, ahash::RandomState>,
+    /// True when the footer's snapshot key index stores its granule first keys in order, checked once at open so a
+    /// snapshot lookup can binary-search them. False when there is no such index.
+    pub(super) snapshot_first_keys_in_order: bool,
     /// Where each stripe id sits in the footer's stripe directory, built once at open so a lookup by id never scans
     /// the directory. When an id repeats, the first entry wins, as a front-to-back scan would.
     stripe_position_by_id: HashMap<u32, usize>,
@@ -2102,6 +2105,10 @@ impl HefFile {
         for (position, stripe) in footer.stripes.iter().enumerate() {
             stripe_position_by_id.entry(stripe.stripe_id).or_insert(position);
         }
+        let snapshot_first_keys_in_order = footer
+            .snapshot_keys
+            .as_ref()
+            .is_some_and(|index| index.first_keys_in_order());
         let stripe_relative = footer.required_feature_flags & required_features::STRIPE_RELATIVE_MARKS != 0;
         // Under stripe-relative marks, a granule's offsets are measured from its stripe's base. A granule whose stripe
         // id is missing from the directory has no base to add back, so its reads would silently fall back to file
@@ -2180,6 +2187,7 @@ impl HefFile {
             residual_seek_tables: DashMap::default(),
             shared_alphabets,
             shared_string_views: DashMap::default(),
+            snapshot_first_keys_in_order,
             stripe_position_by_id,
             stripe_relative,
             text_token_cache: DashMap::default(),

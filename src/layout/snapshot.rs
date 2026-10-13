@@ -9,7 +9,7 @@
 //! See: hef-file-layout/spec.md
 
 use super::Profile;
-use super::constant::SNAPSHOT_KEY_ERROR_BOUND;
+use super::constant::{SNAPSHOT_KEY_ERROR_BOUND, SNAPSHOT_KEY_INDEX_FRAMING_BYTES, SNAPSHOT_KEY_LENGTH_BYTES};
 use super::footer::GranuleEntry;
 use super::optional_features;
 use super::reader::{HefFile, PayloadRead};
@@ -95,9 +95,19 @@ impl SnapshotKeyIndex {
         })
     }
 
+    /// Whether every granule's first key sorts at or after the one before it, as a writer always stores them. Checked
+    /// once per open file so [`Self::locate`] can binary-search the first keys instead of walking them.
+    pub(crate) fn first_keys_in_order(&self) -> bool {
+        self.granule_first_keys
+            .iter()
+            .zip(self.granule_first_keys.iter().skip(1))
+            .all(|(before, after)| before <= after)
+    }
+
     /// The position in `granules` of the one granule that can hold `key`, with the file rows (inclusive) the key can
-    /// sit in, or `None` when no granule can.
-    fn locate(&self, key: &str, granules: &[GranuleEntry]) -> Option<(usize, u64, u64)> {
+    /// sit in, or `None` when no granule can. `first_keys_in_order` is [`Self::first_keys_in_order`]: when set, the
+    /// candidate granules' first keys are binary-searched; otherwise they are walked from the last one back.
+    fn locate(&self, key: &str, granules: &[GranuleEntry], first_keys_in_order: bool) -> Option<(usize, u64, u64)> {
         if !key.as_bytes().starts_with(&self.common_prefix) {
             return None;
         }
@@ -108,21 +118,29 @@ impl SnapshotKeyIndex {
         let to = window.search_to.saturating_add(self.longest_run.saturating_sub(1));
         let first =
             granules.partition_point(|granule| granule.first_row_ordinal + u64::from(granule.row_count) <= from);
-        let end = granules.partition_point(|granule| granule.first_row_ordinal <= to);
-        (first..end)
-            .rev()
-            .find(|&index| {
-                self.granule_first_keys
-                    .get(index)
-                    .is_some_and(|first_key| first_key.as_str() <= key)
-            })
-            .map(|index| (index, from, to))
+        let end = granules
+            .partition_point(|granule| granule.first_row_ordinal <= to)
+            .min(self.granule_first_keys.len());
+        let candidates = self.granule_first_keys.get(first..end)?;
+        let at_or_before = |first_key: &String| first_key.as_str() <= key;
+        let found = if first_keys_in_order {
+            candidates.partition_point(at_or_before).checked_sub(1)
+        } else {
+            candidates.iter().rposition(at_or_before)
+        };
+        found.map(|offset| (first + offset, from, to))
     }
 
     /// Serializes the index for the footer's snapshot-keys section. Pairs with [`Self::decode`].
     pub fn encode(&self) -> Vec<u8> {
-        let model = self.model.encode();
-        let mut out = Writer::new();
+        let model_len = self.model.encoded_len();
+        let keys_len: usize = self
+            .granule_first_keys
+            .iter()
+            .map(|key| SNAPSHOT_KEY_LENGTH_BYTES + key.len())
+            .sum();
+        let mut out =
+            Writer::with_capacity(SNAPSHOT_KEY_INDEX_FRAMING_BYTES + self.common_prefix.len() + keys_len + model_len);
         out.put_u32(self.common_prefix.len() as u32);
         out.put_slice(&self.common_prefix);
         out.put_u32(self.granule_first_keys.len() as u32);
@@ -131,8 +149,8 @@ impl SnapshotKeyIndex {
             out.put_slice(key.as_bytes());
         }
         out.put_u64(self.longest_run);
-        out.put_u32(model.len() as u32);
-        out.put_slice(&model);
+        out.put_u32(model_len as u32);
+        self.model.encode_into(&mut out);
         out.into_bytes()
     }
 
@@ -197,7 +215,7 @@ impl HefFile {
             .filter(|_| self.usable_optional_features() & optional_features::SNAPSHOT_KEY_INDEX != 0);
         // The file rows (inclusive) the key can sit in, and the granules that can hold them.
         let (candidates, from, to) = match index {
-            Some(index) => match index.locate(key, &footer.granules) {
+            Some(index) => match index.locate(key, &footer.granules, self.snapshot_first_keys_in_order) {
                 Some((granule, from, to)) => (granule..granule + 1, from, to),
                 None => return Ok(None),
             },
