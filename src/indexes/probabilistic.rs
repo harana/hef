@@ -216,11 +216,22 @@ impl SplitBlockBloomFilter {
     /// Serializes the filter to bytes (magic, block count, then the lanes little-endian). Pairs with
     /// [`SplitBlockBloomFilter::decode`].
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Writer::with_capacity(SPLIT_BLOCK_BLOOM_HEADER_BYTES + self.lanes.len() * LANE_BYTES);
+        let mut out = Writer::with_capacity(self.encoded_len());
+        self.encode_into(&mut out);
+        out.into_bytes()
+    }
+
+    /// The number of bytes [`SplitBlockBloomFilter::encode`] produces.
+    pub(crate) fn encoded_len(&self) -> usize {
+        SPLIT_BLOCK_BLOOM_HEADER_BYTES + self.lanes.len() * LANE_BYTES
+    }
+
+    /// Appends exactly the bytes [`SplitBlockBloomFilter::encode`] produces to `out`, leaving what is already there
+    /// untouched.
+    pub(crate) fn encode_into(&self, out: &mut Writer) {
         out.put_u32(SPLIT_BLOCK_BLOOM_MAGIC);
         out.put_u32(self.block_count() as u32);
         out.put_u32_slice(&self.lanes);
-        out.into_bytes()
     }
 
     /// Rebuilds a filter from [`SplitBlockBloomFilter::encode`] output. Refuses on a wrong tag or a truncated body
@@ -286,6 +297,19 @@ pub struct BinaryFuseFilter {
     segment_len: u32,
 }
 
+/// Temporary buffers one [`BinaryFuseFilter::build`] reuses across its reseed attempts, so a failed peel does not
+/// throw away capacity the next seed needs again. Every buffer is reset at the start of each attempt.
+///
+/// See: indexes/spec.md
+#[derive(Default)]
+struct FuseScratch {
+    counts: Vec<u32>,
+    precomputed: Vec<([usize; FUSE_SEGMENTS], u8)>,
+    queue: Vec<usize>,
+    stack: Vec<(usize, usize)>,
+    xor_index: Vec<u64>,
+}
+
 /// How many distinct seeds construction will try before giving up. Peeling a 3-wise xor filter at ~1.23x sizing
 /// succeeds with overwhelming probability on the first seed; the extra attempts only guard pathological key sets.
 const FUSE_MAX_SEEDS: u32 = 64;
@@ -324,9 +348,10 @@ impl BinaryFuseFilter {
         let capacity = n.saturating_mul(FUSE_LOAD_FACTOR_PERCENT) / 100 + FUSE_CAPACITY_SLACK;
         let segment_len = (capacity.div_ceil(FUSE_SEGMENTS)).max(1) as u32;
 
+        let mut scratch = FuseScratch::default();
         for attempt in 0..FUSE_MAX_SEEDS {
             let seed = 0x51_2b_9f_01_u64.wrapping_mul(u64::from(attempt) + 1);
-            if let Some(filter) = Self::try_build(&distinct, segment_len, seed) {
+            if let Some(filter) = Self::try_build(&distinct, segment_len, seed, &mut scratch) {
                 return Ok(filter);
             }
         }
@@ -370,21 +395,32 @@ impl BinaryFuseFilter {
 
     /// One construction attempt at a fixed seed. Returns `None` if the hypergraph of (key → three slots) cannot be
     /// peeled, i.e. some slots stay shared by two or more keys to the end.
-    fn try_build(distinct: &[u64], segment_len: u32, seed: u64) -> Option<Self> {
+    fn try_build(distinct: &[u64], segment_len: u32, seed: u64, scratch: &mut FuseScratch) -> Option<Self> {
         let array_len = (segment_len as usize).checked_mul(FUSE_SEGMENTS)?;
+        let FuseScratch {
+            counts,
+            precomputed,
+            queue,
+            stack,
+            xor_index,
+        } = scratch;
 
         // Each key's three slots and fingerprint depend only on (key, segment_len, seed), so hash every key once here
         // rather than recomputing it on each of the three passes below (build, peel, fingerprint-assign).
-        let precomputed: Vec<([usize; 3], u8)> = distinct
-            .iter()
-            .map(|&key| Self::slots_and_fingerprint(key, segment_len, seed))
-            .collect();
+        precomputed.clear();
+        precomputed.extend(
+            distinct
+                .iter()
+                .map(|&key| Self::slots_and_fingerprint(key, segment_len, seed)),
+        );
 
         // Per-slot XOR of the *indices* into `precomputed` for every key still touching it, and a count of how many
         // keys touch it. A slot with count 1 is "peelable", and its xor_index is then exactly the surviving key's
         // index (XOR of one item is itself) — recovered without hashing anything again.
-        let mut xor_index = vec![0u64; array_len];
-        let mut counts = vec![0u32; array_len];
+        xor_index.clear();
+        xor_index.resize(array_len, 0);
+        counts.clear();
+        counts.resize(array_len, 0);
         for (index, &(slots, _)) in precomputed.iter().enumerate() {
             for &s in &slots {
                 let xi = xor_index.get_mut(s)?;
@@ -396,8 +432,10 @@ impl BinaryFuseFilter {
 
         // Peel: repeatedly remove a key that is alone in some slot, recording the order. Each removal may free up
         // further slots.
-        let mut stack: Vec<(usize, usize)> = Vec::with_capacity(distinct.len());
-        let mut queue: Vec<usize> = (0..array_len).filter(|&s| counts.get(s) == Some(&1)).collect();
+        stack.clear();
+        stack.reserve(distinct.len());
+        queue.clear();
+        queue.extend((0..array_len).filter(|&s| counts.get(s) == Some(&1)));
 
         while let Some(slot) = queue.pop() {
             if counts.get(slot).copied().unwrap_or(0) != 1 {
@@ -456,6 +494,20 @@ impl BinaryFuseFilter {
         acc == fp
     }
 
+    /// Reports whether `key` might be present in a filter still in its [`BinaryFuseFilter::encode`] form, reading
+    /// only the three fingerprint bytes the key maps to instead of copying the whole array. Answers exactly as
+    /// [`BinaryFuseFilter::contains`] would on the decoded filter, and refuses the same bytes
+    /// [`BinaryFuseFilter::decode`] refuses.
+    pub fn contains_encoded(bytes: &[u8], key: u64) -> Result<bool, FormatError> {
+        let (fingerprints, seed, segment_len) = Self::parse(bytes)?;
+        let (slots, fp) = Self::slots_and_fingerprint(key, segment_len, seed);
+        let mut acc = 0u8;
+        for &s in &slots {
+            acc ^= fingerprints.get(s).copied().unwrap_or(0);
+        }
+        Ok(acc == fp)
+    }
+
     /// How trustworthy this filter is for pruning: always [`Exactness::InexactNoFalseNegative`].
     pub fn exactness(&self) -> Exactness {
         Exactness::InexactNoFalseNegative
@@ -475,6 +527,16 @@ impl BinaryFuseFilter {
     /// Rebuilds a filter from [`BinaryFuseFilter::encode`] output, refusing on a wrong tag, an impossible length,
     /// or a truncated body.
     pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let (fingerprints, seed, segment_len) = Self::parse(bytes)?;
+        Ok(BinaryFuseFilter {
+            fingerprints: fingerprints.to_vec(),
+            seed,
+            segment_len,
+        })
+    }
+
+    /// Validates encoded bytes and returns the borrowed fingerprint array, seed and segment length.
+    fn parse(bytes: &[u8]) -> Result<(&[u8], u64, u32), FormatError> {
         let mut reader = Reader::new(bytes);
         if reader.u32("binary fuse magic")? != BINARY_FUSE_MAGIC {
             return Err(FormatError::Structural {
@@ -493,12 +555,8 @@ impl BinaryFuseFilter {
             .ok_or(FormatError::Structural {
                 rule: "binary fuse filter length overflow",
             })?;
-        let fingerprints = reader.take(array_len, "binary fuse fingerprints")?.to_vec();
-        Ok(BinaryFuseFilter {
-            fingerprints,
-            seed,
-            segment_len,
-        })
+        let fingerprints = reader.take(array_len, "binary fuse fingerprints")?;
+        Ok((fingerprints, seed, segment_len))
     }
 }
 

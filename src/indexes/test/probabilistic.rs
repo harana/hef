@@ -259,3 +259,83 @@ fn probing_encoded_bytes_refuses_anything_that_is_not_a_filter() {
     wrong_magic[0] ^= 0xff;
     assert!(SplitBlockBloomFilter::contains_encoded(&wrong_magic, 1).is_err());
 }
+
+#[test]
+fn binary_fuse_scratch_reuse_after_failed_attempt_matches_fresh_build() {
+    let keys = {
+        let mut keys = make_keys(85, 400);
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    };
+    let mut scratch = FuseScratch::default();
+    assert!(BinaryFuseFilter::try_build(&keys, 4, 7, &mut scratch).is_none());
+    let segment_len = 200;
+    let reused = BinaryFuseFilter::try_build(&keys, segment_len, 9, &mut scratch).expect("peels");
+    let fresh = BinaryFuseFilter::try_build(&keys, segment_len, 9, &mut FuseScratch::default()).expect("peels");
+    assert_eq!(reused.encode(), fresh.encode());
+    for &key in &keys {
+        assert!(reused.contains(key));
+    }
+}
+
+#[test]
+fn binary_fuse_build_matches_per_seed_fresh_scratch() {
+    for count in [0, 1, 50, 5_000] {
+        let mut keys = make_keys(count as u64 + 3, count);
+        keys.extend_from_slice(&keys.clone());
+        let built = BinaryFuseFilter::build(&keys).expect("builds");
+        let mut distinct = keys.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let expected = (0..FUSE_MAX_SEEDS)
+            .find_map(|attempt| {
+                let seed = 0x51_2b_9f_01_u64.wrapping_mul(u64::from(attempt) + 1);
+                BinaryFuseFilter::try_build(&distinct, built.segment_len, seed, &mut FuseScratch::default())
+            })
+            .expect("builds");
+        assert_eq!(built.encode(), expected.encode());
+    }
+}
+
+#[test]
+fn binary_fuse_encoded_probe_matches_owned_probe() {
+    for count in [0, 1, 100, 10_000] {
+        let keys = make_keys(count as u64 + 35, count);
+        let filter = BinaryFuseFilter::build(&keys).expect("builds");
+        let bytes = filter.encode();
+        for key in keys.iter().copied().chain(make_keys(9_999, 2_000)) {
+            assert_eq!(
+                BinaryFuseFilter::contains_encoded(&bytes, key).unwrap(),
+                filter.contains(key)
+            );
+        }
+    }
+}
+
+#[test]
+fn binary_fuse_encoded_probe_rejects_what_decode_rejects() {
+    let bytes = BinaryFuseFilter::build(&make_keys(5, 64)).expect("builds").encode();
+    for cut in 0..bytes.len() {
+        assert!(BinaryFuseFilter::contains_encoded(&bytes[..cut], 1).is_err());
+        assert!(BinaryFuseFilter::decode(&bytes[..cut]).is_err());
+    }
+    let mut bad_magic = bytes.clone();
+    bad_magic[0] ^= 0xff;
+    assert!(BinaryFuseFilter::contains_encoded(&bad_magic, 1).is_err());
+    let mut zero_segment = bytes.clone();
+    zero_segment[4..8].copy_from_slice(&0u32.to_le_bytes());
+    assert!(BinaryFuseFilter::contains_encoded(&zero_segment, 1).is_err());
+}
+
+#[test]
+fn split_block_bloom_encode_into_preserves_prefix() {
+    let filter = SplitBlockBloomFilter::build(&make_keys(67, 1_000), 10);
+    let mut out = Writer::with_capacity(3 + filter.encoded_len());
+    out.put_slice(&[7, 8, 9]);
+    filter.encode_into(&mut out);
+    let bytes = out.into_bytes();
+    assert_eq!(&bytes[..3], &[7, 8, 9]);
+    assert_eq!(&bytes[3..], filter.encode().as_slice());
+    assert_eq!(filter.encode().len(), filter.encoded_len());
+}
