@@ -2245,10 +2245,12 @@ fn encode_fsst_string(
     out: &mut Writer,
 ) -> Result<(SideStream, Option<FsstTable>, Vec<usize>), FormatError> {
     NullStream::from_values(values).write(out);
-    let corpus: Vec<&[u8]> = present.iter().map(|value| value.as_bytes()).collect();
     let table = match replay {
         Some(table) => Cow::Borrowed(table),
-        None => Cow::Owned(FsstTable(fsst::Compressor::train(&corpus))),
+        None => {
+            let corpus: Vec<&[u8]> = present.iter().map(|value| value.as_bytes()).collect();
+            Cow::Owned(FsstTable(fsst::Compressor::train(&corpus)))
+        }
     };
     let compressor = &table.0;
     let symbols = compressor.symbol_table();
@@ -2258,21 +2260,28 @@ fn encode_fsst_string(
         out.put_u64(symbol.to_u64());
         out.put_u8(*length);
     }
+    out.put_u32(present.len() as u32);
+    // The offset table is reserved up front and each end offset patched in once its value's compressed bytes are
+    // appended, so the compressed values land in `out` directly instead of in a separate buffer copied in after.
+    let offsets_start = out.len();
+    out.reserve_bytes((present.len() + 1) * 4);
     let mut scratch = Vec::new();
-    let mut arena = Vec::new();
-    let mut compressed_lens = Vec::with_capacity(corpus.len());
-    for value in &corpus {
-        compress_fsst_value(compressor, value, &mut scratch);
-        compressed_lens.push(scratch.len());
-        arena.extend_from_slice(&scratch);
+    let mut offset = 0u32;
+    for (index, value) in present.iter().enumerate() {
+        compress_fsst_value(compressor, value.as_bytes(), &mut scratch);
+        offset = u32::try_from(scratch.len())
+            .ok()
+            .and_then(|len| offset.checked_add(len))
+            .ok_or(FormatError::Structural {
+                rule: "string arena offsets exceed the u32 range the format stores",
+            })?;
+        out.put_slice(&scratch);
+        out.patch_u32(offsets_start + (index + 1) * 4, offset);
     }
     let trained = match table {
         Cow::Owned(table) => Some(table),
         Cow::Borrowed(_) => None,
     };
-    out.put_u32(present.len() as u32);
-    write_offsets(compressed_lens.into_iter(), out)?;
-    out.put_slice(&arena);
     if !fsst_value_keys_pay(present) {
         return Ok((SideStream::None, trained, Vec::new()));
     }

@@ -3747,3 +3747,151 @@ fn alp_exception_indexes_pack_identically_to_a_collected_index_vector() {
     });
     assert_eq!(actual.into_bytes(), expected.into_bytes());
 }
+
+/// The FSST block layout as it was written before the encoder stopped staging the compressed values in a separate
+/// buffer: every value compressed into a side arena with its length recorded, then the count, the offset table, and
+/// the arena copied in behind them. The encoder's output must match it byte for byte.
+fn reference_fsst_block(values: &StringColumn, replay: Option<&FsstTable>) -> (Vec<u8>, SideStream, Vec<usize>) {
+    let present = present_values(values);
+    let mut out = Writer::new();
+    NullStream::from_values(values).write(&mut out);
+    let corpus: Vec<&[u8]> = present.iter().map(|value| value.as_bytes()).collect();
+    let trained;
+    let compressor = match replay {
+        Some(table) => &table.0,
+        None => {
+            trained = fsst::Compressor::train(&corpus);
+            &trained
+        }
+    };
+    out.put_u16(compressor.symbol_table().len() as u16);
+    for (symbol, length) in compressor.symbol_table().iter().zip(compressor.symbol_lengths().iter()) {
+        out.put_u64(symbol.to_u64());
+        out.put_u8(*length);
+    }
+    let mut scratch = Vec::new();
+    let mut arena = Vec::new();
+    let mut compressed_lens = Vec::new();
+    for value in &corpus {
+        compress_fsst_value(compressor, value, &mut scratch);
+        compressed_lens.push(scratch.len());
+        arena.extend_from_slice(&scratch);
+    }
+    out.put_u32(present.len() as u32);
+    write_offsets(compressed_lens.into_iter(), &mut out).unwrap();
+    out.put_slice(&arena);
+    if !fsst_value_keys_pay(&present) {
+        return (out.into_bytes(), SideStream::None, Vec::new());
+    }
+    let prefixes_start = out.len();
+    for value in &present {
+        out.put_slice(&PrefixKey::of(value).to_stored());
+    }
+    let fingerprints_start = out.len();
+    for value in &present {
+        out.put_u32(StringFingerprint::of(value.as_bytes()).to_bits());
+    }
+    (
+        out.into_bytes(),
+        SideStream::FsstValueKeys,
+        vec![prefixes_start, fingerprints_start],
+    )
+}
+
+/// String columns covering the FSST encoder's edge cases: no rows, only nulls, present empty strings, alternating
+/// nulls, multibyte text, values long enough to earn the per-value keys, and text the table mostly has to escape.
+fn fsst_layout_columns() -> Vec<(&'static str, StringColumn)> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let escape_heavy: StringColumn = (0..300)
+        .map(|_| {
+            let text: String = (0..24)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    char::from_u32(0x20 + (state >> 40) as u32 % 0x2_0000).unwrap_or('?')
+                })
+                .collect();
+            Some(text)
+        })
+        .collect();
+    vec![
+        ("empty", StringColumn::new()),
+        ("all null", (0..50).map(|_| None::<&str>).collect()),
+        (
+            "present empty strings",
+            (0..60).map(|i| Some(if i % 3 == 0 { "" } else { "abc" })).collect(),
+        ),
+        (
+            "alternating nulls",
+            (0..400)
+                .map(|i| (i % 2 == 0).then(|| format!("user-{i:05}@example.com")))
+                .collect(),
+        ),
+        (
+            "multibyte unicode",
+            (0..200)
+                .map(|i| {
+                    Some(format!(
+                        "Gr\u{fc}\u{df}e {i} \u{65e5}\u{672c}\u{8a9e} \u{1f680} {}",
+                        i * 7
+                    ))
+                })
+                .collect(),
+        ),
+        (
+            "long strings",
+            (0..120)
+                .map(|i| (i % 5 != 0).then(|| format!("{i}:").repeat(40) + &"lorem ipsum dolor sit amet ".repeat(8)))
+                .collect(),
+        ),
+        ("escape heavy", escape_heavy),
+    ]
+}
+
+/// A block that trains its own table lays out the same bytes, frame breaks, and side stream the arena-staging
+/// encoder did, and hands back the table it trained.
+#[test]
+fn fsst_trained_block_bytes_match_the_reference_layout() {
+    for (name, values) in fsst_layout_columns() {
+        let (expected, expected_side, expected_breaks) = reference_fsst_block(&values, None);
+        let present = present_values(&values);
+        let mut out = Writer::new();
+        let (side, trained, breaks) = encode_fsst_string(&values, &present, None, &mut out).unwrap();
+        assert_eq!(out.into_bytes(), expected, "{name}: bytes");
+        assert_eq!(side, expected_side, "{name}: side stream");
+        assert_eq!(breaks, expected_breaks, "{name}: frame breaks");
+        if name == "long strings" {
+            assert_eq!(
+                side,
+                SideStream::FsstValueKeys,
+                "long values must exercise the per-value keys"
+            );
+        }
+        let corpus: Vec<&[u8]> = present.iter().map(|value| value.as_bytes()).collect();
+        assert_eq!(
+            fsst_table_entries(&trained.expect("a block without a replay table trains one")),
+            fsst_table_entries(&FsstTable(fsst::Compressor::train(&corpus))),
+            "{name}: trained table"
+        );
+    }
+}
+
+/// A block compressed with a replayed table lays out the same bytes the arena-staging encoder did and trains
+/// nothing, including when the replayed table was trained on unrelated text and has to escape most bytes.
+#[test]
+fn fsst_replayed_block_bytes_match_the_reference_layout() {
+    let training: Vec<String> = (0..300).map(|i| format!("user-{i:05}@example.com")).collect();
+    let corpus: Vec<&[u8]> = training.iter().map(|value| value.as_bytes()).collect();
+    let table = FsstTable(fsst::Compressor::train(&corpus));
+    for (name, values) in fsst_layout_columns() {
+        let (expected, expected_side, expected_breaks) = reference_fsst_block(&values, Some(&table));
+        let present = present_values(&values);
+        let mut out = Writer::new();
+        let (side, trained, breaks) = encode_fsst_string(&values, &present, Some(&table), &mut out).unwrap();
+        assert_eq!(out.into_bytes(), expected, "{name}: bytes");
+        assert_eq!(side, expected_side, "{name}: side stream");
+        assert_eq!(breaks, expected_breaks, "{name}: frame breaks");
+        assert!(trained.is_none(), "{name}: a replayed block trains no table");
+    }
+}
