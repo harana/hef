@@ -387,3 +387,29 @@ fn minimum_and_maximum_skip_nan_and_order_negative_zero_first() {
     assert!(empty.min.is_nan() && empty.max.is_nan());
     assert_eq!(empty.count, 0);
 }
+
+/// Empty, reversed and extreme ranges give the same answer from rollups as from a full scan.
+#[test]
+fn rollup_answers_equal_full_scan_answers_for_empty_reversed_and_extreme_ranges() {
+    let with_rollups = open(&build(Profile::TimeSeries, Some(BUCKET_NANOS)));
+    let scan_only = open(&build(Profile::TimeSeries, Some(BUCKET_NANOS * 7 + 3)));
+    let samples = samples();
+    let first = samples[0].at;
+    let last = samples[ROWS as usize - 1].at;
+    for (from, to) in [
+        (first, first),
+        (last, first),
+        (i64::MIN, i64::MAX),
+        (i64::MAX, i64::MIN),
+        (i64::MIN, first + BUCKET_NANOS),
+        (last - BUCKET_NANOS, i64::MAX),
+    ] {
+        for column in [CPU, TEMPERATURE] {
+            let rolled = with_rollups
+                .time_series_aggregate(column, from, to, BUCKET_NANOS)
+                .unwrap();
+            let scanned = scan_only.time_series_aggregate(column, from, to, BUCKET_NANOS).unwrap();
+            assert_eq!(bits(rolled), bits(scanned), "column {column}, range {from}..{to}");
+        }
+    }
+}
