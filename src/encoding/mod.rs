@@ -1768,33 +1768,55 @@ fn set_bit_range(bits: &mut [u8], start: usize, end: usize) {
     bits[end_byte] |= 0xFFu8 >> (7 - high);
 }
 
+/// Calls `emit(start, end)` for each maximal `[start, end)` run of present rows, in row order.
+fn each_present_run(values: &StringColumn, mut emit: impl FnMut(usize, usize)) {
+    let mut run_start: Option<usize> = None;
+    for (index, value) in values.iter().enumerate() {
+        match (value.is_some(), run_start) {
+            (true, None) => run_start = Some(index),
+            (false, Some(start)) => {
+                emit(start, index);
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = run_start {
+        emit(start, values.len());
+    }
+}
+
 impl NullStream {
     /// Derives the stream from a block's values, choosing the smallest form: `all_present` / `all_absent` at zero
     /// bytes, the run form when it undercuts the raw bitmap, the raw bitmap otherwise. Deterministic, so
     /// byte-identical encodes across nodes hold unchanged.
     fn from_values(values: &StringColumn) -> Self {
-        let mut runs: Vec<(u32, u32)> = Vec::new();
-        for (index, value) in values.iter().enumerate() {
-            if value.is_some() {
-                let index = index as u32;
-                match runs.last_mut() {
-                    Some(run) if run.1 == index => run.1 = index + 1,
-                    _ => runs.push((index, index + 1)),
+        // First pass counts only, so the run list or bitmap is allocated once, for the form actually chosen.
+        let row_count = values.len();
+        let mut present_count = 0usize;
+        let mut run_count = 0usize;
+        let mut previous_present = false;
+        for value in values.iter() {
+            let present = value.is_some();
+            if present {
+                present_count += 1;
+                if !previous_present {
+                    run_count += 1;
                 }
             }
+            previous_present = present;
         }
-        let row_count = values.len();
-        let form = if runs.is_empty() {
+        let form = if present_count == 0 {
             NullStreamForm::AllAbsent
-        } else if runs == [(0, row_count as u32)] {
+        } else if present_count == row_count {
             NullStreamForm::AllPresent
-        } else if 4 + runs.len() * 8 < row_count.div_ceil(8) {
+        } else if 4 + run_count * 8 < row_count.div_ceil(8) {
+            let mut runs: Vec<(u32, u32)> = Vec::with_capacity(run_count);
+            each_present_run(values, |start, end| runs.push((start as u32, end as u32)));
             NullStreamForm::Runs(runs)
         } else {
             let mut raw = vec![0u8; row_count.div_ceil(8)];
-            for &(start, end) in &runs {
-                set_bit_range(&mut raw, start as usize, end as usize);
-            }
+            each_present_run(values, |start, end| set_bit_range(&mut raw, start, end));
             NullStreamForm::Raw(raw)
         };
         Self { form, row_count }
@@ -3282,16 +3304,16 @@ fn choose_string_transform(present: &[&str]) -> Transform {
     if present.is_empty() {
         return Transform::RawString;
     }
-    let sample = transform_sample(present);
-    let sample: &[&str] = sample.as_deref().unwrap_or(present);
-    let mut distinct: Vec<&str> = sample.to_vec();
+    // A long block's sample is already owned, so it is sorted in place; only a short block's slice is copied.
+    let mut distinct: Vec<&str> = transform_sample(present).unwrap_or_else(|| present.to_vec());
+    let sample_len = distinct.len();
+    // Low cardinality: dictionary. High-cardinality short strings: FSST. Long/opaque strings: raw arena + offsets.
+    let average_len = distinct.iter().map(|value| value.len()).sum::<usize>() / sample_len.max(1);
     distinct.sort_unstable();
     distinct.dedup();
-    // Low cardinality: dictionary. High-cardinality short strings: FSST. Long/opaque strings: raw arena + offsets.
-    let average_len = sample.iter().map(|value| value.len()).sum::<usize>() / sample.len().max(1);
-    if distinct.len() * DICTIONARY_MAX_CARDINALITY_DIVISOR <= sample.len() {
+    if distinct.len() * DICTIONARY_MAX_CARDINALITY_DIVISOR <= sample_len {
         Transform::DictionaryString
-    } else if average_len <= FSST_MAX_AVERAGE_VALUE_LEN && sample.len() >= FSST_MIN_SAMPLE_COUNT {
+    } else if average_len <= FSST_MAX_AVERAGE_VALUE_LEN && sample_len >= FSST_MIN_SAMPLE_COUNT {
         Transform::FsstString
     } else {
         Transform::RawString

@@ -953,6 +953,150 @@ fn null_stream_picks_the_smallest_form() {
     assert_eq!(encoded_len(&string_values_with_nulls(4096, |i| i % 2 == 0)), 517);
 }
 
+/// The null-stream derivation as it stood before the counting first pass: build every present-row run, then pick the
+/// form from them. Kept here as the reference the current derivation must match byte for byte.
+fn reference_null_stream(values: &StringColumn) -> NullStream {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        if value.is_some() {
+            let index = index as u32;
+            match runs.last_mut() {
+                Some(run) if run.1 == index => run.1 = index + 1,
+                _ => runs.push((index, index + 1)),
+            }
+        }
+    }
+    let row_count = values.len();
+    let form = if runs.is_empty() {
+        NullStreamForm::AllAbsent
+    } else if runs == [(0, row_count as u32)] {
+        NullStreamForm::AllPresent
+    } else if 4 + runs.len() * 8 < row_count.div_ceil(8) {
+        NullStreamForm::Runs(runs)
+    } else {
+        let mut raw = vec![0u8; row_count.div_ceil(8)];
+        for &(start, end) in &runs {
+            for row in start as usize..end as usize {
+                raw[row / 8] |= 1 << (row % 8);
+            }
+        }
+        NullStreamForm::Raw(raw)
+    };
+    NullStream { form, row_count }
+}
+
+/// The counting first pass must choose the same form and write the same bytes as the reference derivation for every
+/// null pattern, including the run/raw size tie (which the raw bitmap wins) and patterns ending on byte boundaries.
+#[test]
+fn null_stream_matches_the_reference_derivation() {
+    let mut patterns: Vec<(String, StringColumn)> = vec![
+        ("empty".into(), string_values_with_nulls(0, |_| true)),
+        ("single present".into(), string_values_with_nulls(1, |_| true)),
+        ("single absent".into(), string_values_with_nulls(1, |_| false)),
+    ];
+    for row_count in [7usize, 8, 9, 15, 16, 17, 63, 64, 65, 100, 255, 256, 257, 1000, 4096] {
+        let shapes: [(&str, Box<dyn Fn(usize) -> bool>); 12] = [
+            ("all present", Box::new(|_| true)),
+            ("all absent", Box::new(|_| false)),
+            ("alternating", Box::new(|i| i % 2 == 0)),
+            ("alternating odd", Box::new(|i| i % 2 == 1)),
+            ("sparse present", Box::new(|i| i % 97 == 3)),
+            ("sparse absent", Box::new(|i| i % 89 != 5)),
+            ("clusters", Box::new(|i| (i / 40) % 3 == 0)),
+            ("leading nulls", Box::new(move |i| i >= row_count / 3)),
+            ("trailing nulls", Box::new(move |i| i < row_count - row_count / 3)),
+            ("byte-aligned blocks", Box::new(|i| (i / 8) % 2 == 0)),
+            ("first row only", Box::new(|i| i == 0)),
+            ("last row only", Box::new(move |i| i + 1 == row_count)),
+        ];
+        for (shape, present) in shapes {
+            patterns.push((
+                format!("{shape} x{row_count}"),
+                string_values_with_nulls(row_count, present),
+            ));
+        }
+    }
+    // Run/raw size equality: 4 + 8 * runs == ceil(rows / 8). One run ties at 12 bitmap bytes (89..=96 rows) and two
+    // runs at 20 bytes (153..=160 rows); the rows just outside each range probe both sides of the tie.
+    for (row_count, run_count) in [
+        (88usize, 1usize),
+        (89, 1),
+        (96, 1),
+        (97, 1),
+        (152, 2),
+        (153, 2),
+        (160, 2),
+        (161, 2),
+    ] {
+        patterns.push((
+            format!("tie {run_count} runs x{row_count}"),
+            string_values_with_nulls(row_count, move |i| i < 10 || (run_count == 2 && (20..30).contains(&i))),
+        ));
+    }
+    for (name, values) in patterns {
+        let actual = NullStream::from_values(&values);
+        let expected = reference_null_stream(&values);
+        assert_eq!(actual, expected, "{name}: form");
+        let mut actual_bytes = Writer::new();
+        actual.write(&mut actual_bytes);
+        let mut expected_bytes = Writer::new();
+        expected.write(&mut expected_bytes);
+        assert_eq!(actual_bytes.into_bytes(), expected_bytes.into_bytes(), "{name}: bytes");
+    }
+}
+
+/// The string-transform choice as it stood before the sample was sorted in place: copy the sample into a second
+/// vector to count distinct values. Kept here as the reference the current choice must match.
+fn reference_string_transform(present: &[&str]) -> Transform {
+    if present.is_empty() {
+        return Transform::RawString;
+    }
+    let sample = transform_sample(present);
+    let sample: &[&str] = sample.as_deref().unwrap_or(present);
+    let mut distinct: Vec<&str> = sample.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let average_len = sample.iter().map(|value| value.len()).sum::<usize>() / sample.len().max(1);
+    if distinct.len() * DICTIONARY_MAX_CARDINALITY_DIVISOR <= sample.len() {
+        Transform::DictionaryString
+    } else if average_len <= FSST_MAX_AVERAGE_VALUE_LEN && sample.len() >= FSST_MIN_SAMPLE_COUNT {
+        Transform::FsstString
+    } else {
+        Transform::RawString
+    }
+}
+
+/// Sorting the owned sample in place must pick the same transform as the reference for every block size around the
+/// sample-size boundary, across low and high cardinality and short and long values, and leave the caller's values
+/// untouched.
+#[test]
+fn string_transform_choice_matches_the_reference() {
+    for size in [0usize, 1, 15, 16, 1023, 1024, 1025, 5000, 20_000] {
+        for cardinality in [1usize, 3, 250, 256, 257, usize::MAX] {
+            for pad in [0usize, 40, 60, 64, 65, 200] {
+                let owned: Vec<String> = (0..size)
+                    .map(|i| {
+                        let key = if cardinality == usize::MAX {
+                            i
+                        } else {
+                            (i * 7) % cardinality
+                        };
+                        format!("{key}{}", "x".repeat(pad + (i % 3)))
+                    })
+                    .collect();
+                let present: Vec<&str> = owned.iter().map(String::as_str).collect();
+                let before = present.clone();
+                assert_eq!(
+                    choose_string_transform(&present),
+                    reference_string_transform(&present),
+                    "size {size}, cardinality {cardinality}, pad {pad}"
+                );
+                assert_eq!(present, before, "caller's values must stay in their order");
+            }
+        }
+    }
+}
+
 /// Every string transform must round-trip under every null side-stream form, and the zero-copy view decode must
 /// report the identical null pattern — the equivalence oracle for retiring the unconditional raw bitmap.
 #[test]
