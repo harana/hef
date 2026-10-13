@@ -721,3 +721,52 @@ fn changed_children_matches_comparing_by_sets() {
         assert_eq!(changed_children(&old, &new), changed_children_by_sets(&old, &new));
     }
 }
+
+/// The tree `build_state_tree` gave before it streamed the leaves: every leaf entry collected first, then each level
+/// cut by `seal_level`.
+fn build_by_collecting(state: &BTreeMap<StateKey, u64>) -> StateTree {
+    let leaves: Vec<(StateKey, [u8; 8])> = state.iter().map(|(key, sn)| (*key, sn.to_le_bytes())).collect();
+    let mut chunks = Vec::new();
+    let mut level = 0u8;
+    let mut parents = seal_level(&key(), level, &leaves, &mut chunks).unwrap();
+    while parents.len() > 1 {
+        level += 1;
+        parents = seal_level(&key(), level, &parents, &mut chunks).unwrap();
+    }
+    StateTree {
+        chunks,
+        root: StateRoot {
+            address: parents[0].1,
+            entry_count: state.len() as u32,
+        },
+    }
+}
+
+#[test]
+fn a_streamed_build_matches_collecting_every_leaf_entry_first() {
+    let mut random = xorshift(0x57EA);
+    let mut states: Vec<BTreeMap<StateKey, u64>> = [0, 1, 2, 1_023, 1_024, 1_025, 20_000, 100_000]
+        .into_iter()
+        .map(room)
+        .collect();
+    states.extend((0..20).map(|_| {
+        (0..random() % 5_000)
+            .map(|_| (member((random() % 1_000_000) as u32), random()))
+            .collect()
+    }));
+    // Keys that never hit the boundary pattern, so every leaf but the last is cut at the maximum.
+    let unbounded: BTreeMap<StateKey, u64> = (0..)
+        .map(member)
+        .filter(|state_key| !is_boundary(0, *state_key, STATE_LEAF_ENTRY_LEN))
+        .take(3 * 1_024 + 7)
+        .map(|state_key| (state_key, 1))
+        .collect();
+    states.push(unbounded.iter().map(|(k, sn)| (*k, *sn)).take(2 * 1_024).collect());
+    states.push(unbounded);
+    for state in &states {
+        assert_eq!(build(state), build_by_collecting(state));
+    }
+    let first_leaf = &build(&states[states.len() - 1]).chunks[0];
+    let plaintext = key().open(&first_leaf.address, &first_leaf.bytes).unwrap();
+    assert!(matches!(decode_state_chunk(&plaintext).unwrap(), StateChunk::Leaf(entries) if entries.len() == 1_024));
+}

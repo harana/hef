@@ -294,10 +294,23 @@ pub fn build_state_tree(key: &StateChunkKey, entries: &BTreeMap<StateKey, u64>) 
     let entry_count = u32::try_from(entries.len()).map_err(|_| FormatError::Structural {
         rule: "a state map holds at most u32::MAX keys",
     })?;
-    let leaves: Vec<(StateKey, [u8; 8])> = entries.iter().map(|(key, sn)| (*key, sn.to_le_bytes())).collect();
     let mut chunks = Vec::new();
+    let mut parents = Vec::new();
+    let mut open = Vec::with_capacity(STATE_CHUNK_MAX_BYTES / STATE_LEAF_ENTRY_LEN);
+    for (entry_key, sn) in entries {
+        push_entry(
+            key,
+            0,
+            (*entry_key, sn.to_le_bytes()),
+            &mut open,
+            &mut parents,
+            &mut chunks,
+        )?;
+    }
+    if !open.is_empty() || parents.is_empty() {
+        parents.push(seal_chunk(key, 0, &open, &mut chunks)?);
+    }
     let mut level = 0u8;
-    let mut parents = seal_level(key, level, &leaves, &mut chunks)?;
     while parents.len() > 1 {
         level += 1;
         parents = seal_level(key, level, &parents, &mut chunks)?;
