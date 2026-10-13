@@ -159,8 +159,24 @@ pub(crate) fn data_commitments_with<'a>(
         });
     }
 
+    let strictly_increasing = stripes
+        .iter()
+        .zip(stripes.iter().skip(1))
+        .all(|(left, right)| left.file_offset < right.file_offset);
+    if strictly_increasing {
+        return emit_data_commitments(data_end, stripes.iter().zip(stripe_checksums), gap);
+    }
     let mut ordered: Vec<_> = stripes.iter().zip(stripe_checksums).collect();
     ordered.sort_unstable_by_key(|(stripe, _)| stripe.file_offset);
+    emit_data_commitments(data_end, ordered.into_iter(), gap)
+}
+
+/// Walks stripes already in file-offset order, emitting each stripe's commitment and hashing the gap before it.
+fn emit_data_commitments<'a, 's>(
+    data_end: usize,
+    ordered: impl ExactSizeIterator<Item = (&'s StripeEntry, &'s [u8; 32])>,
+    gap: impl Fn(std::ops::Range<usize>) -> Option<&'a [u8]>,
+) -> Result<Vec<DataCommitment>, FormatError> {
     let mut cursor = HEADER_BLOCK_LEN;
     let mut commitments = Vec::with_capacity(ordered.len().saturating_mul(2).saturating_add(1));
 
@@ -324,5 +340,94 @@ mod tests {
         bytes[HEADER_BLOCK_LEN] ^= 1;
         let changed = data_commitments(&bytes, bytes.len(), &stripes, &checksum).unwrap();
         assert_ne!(commitments, changed, "the leading alignment gap is authoritative");
+    }
+
+    fn stripe(stripe_id: u32, file_offset: usize, byte_len: u64) -> StripeEntry {
+        StripeEntry {
+            byte_len,
+            file_offset: file_offset as u64,
+            first_row_ordinal: 0,
+            row_count: 1,
+            stripe_id,
+        }
+    }
+
+    fn gapped_bytes() -> Vec<u8> {
+        (0..HEADER_BLOCK_LEN + 20).map(|index| index as u8).collect()
+    }
+
+    #[test]
+    fn sorted_and_shuffled_stripes_commit_identically_with_the_same_gap_reads() {
+        let bytes = gapped_bytes();
+        let base = HEADER_BLOCK_LEN;
+        let sorted = [stripe(1, base + 2, 3), stripe(2, base + 5, 4), stripe(3, base + 12, 5)];
+        let sorted_checksums = [[1; 32], [2; 32], [3; 32]];
+        let shuffled = [sorted[2], sorted[0], sorted[1]];
+        let shuffled_checksums = [sorted_checksums[2], sorted_checksums[0], sorted_checksums[1]];
+
+        let reads = std::cell::RefCell::new(Vec::new());
+        let direct = data_commitments_with(bytes.len(), &sorted, &sorted_checksums, |range| {
+            reads.borrow_mut().push(range.clone());
+            bytes.get(range)
+        })
+        .unwrap();
+        let direct_reads = reads.replace(Vec::new());
+        let fallback = data_commitments_with(bytes.len(), &shuffled, &shuffled_checksums, |range| {
+            reads.borrow_mut().push(range.clone());
+            bytes.get(range)
+        })
+        .unwrap();
+
+        assert_eq!(direct, fallback);
+        assert_eq!(direct_reads, reads.into_inner());
+        assert_eq!(
+            direct_reads,
+            vec![base..base + 2, base + 9..base + 12, base + 17..base + 20]
+        );
+        assert_eq!(direct.len(), 6);
+    }
+
+    #[test]
+    fn empty_and_single_stripe_inputs_cover_the_whole_data_area() {
+        let bytes = gapped_bytes();
+        let empty = data_commitments(&bytes, bytes.len(), &[], &[]).unwrap();
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].kind, SegmentKind::Gap);
+        assert_eq!(empty[0].len, 20);
+
+        let single = data_commitments(&bytes, bytes.len(), &[stripe(4, HEADER_BLOCK_LEN, 20)], &[[4; 32]]).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].kind, SegmentKind::Stripe);
+    }
+
+    #[test]
+    fn overlapping_or_tied_stripes_are_rejected_on_both_paths() {
+        let bytes = gapped_bytes();
+        let base = HEADER_BLOCK_LEN;
+        let geometry = Err(FormatError::Structural {
+            rule: "stripe ranges must be ordered, disjoint, and inside the data area",
+        });
+        let increasing_overlap = [stripe(1, base, 5), stripe(2, base + 4, 2)];
+        assert_eq!(
+            data_commitments(&bytes, bytes.len(), &increasing_overlap, &[[1; 32], [2; 32]]),
+            geometry
+        );
+        let tied = [stripe(1, base, 2), stripe(2, base, 2)];
+        assert_eq!(
+            data_commitments(&bytes, bytes.len(), &tied, &[[1; 32], [2; 32]]),
+            geometry
+        );
+        let past_end = [stripe(1, base + 18, 4)];
+        assert_eq!(data_commitments(&bytes, bytes.len(), &past_end, &[[1; 32]]), geometry);
+        assert_eq!(
+            data_commitments(&bytes, bytes.len(), &past_end, &[]),
+            Err(FormatError::Structural {
+                rule: "stripe checksum count must match the stripe directory",
+            })
+        );
+        assert_eq!(
+            data_commitments_with(bytes.len(), &[stripe(1, base + 2, 3)], &[[1; 32]], |_| None),
+            Err(FormatError::Truncated { what: "data gap" })
+        );
     }
 }
