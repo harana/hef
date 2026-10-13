@@ -3,7 +3,8 @@ use super::super::batch::{EventInput, PayloadInput, build_batch, decode_batch};
 use super::super::frame::{FrameBuildInput, build_frame, decode_frame};
 use super::super::segment::ReplayTail;
 use super::*;
-use crate::events::EventEnvelope;
+use crate::events::provenance::{SignatureScheme, SignedEventProvenance, hex_lower};
+use crate::events::{EventEnvelope, TimestampValue};
 use crate::lifecycle::{FileType, HefFileEntry, ManifestGeneration, PartState};
 use crate::typed_id::TypedIdTestExt;
 
@@ -127,6 +128,90 @@ fn text_columns_keep_every_value_null_and_empty_string() {
     assert!(Arc::ptr_eq(&segment.batch.schema(), &live_overlay_schema()));
     for (name, column) in expected {
         assert_eq!(segment.batch.column_by_name(name).unwrap(), &column, "{name}");
+    }
+}
+
+#[test]
+fn provenance_columns_hold_each_signed_rows_values_and_nulls_elsewhere() {
+    let signed = |row: u8, scheme: SignatureScheme| SignedEventProvenance {
+        author_pubkey: [row; 32],
+        claimed_at: TimestampValue::from_physical_nanos(1_000_000_000 * i64::from(row)),
+        protocol_event_id: [0xA0 | row; 32],
+        protocol_kind: u32::from(row) + 1,
+        scheme,
+        signature: [0xF0 | row; 64],
+    };
+    let unsigned = [false; 5];
+    let all_signed = [true; 5];
+    let mixed = [true, false, false, true, false];
+    let ends = [false, true, false, false, true];
+    for pattern in [unsigned, all_signed, mixed, ends] {
+        let mut events = sample_events(pattern.len());
+        for (row, (event, is_signed)) in events.iter_mut().zip(pattern).enumerate() {
+            let scheme = if row % 2 == 0 {
+                SignatureScheme::Ed25519
+            } else {
+                SignatureScheme::Bip340SchnorrSecp256k1
+            };
+            event.provenance = is_signed.then(|| signed(row as u8, scheme));
+        }
+        let segment = convert_events(&events);
+        if !pattern.contains(&true) {
+            assert!(Arc::ptr_eq(&segment.batch.schema(), &live_overlay_schema()));
+            continue;
+        }
+        assert!(Arc::ptr_eq(
+            &segment.batch.schema(),
+            &live_overlay_schema_with_provenance()
+        ));
+        let provenance: Vec<Option<&SignedEventProvenance>> =
+            events.iter().map(|event| event.provenance.as_ref()).collect();
+        let hex_of = |bytes: fn(&SignedEventProvenance) -> &[u8]| -> ArrayRef {
+            Arc::new(StringArray::from(
+                provenance
+                    .iter()
+                    .map(|signed| signed.map(|signed| hex_lower(bytes(signed))))
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        let expected: [(&str, ArrayRef); 6] = [
+            ("author_pubkey", hex_of(|signed| &signed.author_pubkey)),
+            ("signature", hex_of(|signed| &signed.signature)),
+            (
+                "signature_scheme",
+                Arc::new(StringArray::from(
+                    provenance
+                        .iter()
+                        .map(|signed| signed.map(|signed| signed.scheme.as_str()))
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+            ("protocol_event_id", hex_of(|signed| &signed.protocol_event_id)),
+            (
+                "protocol_kind",
+                Arc::new(Int64Array::from(
+                    provenance
+                        .iter()
+                        .map(|signed| signed.map(|signed| i64::from(signed.protocol_kind)))
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+            (
+                "claimed_at",
+                Arc::new(
+                    TimestampNanosecondArray::from(
+                        provenance
+                            .iter()
+                            .map(|signed| signed.map(|signed| signed.claimed_at.physical_nanos()))
+                            .collect::<Vec<_>>(),
+                    )
+                    .with_timezone("UTC"),
+                ),
+            ),
+        ];
+        for (name, column) in expected {
+            assert_eq!(segment.batch.column_by_name(name).unwrap(), &column, "{name}");
+        }
     }
 }
 
