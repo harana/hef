@@ -4792,39 +4792,36 @@ pub fn decode_block_range_shared(
     {
         return decode_plain_deflate_range(pipeline.value_kind()?, bytes, start, end);
     }
-    let body = remove_trailing(pipeline.compression()?, bytes)?;
-    match (pipeline.value_kind()?, transform) {
-        (ValueKind::F64, Transform::Alp) => {
-            let mut reader = Reader::new(&body);
-            Ok(ColumnData::F64(decode_alp_range(
-                &mut reader,
-                pipeline.side_stream()?,
-                start,
-                end,
-            )?))
+    with_trailing_removed(pipeline.compression()?, bytes, |body| {
+        match (pipeline.value_kind()?, transform) {
+            (ValueKind::F64, Transform::Alp) => {
+                let mut reader = Reader::new(body);
+                Ok(ColumnData::F64(decode_alp_range(
+                    &mut reader,
+                    pipeline.side_stream()?,
+                    start,
+                    end,
+                )?))
+            }
+            (ValueKind::String, Transform::DictionaryString) => Ok(ColumnData::Strings(
+                decode_dictionary_string_range(body, pipeline.side_stream()?, shared, start, end)?,
+            )),
+            (ValueKind::String, Transform::FsstString) => {
+                Ok(ColumnData::Strings(decode_fsst_string_range(body, start, end)?))
+            }
+            (ValueKind::String, Transform::RawString) => {
+                Ok(ColumnData::Strings(decode_raw_string_range(body, start, end)?))
+            }
+            _ => {
+                debug_assert!(
+                    !transform.is_per_value_addressable(),
+                    "transform {transform:?} claims byte-range extraction support but decode_block_range has no fast path for it"
+                );
+                let full = decode_block_shared_with_body(pipeline, body, shared)?;
+                Ok(slice_column_data(full, start, end))
+            }
         }
-        (ValueKind::String, Transform::DictionaryString) => Ok(ColumnData::Strings(decode_dictionary_string_range(
-            &body,
-            pipeline.side_stream()?,
-            shared,
-            start,
-            end,
-        )?)),
-        (ValueKind::String, Transform::FsstString) => {
-            Ok(ColumnData::Strings(decode_fsst_string_range(&body, start, end)?))
-        }
-        (ValueKind::String, Transform::RawString) => {
-            Ok(ColumnData::Strings(decode_raw_string_range(&body, start, end)?))
-        }
-        _ => {
-            debug_assert!(
-                !transform.is_per_value_addressable(),
-                "transform {transform:?} claims byte-range extraction support but decode_block_range has no fast path for it"
-            );
-            let full = decode_block_shared(pipeline, bytes, shared)?;
-            Ok(slice_column_data(full, start, end))
-        }
-    }
+    })
 }
 
 /// Decodes one column block by its recorded pipeline id. A block recording the file-scope dictionary side stream

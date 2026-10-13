@@ -163,7 +163,31 @@ impl GlobalDictionary {
     /// dictionary, `None` when absent. A `None` slot gets the pruning-safe verdict described on
     /// [`GlobalCodeFilter::matches_local_code`].
     pub fn local_to_global_map(&self, local_entries: &[String]) -> Vec<Option<u64>> {
-        local_entries.iter().map(|e| self.code_for(e.as_str())).collect()
+        let sorted = local_entries
+            .iter()
+            .zip(local_entries.iter().skip(1))
+            .all(|(a, b)| a <= b);
+        if !sorted {
+            return local_entries.iter().map(|e| self.code_for(e.as_str())).collect();
+        }
+        // Sorted local values only move forward through the global entries, so each lookup gallops from where the
+        // previous one landed instead of binary-searching the whole dictionary again. The cursor stays on an equal
+        // entry, so a repeated local value gets the same code.
+        let mut from = 0;
+        local_entries
+            .iter()
+            .map(|value| {
+                let rest = self.entries.get(from..).unwrap_or(&[]);
+                let mut step = 1;
+                while rest.get(step - 1).is_some_and(|entry| entry < value) {
+                    step = step.saturating_mul(2);
+                }
+                let window = rest.get(..step.min(rest.len())).unwrap_or(rest);
+                let offset = window.partition_point(|entry| entry < value);
+                from += offset;
+                rest.get(offset).filter(|entry| *entry == value).map(|_| from as u64)
+            })
+            .collect()
     }
 }
 
