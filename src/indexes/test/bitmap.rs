@@ -412,6 +412,9 @@ fn from_ranges_merges_overlapping_touching_and_drops_empty() {
     assert!(RoaringRangeBitmap::from_ranges([r(4, 4), r(9, 2)]).is_empty());
 }
 
+/// A run list written as `(start, end)` pairs.
+type Runs<'a> = &'a [(u64, u64)];
+
 fn bitmap_of(runs: &[(u64, u64)]) -> RoaringRangeBitmap {
     RoaringRangeBitmap::from_ranges(runs.iter().map(|&(start, end)| RowRange { end, start }))
 }
@@ -424,7 +427,7 @@ fn reference_union(a: &RoaringRangeBitmap, b: &RoaringRangeBitmap) -> RoaringRan
 
 #[test]
 fn union_matches_the_sorting_reference_and_set_union() {
-    let cases: &[(&[(u64, u64)], &[(u64, u64)])] = &[
+    let cases: &[(Runs<'_>, Runs<'_>)] = &[
         // Disjoint.
         (&[(0, 2)], &[(5, 7)]),
         // Interleaved.

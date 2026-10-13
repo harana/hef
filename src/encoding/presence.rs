@@ -96,7 +96,9 @@ impl PresenceRank {
 /// short final chunk is padded with unset bits.
 fn load_word(bytes: &[u8]) -> u64 {
     let mut word = [0u8; 8];
-    word[..bytes.len()].copy_from_slice(bytes);
+    for (slot, byte) in word.iter_mut().zip(bytes) {
+        *slot = *byte;
+    }
     u64::from_le_bytes(word)
 }
 
