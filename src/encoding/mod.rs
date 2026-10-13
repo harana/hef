@@ -870,16 +870,36 @@ fn decode_delta_bitpack<T: IntValue>(reader: &mut Reader<'_>) -> Result<Vec<T>, 
 }
 
 fn encode_rle(values: &[u64], out: &mut Writer) {
-    let mut runs: Vec<(u64, u32)> = Vec::new();
-    for value in values {
-        match runs.last_mut() {
-            Some((current, count)) if current == value => *count += 1,
-            _ => runs.push((*value, 1)),
+    encode_rle_iter(values.iter().copied(), out);
+}
+
+/// [`encode_rle`] over any replayable value sequence: one pass counts the runs for the header, a second emits each run
+/// as it completes, so no run list is ever collected.
+fn encode_rle_iter(values: impl Iterator<Item = u64> + Clone, out: &mut Writer) {
+    let mut run_count = 0u32;
+    let mut previous = None;
+    for value in values.clone() {
+        if previous != Some(value) {
+            run_count += 1;
+            previous = Some(value);
         }
     }
-    out.put_u32(runs.len() as u32);
-    for (value, count) in runs {
-        out.put_u64(value);
+    out.put_u32(run_count);
+    let mut current: Option<(u64, u32)> = None;
+    for value in values {
+        match current.as_mut() {
+            Some((run_value, count)) if *run_value == value => *count += 1,
+            _ => {
+                if let Some((run_value, count)) = current {
+                    out.put_u64(run_value);
+                    out.put_u32(count);
+                }
+                current = Some((value, 1));
+            }
+        }
+    }
+    if let Some((run_value, count)) = current {
+        out.put_u64(run_value);
         out.put_u32(count);
     }
 }
@@ -1040,18 +1060,22 @@ fn encode_u64_with(transform: Transform, values: &[u64], out: &mut Writer) {
     }
 }
 
-/// [`encode_u64_with`] for `i64` values: `ForBitpack`/`DeltaBitpack` fuse the zigzag mapping straight into the
-/// bitpack gather ([`encode_for_bitpack_i64`], [`encode_delta_bitpack_i64`]); `Rle` and `PlainU64` write every value
-/// regardless of encoding, so there is no gather to fuse into and the zigzag-mapped column is built once here.
+/// [`encode_u64_with`] for `i64` values: every branch zigzag-maps each value on the fly, so no zigzag-mapped copy of
+/// the column is ever built. `ForBitpack`/`DeltaBitpack` fuse the mapping into the bitpack gather
+/// ([`encode_for_bitpack_i64`], [`encode_delta_bitpack_i64`]); `Rle` and `PlainU64` map while writing.
 fn encode_i64_with(transform: Transform, values: &[i64], out: &mut Writer) {
     match transform {
         Transform::ForBitpack => encode_for_bitpack_i64(values, out),
         Transform::DeltaBitpack => encode_delta_bitpack_i64(values, out),
+        Transform::Rle => encode_rle_iter(values.iter().map(|value| zigzag(*value)), out),
         _ => {
-            let mapped: Vec<u64> = values.iter().map(|value| zigzag(*value)).collect();
-            match transform {
-                Transform::Rle => encode_rle(&mapped, out),
-                _ => encode_plain_u64(&mapped, out),
+            out.put_u32(values.len() as u32);
+            let mut chunk = [0u64; FASTLANES_VECTOR];
+            for slice in values.chunks(FASTLANES_VECTOR) {
+                for (slot, value) in chunk.iter_mut().zip(slice) {
+                    *slot = zigzag(*value);
+                }
+                out.put_u64_slice(&chunk[..slice.len()]);
             }
         }
     }
@@ -1134,11 +1158,9 @@ fn plain_exception_index_size(count: usize) -> usize {
 /// Bytes the same index stream occupies under the frame-of-reference + bitpack inner encoding: the FOR base, the
 /// count/width header, and whole FastLanes vectors of packed words. Measured exactly — this is the sampling input that
 /// decides whether the deeper cascade level is kept.
-fn cascaded_exception_index_size(indexes: &[u64]) -> usize {
-    let base = indexes.iter().copied().min().unwrap_or(0);
-    let max_delta = indexes.iter().map(|index| index - base).max().unwrap_or(0);
+fn cascaded_exception_index_size(count: usize, max_delta: u64) -> usize {
     let width = bits_needed(max_delta) as usize;
-    let vectors = indexes.len().div_ceil(FASTLANES_VECTOR);
+    let vectors = count.div_ceil(FASTLANES_VECTOR);
     8 + 5 + vectors * width * FASTLANES_LANES * 8
 }
 
@@ -1146,12 +1168,13 @@ fn cascaded_exception_index_size(indexes: &[u64]) -> usize {
 /// is kept only when it must fit under [`MAX_CASCADE_DEPTH`] and the sampled sizes prove it shrinks the stream past
 /// the strategy's bar: `DecodeOptimized` demands at least a 25% saving before it accepts the extra decode step,
 /// `SizeOptimized` accepts 5%.
-fn choose_exception_side_stream(indexes: &[u64], strategy: CascadeStrategy) -> SideStream {
-    if indexes.is_empty() || !cascade_level_fits(1) {
+/// `count` is the number of exceptions and `max_delta` the spread between their largest and smallest index.
+fn choose_exception_side_stream(count: usize, max_delta: u64, strategy: CascadeStrategy) -> SideStream {
+    if count == 0 || !cascade_level_fits(1) {
         return SideStream::None;
     }
-    let plain = plain_exception_index_size(indexes.len());
-    let cascaded = cascaded_exception_index_size(indexes);
+    let plain = plain_exception_index_size(count);
+    let cascaded = cascaded_exception_index_size(count, max_delta);
     let threshold = match strategy {
         CascadeStrategy::DecodeOptimized | CascadeStrategy::NoTrailing => {
             plain * DECODE_OPTIMIZED_THRESHOLD_NUM / DECODE_OPTIMIZED_THRESHOLD_DEN
@@ -1245,8 +1268,13 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
             }
         }
     }
-    let indexes: Vec<u64> = exceptions.iter().map(|(index, _)| u64::from(*index)).collect();
-    let side = choose_exception_side_stream(&indexes, strategy);
+    let index_base = exceptions.iter().map(|(index, _)| u64::from(*index)).min().unwrap_or(0);
+    let index_max_delta = exceptions
+        .iter()
+        .map(|(index, _)| u64::from(*index).wrapping_sub(index_base))
+        .max()
+        .unwrap_or(0);
+    let side = choose_exception_side_stream(exceptions.len(), index_max_delta, strategy);
     if escaped.is_empty() {
         out.put_u8(exponent_index as u8);
     } else {
@@ -1266,7 +1294,13 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
             }
         }
         SideStream::ForBitpack => {
-            encode_for_bitpack(&indexes, out);
+            // Byte-identical to collecting the indexes and calling [`encode_for_bitpack`] on them.
+            out.put_u64(index_base);
+            bitpack_with(exceptions.len(), bits_needed(index_max_delta), out, |i| {
+                exceptions
+                    .get(i)
+                    .map_or(0, |(index, _)| u64::from(*index).wrapping_sub(index_base))
+            });
             for (_, bits) in &exceptions {
                 out.put_u64(*bits);
             }
@@ -2085,13 +2119,12 @@ fn encode_dictionary_string(
                     .unwrap_or(0)
             })
             .collect();
-        let shared_codes: Vec<u64> = codes
-            .iter()
-            .map(|&code| alphabet_index_of.get(code as usize).copied().unwrap_or(0))
-            .collect();
-        let max = shared_codes.iter().copied().max().unwrap_or(0);
+        let shared_code = |code: u64| alphabet_index_of.get(code as usize).copied().unwrap_or(0);
+        let max = codes.iter().map(|&code| shared_code(code)).max().unwrap_or(0);
         let mut shared_out = Writer::new();
-        bitpack(&shared_codes, bits_needed(max), &mut shared_out);
+        bitpack_with(codes.len(), bits_needed(max), &mut shared_out, |i| {
+            codes.get(i).map_or(0, |&code| shared_code(code))
+        });
         let shared_bytes = shared_out.into_bytes();
         let mut local_out = Writer::new();
         let local_side = encode_local_dictionary(&dictionary, &codes, strategy, &mut local_out)?;
@@ -4248,29 +4281,20 @@ fn decode_dictionary_string_range(
     }
     // Materialize only the entries the extracted codes name, weaving them back through the null stream.
     let materialize = |codes: &[u64]| {
-        let mut resolved = Vec::with_capacity(codes.len());
-        let mut text_bytes = 0usize;
-        for &code in codes {
-            let entry = entries.get(code as usize).copied().ok_or(FormatError::RefOutOfRange {
-                what: "dictionary code",
-            })?;
-            text_bytes += entry.len();
-            resolved.push(entry);
-        }
-        let mut result = StringColumn::with_capacity(effective_len, text_bytes);
-        let mut resolved_iter = resolved.into_iter();
-        nulls.each_row_range(start, effective_end, |present| {
-            if present {
-                let entry = resolved_iter.next().ok_or(FormatError::Structural {
-                    rule: "null bitmap disagrees with present count",
-                })?;
-                result.push(Some(entry));
-            } else {
-                result.push(None);
-            }
-            Ok(())
-        })?;
-        Ok(result)
+        merge_nulls_range(
+            &nulls,
+            codes.len(),
+            |index| {
+                codes
+                    .get(index)
+                    .and_then(|&code| entries.get(code as usize).copied())
+                    .ok_or(FormatError::RefOutOfRange {
+                        what: "dictionary code",
+                    })
+            },
+            start,
+            effective_end,
+        )
     };
     if width == 0 {
         let zero_codes = vec![0u64; present_end - present_start];
@@ -4341,23 +4365,31 @@ fn read_string_header(transform: Transform, reader: &mut Reader<'_>) -> Result<S
     })
 }
 
-/// Threads a decoded run of present values back through the block's presence stream, for rows `[start, end)` only —
-/// the range counterpart of [`merge_nulls`].
-fn merge_nulls_range<T: AsRef<str>>(
+/// Threads a decoded run of `count` present values back through the block's presence stream, for rows `[start, end)`
+/// only — the range counterpart of [`merge_nulls`]. `value(i)` borrows present value `i` on demand: every value is
+/// checked and sized first, so a malformed value is refused before the presence stream is walked, then each is fetched
+/// again straight into the output instead of through a collected list of views.
+fn merge_nulls_range<'a>(
     nulls: &NullStream,
-    present: &[T],
+    count: usize,
+    value: impl Fn(usize) -> Result<&'a str, FormatError>,
     start: usize,
     end: usize,
 ) -> Result<StringColumn, FormatError> {
-    let text_bytes = present.iter().map(|value| value.as_ref().len()).sum();
+    let mut text_bytes = 0usize;
+    for index in 0..count {
+        text_bytes += value(index)?.len();
+    }
     let mut result = StringColumn::with_capacity(end.saturating_sub(start), text_bytes);
     let mut next = 0usize;
     nulls.each_row_range(start, end, |row_present| {
         if row_present {
-            let value = present.get(next).ok_or(FormatError::Structural {
-                rule: "null bitmap disagrees with present count",
-            })?;
-            result.push(Some(value.as_ref()));
+            if next >= count {
+                return Err(FormatError::Structural {
+                    rule: "null bitmap disagrees with present count",
+                });
+            }
+            result.push(Some(value(next)?));
             next += 1;
         } else {
             result.push(None);
@@ -4414,18 +4446,20 @@ fn decode_fsst_string_range(body: &[u8], start: usize, end: usize) -> Result<Str
         "fsst value",
         "fsst offsets must be non-decreasing",
     )?;
-    merge_nulls_range(&header.nulls, &fsst_arena_values(&arena)?, start, effective_end)
+    merge_nulls_range(
+        &header.nulls,
+        arena.len(),
+        |index| fsst_arena_value(&arena, index),
+        start,
+        effective_end,
+    )
 }
 
-/// Every value of a decompressed FSST arena, in order.
-fn fsst_arena_values(arena: &FsstArena) -> Result<Vec<&str>, FormatError> {
-    (0..arena.len())
-        .map(|index| {
-            arena
-                .value(index)
-                .ok_or(FormatError::InvalidUtf8 { what: "fsst value" })
-        })
-        .collect()
+/// Value `index` of a decompressed FSST arena.
+fn fsst_arena_value(arena: &FsstArena, index: usize) -> Result<&str, FormatError> {
+    arena
+        .value(index)
+        .ok_or(FormatError::InvalidUtf8 { what: "fsst value" })
 }
 
 /// Decodes logical rows `[start, end)` from a raw string block, slicing the requested values straight out of the
@@ -4440,24 +4474,29 @@ fn decode_raw_string_range(body: &[u8], start: usize, end: usize) -> Result<Stri
     let present_start = header.nulls.present_before(start);
     let present_end = header.nulls.present_before(effective_end);
     let (data, offsets) = value_bytes_for_range(body, &header, present_start, present_end, "raw string data")?;
-    merge_nulls_range(&header.nulls, &raw_string_values(data, &offsets)?, start, effective_end)
+    merge_nulls_range(
+        &header.nulls,
+        offsets.len().saturating_sub(1),
+        |index| raw_string_value(data, &offsets, index),
+        start,
+        effective_end,
+    )
 }
 
-/// The values `offsets` bounds inside a raw string block's byte arena, checked for UTF-8 as they are sliced.
-fn raw_string_values<'a>(data: &'a [u8], offsets: &[usize]) -> Result<Vec<&'a str>, FormatError> {
-    offsets
-        .windows(2)
-        .map(|pair| {
-            let (start, end) = (pair.first().copied().unwrap_or(0), pair.last().copied().unwrap_or(0));
-            if end < start {
-                return Err(FormatError::Structural {
-                    rule: "raw string offsets must be non-decreasing",
-                });
-            }
-            simdutf8::basic::from_utf8(slice(data, start, end - start, "raw string")?)
-                .map_err(|_| FormatError::InvalidUtf8 { what: "raw string" })
-        })
-        .collect()
+/// Value `index` of the values `offsets` bounds inside a raw string block's byte arena, checked for UTF-8 as it is
+/// sliced.
+fn raw_string_value<'a>(data: &'a [u8], offsets: &[usize], index: usize) -> Result<&'a str, FormatError> {
+    let (start, end) = (
+        offsets.get(index).copied().unwrap_or(0),
+        offsets.get(index + 1).copied().unwrap_or(0),
+    );
+    if end < start {
+        return Err(FormatError::Structural {
+            rule: "raw string offsets must be non-decreasing",
+        });
+    }
+    simdutf8::basic::from_utf8(slice(data, start, end - start, "raw string")?)
+        .map_err(|_| FormatError::InvalidUtf8 { what: "raw string" })
 }
 
 /// Reads a framed string block's header by decompressing only the frames it spans. The header sits at the front of
@@ -4499,7 +4538,7 @@ fn decode_string_framed_range(
     }
     let present_start = header.nulls.present_before(start);
     let present_end = header.nulls.present_before(effective_end);
-    let offsets = decode_offsets(&window.read(
+    let mut offsets = decode_offsets(&window.read(
         header.offsets_start + present_start * 4,
         (present_end - present_start + 1) * 4,
     )?);
@@ -4514,21 +4553,30 @@ fn decode_string_framed_range(
     let arena_start = header.offsets_start + (header.present_count + 1) * 4;
     let data = window.read(arena_start + first, last - first)?;
     // The values were read out of the middle of the arena, so their offsets are rebased onto what was read.
-    let rebased: Vec<usize> = offsets.iter().map(|offset| offset.saturating_sub(first)).collect();
+    for offset in &mut offsets {
+        *offset = offset.saturating_sub(first);
+    }
     match transform {
         Transform::FsstString => {
             let arena = fsst_decompress_arena(
                 header.fsst()?,
                 &data,
-                &rebased,
+                &offsets,
                 "fsst value",
                 "fsst offsets must be non-decreasing",
             )?;
-            merge_nulls_range(&header.nulls, &fsst_arena_values(&arena)?, start, effective_end)
+            merge_nulls_range(
+                &header.nulls,
+                arena.len(),
+                |index| fsst_arena_value(&arena, index),
+                start,
+                effective_end,
+            )
         }
         _ => merge_nulls_range(
             &header.nulls,
-            &raw_string_values(&data, &rebased)?,
+            offsets.len().saturating_sub(1),
+            |index| raw_string_value(&data, &offsets, index),
             start,
             effective_end,
         ),
