@@ -1266,3 +1266,105 @@ fn multi_needle_matching_agrees_with_per_needle_checks_across_mark_sizes() {
     assert!(!overlapping.matches("abcabc"));
     assert!(overlapping.matches("ABCABC\u{e9}"));
 }
+
+/// The merge as it was before it compacted in place: sort, then copy each merged run into a fresh vector.
+fn merge_intervals_by_copying<T: Copy + Ord>(mut intervals: Vec<(T, T)>, after: fn(T) -> T) -> Vec<(T, T)> {
+    intervals.sort_unstable_by_key(|&(lo, _)| lo);
+    let mut merged: Vec<(T, T)> = Vec::with_capacity(intervals.len());
+    for (lo, hi) in intervals {
+        match merged.last_mut() {
+            Some((_, last_hi)) if lo <= after(*last_hi) => {
+                if hi > *last_hi {
+                    *last_hi = hi;
+                }
+            }
+            _ => merged.push((lo, hi)),
+        }
+    }
+    merged
+}
+
+/// Interval lists covering empty, singleton, duplicate, equal-start, nested, overlapping, adjacent, disjoint and
+/// shuffled inputs, built from `points` (which should include the type's extremes) plus deterministic pseudo-random
+/// picks among them.
+fn interval_cases<T: Copy + Ord>(points: &[T]) -> Vec<Vec<(T, T)>> {
+    let ordered = |a: T, b: T| if a <= b { (a, b) } else { (b, a) };
+    let mut cases: Vec<Vec<(T, T)>> = vec![Vec::new()];
+    for &a in points {
+        cases.push(vec![(a, a)]);
+        cases.push(vec![(a, a), (a, a)]);
+        for &b in points {
+            cases.push(vec![ordered(a, b)]);
+            cases.push(vec![ordered(a, b), ordered(a, b)]);
+            cases.push(vec![(a, a), ordered(a, b)]);
+            cases.push(vec![ordered(b, a), (b, b), (a, a)]);
+        }
+    }
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for len in 0..40 {
+        for _ in 0..25 {
+            let case = (0..len)
+                .map(|_| {
+                    let a = points[(next() % points.len() as u64) as usize];
+                    let b = points[(next() % points.len() as u64) as usize];
+                    ordered(a, b)
+                })
+                .collect();
+            cases.push(case);
+        }
+    }
+    cases
+}
+
+#[test]
+fn merging_intervals_in_place_matches_merging_by_copying() {
+    let u64_points = [
+        u64::MIN,
+        1,
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        10,
+        11,
+        100,
+        u64::MAX / 2,
+        u64::MAX - 2,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    for case in interval_cases(&u64_points) {
+        let expected = merge_intervals_by_copying(case.clone(), |hi: u64| hi.saturating_add(1));
+        assert_eq!(merge_intervals(case.clone()), expected, "u64 input {case:?}");
+    }
+
+    let i128_points = [
+        i128::MIN,
+        i128::MIN + 1,
+        i128::MIN + 2,
+        -5,
+        -2,
+        -1,
+        0,
+        1,
+        2,
+        3,
+        5,
+        6,
+        i128::MAX - 2,
+        i128::MAX - 1,
+        i128::MAX,
+    ];
+    for case in interval_cases(&i128_points) {
+        let expected = merge_intervals_by_copying(case.clone(), |hi: i128| hi.saturating_add(1));
+        assert_eq!(merge_intervals_i128(case.clone()), expected, "i128 input {case:?}");
+    }
+}

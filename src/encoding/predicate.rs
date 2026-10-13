@@ -1259,20 +1259,36 @@ fn interval_contains(intervals: &[(u64, u64)], value: u64) -> bool {
 
 /// Sorts `intervals` by `lo` and merges every overlapping or adjacent pair into one, so a later membership test walks
 /// a minimal, non-overlapping, ascending set instead of the original (possibly overlapping) list.
-fn merge_intervals(mut intervals: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+fn merge_intervals(intervals: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    merge_intervals_in_place(intervals, |hi| hi.saturating_add(1))
+}
+
+/// Sorts `intervals` by `lo` and merges every pair where the next `lo` is at most `after(last_hi)`, reusing the input
+/// vector's storage instead of allocating a second one. `after` is the value just past a bound, saturating at the
+/// type's maximum, so an interval ending at the maximum still absorbs any later one.
+fn merge_intervals_in_place<T: Copy + Ord>(mut intervals: Vec<(T, T)>, after: fn(T) -> T) -> Vec<(T, T)> {
     intervals.sort_unstable_by_key(|&(lo, _)| lo);
-    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
-    for (lo, hi) in intervals {
-        match merged.last_mut() {
-            Some((_, last_hi)) if lo <= last_hi.saturating_add(1) => {
+    let mut len: usize = 0;
+    for read in 0..intervals.len() {
+        let Some(&(lo, hi)) = intervals.get(read) else {
+            break;
+        };
+        match len.checked_sub(1).and_then(|last| intervals.get_mut(last)) {
+            Some((_, last_hi)) if lo <= after(*last_hi) => {
                 if hi > *last_hi {
                     *last_hi = hi;
                 }
             }
-            _ => merged.push((lo, hi)),
+            _ => {
+                if let Some(slot) = intervals.get_mut(len) {
+                    *slot = (lo, hi);
+                }
+                len += 1;
+            }
         }
     }
-    merged
+    intervals.truncate(len);
+    intervals
 }
 
 /// A [`PackedLaneTest`]'s ranges, merged once at translate time so a lane's verdict is a couple of binary searches
@@ -1615,20 +1631,8 @@ fn filter_decimal128_block(body: &[u8], predicate: &NumericPredicate) -> Result<
 
 /// Sorts `intervals` by `lo` and merges every overlapping or adjacent pair into one — the `i128` domain's counterpart
 /// to [`merge_intervals`].
-fn merge_intervals_i128(mut intervals: Vec<(i128, i128)>) -> Vec<(i128, i128)> {
-    intervals.sort_unstable_by_key(|&(lo, _)| lo);
-    let mut merged: Vec<(i128, i128)> = Vec::with_capacity(intervals.len());
-    for (lo, hi) in intervals {
-        match merged.last_mut() {
-            Some((_, last_hi)) if lo <= last_hi.saturating_add(1) => {
-                if hi > *last_hi {
-                    *last_hi = hi;
-                }
-            }
-            _ => merged.push((lo, hi)),
-        }
-    }
-    merged
+fn merge_intervals_i128(intervals: Vec<(i128, i128)>) -> Vec<(i128, i128)> {
+    merge_intervals_in_place(intervals, |hi| hi.saturating_add(1))
 }
 
 /// Whether `value` falls in any of `intervals` — the `i128` domain's counterpart to [`interval_contains`].
