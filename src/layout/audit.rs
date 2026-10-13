@@ -16,7 +16,7 @@ use super::constant::{AUDIT_ROW_HASHER, ROW_DIGEST_INPUT_CAPACITY};
 use super::event::read_u64s;
 use super::footer::AuditTrail;
 use super::reader::{HefFile, PayloadRead};
-use crate::artifacts::batch::encode_variant_dictionary;
+use crate::artifacts::batch::encode_variant_dictionary_into;
 use crate::columns::column_ids;
 use crate::error::{AuditChainError, FormatError};
 use crate::events::EventEnvelope;
@@ -206,7 +206,7 @@ pub(crate) fn envelope_row_digest(
 /// Writes the dictionary of a payload's own keys and returns it for encoding the payload against.
 fn put_dictionary(out: &mut Writer, keys: BTreeSet<&str>) -> Result<KeyDictionary, FormatError> {
     let dictionary = KeyDictionary::from_sorted_unique(keys.into_iter().map(str::to_owned).collect())?;
-    out.put_slice(&encode_variant_dictionary(&dictionary));
+    encode_variant_dictionary_into(&dictionary, out);
     Ok(dictionary)
 }
 
