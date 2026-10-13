@@ -985,6 +985,9 @@ fn reference_null_stream(values: &StringColumn) -> NullStream {
     NullStream { form, row_count }
 }
 
+/// A named presence pattern: whether row `i` carries a value.
+type RowShape = (&'static str, Box<dyn Fn(usize) -> bool>);
+
 /// The counting first pass must choose the same form and write the same bytes as the reference derivation for every
 /// null pattern, including the run/raw size tie (which the raw bitmap wins) and patterns ending on byte boundaries.
 #[test]
@@ -995,7 +998,7 @@ fn null_stream_matches_the_reference_derivation() {
         ("single absent".into(), string_values_with_nulls(1, |_| false)),
     ];
     for row_count in [7usize, 8, 9, 15, 16, 17, 63, 64, 65, 100, 255, 256, 257, 1000, 4096] {
-        let shapes: [(&str, Box<dyn Fn(usize) -> bool>); 12] = [
+        let shapes: [RowShape; 12] = [
             ("all present", Box::new(|_| true)),
             ("all absent", Box::new(|_| false)),
             ("alternating", Box::new(|i| i % 2 == 0)),
