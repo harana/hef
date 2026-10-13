@@ -399,7 +399,7 @@ impl LiveOverlayStore {
         let mut chain: Option<[u8; BLAKE3_LEN]> = None;
         // The ranges accepted so far, per tenant: sequence identity includes the tenant, so one tenant's frame never
         // arbitrates against another's identically numbered range.
-        let mut covered: Vec<(TenantId, SequenceRange)> = Vec::new();
+        let mut covered = BTreeMap::new();
         for ReplayedFrame {
             header, frame_bytes, ..
         } in &replay.frames
@@ -413,13 +413,9 @@ impl LiveOverlayStore {
                 first_sequence: header.first_sequence,
                 last_sequence: header.last_sequence,
             };
-            if covered
-                .iter()
-                .any(|(tenant_id, existing)| *tenant_id == header.tenant_id && existing.overlaps(&range))
-            {
+            if !claim_range(&mut covered, header.tenant_id, range) {
                 continue;
             }
-            covered.push((header.tenant_id, range));
             if header.is_void_record() {
                 self.publish_void(header.tenant_id, range);
                 continue;
@@ -507,6 +503,28 @@ impl LiveOverlayStore {
     pub fn segments(&self) -> impl Iterator<Item = &LiveOverlaySegment> {
         self.segments.values()
     }
+}
+
+/// Records `range` as `tenant_id`'s when no range already in `covered` overlaps it, and says whether it did. `covered`
+/// maps each accepted range's `(tenant, epoch, first sequence)` to its last sequence; its ranges never overlap, so only
+/// the nearest one starting at or before `range` and the nearest one starting after it can.
+fn claim_range(covered: &mut BTreeMap<(TenantId, u64, u64), u64>, tenant_id: TenantId, range: SequenceRange) -> bool {
+    let start = (tenant_id, range.epoch, range.first_sequence);
+    let same_epoch =
+        |(claimed_tenant, epoch, _): &(TenantId, u64, u64)| *claimed_tenant == tenant_id && *epoch == range.epoch;
+    let before = covered
+        .range(..=start)
+        .next_back()
+        .is_some_and(|(claimed, last)| same_epoch(claimed) && *last >= range.first_sequence);
+    let after = covered
+        .range(start..)
+        .next()
+        .is_some_and(|(claimed, _)| same_epoch(claimed) && claimed.2 <= range.last_sequence);
+    if before || after {
+        return false;
+    }
+    covered.insert(start, range.last_sequence);
+    true
 }
 
 #[cfg(test)]

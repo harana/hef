@@ -428,3 +428,99 @@ fn a_rebuilt_overlay_rejects_a_void_that_overlaps_an_earlier_event_frame() {
         FreshRead::Behind { missing } => panic!("expected Ready, got Behind {missing:?}"),
     }
 }
+
+/// What `rebuild_from_replay` decided before it indexed the accepted ranges: a frame is accepted when no earlier
+/// accepted range of its tenant overlaps it.
+fn claim_range_by_scanning(
+    covered: &mut Vec<(TenantId, SequenceRange)>,
+    tenant_id: TenantId,
+    range: SequenceRange,
+) -> bool {
+    if covered
+        .iter()
+        .any(|(claimed_tenant, existing)| *claimed_tenant == tenant_id && existing.overlaps(&range))
+    {
+        return false;
+    }
+    covered.push((tenant_id, range));
+    true
+}
+
+#[test]
+fn claiming_ranges_matches_scanning_every_accepted_range() {
+    let mut state = 0x0E1A_u64;
+    let mut random = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let fixed = [
+        (7, seq_range(1, 10, 20)),
+        (7, seq_range(1, 10, 20)),
+        (7, seq_range(1, 15, 25)),
+        (7, seq_range(1, 5, 10)),
+        (7, seq_range(1, 20, 30)),
+        (7, seq_range(1, 21, 30)),
+        (7, seq_range(1, 0, 9)),
+        (7, seq_range(1, 1, 40)),
+        (8, seq_range(1, 10, 20)),
+        (7, seq_range(2, 10, 20)),
+        (7, seq_range(1, u64::MAX - 1, u64::MAX)),
+        (7, seq_range(1, u64::MAX, u64::MAX)),
+        (7, seq_range(1, 31, u64::MAX - 2)),
+        (7, seq_range(1, 31, u64::MAX - 1)),
+    ];
+    let mut histories: Vec<Vec<(u128, SequenceRange)>> = vec![fixed.to_vec()];
+    for _ in 0..200 {
+        histories.push(
+            (0..random() % 60)
+                .map(|_| {
+                    let first = random() % 100;
+                    let last = first + random() % 12;
+                    (7 + u128::from(random() % 2), seq_range(random() % 2, first, last))
+                })
+                .collect(),
+        );
+    }
+    for history in histories {
+        let mut indexed = BTreeMap::new();
+        let mut scanned = Vec::new();
+        for (tenant, range) in history {
+            let tenant_id = TenantId::new_test_id(tenant);
+            assert_eq!(
+                claim_range(&mut indexed, tenant_id, range),
+                claim_range_by_scanning(&mut scanned, tenant_id, range),
+                "{range:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_rebuilt_overlay_rejects_frames_overlapping_one_already_published() {
+    // The first frame is already HEF-covered, so it builds no segment, but it still won its range: a later
+    // overlapping void or event frame is a rejected duplicate, not a new owner of those sequences.
+    let published = sample_frame(3, 1, 1); // covers 1..=3
+    let late_void = void_frame(1, 2, 4);
+    let late_event = sample_frame(3, 1, 3); // covers 3..=5
+    let replay = ReplayOutcome {
+        frames: vec![
+            replayed_frame(published.clone(), 0),
+            replayed_frame(late_void.clone(), published.len() as u64),
+            replayed_frame(late_event, (published.len() + late_void.len()) as u64),
+        ],
+        segment_chain_blake3: None,
+        tail: ReplayTail::Clean,
+    };
+
+    let mut store = LiveOverlayStore::new();
+    store
+        .rebuild_from_replay(&replay, 1, 1, |_, range| range.first_sequence == 1)
+        .unwrap();
+    assert_eq!(store.segment_count(), 0, "the late event frame is rejected");
+    match store.fresh_read(TenantId::new_test_id(7), seq_range(1, 2, 4)) {
+        FreshRead::Behind { missing } => assert_eq!(missing, seq_range(1, 2, 4), "the late void is rejected"),
+        FreshRead::Ready(_) => panic!("the late void must not claim the published range"),
+    }
+}
