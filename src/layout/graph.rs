@@ -640,7 +640,7 @@ pub fn event_id_hash(event_id: &[u8]) -> u64 {
 /// with protocol id `event_id`. `false` is certain; `true` may be wrong, and is the answer for bytes that do not
 /// decode as a filter.
 pub fn event_id_filter_may_hold(filter: &[u8], event_id: &[u8]) -> bool {
-    BinaryFuseFilter::decode(filter).map_or(true, |filter| filter.contains(event_id_hash(event_id)))
+    BinaryFuseFilter::contains_encoded(filter, event_id_hash(event_id)).unwrap_or(true)
 }
 
 impl EventIdIndex {
@@ -700,7 +700,7 @@ impl EventIdIndex {
         let sns = take_block(&mut reader)?;
         let filter_len = reader.u32("graph event id filter length")? as usize;
         let filter = reader.take(filter_len, "graph event id filter")?.to_vec();
-        BinaryFuseFilter::decode(&filter)?;
+        BinaryFuseFilter::parse(&filter)?;
         let (ColumnData::U64(hashes), ColumnData::U64(sns)) = (hashes, sns) else {
             return Err(FormatError::Structural {
                 rule: "graph event id hashes and sequence numbers must decode to u64 columns",

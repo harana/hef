@@ -59,3 +59,35 @@ fn sketches_are_deterministic() {
     assert_eq!(a.distinct(), b.distinct());
     assert_eq!(a, b);
 }
+
+fn sketch_of(values: std::ops::Range<u64>) -> NdvSketch {
+    let mut sketch = NdvSketch::new();
+    sketch.observe_column(&ColumnData::U64(values.collect()));
+    sketch
+}
+
+#[test]
+fn merge_stays_exact_up_to_the_cap_and_degrades_past_it() {
+    for (union, exact) in [(1023u64, true), (1024, true), (1025, false), (2048, false)] {
+        let mut left = sketch_of(0..union / 2);
+        left.merge(&sketch_of(union / 2..union));
+        assert_eq!(left.distinct().1, exact, "union of {union}");
+        assert_eq!(left, sketch_of(0..union), "union of {union}");
+    }
+}
+
+#[test]
+fn overlapping_merge_that_fits_stays_exact() {
+    let mut left = sketch_of(0..800);
+    left.merge(&sketch_of(200..1000));
+    assert_eq!(left.distinct(), (1000, true));
+    assert_eq!(left, sketch_of(0..1000));
+}
+
+#[test]
+fn degraded_merge_keeps_register_parity() {
+    let mut left = sketch_of(0..1000);
+    left.merge(&sketch_of(500..1600));
+    assert!(!left.distinct().1);
+    assert_eq!(left.registers, sketch_of(0..1600).registers);
+}

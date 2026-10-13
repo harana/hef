@@ -31,7 +31,10 @@ impl RankSelect {
     /// Builds the rank/select index from a bitmap. Precomputes one cumulative-count entry per run; subsequent queries
     /// cost O(log runs).
     pub fn from_bitmap(bitmap: &RoaringRangeBitmap) -> Self {
-        let runs = bitmap.ranges().to_vec();
+        Self::from_runs(bitmap.ranges().to_vec())
+    }
+
+    fn from_runs(runs: Vec<RowRange>) -> Self {
         let mut cumulative = Vec::with_capacity(runs.len());
         let mut acc = 0u64;
         for run in &runs {
@@ -50,7 +53,7 @@ impl RankSelect {
     /// is identical to building over `RoaringRangeBitmap::from_rows(<every set row>)` of the same bits — the raw path
     /// stays the equivalence oracle in tests.
     pub fn from_packed_bits(bits: &[u8]) -> Self {
-        Self::from_bitmap(&RoaringRangeBitmap::from_packed_bits(bits))
+        Self::from_runs(RoaringRangeBitmap::from_packed_bits(bits).into_ranges())
     }
 
     /// How many set bits (live or non-null rows) appear strictly before `position`. Returns 0 when `position` is 0 or
