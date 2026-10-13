@@ -981,6 +981,13 @@ fn delta_size(values: &[u64], block_len: usize) -> usize {
 /// Fixed positions keep selection deterministic, so byte-identical encodes across nodes hold unchanged. Requirement:
 /// "Stratified sampling through one shared statistics pass".
 fn transform_sample<T: Copy>(values: &[T]) -> Option<Vec<T>> {
+    transform_sample_mapped(values, |value| value)
+}
+
+/// [`transform_sample`] with `map` applied to each drawn value as it is copied: the same `None` for a short block and
+/// the same runs, in the same order, for a long one — so a caller that scores the sample in another domain (zigzag
+/// codes for `i64`) fills one buffer instead of drawing the sample and then mapping a second copy of it.
+fn transform_sample_mapped<T: Copy, U>(values: &[T], map: impl Fn(T) -> U) -> Option<Vec<U>> {
     if values.len() <= TRANSFORM_SAMPLE_SIZE {
         return None;
     }
@@ -990,7 +997,7 @@ fn transform_sample<T: Copy>(values: &[T]) -> Option<Vec<T>> {
     for i in 0..TRANSFORM_SAMPLE_RUNS {
         let start = span * i / (TRANSFORM_SAMPLE_RUNS - 1);
         if let Some(window) = values.get(start..start + run) {
-            sample.extend_from_slice(window);
+            sample.extend(window.iter().map(|value| map(*value)));
         }
     }
     Some(sample)
@@ -1043,11 +1050,10 @@ fn score_u64_candidates(sample: &[u64], block_len: usize, strategy: CascadeStrat
 
 /// [`choose_u64_transform`] for `i64` values: only the (bounded [`TRANSFORM_SAMPLE_SIZE`]) sample is zigzag-mapped
 /// to score candidates, instead of the whole column — the full mapping happens only once, in [`encode_i64_with`],
-/// for whichever transform wins.
+/// for whichever transform wins. The sample is drawn straight into zigzag codes, so no signed copy is made first.
 fn choose_i64_transform(values: &[i64], strategy: CascadeStrategy) -> Transform {
-    let sample = transform_sample(values);
-    let sample: &[i64] = sample.as_deref().unwrap_or(values);
-    let mapped: Vec<u64> = sample.iter().map(|value| zigzag(*value)).collect();
+    let mapped =
+        transform_sample_mapped(values, zigzag).unwrap_or_else(|| values.iter().map(|value| zigzag(*value)).collect());
     score_u64_candidates(&mapped, values.len(), strategy)
 }
 
@@ -1455,15 +1461,6 @@ fn write_byte_stream_split(values: &[f64], out: &mut [u8]) {
     }
 }
 
-/// The bytes of `values`, regrouped into 8 same-significance planes (see [`write_byte_stream_split`]) — for a caller
-/// that needs them as a standalone buffer rather than written into a [`Writer`] in place, as
-/// [`choose_float_fallback`]'s sample trial does.
-fn byte_stream_split_bytes(values: &[f64]) -> Vec<u8> {
-    let mut out = vec![0u8; values.len() * 8];
-    write_byte_stream_split(values, &mut out);
-    out
-}
-
 /// Picks the transform for a float column ALP rejected: ALP-RD, byte-stream-split, or plain, whichever the sample says
 /// stores smallest. Byte-stream-split regroups bytes by significance so the high-order planes (sign/exponent) form
 /// long runs deflate can shrink; plain interleaves all 8 bytes of every value, which defeats deflate's small window on
@@ -1475,10 +1472,15 @@ fn choose_float_fallback(values: &[f64]) -> Transform {
     if sample.is_empty() {
         return Transform::PlainF64;
     }
-    let plain_bytes: Vec<u8> = sample.iter().flat_map(|value| value.to_le_bytes()).collect();
-    let bss_bytes = byte_stream_split_bytes(sample);
-    let plain_compressed = deflate::compress(&plain_bytes).len();
-    let bss_compressed = deflate::compress(&bss_bytes).len();
+    // The two trials run one after the other and keep only a compressed length, so they share one raw buffer: plain
+    // little-endian bytes first, then overwritten in full by the byte-stream-split planes.
+    let mut trial = vec![0u8; sample.len() * 8];
+    for (bytes, value) in trial.chunks_exact_mut(8).zip(sample) {
+        bytes.copy_from_slice(&value.to_le_bytes());
+    }
+    let plain_compressed = deflate::compress(&trial).len();
+    write_byte_stream_split(sample, &mut trial);
+    let bss_compressed = deflate::compress(&trial).len();
     let (_, _, alp_rd_estimate) = alp_rd_choose_split(sample);
     if alp_rd_estimate < plain_compressed.min(bss_compressed) {
         Transform::AlpRd

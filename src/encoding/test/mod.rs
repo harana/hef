@@ -124,6 +124,149 @@ fn monotonic_block_still_chooses_delta_across_sample_run_boundaries() {
     );
 }
 
+/// Signed selection columns covering the sample threshold on both sides, the extremes of the range and the shapes
+/// selection must tell apart.
+fn signed_selection_columns() -> Vec<Vec<i64>> {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut random = |count: usize| -> Vec<i64> {
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                state as i64
+            })
+            .collect()
+    };
+    let mut columns = Vec::new();
+    for count in [0usize, 1, 1023, 1024, 1025, 4096, 10_007] {
+        columns.push(random(count));
+        columns.push(vec![-7; count]);
+        columns.push((0..count as i64).map(|i| i * 3 - 5_000).collect());
+        columns.push((0..count as i64).map(|i| if i % 2 == 0 { i } else { -i }).collect());
+        columns.push(
+            (0..count)
+                .map(|i| if i % 3 == 0 { i64::MIN } else { i64::MAX })
+                .collect(),
+        );
+    }
+    let mut prefixed = vec![42i64; TRANSFORM_SAMPLE_SIZE];
+    prefixed.extend(random(7 * 1024));
+    columns.push(prefixed);
+    columns
+}
+
+/// Drawing the signed sample straight into zigzag codes must yield exactly the codes of the sample drawn first and
+/// mapped afterwards — same runs, same order, same `None` for a short block — and so the same chosen transform under
+/// every strategy.
+#[test]
+fn signed_sample_drawn_as_zigzag_codes_matches_the_mapped_signed_sample() {
+    for values in signed_selection_columns() {
+        let reference: Option<Vec<u64>> =
+            transform_sample(&values).map(|sample| sample.iter().map(|value| zigzag(*value)).collect());
+        assert_eq!(
+            transform_sample_mapped(&values, zigzag),
+            reference,
+            "sample at {} values",
+            values.len()
+        );
+        let reference_mapped = reference.unwrap_or_else(|| values.iter().map(|value| zigzag(*value)).collect());
+        for strategy in [
+            CascadeStrategy::DecodeOptimized,
+            CascadeStrategy::NoTrailing,
+            CascadeStrategy::SizeOptimized,
+        ] {
+            assert_eq!(
+                choose_i64_transform(&values, strategy),
+                score_u64_candidates(&reference_mapped, values.len(), strategy),
+                "{strategy:?} at {} values",
+                values.len()
+            );
+        }
+    }
+}
+
+/// The float fallback trial as it stood with a separate raw buffer per trial: the reference the shared-buffer trial
+/// must agree with.
+fn reference_float_fallback(values: &[f64]) -> Transform {
+    let sample = transform_sample(values);
+    let sample: &[f64] = sample.as_deref().unwrap_or(values);
+    if sample.is_empty() {
+        return Transform::PlainF64;
+    }
+    let plain_bytes: Vec<u8> = sample.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let mut bss_bytes = vec![0u8; sample.len() * 8];
+    write_byte_stream_split(sample, &mut bss_bytes);
+    let plain_compressed = deflate::compress(&plain_bytes).len();
+    let bss_compressed = deflate::compress(&bss_bytes).len();
+    let (_, _, alp_rd_estimate) = alp_rd_choose_split(sample);
+    if alp_rd_estimate < plain_compressed.min(bss_compressed) {
+        Transform::AlpRd
+    } else if bss_compressed < plain_compressed {
+        Transform::ByteStreamSplit
+    } else {
+        Transform::PlainF64
+    }
+}
+
+/// Float columns for the fallback trial: threshold boundaries, repeated exponents, raw random bits and the special
+/// IEEE values whose bit patterns must survive untouched.
+fn float_fallback_columns() -> Vec<Vec<f64>> {
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    let mut random_bits = |count: usize| -> Vec<f64> {
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                f64::from_bits(state)
+            })
+            .collect()
+    };
+    let specials = [
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7FF8_0000_0000_0001),
+        f64::from_bits(0xFFF0_0000_0000_BEEF),
+        f64::MIN_POSITIVE / 3.0,
+        -f64::MIN_POSITIVE / 7.0,
+    ];
+    let mut columns = Vec::new();
+    for count in [0usize, 1, 1023, 1024, 1025, 4096, 10_007] {
+        columns.push(random_bits(count));
+        columns.push((0..count).map(|i| 1.0 + (i as f64) * f64::EPSILON * 977.0).collect());
+        columns.push((0..count).map(|i| specials[i % specials.len()]).collect());
+        columns.push(
+            (0..count)
+                .map(|i| f64::from_bits((1023u64 << 52) | ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 12)))
+                .collect(),
+        );
+    }
+    columns
+}
+
+/// The float fallback trial reuses one raw buffer for its plain and byte-stream-split compressions. It must choose
+/// exactly what separate buffers chose, and the byte-stream-split planes written over the plain bytes must equal
+/// those written into a fresh buffer.
+#[test]
+fn float_fallback_trial_in_one_buffer_matches_separate_buffers() {
+    for values in float_fallback_columns() {
+        assert_eq!(
+            choose_float_fallback(&values),
+            reference_float_fallback(&values),
+            "fallback at {} values",
+            values.len()
+        );
+        let mut reused: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
+        write_byte_stream_split(&values, &mut reused);
+        let mut fresh = vec![0u8; values.len() * 8];
+        write_byte_stream_split(&values, &mut fresh);
+        assert_eq!(reused, fresh, "planes at {} values", values.len());
+    }
+}
+
 #[test]
 fn metric_f64_uses_alp_with_exact_round_trip() {
     let values: Vec<f64> = (0..2048).map(|i| (i as f64) * 0.25 + 10.5).collect();
