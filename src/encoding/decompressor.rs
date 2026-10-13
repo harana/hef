@@ -145,7 +145,7 @@ impl Decompressor for SoftwareDecompressor {
                 plain.clear();
                 plain.extend_from_slice(bytes);
             }
-            Compression::Deflate => *plain = super::deflate::decompress(bytes)?,
+            Compression::Deflate => super::deflate::decompress_into(bytes, plain)?,
             Compression::SeekableZstd => super::seekable_zstd::decompress_all_into(bytes, plain)?,
             Compression::Lz4 => {
                 let mut reader = Reader::new(bytes);
