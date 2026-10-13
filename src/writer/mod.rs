@@ -4,10 +4,13 @@
 //! building and publishing the file, and the policy that decides when to roll to a new file. This runs only on the
 //! leader (behind the `write` feature) and is not reachable from a read-only binary.
 
+pub mod audit;
 pub mod build;
 pub mod compaction;
 pub mod constant;
 pub mod error;
+pub mod graph;
+pub mod graph_seal;
 pub mod pipeline;
 pub mod projection;
 pub mod publish;
@@ -18,5 +21,6 @@ pub mod retry;
 pub mod rewrite;
 pub mod sim;
 pub(crate) mod source_form;
+pub mod state_gc;
 pub mod subject_seal;
 pub mod upload;

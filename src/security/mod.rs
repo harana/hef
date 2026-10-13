@@ -23,9 +23,11 @@ use std::fmt;
 use std::mem::size_of;
 use std::sync::{Arc, Mutex, PoisonError};
 
+pub use state_chunk::*;
 pub use subject_payload::*;
 
 mod constant;
+mod state_chunk;
 mod subject_payload;
 
 /// HKDF-SHA256 label binding a wrapping key derived from a master key to its one job: wrapping per-tenant DEKs.

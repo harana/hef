@@ -2,20 +2,24 @@
 //!
 //! Every accepted body is converted to the canonical value before it is written to the journal; the original source
 //! bytes are not kept, unless the stream opts into the raw-payload column that stores them beside the canonical value.
-//! This change wires up the JSON and raw-bytes converters; the Protobuf, Avro, and MessagePack converters need
-//! registered source schemas and land with the connector-service work (design D7). The single-format rule is already
+//! JSON, Protobuf, and raw-bytes converters are wired up; Protobuf decodes against the message schema the ingest route
+//! registered for the stream. The Avro and MessagePack converters land with the connector-service work (design D7). The single-format rule is already
 //! enforced everywhere: the journal rejects every other payload encoding.
 
+use super::envelope::TimestampValue;
 use super::variant::{MAX_DEPTH, VariantValue};
 use crate::error::FormatError;
+use prost_reflect::{DynamicMessage, EnumDescriptor, MapKey, MessageDescriptor, ReflectMessage, Value};
 use serde::de::{Deserialize, DeserializeSeed, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
 use std::collections::BTreeMap;
 use std::fmt;
 
 /// Source formats accepted at the ingest edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceFormat {
+pub enum SourceFormat<'a> {
     Json,
+    /// A binary Protobuf message, decoded against the schema registered for the ingest route.
+    Protobuf(&'a MessageDescriptor),
     /// Raw or undecodable binary bodies: stored as a single Variant binary scalar.
     RawBytes,
 }
@@ -23,7 +27,7 @@ pub enum SourceFormat {
 /// Transcodes one source body into the canonical variant value. Deterministic: object keys collect into the shared
 /// dictionary at encode time, numbers map to the narrowest lossless variant numeric type, and raw bytes become one
 /// binary scalar.
-pub fn transcode(format: SourceFormat, body: &[u8]) -> Result<VariantValue, FormatError> {
+pub fn transcode(format: SourceFormat<'_>, body: &[u8]) -> Result<VariantValue, FormatError> {
     let mut scratch = Vec::new();
     transcode_with_scratch(format, body, &mut scratch)
 }
@@ -32,7 +36,7 @@ pub fn transcode(format: SourceFormat, body: &[u8]) -> Result<VariantValue, Form
 /// every call — pass the same buffer across a worker's calls (cleared here, not dropped) so steady-state ingest
 /// allocates nothing for it.
 pub fn transcode_with_scratch(
-    format: SourceFormat,
+    format: SourceFormat<'_>,
     body: &[u8],
     scratch: &mut Vec<u8>,
 ) -> Result<VariantValue, FormatError> {
@@ -50,8 +54,118 @@ pub fn transcode_with_scratch(
             })?;
             Ok(parsed.0)
         }
+        SourceFormat::Protobuf(descriptor) => {
+            let message = DynamicMessage::decode(descriptor.clone(), body).map_err(|_| FormatError::Structural {
+                rule: "declared-Protobuf ingest body did not decode against its registered schema",
+            })?;
+            protobuf_message(message)
+        }
         SourceFormat::RawBytes => Ok(VariantValue::Binary(body.to_vec())),
     }
+}
+
+/// Converts one decoded Protobuf message into a canonical object keyed by field name. Only fields present in the
+/// message are kept; unknown fields (numbers the schema does not declare) are dropped. A
+/// `google.protobuf.Timestamp` becomes a timestamp value rather than an object. Nesting needs no bound here: the
+/// Protobuf decoder already refuses messages nested past 100 levels, under the canonical format's limit.
+fn protobuf_message(mut message: DynamicMessage) -> Result<VariantValue, FormatError> {
+    if message.descriptor().full_name() == "google.protobuf.Timestamp" {
+        return protobuf_timestamp(&message);
+    }
+    let mut fields = BTreeMap::new();
+    // Drains the decoded values so strings and map keys move into the canonical tree instead of being cloned.
+    for (field, value) in message.take_fields() {
+        // Resolved once per field, not once per repeated item or map value. For a map field the enum comes from the
+        // entry's value field.
+        let enum_kind = match field.kind().as_message() {
+            Some(entry) if field.is_map() => entry.map_entry_value_field().kind(),
+            _ => field.kind(),
+        }
+        .as_enum()
+        .cloned();
+        let enum_kind = enum_kind.as_ref();
+        let value = match value {
+            Value::List(items) => {
+                let mut array = Vec::with_capacity(items.len());
+                for item in items {
+                    array.push(protobuf_value(enum_kind, item)?);
+                }
+                VariantValue::Array(array)
+            }
+            Value::Map(entries) => {
+                let mut object = BTreeMap::new();
+                for (key, item) in entries {
+                    object.insert(protobuf_map_key(key), protobuf_value(enum_kind, item)?);
+                }
+                VariantValue::Object(object)
+            }
+            other => protobuf_value(enum_kind, other)?,
+        };
+        fields.insert(field.name().to_owned(), value);
+    }
+    Ok(VariantValue::Object(fields))
+}
+
+/// Converts one scalar, enum, or nested-message value. `enum_kind` is the field's enum, if it holds one, which names
+/// the enum numbers.
+fn protobuf_value(enum_kind: Option<&EnumDescriptor>, value: Value) -> Result<VariantValue, FormatError> {
+    Ok(match value {
+        Value::Bool(value) => VariantValue::Bool(value),
+        Value::Bytes(value) => VariantValue::Binary(value.to_vec()),
+        Value::EnumNumber(number) => match enum_kind.and_then(|kind| kind.get_value(number)) {
+            Some(known) => VariantValue::String(known.name().to_owned()),
+            None => VariantValue::Int(i64::from(number)),
+        },
+        Value::F32(value) => VariantValue::Float(value),
+        Value::F64(value) => VariantValue::Double(value),
+        Value::I32(value) => VariantValue::Int(i64::from(value)),
+        Value::I64(value) => VariantValue::Int(value),
+        Value::List(_) | Value::Map(_) => {
+            return Err(FormatError::Structural {
+                rule: "declared-Protobuf ingest body nests a repeated or map value directly",
+            });
+        }
+        Value::Message(message) => protobuf_message(message)?,
+        Value::String(value) => VariantValue::String(value),
+        Value::U32(value) => VariantValue::Int(i64::from(value)),
+        Value::U64(value) => match i64::try_from(value) {
+            Ok(value) => VariantValue::Int(value),
+            // Beyond i64: preserved losslessly as a scale-0 decimal, as JSON does.
+            Err(_) => VariantValue::Decimal {
+                unscaled: i128::from(value),
+                scale: 0,
+            },
+        },
+    })
+}
+
+fn protobuf_map_key(key: MapKey) -> String {
+    match key {
+        MapKey::Bool(value) => value.to_string(),
+        MapKey::I32(value) => value.to_string(),
+        MapKey::I64(value) => value.to_string(),
+        MapKey::String(value) => value,
+        MapKey::U32(value) => value.to_string(),
+        MapKey::U64(value) => value.to_string(),
+    }
+}
+
+fn protobuf_timestamp(message: &DynamicMessage) -> Result<VariantValue, FormatError> {
+    let seconds = message
+        .get_field_by_name("seconds")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    let nanos = message
+        .get_field_by_name("nanos")
+        .and_then(|value| value.as_i32())
+        .unwrap_or(0);
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(i64::from(nanos)))
+        .map(|nanos| VariantValue::Timestamp(TimestampValue::from_physical_nanos(nanos)))
+        .ok_or(FormatError::Structural {
+            rule: "declared-Protobuf timestamp is outside the representable range",
+        })
 }
 
 /// One JSON body deserialized straight into the canonical value, so a parse builds the stored tree once instead of

@@ -4,6 +4,8 @@
 //! The builder is deterministic: the same rows and configuration produce byte-identical files, which is what makes
 //! publication idempotent (the file identity is derived from its content).
 
+use super::audit::{AuditSettings, audit_trail, refuse_audit_rewrite};
+use super::constant::DEFAULT_TIME_SERIES_BUCKET_NANOS;
 use super::source_form::{self, SourceFormIndexes};
 use crate::artifacts::batch::{
     EncodedPayload, EventInput, PAYLOAD_FLAG_EXTERNAL_REF, PayloadInput, encode_variant_dictionary,
@@ -14,8 +16,9 @@ use crate::columns::{
 };
 use crate::deletes::SubjectId;
 use crate::encoding::{
-    BlockStats, CascadeStrategy, ColumnData, FsstTable, ReplayCapture, SideStream, StringColumn, ValueKind,
-    count_set_bits, encode_block_replayed, encode_block_with_shared_dictionary, seekable_zstd,
+    BlockStats, CascadeStrategy, ColumnData, FsstTable, ReplayCapture, SideStream, StringColumn, Transform, ValueKind,
+    count_set_bits, encode_block_replayed, encode_block_with_shared_dictionary, encode_block_with_xor_floats,
+    seekable_zstd,
 };
 use crate::error::FormatError;
 use crate::events::matrix::MatrixProvenance;
@@ -35,15 +38,18 @@ use crate::invariants::EncodeExecutor;
 use crate::invariants::sim::SerialEncodeExecutor;
 use crate::layout::footer::{
     ClusteringEntry, ColumnDescriptor, ColumnKind, ColumnMark, EntityHashFilterEntry, ExactCounts, FileDictionaries,
-    Footer, FreetextEntry, FreetextRowOffsets, GranuleEntry, MarksPageEntry, PageDirectoryEntry, PageMinMax, PageStats,
-    PayloadGranule, PresenceEntry, ResidualCompression, SharedDictionaryEntry, ShredEntry, SortDirection,
-    SortednessProof, StripeEntry, StripeNdvEntry, StripeProofEntry, TextTokenEntry, TextTokenOffsetsEntry,
-    encode_stripe_marks_pages,
+    Footer, FreetextEntry, FreetextRowOffsets, GranuleEntry, GraphBlockEntry, GraphDirectory, InboxRecipientEntry,
+    MarksPageEntry, PageDirectoryEntry, PageMinMax, PageStats, PayloadGranule, PresenceEntry, ResidualCompression,
+    SharedDictionaryEntry, ShredEntry, SortDirection, SortednessProof, StripeEntry, StripeNdvEntry, StripeProofEntry,
+    TextTokenEntry, TextTokenOffsetsEntry, encode_stripe_marks_pages,
 };
+use crate::layout::graph::{ChainCover, EventIdIndex, GraphInput, encode_graph_blocks, state_root_entries};
 use crate::layout::reader::{HefFile, PayloadRead};
+use crate::layout::snapshot::SnapshotKeyIndex;
+use crate::layout::time_series::{FloatAggregate, RollupBucket, TimeSeriesRollups};
 use crate::layout::{
-    EMPTY_VALUE_ROW_OFFSET, HEADER_BLOCK_LEN, HefHeader, LayoutClass, LayoutTargets, MAX_PAGE_BYTES, encode_header,
-    optional_features, required_features,
+    EMPTY_VALUE_ROW_OFFSET, HEADER_BLOCK_LEN, HefHeader, LayoutClass, LayoutTargets, MAX_PAGE_BYTES, Profile,
+    encode_header, optional_features, required_features,
 };
 use crate::security::{AeadScheme, FooterEncryption};
 use crate::writer::projection::{RowKey, RowOrder};
@@ -446,6 +452,9 @@ pub struct HefBuildConfig {
     /// Pre-computed analytical columns (context projections, embeddings) to include alongside the required columns.
     /// Empty by default.
     pub analytical_columns: Vec<AnalyticalColumn>,
+    /// Where an audit file's row chain starts and how the object store must keep the file. Required with
+    /// [`Profile::Audit`] and refused with any other profile.
+    pub audit: Option<AuditSettings>,
     pub created_at_physical: i64,
     /// The 32-byte file DEK to seal the footer under when `footer_encryption` is `Encrypted`. The caller supplies it;
     /// the writer derives no keys of its own. Ignored (and normally `None`) for a plaintext footer.
@@ -463,6 +472,9 @@ pub struct HefBuildConfig {
     /// value.
     pub freetext_row_offset_index: bool,
     pub generation_id: u64,
+    /// The edges to store beside the rows of a [`Profile::Graph`] file, or `None` for a file without edges. Only a
+    /// whole build in sequence order takes one.
+    pub graph: Option<GraphInput>,
     /// IO alignment for column block boundaries in bytes. When non-zero, the writer pads each column block to a
     /// multiple of this value and records it in the footer, enabling aligned `O_DIRECT` reads of individual pages.
     /// Zero disables alignment recording and uses the default 64-byte padding.
@@ -474,9 +486,15 @@ pub struct HefBuildConfig {
     /// data into independently decodable pages and records per-page byte ranges in the PAGE_DIRECTORY footer section.
     /// Zero means one page per granule (current default).
     pub page_size_rows: usize,
+    /// What kind of file this is, stored in its header, footer, and manifest entry. [`Profile::Event`] for an
+    /// ordinary event file.
+    pub profile: Profile,
     pub promotion: PromotionPlan,
     pub targets: LayoutTargets,
     pub tenant_id: TenantId,
+    /// The width of a [`Profile::TimeSeries`] file's rollup buckets, in nanoseconds of `occurred_at`; `None` uses
+    /// [`DEFAULT_TIME_SERIES_BUCKET_NANOS`]. Refused with any other profile, and when not positive.
+    pub time_series_bucket_nanos: Option<i64>,
 }
 
 /// Granules per replay segment: the first granule of each segment runs full encoding selection and later granules of
@@ -620,7 +638,9 @@ fn plan_sparse_update(
                     .iter()
                     .any(|column| column.column_id == column_id && column.kind == ColumnKind::String))
     };
-    if !reuse.payload_only
+    // A time-series file's rollups are built from every row, so its updates are always whole builds.
+    if config.profile == Profile::TimeSeries
+        || !reuse.payload_only
         || reuse.path_statistics_changed
         || !config.analytical_columns.is_empty()
         || !static_routes_compatible(footer, config)
@@ -2437,6 +2457,7 @@ pub fn update_hef_file_with_executor<R: BuildInput>(
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
 ) -> Result<BuiltHef, FormatError> {
+    refuse_audit_rewrite(source.header.profile, config.profile)?;
     let before = R::into_build_rows(before.to_vec());
     let after = R::into_build_rows(after);
     let reuse = plan_update_reuse(source, &before, &after, config).map(|reuse| with_sparse_plan(reuse, &after, config));
@@ -2453,6 +2474,7 @@ pub fn update_hef_file_from_changes_with_executor<R: BuildInput>(
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
 ) -> Result<BuiltHef, FormatError> {
+    refuse_audit_rewrite(source.header.profile, config.profile)?;
     let after = R::into_build_rows(after);
     let reuse = plan_change_set_reuse(source, &after, &R::build_changes(changes), config);
     build_hef_file_sealed(after, config, encode, None, None, reuse.as_ref())
@@ -2472,6 +2494,7 @@ pub fn update_hef_file_from_source_changes_with_executor<R: BuildInput>(
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
 ) -> Result<BuiltHef, FormatError> {
+    refuse_audit_rewrite(source.header.profile, config.profile)?;
     let (rows, reuse) = plan_source_update(source, &R::build_changes(changes), config)?;
     build_hef_file_sealed(rows, config, encode, None, None, Some(&reuse))
 }
@@ -2484,6 +2507,7 @@ pub fn update_hef_file_profiled_with_executor<R: BuildInput>(
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
 ) -> Result<(BuiltHef, BuildProfile), FormatError> {
+    refuse_audit_rewrite(source.header.profile, config.profile)?;
     let before = R::into_build_rows(before.to_vec());
     let after = R::into_build_rows(after);
     let reuse = plan_update_reuse(source, &before, &after, config).map(|reuse| with_sparse_plan(reuse, &after, config));
@@ -2500,6 +2524,7 @@ pub fn update_hef_file_from_changes_profiled_with_executor<R: BuildInput>(
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
 ) -> Result<(BuiltHef, BuildProfile), FormatError> {
+    refuse_audit_rewrite(source.header.profile, config.profile)?;
     let after = R::into_build_rows(after);
     let reuse = plan_change_set_reuse(source, &after, &R::build_changes(changes), config);
     let mut profile = BuildProfile::default();
@@ -2515,6 +2540,7 @@ pub fn update_hef_file_from_source_changes_profiled_with_executor<R: BuildInput>
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
 ) -> Result<(BuiltHef, BuildProfile), FormatError> {
+    refuse_audit_rewrite(source.header.profile, config.profile)?;
     let mut profile = BuildProfile::default();
     let decoding = PhaseClock::new(Some(&mut profile), BuildPhase::SourceDecoding);
     let planned = plan_source_update(source, &R::build_changes(changes), config);
@@ -2546,6 +2572,99 @@ fn check_rows(
         }
     }
     Ok(rows.first().map(|row| order.key(row)).zip(previous))
+}
+
+/// An inbox file's recipient directory: one entry per run of rows sharing an entity hash, with the run's first row,
+/// length, and last `(epoch, sequence)` point. `rows` are in the entity order, so each recipient is one run and its
+/// last row is its newest.
+fn inbox_recipient_directory(rows: &[BuildRow]) -> Vec<InboxRecipientEntry> {
+    let mut directory: Vec<InboxRecipientEntry> = Vec::new();
+    for (ordinal, row) in rows.iter().enumerate() {
+        let envelope = &row.envelope;
+        match directory.last_mut() {
+            Some(entry)
+                if entry.entity_id_hash_low == envelope.entity_id_hash_low
+                    && entry.entity_id_hash_high == envelope.entity_id_hash_high =>
+            {
+                entry.last_epoch = row.epoch;
+                entry.last_sequence = row.sequence;
+                entry.row_count += 1;
+            }
+            _ => directory.push(InboxRecipientEntry {
+                entity_id_hash_high: envelope.entity_id_hash_high,
+                entity_id_hash_low: envelope.entity_id_hash_low,
+                first_row_ordinal: ordinal as u64,
+                last_epoch: row.epoch,
+                last_sequence: row.sequence,
+                row_count: 1,
+            }),
+        }
+    }
+    directory
+}
+
+/// A time-series file's rollups over `float_columns`: one bucket per `bucket_nanos`-wide run of `occurred_at` that
+/// holds rows, with its row range and each column's aggregate. `granules` are in row order and their rows never go
+/// back in time, so every bucket is one run of rows and each aggregate adds its values in row order, exactly as a
+/// reader's scan does.
+fn time_series_rollups(
+    granules: &[GranulePieces],
+    float_columns: Vec<u32>,
+    bucket_nanos: i64,
+) -> Result<TimeSeriesRollups, FormatError> {
+    let missing = FormatError::Structural {
+        rule: "a time-series granule holds every rolled-up column",
+    };
+    let mut buckets: Vec<RollupBucket> = Vec::new();
+    for granule in granules {
+        let block = |column_id: u32| granule.blocks.iter().find(|block| block.column_id == column_id);
+        let Some(ColumnData::I64(occurred)) = block(column_ids::OCCURRED_AT).map(|block| &block.data) else {
+            return Err(missing);
+        };
+        // Each column's presence bitmap, its present values, and how many of them the rows so far have taken.
+        let mut columns = Vec::with_capacity(float_columns.len());
+        for &column_id in &float_columns {
+            let Some(PendingBlock {
+                data: ColumnData::F64(values),
+                presence,
+                ..
+            }) = block(column_id)
+            else {
+                return Err(missing);
+            };
+            columns.push((presence.as_slice(), values.as_slice(), 0usize));
+        }
+        for (row, &at) in occurred.iter().enumerate() {
+            let bucket = at.div_euclid(bucket_nanos);
+            if buckets.last().is_none_or(|last| last.bucket != bucket) {
+                buckets.push(RollupBucket {
+                    aggregates: vec![FloatAggregate::default(); float_columns.len()],
+                    bucket,
+                    first_row_ordinal: granule.entry.first_row_ordinal + row as u64,
+                    row_count: 0,
+                });
+            }
+            let Some(current) = buckets.last_mut() else {
+                continue;
+            };
+            current.row_count += 1;
+            for ((presence, values, taken), aggregate) in columns.iter_mut().zip(&mut current.aggregates) {
+                let present =
+                    presence.is_empty() || presence.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0);
+                if present {
+                    if let Some(value) = values.get(*taken) {
+                        aggregate.add(*value);
+                    }
+                    *taken += 1;
+                }
+            }
+        }
+    }
+    Ok(TimeSeriesRollups {
+        bucket_nanos,
+        buckets,
+        column_ids: float_columns,
+    })
 }
 
 /// Abandons a sparse update whose rebuilt granules no longer reproduce the source's granule or stripe geometry and
@@ -2648,14 +2767,22 @@ pub fn build_hef_file_streamed_profiled<R: BuildInput>(
 }
 
 fn build_hef_file_sealed(
-    rows: Vec<BuildRow>,
+    mut rows: Vec<BuildRow>,
     config: &HefBuildConfig,
     encode: &dyn EncodeExecutor,
     sink: Option<&mut dyn FnMut(u64, Vec<u8>)>,
     profile: Option<&mut BuildProfile>,
     update_reuse: Option<&UpdateReuse<'_>>,
 ) -> Result<BuiltHef, FormatError> {
-    build_hef_file_sealed_in_order(rows, config, encode, sink, profile, update_reuse, RowOrder::Sequence)
+    // An inbox file stores each recipient's rows side by side, in queue order, so one recipient's queue reads from a
+    // few neighbouring granules: its rows are sorted into the entity order whatever order they arrive in.
+    let order = if config.profile == Profile::Inbox {
+        rows.par_sort_unstable_by_key(|row| RowOrder::Entity.key(row));
+        RowOrder::Entity
+    } else {
+        RowOrder::Sequence
+    };
+    build_hef_file_sealed_in_order(rows, config, encode, sink, profile, update_reuse, order)
 }
 
 /// Builds one file from rows already sorted in `order`: the primary `(epoch, sequence)` order, or the entity order
@@ -2716,6 +2843,14 @@ fn build_hef_file_sealed_in_order(
             }
         }
     };
+    // Graph edges name rows by their position in sequence order, so only a whole build in that order stores them.
+    if config.graph.is_some()
+        && (config.profile != Profile::Graph || update_reuse.is_some() || order != RowOrder::Sequence)
+    {
+        return Err(FormatError::Structural {
+            rule: "graph edges are built only into a whole graph-profile file in sequence order",
+        });
+    }
     // A row is a few hundred bytes, so a pass over a file's worth of them streams tens of megabytes: the order and
     // tenant checks make one pass, on the worker pool, and only the chunk boundaries are compared in sequence.
     let checked: Vec<Result<Option<(RowKey, RowKey)>, &'static str>> = rows
@@ -2732,6 +2867,52 @@ fn build_hef_file_sealed_in_order(
         }
         previous = Some(last);
     }
+    let audit = audit_trail(&rows, config, order)?;
+    // A graph file indexes each row's protocol id by its sequence number, so a reader finds an event without a scan.
+    let graph_event_ids = match &config.graph {
+        Some(graph) => EventIdIndex::build(
+            rows.iter()
+                .zip(graph.first_sn..)
+                .filter_map(|(row, sn)| Some((row.external_id.as_deref()?, sn))),
+        )?,
+        None => None,
+    };
+    let inbox_recipients = if config.profile == Profile::Inbox {
+        if order != RowOrder::Entity || sparse.is_some_and(|plan| !plan.rows_cover_file) {
+            return Err(FormatError::Structural {
+                rule: "an inbox file is built from all of its rows in recipient order",
+            });
+        }
+        inbox_recipient_directory(&rows)
+    } else {
+        Vec::new()
+    };
+    // A time-series file's rollup buckets each cover one run of neighbouring rows, which holds because its rows never
+    // go back in occurred_at. Its updates are always whole builds (see `plan_sparse_update`), so `rows` is every row.
+    let time_series_bucket_nanos = match (config.profile, config.time_series_bucket_nanos) {
+        (Profile::TimeSeries, width) => {
+            let width = width.unwrap_or(DEFAULT_TIME_SERIES_BUCKET_NANOS);
+            if width <= 0 {
+                return Err(FormatError::Structural {
+                    rule: "a time-series bucket width is positive",
+                });
+            }
+            if rows.iter().zip(rows.iter().skip(1)).any(|(before, after)| {
+                after.envelope.occurred_at.physical_nanos() < before.envelope.occurred_at.physical_nanos()
+            }) {
+                return Err(FormatError::Structural {
+                    rule: "a time-series file's rows never go back in occurred_at",
+                });
+            }
+            Some(width)
+        }
+        (_, Some(_)) => {
+            return Err(FormatError::Structural {
+                rule: "only a time-series file takes a rollup bucket width",
+            });
+        }
+        (_, None) => None,
+    };
     // The rows of each source granule as this build holds them: every granule's for a build over the whole file,
     // only the built granules' — the rest empty — for one handed just those.
     let sparse_ranges: Option<Vec<(usize, usize)>> = sparse.zip(source).map(|(plan, source)| {
@@ -3144,6 +3325,32 @@ fn build_hef_file_sealed_in_order(
     if sparse.is_none() && start < rows.len() {
         granule_row_ranges.push((start, rows.len()));
     }
+    // A snapshot file's key index, from the rows' keys before granule construction takes their strings. A snapshot
+    // is replaced whole each epoch, so a sparse update, which holds only some rows, is refused.
+    let snapshot_keys = match (config.profile, source) {
+        (Profile::Snapshot, Some(_)) => {
+            return Err(FormatError::Structural {
+                rule: "a snapshot file is replaced whole, never sparsely updated",
+            });
+        }
+        (Profile::Snapshot, None) => {
+            if rows.iter().any(|row| row.epoch != first_key.0) {
+                return Err(FormatError::Structural {
+                    rule: "a snapshot file holds one epoch",
+                });
+            }
+            let keys = rows
+                .iter()
+                .map(|row| row.envelope.entity_id.as_deref())
+                .collect::<Option<Vec<&str>>>()
+                .ok_or(FormatError::Structural {
+                    rule: "every snapshot row carries an entity_id",
+                })?;
+            let granule_first_rows: Vec<usize> = granule_row_ranges.iter().map(|&(start, _)| start).collect();
+            Some(SnapshotKeyIndex::build(&keys, &granule_first_rows)?)
+        }
+        _ => None,
+    };
     // The original-form blocks and indexes, from the rows before granule construction takes their strings. A sparse
     // update changes none of them, so it borrows the source's blocks and keeps its indexes.
     let (source_form_blocks, source_form_indexes) = match source {
@@ -3258,6 +3465,23 @@ fn build_hef_file_sealed_in_order(
                 random_access: true,
             }));
     }
+    // The rollups summarise the promoted and shredded float columns: the metrics the file's views read.
+    let time_series_rollups = match time_series_bucket_nanos {
+        Some(width) => {
+            let float_columns: Vec<u32> = columns
+                .iter()
+                .filter(|column| {
+                    column.kind == ColumnKind::F64
+                        && (column_ids::PROMOTED_BASE..column_ids::FREETEXT_BASE).contains(&column.column_id)
+                })
+                .map(|column| column.column_id)
+                .collect();
+            (!float_columns.is_empty())
+                .then(|| time_series_rollups(&granules, float_columns, width))
+                .transpose()?
+        }
+        None => None,
+    };
 
     phase_clock.transition(BuildPhase::BlockEncoding);
 
@@ -3361,7 +3585,10 @@ fn build_hef_file_sealed_in_order(
                         .sum::<usize>()
                 })
                 .unwrap_or_default();
-        if stripe_bytes + granule_bytes > config.targets.stripe_target_bytes && stripe_bytes > 0 {
+        // A snapshot file gives every granule its own stripe, so a key lookup fetches exactly one granule.
+        if (config.profile == Profile::Snapshot || stripe_bytes + granule_bytes > config.targets.stripe_target_bytes)
+            && stripe_bytes > 0
+        {
             stripe_id += 1;
             stripe_bytes = 0;
         }
@@ -3545,7 +3772,16 @@ fn build_hef_file_sealed_in_order(
         searchable_text_columns: &HashMap<u32, bool>,
         replay: Option<&ReplayCapture>,
         shared: Option<&[String]>,
+        xor_floats: bool,
     ) -> BlockProduct<'static> {
+        // A time-series file's float blocks also try Chimp XOR floats, which never replay a capture.
+        let encode = |data: &ColumnData| {
+            if xor_floats && matches!(data, ColumnData::F64(_)) {
+                encode_block_with_xor_floats(data, block.random_access, strategy)
+            } else {
+                encode_block_replayed(data, block.random_access, strategy, replay, shared).0
+            }
+        };
         let mut text_tokens: Vec<TextTokenEntry> = Vec::new();
         let mut fsst = None;
         let granule_row_count = entry.row_count as usize;
@@ -3561,7 +3797,7 @@ fn build_hef_file_sealed_in_order(
                 let page_start = page_idx * page_size;
                 let page_len = (page_start + page_size).min(granule_row_count) - page_start;
                 let page_data = slice_column_data(&block.data, page_start, page_start + page_len);
-                let mut encoded = encode_block_replayed(&page_data, block.random_access, strategy, replay, shared).0;
+                let mut encoded = encode(&page_data);
                 if fsst.is_none() {
                     fsst = encoded.fsst.take();
                 }
@@ -3622,7 +3858,7 @@ fn build_hef_file_sealed_in_order(
                 let present_count = count_set_bits(&page_presence, page_len);
                 let page_data = slice_column_data(&block.data, value_offset, value_offset + present_count);
                 value_offset += present_count;
-                let mut encoded = encode_block_replayed(&page_data, block.random_access, strategy, replay, shared).0;
+                let mut encoded = encode(&page_data);
                 if fsst.is_none() {
                     fsst = encoded.fsst.take();
                 }
@@ -3670,7 +3906,7 @@ fn build_hef_file_sealed_in_order(
                 uncompressed_len: uncompressed_total,
             }
         } else {
-            let mut encoded = encode_block_replayed(&block.data, block.random_access, strategy, replay, shared).0;
+            let mut encoded = encode(&block.data);
             fsst = encoded.fsst.take();
             let mut prefix = Writer::with_capacity(block.presence.len() + 8);
             crate::layout::encode_presence(&block.presence, entry.row_count, &mut prefix);
@@ -4033,6 +4269,7 @@ fn build_hef_file_sealed_in_order(
                         &searchable_text_columns,
                         captures.get(&(column_id, granule_idx / REPLAY_SEGMENT_GRANULES)),
                         shared_alphabets.get(&column_id).map(Vec::as_slice),
+                        config.profile == Profile::TimeSeries,
                     )),
                     None => Err(FormatError::Structural {
                         rule: "a sparse update encodes only blocks it built",
@@ -4220,6 +4457,12 @@ fn build_hef_file_sealed_in_order(
         pieces.push(product.piece);
     }
     let encoded_blocks = pieces.len() as u64 - reused_source_blocks;
+    // Whether any block or page, built or borrowed from the source, stores Chimp XOR floats.
+    let xor_float_blocks = pieces.iter().any(|piece| {
+        std::iter::once(piece.pipeline)
+            .chain(piece.pages.iter().map(|page| page.1))
+            .any(|pipeline| pipeline.transform() == Ok(Transform::Chimp))
+    });
 
     // The promotion plan is the column-heat measurement: promoted columns are precisely the columns whose planner
     // metadata justifies the NDV pass. Once block encoding has released its scratch, build NDV sketches, exact-count
@@ -4335,6 +4578,7 @@ fn build_hef_file_sealed_in_order(
         crc: crate::file::integrity::StreamingCrc64Nvme,
         entity_hash_filters: Vec<EntityHashFilterEntry>,
         freetext_row_offsets: Vec<FreetextRowOffsets>,
+        graph_blocks: Vec<GraphBlockEntry>,
         integrity: crate::file::integrity::BuiltOutboard,
         marks: Vec<ColumnMark>,
         marks_page_offsets: Vec<MarksPageEntry>,
@@ -4352,6 +4596,7 @@ fn build_hef_file_sealed_in_order(
         block_alignment: usize,
         entity_hash_filters_by_granule: &'a BTreeMap<u32, Vec<u8>>,
         granule_by_id: &'a BTreeMap<u32, &'a GranuleEntry>,
+        graph_blocks_by_granule: &'a BTreeMap<u32, Vec<u8>>,
         hot_columns: Range<u32>,
         payload_geometry: &'a [PayloadGeometry<'p>],
         payload_idx_by_stripe: &'a BTreeMap<u32, Vec<usize>>,
@@ -4437,6 +4682,7 @@ fn build_hef_file_sealed_in_order(
                 Vec::with_capacity(geometry.iter().map(|g| g.freetext_row_offsets.len()).sum());
             let mut text_token_offsets: Vec<TextTokenOffsetsEntry> = Vec::with_capacity(text_token_count);
             let mut entity_hash_filters: Vec<EntityHashFilterEntry> = Vec::with_capacity(entity_filter_count);
+            let mut graph_blocks: Vec<GraphBlockEntry> = Vec::new();
             let mut aliased_block_bytes = 0u64;
             // Byte-identical blocks within one stripe are stored once: later marks alias the first extent (marks are
             // `(offset, len)` pairs, so aliasing is already representable). Keyed by a fast non-cryptographic hash,
@@ -4615,6 +4861,18 @@ fn build_hef_file_sealed_in_order(
                         offsets_offset,
                     });
                 }
+                // A graph file's edge block for the granule, right after its payload so one range read returns the
+                // granule's rows and their edges. Stripe-relative like the arenas above.
+                if let Some(block) = self.graph_blocks_by_granule.get(&geometry.granule_id) {
+                    data.pad_to(self.block_alignment);
+                    let offset = data.len() as u64;
+                    data.put_slice(block);
+                    graph_blocks.push(GraphBlockEntry {
+                        granule_id: geometry.granule_id,
+                        len: block.len() as u64,
+                        offset,
+                    });
+                }
             }
 
             // The stripe's text-token filters, grouped at the stripe tail — not scattered per granule between the
@@ -4687,6 +4945,7 @@ fn build_hef_file_sealed_in_order(
                 crc,
                 entity_hash_filters,
                 freetext_row_offsets,
+                graph_blocks,
                 integrity,
                 marks,
                 marks_page_offsets,
@@ -4700,6 +4959,18 @@ fn build_hef_file_sealed_in_order(
         }
     }
 
+    let graph_blocks_by_granule = match &config.graph {
+        Some(graph) => {
+            let entries: Vec<GranuleEntry> = granules.iter().map(|granule| granule.entry).collect();
+            encode_graph_blocks(graph, row_count as u64, &entries)?
+        }
+        None => BTreeMap::new(),
+    };
+    let state_roots = match &config.graph {
+        Some(graph) => state_root_entries(graph, row_count as u64)?,
+        None => Vec::new(),
+    };
+
     // One job per stripe on the injected executor: stripes are independent once their offsets are stripe-relative,
     // so each is laid out, its marks pages encoded, and its checksum taken beside the others instead of one after
     // another on this thread. The serial executor runs the same jobs in turn and builds the same bytes.
@@ -4707,6 +4978,7 @@ fn build_hef_file_sealed_in_order(
         block_alignment,
         entity_hash_filters_by_granule,
         granule_by_id: &granule_by_id,
+        graph_blocks_by_granule: &graph_blocks_by_granule,
         hot_columns: hot_columns.clone(),
         payload_geometry: &payload_geometry,
         payload_idx_by_stripe: &payload_idx_by_stripe,
@@ -4784,6 +5056,7 @@ fn build_hef_file_sealed_in_order(
     let mut entity_hash_filters: Vec<EntityHashFilterEntry> = Vec::with_capacity(entity_hash_filters_by_granule.len());
     let mut marks_page_offsets: Vec<MarksPageEntry> =
         Vec::with_capacity(laid_out.iter().map(|laid| laid.marks_page_offsets.len()).sum());
+    let mut graph_blocks: Vec<GraphBlockEntry> = Vec::with_capacity(graph_blocks_by_granule.len());
     for ((stripe_id, _), laid) in stripe_piece_ranges.iter().zip(laid_out) {
         let (first_row, row_count) = stripe_rows.get(stripe_id).copied().unwrap_or((u64::MAX, 0));
         stripes.push(StripeEntry {
@@ -4815,6 +5088,7 @@ fn build_hef_file_sealed_in_order(
         text_token_offsets.extend(laid.text_token_offsets);
         entity_hash_filters.extend(laid.entity_hash_filters);
         marks_page_offsets.extend(laid.marks_page_offsets);
+        graph_blocks.extend(laid.graph_blocks);
         stripe_bytes.push(laid.bytes);
     }
 
@@ -4884,6 +5158,15 @@ fn build_hef_file_sealed_in_order(
     if !entity_hash_filters.is_empty() {
         optional_flags |= optional_features::ENTITY_HASH_POINT_FILTERS;
     }
+    if !inbox_recipients.is_empty() {
+        optional_flags |= optional_features::INBOX_RECIPIENT_DIRECTORY;
+    }
+    if snapshot_keys.is_some() {
+        optional_flags |= optional_features::SNAPSHOT_KEY_INDEX;
+    }
+    if time_series_rollups.is_some() {
+        optional_flags |= optional_features::TIME_SERIES_ROLLUPS;
+    }
 
     // Schema fingerprint over the column directory.
     let mut schema_hash = blake3::Hasher::new();
@@ -4901,7 +5184,32 @@ fn build_hef_file_sealed_in_order(
         .map(|(column_id, values)| SharedDictionaryEntry { column_id, values })
         .collect();
 
+    // An audit file declares its own required feature, so a reader or rewriter that predates audit files refuses it.
+    // A file with edges declares the dense sequence numbers its edges name and both edge features: the forward blocks
+    // and the reverse blocks built from them. One with state roots also declares the state roots feature.
+    let mut required_feature_flags = required_features::ALL;
+    if audit.is_some() {
+        required_feature_flags |= required_features::AUDIT_HASH_CHAIN;
+    }
+    if config.graph.is_some() {
+        required_feature_flags |= required_features::GRAPH_DENSE_IDS
+            | required_features::GRAPH_CSR_FORWARD
+            | required_features::GRAPH_CSR_REVERSE;
+    }
+    if graph_event_ids.is_some() {
+        required_feature_flags |= required_features::GRAPH_EVENT_ID_INDEX;
+    }
+    if config.graph.as_ref().is_some_and(|graph| graph.chain_cover.is_some()) {
+        required_feature_flags |= required_features::GRAPH_CHAIN_COVER;
+    }
+    if xor_float_blocks {
+        required_feature_flags |= required_features::XOR_FLOAT_BLOCKS;
+    }
+    if !state_roots.is_empty() {
+        required_feature_flags |= required_features::GRAPH_STATE_ROOTS;
+    }
     let footer = Footer {
+        audit,
         clustering,
         columns,
         dictionaries,
@@ -4917,6 +5225,20 @@ fn build_hef_file_sealed_in_order(
         freetext: freetext_entries,
         freetext_row_offsets,
         granules: granules.iter().map(|granule| granule.entry).collect(),
+        graph: config.graph.as_ref().map(|graph| GraphDirectory {
+            blocks: graph_blocks,
+            chain_cover: graph.chain_cover.as_ref().map(ChainCover::build),
+            depth: graph.depth,
+            event_ids: graph_event_ids,
+            first_sn: graph.first_sn,
+            subject: graph.subject.clone(),
+            unresolved: {
+                let mut unresolved = graph.unresolved.clone();
+                unresolved.sort_by_key(|edge| edge.child);
+                unresolved
+            },
+        }),
+        inbox_recipients,
         integrity_gaps,
         // The real applied alignment: the IO granularity the caller declared (and the writer padded every block to),
         // or zero when none was requested — in which case readers fall back to unaligned reads.
@@ -4934,12 +5256,15 @@ fn build_hef_file_sealed_in_order(
         page_stats,
         payload_granules,
         presence: presence_entries,
+        profile: config.profile,
         reference_filters: source_form_indexes.reference_filters,
-        required_feature_flags: required_features::ALL,
+        required_feature_flags,
         schema_fingerprint: *schema_hash.finalize().as_bytes(),
         shared_dictionaries,
         shredded: shred_plan,
+        snapshot_keys,
         sparse_keys,
+        state_roots,
         stripe_checksums,
         stripe_proofs,
         stripe_ndv,
@@ -4947,6 +5272,7 @@ fn build_hef_file_sealed_in_order(
         // Filter bytes live in the data area; the footer records only their byte ranges below.
         text_token_indexes: Vec::new(),
         text_token_offsets,
+        time_series_rollups,
     };
 
     // The checksum/proof pass above produced the large-byte leaves shared by deterministic identity, the authoritative
@@ -4998,12 +5324,13 @@ fn build_hef_file_sealed_in_order(
         max_epoch: last_key.0,
         min_sequence: first_key.1,
         max_sequence: last_key.1,
+        profile: config.profile,
         row_count: row_count as u64,
         // The footer-encryption bit rides the header's required features so a reader gates it before decoding the
         // (now ciphertext) footer; kept out of `required_features::ALL`, it is set only for an encrypted footer.
         feature_flags: match config.footer_encryption {
-            FooterEncryption::Encrypted => required_features::ALL | required_features::FOOTER_ENCRYPTED,
-            FooterEncryption::Plaintext => required_features::ALL,
+            FooterEncryption::Encrypted => required_feature_flags | required_features::FOOTER_ENCRYPTED,
+            FooterEncryption::Plaintext => required_feature_flags,
         },
         footer_pointer_hint: data_end,
     };

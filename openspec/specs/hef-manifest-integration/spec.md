@@ -48,3 +48,16 @@ Metadata SHALL be placed as follows: the manifest holds only small open/skip sum
 - **WHEN** a large rollup must be stored
 - **THEN** it is placed in HEF aggregate blocks or a PreparedView output, not copied into the manifest
 
+### Requirement: Graph event-id filter in the manifest entry
+A manifest entry for a graph file that carries an event-id index SHALL carry a copy of that index's binary fuse filter (about 1.23 bytes per indexed event) as an optional skip summary, so a planner looking for an event by protocol id skips, without opening it, every file whose filter rules the id out. The field SHALL default to absent, so an entry written before it existed reads unchanged, and an entry without a filter SHALL never be skipped on its account.
+
+#### Scenario: File pruned by event id
+- **WHEN** a planner asks which graph files may hold an event id
+- **THEN** every file whose entry filter rules the id out is skipped, and no file holding the id is skipped
+
+### Requirement: Graph file summary in the manifest entry
+A manifest entry for a graph file SHALL carry a summary copied from its footer at publication and at compaction: the subject, the lowest and highest `event_sn` it holds, its depth range when the file records one, and the `seq` range of each auth chain it covers when it stores a chain cover (beside the event-id filter of "Graph event-id filter in the manifest entry"). A planner SHALL be able to choose files and plan a subject's merges from the summary without opening any file. The field SHALL default to absent, so an entry written before it existed reads unchanged.
+
+#### Scenario: Summary published and defaulted
+- **WHEN** a compacted graph file is published, and an entry written before the summary existed is read
+- **THEN** the published entry carries the file's subject, event range, depth range and chain ranges, and the older entry reads with no summary

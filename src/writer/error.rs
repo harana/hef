@@ -19,12 +19,6 @@ pub enum FlushError {
     Queue(QueueError),
     #[error(transparent)]
     Storage(StorageError),
-    /// The durability barrier failed after the frame's bytes were already appended *and* those bytes were read back
-    /// intact. They may still be persisted by a later sync, so the caller must not close the frame's range with a void
-    /// record. A sync failure whose bytes are not present at all is reported as `Storage` instead, because that range
-    /// can safely be voided.
-    #[error("durability barrier failed after append: {error}")]
-    SyncAfterAppend { error: StorageError, frame_offset: u64 },
 }
 
 /// Why a harden attempt was refused.

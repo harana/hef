@@ -129,21 +129,26 @@ impl RoaringRangeBitmap {
     /// non-adjacent form first. Empty runs are dropped and overlapping or touching runs are merged, so two inputs that
     /// describe the same set of rows produce byte-identical bitmaps.
     pub fn from_ranges<I: IntoIterator<Item = RowRange>>(ranges: I) -> Self {
-        let mut sorted: Vec<RowRange> = ranges.into_iter().filter(|r| !r.is_empty()).collect();
-        sorted.sort_unstable_by_key(|r| (r.start, r.end));
-        let mut runs: Vec<RowRange> = Vec::with_capacity(sorted.len());
-        for range in sorted {
-            match runs.last_mut() {
-                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
-                _ => runs.push(range),
+        let mut runs: Vec<RowRange> = ranges.into_iter().filter(|r| !r.is_empty()).collect();
+        runs.sort_unstable_by_key(|r| (r.start, r.end));
+        runs.dedup_by(|range, last| {
+            let merges = range.start <= last.end;
+            if merges {
+                last.end = last.end.max(range.end);
             }
-        }
+            merges
+        });
         Self { runs }
     }
 
     /// The set of `[start, end)` runs backing this bitmap, in sorted order.
     pub fn ranges(&self) -> &[RowRange] {
         &self.runs
+    }
+
+    /// Hands over the runs without copying them, for crate code that keeps its own copy of the run list.
+    pub(crate) fn into_ranges(self) -> Vec<RowRange> {
+        self.runs
     }
 
     /// Whether this bitmap holds no rows at all.
@@ -242,13 +247,21 @@ impl RoaringRangeBitmap {
     /// Serializes the bitmap to bytes: a run count followed by each run's `start` and `end`. Round-trips exactly with
     /// [`decode`](Self::decode).
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Writer::with_capacity(RUN_COUNT_PREFIX_BYTES + self.runs.len() * ENCODED_ROW_RANGE_BYTES);
+        let mut out = Writer::with_capacity(self.encoded_len());
+        self.encode_into(&mut out);
+        out.into_bytes()
+    }
+
+    fn encoded_len(&self) -> usize {
+        RUN_COUNT_PREFIX_BYTES + self.runs.len() * ENCODED_ROW_RANGE_BYTES
+    }
+
+    fn encode_into(&self, out: &mut Writer) {
         out.put_u32(self.runs.len() as u32);
         for run in &self.runs {
             out.put_u64(run.start);
             out.put_u64(run.end);
         }
-        out.into_bytes()
     }
 
     /// Reads a bitmap back from [`encode`](Self::encode)'s bytes. Refuses on truncated input or on runs that are
@@ -356,13 +369,18 @@ impl BitmapIndex {
     /// Serializes the whole index: a value count, then each value followed by its encoded bitmap. Round-trips with
     /// [`decode`](Self::decode).
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Writer::new();
+        let capacity = RUN_COUNT_PREFIX_BYTES
+            + self
+                .entries
+                .iter()
+                .map(|(_, bitmap)| INDEX_ENTRY_HEADER_BYTES + bitmap.encoded_len())
+                .sum::<usize>();
+        let mut out = Writer::with_capacity(capacity);
         out.put_u32(self.entries.len() as u32);
         for (value, bitmap) in &self.entries {
             out.put_u64(*value);
-            let block = bitmap.encode();
-            out.put_u32(block.len() as u32);
-            out.put_slice(&block);
+            out.put_u32(bitmap.encoded_len() as u32);
+            bitmap.encode_into(&mut out);
         }
         out.into_bytes()
     }

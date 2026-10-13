@@ -27,6 +27,7 @@ fn minimal_header() -> HefHeader {
         min_ingested_at_physical: 0,
         min_occurred_at_physical: 0,
         min_sequence: 1,
+        profile: crate::layout::Profile::Event,
         projection_count: 1,
         row_count: 1,
         tenant_id: TenantId::new_test_id(1),
@@ -37,6 +38,7 @@ fn minimal_header() -> HefHeader {
 
 fn minimal_footer(mark: ColumnMark) -> Footer {
     Footer {
+        audit: None,
         clustering: Vec::new(),
         columns: Vec::new(),
         dictionaries: Default::default(),
@@ -66,6 +68,8 @@ fn minimal_footer(mark: ColumnMark) -> Footer {
             row_count: mark.row_count,
             stripe_id: 0,
         }],
+        graph: None,
+        inbox_recipients: Vec::new(),
         integrity_gaps: Vec::new(),
         io_alignment_bytes: 0,
         marks: vec![mark],
@@ -78,6 +82,7 @@ fn minimal_footer(mark: ColumnMark) -> Footer {
         page_stats: Vec::new(),
         payload_granules: Vec::new(),
         presence: Vec::new(),
+        profile: crate::layout::Profile::Event,
         reference_filters: None,
         // The current writer's full feature set: these fixtures hand-craft current-format blocks, so the footer
         // must declare the framing the blocks actually use (compressed presence in particular).
@@ -85,13 +90,16 @@ fn minimal_footer(mark: ColumnMark) -> Footer {
         schema_fingerprint: [0u8; 32],
         shared_dictionaries: Vec::new(),
         shredded: Vec::new(),
+        snapshot_keys: None,
         sparse_keys: Vec::new(),
+        state_roots: Vec::new(),
         stripe_checksums: Vec::new(),
         stripe_proofs: Vec::new(),
         stripe_ndv: Vec::new(),
         stripes: Vec::new(),
         text_token_indexes: Vec::new(),
         text_token_offsets: Vec::new(),
+        time_series_rollups: None,
     }
 }
 
@@ -115,6 +123,8 @@ fn file_with_mark(mark: ColumnMark, bytes: Vec<u8>, usable_optional_features: u6
         granule_dictionaries: DashMap::default(),
         granule_dictionaries_bytes: AtomicU64::new(0),
         granule_stripe_base: HashMap::new(),
+        graph_edges: DashMap::default(),
+        graph_edges_bytes: AtomicU64::new(0),
         header: minimal_header(),
         inflated_residuals: DashMap::default(),
         inflated_residuals_bytes: AtomicU64::new(0),
@@ -127,6 +137,7 @@ fn file_with_mark(mark: ColumnMark, bytes: Vec<u8>, usable_optional_features: u6
         residual_seek_tables: DashMap::default(),
         shared_alphabets: HashMap::new(),
         shared_string_views: DashMap::new(),
+        stripe_position_by_id: HashMap::new(),
         stripe_relative: false,
         text_token_cache: DashMap::default(),
         text_token_indexes_by_key: HashMap::new(),
@@ -516,6 +527,7 @@ fn freetext_point_lookup_matches_whole_granule_decode_and_falls_back_identically
         .collect();
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -524,9 +536,11 @@ fn freetext_point_lookup_matches_whole_granule_decode_and_falls_back_identically
         },
         freetext_row_offset_index: true,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 6,
@@ -536,6 +550,7 @@ fn freetext_point_lookup_matches_whole_granule_decode_and_falls_back_identically
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(3),
+        time_series_bucket_nanos: None,
     };
     let built = build_hef_file(rows.clone(), &config).unwrap();
     assert_ne!(
@@ -584,6 +599,7 @@ fn payload_path_and_payload_agree_on_a_freetext_declared_field() {
         .collect();
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -592,9 +608,11 @@ fn payload_path_and_payload_agree_on_a_freetext_declared_field() {
         },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 6,
@@ -604,6 +622,7 @@ fn payload_path_and_payload_agree_on_a_freetext_declared_field() {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(3),
+        time_series_bucket_nanos: None,
     };
     let built = build_hef_file(rows.clone(), &config).unwrap();
     let file = HefFile::open(built.bytes, Some(&built.file_seal)).unwrap();
@@ -632,6 +651,7 @@ fn payload_path_and_payload_agree_on_a_freetext_declared_field() {
 fn freetext_config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -640,9 +660,11 @@ fn freetext_config() -> HefBuildConfig {
         },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 6,
@@ -652,6 +674,7 @@ fn freetext_config() -> HefBuildConfig {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(3),
+        time_series_bucket_nanos: None,
     }
 }
 
@@ -826,6 +849,7 @@ fn cold_scan_never_initializes_the_search_cache_a_point_lookup_pays_for() {
     let rows: Vec<_> = (0..20).map(|i| freetext_row(i, Some("free text body"))).collect();
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -834,9 +858,11 @@ fn cold_scan_never_initializes_the_search_cache_a_point_lookup_pays_for() {
         },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 6,
@@ -846,6 +872,7 @@ fn cold_scan_never_initializes_the_search_cache_a_point_lookup_pays_for() {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(3),
+        time_series_bucket_nanos: None,
     };
     let built = build_hef_file(rows.clone(), &config).unwrap();
     // "amount" is present in every row with a consistent kind, so statistics-driven shredding picks it up
@@ -875,6 +902,7 @@ fn cold_scan_never_initializes_the_search_cache_a_point_lookup_pays_for() {
 fn small_stripe_config(stripe_target_bytes: usize) -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -883,9 +911,11 @@ fn small_stripe_config(stripe_target_bytes: usize) -> HefBuildConfig {
         },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 4,
@@ -895,6 +925,7 @@ fn small_stripe_config(stripe_target_bytes: usize) -> HefBuildConfig {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(3),
+        time_series_bucket_nanos: None,
     }
 }
 
@@ -1997,15 +2028,18 @@ fn relationship_lookups_filter_threads_and_resolve_references() {
         .collect();
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
         freetext: FreetextDeclaration::default(),
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 6,
@@ -2015,6 +2049,7 @@ fn relationship_lookups_filter_threads_and_resolve_references() {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(3),
+        time_series_bucket_nanos: None,
     };
     let built = build_hef_file(rows, &config).unwrap();
     let file = HefFile::open(built.bytes, Some(&built.file_seal)).unwrap();
@@ -2081,15 +2116,18 @@ fn link_lookups_match_whole_references_only() {
         .collect();
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
         freetext: FreetextDeclaration::default(),
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 6,
@@ -2099,6 +2137,7 @@ fn link_lookups_match_whole_references_only() {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(3),
+        time_series_bucket_nanos: None,
     };
     let built = build_hef_file(rows, &config).unwrap();
     let file = HefFile::open(built.bytes, Some(&built.file_seal)).unwrap();
@@ -2486,4 +2525,18 @@ fn cold_footer_locates_the_same_blocks_as_the_whole_file_reader() {
             }
         }
     }
+}
+
+#[test]
+fn a_graph_profile_build_opens_with_its_profile_in_header_and_footer() {
+    let rows: Vec<_> = (0..10).map(|i| freetext_row(i, None)).collect();
+    let config = HefBuildConfig {
+        profile: crate::layout::Profile::Graph,
+        ..freetext_config()
+    };
+    let built = build_hef_file(rows, &config).unwrap();
+    assert_eq!(built.header.profile, crate::layout::Profile::Graph);
+    let file = HefFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    assert_eq!(file.header().profile, crate::layout::Profile::Graph);
+    assert_eq!(file.footer().profile, crate::layout::Profile::Graph);
 }

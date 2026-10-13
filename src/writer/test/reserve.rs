@@ -63,3 +63,53 @@ fn arbitrate_coverage_keeps_many_disjoint_frames_in_any_order() {
         .collect();
     assert!(arbitrate_coverage(&ranges).is_empty());
 }
+
+fn cursor_walk(allocator: &SequenceAllocator, now: u64) -> Vec<(u64, SequenceRange)> {
+    let mut walked = Vec::new();
+    let mut cursor = None;
+    while let Some((id, range)) = allocator.next_expired_after(now, cursor) {
+        walked.push((id, range));
+        cursor = Some(id);
+    }
+    walked
+}
+
+#[test]
+fn next_expired_after_walks_the_same_leases_as_expired_leases() {
+    // Arbitrary deadlines: reservation times out of order, so expired and live leases interleave by id.
+    let mut allocator = SequenceAllocator::new(1);
+    for reserved_at in [500, 0, 900, 100, 100, 2_000, 0, 750] {
+        allocator.reserve(2, reserved_at);
+    }
+    // Sparse: retire a few leases so ids have gaps.
+    allocator.close_voided(2);
+    allocator.close_voided(5);
+    for now in [
+        0,
+        LEASE_NANOS,
+        LEASE_NANOS + 100,
+        LEASE_NANOS + 800,
+        LEASE_NANOS + 10_000,
+    ] {
+        assert_eq!(
+            cursor_walk(&allocator, now),
+            allocator.expired_leases(now),
+            "now = {now}"
+        );
+    }
+}
+
+#[test]
+fn next_expired_after_requires_the_deadline_to_have_strictly_passed() {
+    let mut allocator = SequenceAllocator::new(1);
+    let lease = allocator.reserve(1, 0);
+    assert_eq!(allocator.next_expired_after(lease.deadline_monotonic_nanos, None), None);
+    assert_eq!(
+        allocator.next_expired_after(lease.deadline_monotonic_nanos + 1, None),
+        Some((lease.lease_id, lease.range))
+    );
+    assert_eq!(
+        allocator.next_expired_after(lease.deadline_monotonic_nanos + 1, Some(lease.lease_id)),
+        None
+    );
+}

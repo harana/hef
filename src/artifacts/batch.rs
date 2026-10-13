@@ -105,6 +105,7 @@ fn target_space_code(space: TargetIdSpace) -> u32 {
         TargetIdSpace::EventId => 1,
         TargetIdSpace::ExternalId => 3,
         TargetIdSpace::ProtocolEventId => 2,
+        TargetIdSpace::SubjectSequence => 4,
     }
 }
 
@@ -113,6 +114,7 @@ fn target_space_from_code(code: u32) -> Result<TargetIdSpace, FormatError> {
         1 => Ok(TargetIdSpace::EventId),
         2 => Ok(TargetIdSpace::ProtocolEventId),
         3 => Ok(TargetIdSpace::ExternalId),
+        4 => Ok(TargetIdSpace::SubjectSequence),
         _ => Err(FormatError::Structural {
             rule: "unknown target identifier space code in a relationship record",
         }),

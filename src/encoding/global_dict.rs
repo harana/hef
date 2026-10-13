@@ -5,7 +5,10 @@
 //! directly comparable without per-file re-translation.
 
 use super::predicate::StringPredicate;
-use std::collections::BTreeSet;
+use std::{
+    cmp::Reverse,
+    collections::{BTreeSet, BinaryHeap},
+};
 
 /// A catalog-level dictionary shared across all HEF files in a manifest file-set.
 ///
@@ -54,8 +57,28 @@ impl GlobalDictionary {
     /// in the merged order, which is what makes a range predicate translatable once for the whole set. A file whose
     /// own alphabet predates the merge maps through [`local_to_global_map`](Self::local_to_global_map).
     pub fn from_file_alphabets<'a>(alphabets: impl IntoIterator<Item = &'a [String]>) -> Self {
-        let merged: BTreeSet<&str> = alphabets.into_iter().flatten().map(String::as_str).collect();
-        Self::from_sorted(merged.into_iter().map(str::to_owned).collect())
+        let alphabets: Vec<&[String]> = alphabets.into_iter().collect();
+        if !alphabets.iter().all(|alphabet| alphabet.is_sorted()) {
+            let merged: BTreeSet<&str> = alphabets.into_iter().flatten().map(String::as_str).collect();
+            return Self::from_sorted(merged.into_iter().map(str::to_owned).collect());
+        }
+        // Every alphabet is sorted, so a heap holding each one's next value merges them with scratch per alphabet
+        // rather than per distinct value.
+        let mut heap: BinaryHeap<Reverse<(&str, usize, usize)>> = alphabets
+            .iter()
+            .enumerate()
+            .filter_map(|(which, alphabet)| alphabet.first().map(|value| Reverse((value.as_str(), which, 0))))
+            .collect();
+        let mut entries: Vec<String> = Vec::new();
+        while let Some(Reverse((value, which, cursor))) = heap.pop() {
+            if entries.last().map(String::as_str) != Some(value) {
+                entries.push(value.to_owned());
+            }
+            if let Some(next) = alphabets.get(which).and_then(|alphabet| alphabet.get(cursor + 1)) {
+                heap.push(Reverse((next.as_str(), which, cursor + 1)));
+            }
+        }
+        Self::from_sorted(entries)
     }
 
     /// Returns the global code for a string, or `None` if the value is absent from this dictionary.

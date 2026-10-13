@@ -41,6 +41,16 @@ pub const ALP_RD_MIN_RIGHT_WIDTH: u32 = 48;
 /// with a real exponent index, which is bounded by the ALP power table's length.
 pub const ALP_VECTOR_ESCAPE_SENTINEL: u8 = 255;
 
+/// The leading-zero counts a Chimp block ([`super::chimp`]) can record, indexed by their 3-bit code. A value's real
+/// count of leading zero bits in its XOR with the previous value is rounded down to the nearest entry, so the code
+/// fits three bits while the common counts of a slowly changing series (12 to 24) lose almost nothing.
+pub const CHIMP_LEADING_ZEROS: [u32; 8] = [0, 8, 12, 16, 18, 20, 22, 24];
+
+/// A Chimp XOR with more trailing zero bits than this stores only its meaningful centre bits plus their length;
+/// one with this many or fewer stores everything after its leading zeros. Six is the published Chimp threshold: the
+/// six-bit length field costs about what it saves at that point.
+pub const CHIMP_TRAILING_ZERO_THRESHOLD: u32 = 6;
+
 /// Denominator of the `DecodeOptimized` cascade threshold (paired with [`DECODE_OPTIMIZED_THRESHOLD_NUM`]): a
 /// candidate is kept only when its size is at most 3/4 of the original — a saving of at least 25%.
 pub const DECODE_OPTIMIZED_THRESHOLD_DEN: usize = 4;

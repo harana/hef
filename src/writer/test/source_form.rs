@@ -3,6 +3,7 @@ use crate::artifacts::batch::{EventInput, PayloadInput};
 use crate::columns::{FreetextDeclaration, PromotionPlan};
 use crate::events::matrix::tests::{federate, message_event, server_key};
 use crate::events::matrix::{self, MatrixProvenance};
+use crate::events::provenance::hex_lower;
 use crate::events::transcode::{SourceFormat, transcode};
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TenantId, TimestampValue};
@@ -17,15 +18,18 @@ use std::collections::BTreeMap;
 pub(crate) fn source_form_config(rows_per_granule: usize) -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 42,
         footer_dek: None,
         footer_encryption: FooterEncryption::Plaintext,
         freetext: FreetextDeclaration { fields: Vec::new() },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan { columns: Vec::new() },
         targets: LayoutTargets {
             index_granularity: rows_per_granule,
@@ -35,6 +39,7 @@ pub(crate) fn source_form_config(rows_per_granule: usize) -> HefBuildConfig {
             stripe_target_bytes: 4096,
         },
         tenant_id: TenantId::new_test_id(7),
+        time_series_bucket_nanos: None,
     }
 }
 
@@ -208,4 +213,27 @@ fn the_external_id_index_is_sorted_and_points_at_rows() {
             .all(|pair| (pair[0].id_hash, pair[0].row_ordinal) <= (pair[1].id_hash, pair[1].row_ordinal))
     );
     assert!(index.iter().all(|entry| entry.row_ordinal != 3));
+}
+
+#[test]
+fn external_id_blocks_store_each_row_as_lowercase_hex() {
+    let ids: [Option<Vec<u8>>; 5] = [
+        None,
+        Some(vec![0xab]),
+        Some(vec![0x5c; 32]),
+        None,
+        Some(vec![0xf0; 255]),
+    ];
+    let mut rows: Vec<BuildRow> = (0..5).map(plain_row).collect();
+    for (row, id) in rows.iter_mut().zip(&ids) {
+        row.external_id = id.clone();
+    }
+    let (column_id, presence, data) = column_block(&rows, column_ids::EXTERNAL_ID).unwrap();
+    assert_eq!(column_id, column_ids::EXTERNAL_ID);
+    assert_eq!(presence, vec![0b10110]);
+    let ColumnData::Strings(values) = data else {
+        panic!("external ids are stored as strings");
+    };
+    let expected: Vec<String> = ids.iter().flatten().map(|id| hex_lower(id)).collect();
+    assert_eq!(values.iter_present().collect::<Vec<_>>(), expected);
 }

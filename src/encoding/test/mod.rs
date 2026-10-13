@@ -1,4 +1,5 @@
 use super::*;
+use crate::benchmarks::{XorFloatMeasurement, xor_float_gate_passes};
 use crate::file::bytes::{Reader, Writer};
 use arrow_array::Array;
 use miniz_oxide::deflate::compress_to_vec;
@@ -2868,4 +2869,200 @@ fn presence_rank_and_present_position_agree_with_a_prefix_count() {
     }
     assert_eq!(rank.position(&bitmap, rows), None, "row past the bitmap");
     assert_eq!(present_position(&bitmap, rows), None, "row past the bitmap");
+}
+
+/// A memory-utilization gauge sampled every few seconds: used bytes over a 16 GB total, holding still for runs of
+/// samples and otherwise moving a few pages at a time. The quotient carries full double precision, as a ratio computed
+/// from two counters does.
+fn memory_utilization_series(count: usize) -> Vec<f64> {
+    let total = 16_000_000_000u64;
+    let mut used = 6_000_000_000u64;
+    (0..count as u64)
+        .map(|i| {
+            let draw = mix(i);
+            if draw % 10 >= 5 {
+                used = (used + (draw >> 8) % 513 * 4096).saturating_sub(256 * 4096);
+            }
+            used as f64 / total as f64
+        })
+        .collect()
+}
+
+/// The smallest block any encoding that predates Chimp stores `values` in, under the random access a promoted
+/// column asks for: adaptive selection's choice and every float transform forced in turn.
+fn best_existing_float_block(values: &[f64]) -> usize {
+    let data = ColumnData::F64(values.to_vec());
+    let strategy = CascadeStrategy::DecodeOptimized;
+    [
+        Transform::Alp,
+        Transform::AlpRd,
+        Transform::ByteStreamSplit,
+        Transform::PlainF64,
+    ]
+    .into_iter()
+    .map(|transform| {
+        encode_block_forced_for_conformance(&data, true, strategy, transform)
+            .unwrap()
+            .bytes
+            .len()
+    })
+    .chain([encode_block_with_strategy(&data, true, strategy).bytes.len()])
+    .min()
+    .unwrap()
+}
+
+#[test]
+fn xor_float_blocks_round_trip_bit_for_bit_through_the_pipeline() {
+    let mut values = vec![
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7FF8_0000_DEAD_BEEF),
+        f64::from_bits(0xFFF0_0000_0000_0001),
+        f64::MIN_POSITIVE,
+        f64::MAX,
+    ];
+    values.extend(memory_utilization_series(3000));
+    let block = encode_block_forced_for_conformance(
+        &ColumnData::F64(values.clone()),
+        true,
+        CascadeStrategy::DecodeOptimized,
+        Transform::Chimp,
+    )
+    .unwrap();
+    assert_eq!(block.pipeline.transform().unwrap(), Transform::Chimp);
+    let bits = |data: ColumnData| match data {
+        ColumnData::F64(values) => values.iter().map(|value| value.to_bits()).collect::<Vec<u64>>(),
+        other => panic!("expected floats, got {other:?}"),
+    };
+    let expected: Vec<u64> = values.iter().map(|value| value.to_bits()).collect();
+    assert_eq!(bits(decode_block(block.pipeline, &block.bytes).unwrap()), expected);
+    assert_eq!(
+        bits(decode_block_range(block.pipeline, &block.bytes, 3, 900).unwrap()),
+        expected[3..900]
+    );
+    // A transform id past the ones this reader knows is refused, never decoded as something else.
+    assert!(PipelineId(15).transform().is_err());
+}
+
+#[test]
+fn xor_floats_beat_every_existing_float_encoding_on_a_slowly_varying_metric() {
+    let values = memory_utilization_series(8192);
+    let data = ColumnData::F64(values.clone());
+    let best_existing = best_existing_float_block(&values);
+    let block = encode_block_with_xor_floats(&data, true, CascadeStrategy::DecodeOptimized);
+    let adaptive = encode_block_with_strategy(&data, true, CascadeStrategy::DecodeOptimized);
+    eprintln!(
+        "memory utilization, 8192 values: chimp {:.3} bytes/value, best existing {:.3} bytes/value, adaptive \
+         selection {:.3} bytes/value",
+        block.bytes.len() as f64 / values.len() as f64,
+        best_existing as f64 / values.len() as f64,
+        adaptive.bytes.len() as f64 / values.len() as f64
+    );
+    assert_eq!(block.pipeline.transform().unwrap(), Transform::Chimp);
+    assert!(xor_float_gate_passes(&XorFloatMeasurement {
+        best_existing_bytes: best_existing as u64,
+        chimp_bytes: block.bytes.len() as u64,
+        values: values.len() as u64,
+    }));
+    assert_eq!(decode_block(block.pipeline, &block.bytes).unwrap(), data);
+}
+
+#[test]
+fn xor_floats_are_kept_only_where_they_store_fewer_bytes() {
+    // Two-decimal readings are what ALP is built for; the time-series encoder keeps ALP there.
+    let decimal: Vec<f64> = (0..8192u64)
+        .map(|i| (2000 + (mix(i) % 50) as i64) as f64 / 100.0)
+        .collect();
+    let data = ColumnData::F64(decimal.clone());
+    let selected = encode_block_with_strategy(&data, true, CascadeStrategy::DecodeOptimized);
+    let time_series = encode_block_with_xor_floats(&data, true, CascadeStrategy::DecodeOptimized);
+    let forced =
+        encode_block_forced_for_conformance(&data, true, CascadeStrategy::DecodeOptimized, Transform::Chimp).unwrap();
+    eprintln!(
+        "two-decimal readings, 8192 values: chimp {:.3} bytes/value, adaptive selection {:.3} bytes/value",
+        forced.bytes.len() as f64 / decimal.len() as f64,
+        selected.bytes.len() as f64 / decimal.len() as f64
+    );
+    assert_eq!(time_series.pipeline, selected.pipeline);
+    assert_eq!(time_series.bytes, selected.bytes);
+    // Blocks that are not floats encode exactly as they always have.
+    let ints = ColumnData::I64((0..4096).collect());
+    assert_eq!(
+        encode_block_with_xor_floats(&ints, false, CascadeStrategy::DecodeOptimized).bytes,
+        encode_block_with_strategy(&ints, false, CascadeStrategy::DecodeOptimized).bytes
+    );
+}
+
+/// The run list the RLE encoder used to collect, serialized: the reference the two-pass encoder must match byte for
+/// byte.
+fn reference_rle(values: &[u64]) -> Vec<u8> {
+    let mut runs: Vec<(u64, u32)> = Vec::new();
+    for value in values {
+        match runs.last_mut() {
+            Some((current, count)) if current == value => *count += 1,
+            _ => runs.push((*value, 1)),
+        }
+    }
+    let mut out = Writer::new();
+    out.put_u32(runs.len() as u32);
+    for (value, count) in runs {
+        out.put_u64(value);
+        out.put_u32(count);
+    }
+    out.into_bytes()
+}
+
+#[test]
+fn rle_without_a_run_list_matches_the_collected_runs() {
+    let alternating: Vec<u64> = (0..2_000).map(|i| i % 2).collect();
+    let distinct: Vec<u64> = (0..2_000).collect();
+    let cases: [Vec<u64>; 6] = [
+        vec![],
+        vec![7],
+        vec![3; 9_000],
+        vec![1, 1, 2, 2, 2, 1, u64::MAX, u64::MAX, 0],
+        alternating,
+        distinct,
+    ];
+    for values in cases {
+        let mut out = Writer::new();
+        encode_rle(&values, &mut out);
+        assert_eq!(out.into_bytes(), reference_rle(&values));
+    }
+}
+
+#[test]
+fn signed_plain_and_rle_stream_zigzag_codes_identically_to_a_mapped_copy() {
+    let mut mixed: Vec<i64> = (0..2_500).map(|i| if i % 3 == 0 { -i } else { i / 7 }).collect();
+    mixed.extend([i64::MIN, i64::MAX, i64::MIN, 0]);
+    let cases: [Vec<i64>; 5] = [vec![], vec![-1], vec![i64::MIN; 1_024], vec![5; 1_025], mixed];
+    for values in cases {
+        let mapped: Vec<u64> = values.iter().map(|value| zigzag(*value)).collect();
+        let mut plain = Writer::new();
+        encode_i64_with(Transform::PlainU64, &values, &mut plain);
+        let mut expected_plain = Writer::new();
+        encode_plain_u64(&mapped, &mut expected_plain);
+        assert_eq!(plain.into_bytes(), expected_plain.into_bytes());
+        let mut rle = Writer::new();
+        encode_i64_with(Transform::Rle, &values, &mut rle);
+        assert_eq!(rle.into_bytes(), reference_rle(&mapped));
+    }
+}
+
+#[test]
+fn alp_exception_indexes_pack_identically_to_a_collected_index_vector() {
+    let exceptions: Vec<(u32, u64)> = (0..3_000u32).map(|i| (i * 3 + 1_000, u64::from(i))).collect();
+    let indexes: Vec<u64> = exceptions.iter().map(|(index, _)| u64::from(*index)).collect();
+    let mut expected = Writer::new();
+    encode_for_bitpack(&indexes, &mut expected);
+    let base = indexes.iter().copied().min().unwrap_or(0);
+    let max_delta = indexes.iter().map(|index| index - base).max().unwrap_or(0);
+    let mut actual = Writer::new();
+    actual.put_u64(base);
+    bitpack_with(exceptions.len(), bits_needed(max_delta), &mut actual, |i| {
+        u64::from(exceptions[i].0) - base
+    });
+    assert_eq!(actual.into_bytes(), expected.into_bytes());
 }

@@ -23,7 +23,7 @@ pub struct AvailabilityWindow {
 /// The pinned windows for every transform family the format has ever assigned. Discriminant 11 (the removed Vortex
 /// shredded-block serialization) is recorded as retired at the version that introduced it, so no declared version may
 /// legally carry it — the same outcome as the reader's unknown-transform rejection, now stated as a window.
-pub const PINNED_AVAILABILITY_WINDOWS: [AvailabilityWindow; 14] = [
+pub const PINNED_AVAILABILITY_WINDOWS: [AvailabilityWindow; 15] = [
     AvailabilityWindow {
         introduced: (1, 0),
         retired: None,
@@ -93,6 +93,11 @@ pub const PINNED_AVAILABILITY_WINDOWS: [AvailabilityWindow; 14] = [
         introduced: (1, 0),
         retired: None,
         transform_id: 13,
+    },
+    AvailabilityWindow {
+        introduced: (1, 0),
+        retired: None,
+        transform_id: 14,
     },
 ];
 

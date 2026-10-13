@@ -61,3 +61,12 @@ pub trait ObjectStore {
 pub fn hef_object_key(tenant_id: TenantId, file_id: u128) -> String {
     format!("hef/{tenant_id}/{file_id:032x}.hef")
 }
+
+/// The object key a tenant's state chunk is stored under: its address in lowercase hex. The address is keyed per
+/// tenant, so the same chunk in two tenants lands under two unrelated keys.
+pub fn state_chunk_object_key(tenant_id: TenantId, address: &[u8; 32]) -> String {
+    format!(
+        "state/{tenant_id}/{}.hsc",
+        hex_simd::encode_to_string(address, hex_simd::AsciiCase::Lower)
+    )
+}

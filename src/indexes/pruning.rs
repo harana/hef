@@ -18,6 +18,7 @@
 //! min/max-only granule scanning.
 
 use super::Exactness;
+use hashbrown::HashMap;
 
 /// What a single statistic concludes about a single filter clause for one granule: either it has *proven* that no row
 /// in the granule can satisfy the clause, or it cannot rule the granule out.
@@ -118,6 +119,18 @@ pub enum Statistic {
     /// `InexactNoFalseNegative`. A query for a token whose hash is absent here can prune the block outright; a hit must
     /// still be confirmed by an exact check over the materialised text. Requirement: "Text-token and path-presence
     /// indexes are produced and used".
+    /// A [`PointMembership`](Statistic::PointMembership) with at most one member, held inline so a single probe
+    /// answer needs no heap allocation. `None` means the probe reported the value absent.
+    SingleMember {
+        column_id: u32,
+        member: Option<i128>,
+    },
+    /// A [`RangeEmptiness`](Statistic::RangeEmptiness) with at most one inclusive non-empty span, held inline so a
+    /// single probe answer needs no heap allocation. `None` means the probed range is empty.
+    SingleSpan {
+        column_id: u32,
+        span: Option<(i128, i128)>,
+    },
     TextToken {
         column_id: u32,
         /// Token hashes the filter reports as possibly present.
@@ -140,6 +153,8 @@ impl Statistic {
             | Statistic::PointMembership { column_id, .. }
             | Statistic::RangeEmptiness { column_id, .. }
             | Statistic::SequenceBounds { column_id, .. }
+            | Statistic::SingleMember { column_id, .. }
+            | Statistic::SingleSpan { column_id, .. }
             | Statistic::TextToken { column_id, .. }
             | Statistic::TimeBounds { column_id, .. } => *column_id,
         }
@@ -170,12 +185,12 @@ impl Statistic {
             ),
             // Point-membership filters never answer a range; they answer point and set lookups only (the spec forbids
             // using them for ranges).
-            Statistic::PointMembership { .. } => {
+            Statistic::PointMembership { .. } | Statistic::SingleMember { .. } => {
                 matches!(clause.predicate, PredicateKind::Equality | PredicateKind::Membership)
             }
             // Range-emptiness filters answer range-shaped questions (and a set, treated as the spanning range) but not
             // a bare presence test.
-            Statistic::RangeEmptiness { .. } => {
+            Statistic::RangeEmptiness { .. } | Statistic::SingleSpan { .. } => {
                 matches!(clause.predicate, PredicateKind::Membership | PredicateKind::Range)
             }
             // Path presence answers only "is this column/path present?".
@@ -205,6 +220,8 @@ impl Statistic {
             | Statistic::PointMembership { .. }
             | Statistic::RangeEmptiness { .. }
             | Statistic::SequenceBounds { .. }
+            | Statistic::SingleMember { .. }
+            | Statistic::SingleSpan { .. }
             | Statistic::TextToken { .. }
             | Statistic::TimeBounds { .. } => false,
         }
@@ -245,6 +262,20 @@ impl Statistic {
             Statistic::PointMembership { members, .. } => {
                 let any_in_range = members.iter().any(|&m| m >= clause.value_lo && m <= clause.value_hi);
                 if any_in_range {
+                    StatVerdict::CouldMatch
+                } else {
+                    StatVerdict::ProvenAbsent
+                }
+            }
+            Statistic::SingleMember { member, .. } => {
+                if member.is_some_and(|m| m >= clause.value_lo && m <= clause.value_hi) {
+                    StatVerdict::CouldMatch
+                } else {
+                    StatVerdict::ProvenAbsent
+                }
+            }
+            Statistic::SingleSpan { span, .. } => {
+                if span.is_some_and(|(lo, hi)| !is_disjoint(lo, hi, clause.value_lo, clause.value_hi)) {
                     StatVerdict::CouldMatch
                 } else {
                     StatVerdict::ProvenAbsent
@@ -474,13 +505,15 @@ pub fn prune_pages_in_granule(
     total_page_count: u32,
 ) -> Vec<u32> {
     let no_stats = GranuleStatistics::default();
+    let mut stats_by_page: HashMap<u32, &GranuleStatistics> = HashMap::with_capacity(page_statistics.len());
+    for (page_idx, stats) in page_statistics {
+        if *page_idx < total_page_count {
+            stats_by_page.entry(*page_idx).or_insert(stats);
+        }
+    }
     (0..total_page_count)
-        .filter(|&page_idx| {
-            let stats = page_statistics
-                .iter()
-                .find(|(pi, _)| *pi == page_idx)
-                .map(|(_, s)| s)
-                .unwrap_or(&no_stats);
+        .filter(|page_idx| {
+            let stats = stats_by_page.get(page_idx).copied().unwrap_or(&no_stats);
             let expr = build_pruning_expression(filter, stats);
             !evaluate(&expr, stats).drop
         })
@@ -517,6 +550,8 @@ fn exactness_of(statistic: &Statistic) -> Exactness {
         Statistic::PathPresence { .. }
         | Statistic::PointMembership { .. }
         | Statistic::RangeEmptiness { .. }
+        | Statistic::SingleMember { .. }
+        | Statistic::SingleSpan { .. }
         | Statistic::TextToken { .. } => Exactness::InexactNoFalseNegative,
     }
 }
@@ -547,6 +582,8 @@ fn same_kind(a: &Statistic, b: &Statistic) -> bool {
             | (Statistic::PointMembership { .. }, Statistic::PointMembership { .. })
             | (Statistic::RangeEmptiness { .. }, Statistic::RangeEmptiness { .. })
             | (Statistic::SequenceBounds { .. }, Statistic::SequenceBounds { .. })
+            | (Statistic::SingleMember { .. }, Statistic::SingleMember { .. })
+            | (Statistic::SingleSpan { .. }, Statistic::SingleSpan { .. })
             | (Statistic::TextToken { .. }, Statistic::TextToken { .. })
             | (Statistic::TimeBounds { .. }, Statistic::TimeBounds { .. })
     )

@@ -4,13 +4,14 @@
 //! receipt and goes no further) → serialize into the worker's lock-free queue (READY) → reach the flush target (16 KiB
 //! default; 4 KiB force-commit) → claim and reserve a contiguous `(epoch, sequence)` range → submit an aligned HEJ
 //! frame → verify CRC-64/NVME + BLAKE3 → HARDENED → record safe-retry metadata → COMMITTED (append-only: immediately;
-//! no GSN/RFA/barrier machinery) → decode into LiveOverlay → acknowledge per the route contract.
+//! no GSN/RFA/barrier machinery) → decode into LiveOverlay → acknowledge per the route contract. A flush that finds
+//! more than one flush target's worth of records pending commits them as several frames behind one sync.
 //!
 //! There is no global group-commit writer and no global acknowledgement thread: each pipeline instance is one worker
 //! flushing autonomously.
 
 use super::error::{FlushError, LeaseError, QueueError};
-use super::queue::{CommitQueue, PendingRecord, peek_steal};
+use super::queue::{CommitQueue, PendingRecord, QueueRegion, peek_steal};
 use super::reserve::{FORCE_COMMIT_IDLE_NANOS, SequenceAllocator};
 use super::retry::{RetryReceipt, SafeRetryStore, StatusClass};
 use crate::artifacts::batch::{EventInput, build_batch, decode_batch};
@@ -79,15 +80,30 @@ pub enum Submission {
     Ready,
 }
 
-/// The outcome of one committed frame.
+/// The outcome of one flush: the frames it committed and the sequence range they cover.
 #[derive(Debug)]
 pub struct FlushResult {
+    /// Bytes of every frame the flush wrote, which it appended back to back from `frame_offset`.
     pub frame_len: u32,
+    /// Where the flush's first frame starts in the journal.
     pub frame_offset: u64,
     pub range: SequenceRange,
     pub reason: FlushReason,
     pub receipts: Vec<RetryReceipt>,
     pub state: CommitState,
+}
+
+/// One frame a flush has appended but not yet made durable: the queue region and lease it holds, its events, and
+/// where its bytes went.
+///
+/// See: hef-write-path/spec.md
+struct StagedFrame {
+    bytes: Vec<u8>,
+    events: Vec<EventInput>,
+    lease_id: u64,
+    offset: u64,
+    range: SequenceRange,
+    region: QueueRegion,
 }
 
 /// One worker's autonomous commit pipeline over the interfaces.
@@ -276,12 +292,14 @@ impl WorkerCommitPipeline {
     }
 
     /// Claims the pending records that match this worker's tenant and the allocator's epoch — a queue spanning an
-    /// epoch roll is split at the boundary, claiming only the matching prefix and leaving the rest pending — reserves
-    /// one contiguous sequence range, writes one aligned HEJ frame, reads it back to verify what landed on media, and
-    /// records durability plus safe-retry receipts. Append-only routes are COMMITTED on durability; transactional
-    /// routes stay HARDENED for the dependency hook.
+    /// epoch roll is split at the boundary, claiming only the matching prefix and leaving the rest pending — and
+    /// commits them as aligned HEJ frames of up to the flush target each, every frame under its own contiguous
+    /// `(epoch, sequence)` range. All the frames are appended and then made durable by one sync, so a burst costs one
+    /// durability barrier however many frames it fills; each is then read back to verify what landed on media, and
+    /// recorded with durability plus safe-retry receipts. Append-only routes are COMMITTED on durability;
+    /// transactional routes stay HARDENED for the dependency hook.
     ///
-    /// A COMMITTED frame is also published to `overlay` before this returns, so its events are readable through
+    /// COMMITTED frames are also published to `overlay` before this returns, so their events are readable through
     /// `LiveOverlayStore::fresh_read` as soon as the flush succeeds.
     #[expect(
         clippy::too_many_arguments,
@@ -297,99 +315,107 @@ impl WorkerCommitPipeline {
         overlay: &mut LiveOverlayStore,
         clock: &dyn MonotonicClock,
     ) -> Result<FlushResult, FlushError> {
-        let epoch = allocator.epoch();
-        let (region, records) = self
-            .queue
-            .copy_matching_prefix(self.tenant_id, epoch)
-            .map_err(FlushError::Queue)?;
-        if records.is_empty() {
-            // An empty prefix with records still pending means the queue front belongs to another tenant or epoch.
-            // Nothing was claimed, so those records stay queued for a matching flush instead of being dropped.
-            if self.queue.pending_bytes() > 0 {
-                return Err(FlushError::MixedTenantOrEpoch);
-            }
-            return Err(FlushError::NothingToFlush);
-        }
-        if !self.queue.claim_for_flush(region) {
-            // Lost the claim to a stealer: the copied bytes are discarded.
-            return Err(FlushError::NothingToFlush);
-        }
-
-        // Reserve the final (epoch, sequence) range under a lease, but do NOT consume the lease yet: the range is used
-        // to build the frame while the lease stays outstanding, so if any step below fails before the frame is durable,
-        // the lease is left to expire into a void record (closing the sequence hole) instead of leaving a permanent gap.
-        let lease = allocator.reserve(records.len() as u64, clock.monotonic_nanos());
-        let range = lease.range;
-
-        let events: Vec<EventInput> = records.into_iter().map(|record| record.event).collect();
         let now = clock.now_nanos();
-        let (frame_bytes, frame_offset) = match self.build_and_persist(&events, range, now, storage) {
-            Ok(result) => result,
-            Err(FlushError::SyncAfterAppend { error, frame_offset }) => {
-                // The appended bytes are present but unsynced, so a later sync can still persist them. Voiding this
-                // range would then overlap the frame if it lands, so consume the lease as potentially-durable — keeping
-                // it out of `expire`/`commit_voids`. Receipts are recorded as `Indeterminate` so a client retry of the
-                // same delivery is recognised instead of appending a second copy of these events; they are never an
-                // acknowledgement, and the failure is still reported so the caller does not acknowledge.
-                let _ = allocator.accept_late(lease.lease_id);
-                self.record_receipts(&events, range, frame_offset, now, StatusClass::Indeterminate, retry);
-                self.queue.abort_flush(region);
-                return Err(FlushError::Storage(error));
-            }
-            Err(error) => {
-                // The append never happened, so the frame never reached durability. Unpin the claimed queue region and
-                // leave the lease outstanding so its range is closed by a void record — no pinned storage, no permanent
-                // sequence hole.
-                self.queue.abort_flush(region);
-                return Err(error);
-            }
-        };
-
-        // Verification against what actually landed on media, not the in-memory buffer just built: read the frame back
-        // and require it to be byte-identical to the frame just appended, before anything is receipted or acknowledged.
-        // Decoding alone is not enough — a stale or misdirected read can return some *other* valid frame of the same
-        // size, and accepting it would acknowledge events replay will not find. A failed read-back or a mismatch is
-        // handled like a failed durability barrier: the appended bytes may be durable, so the lease is consumed as
-        // potentially-durable — never closed by a void — and the failure is reported so the caller does not
-        // acknowledge. `sync` is the durability barrier and it succeeded, so the frame can already be durable with only
-        // the verification read at fault; `Indeterminate` receipts are recorded for the same reason as the failed-sync
-        // branch, so a client retry of the same delivery is recognised instead of appending a second copy.
-        if let Err(error) = storage
-            .read(self.shard, frame_offset, frame_bytes.len() as u32)
-            .map_err(FlushError::Storage)
-            .and_then(|stored| {
-                if stored == frame_bytes {
-                    Ok(())
-                } else {
-                    Err(FlushError::Format(FormatError::Structural {
-                        rule: "frame read back after sync differs from the frame appended",
-                    }))
-                }
-            })
-        {
-            let _ = allocator.accept_late(lease.lease_id);
-            self.record_receipts(&events, range, frame_offset, now, StatusClass::Indeterminate, retry);
-            self.queue.abort_flush(region);
+        let mut frames = Vec::new();
+        if let Err(error) = self.append_frames(allocator, storage, clock, now, &mut frames) {
+            // The frames appended before the failure are unsynced, but a later sync can still persist them.
+            self.abandon_possibly_durable(&frames, allocator, now, retry);
             return Err(error);
         }
+        let (Some(first), Some(last)) = (frames.first(), frames.last()) else {
+            return Err(FlushError::NothingToFlush);
+        };
+        let range = SequenceRange {
+            epoch: first.range.epoch,
+            first_sequence: first.range.first_sequence,
+            last_sequence: last.range.last_sequence,
+        };
+        let frame_offset = first.offset;
 
-        // Durable and verified: only now consume the lease, then advance the durable watermark and release the queue.
+        // Durability barrier per the selected policy (direct-I/O completion or buffered fdatasync-equivalent), once for
+        // every frame. A sync failure leaves each frame's appended bytes in one of two states, and which one it is
+        // decides whether its range may be voided, so each offset is read back to tell them apart: bytes that are not
+        // there cannot become durable, and the frame's region is released with its lease left to expire into a void
+        // record; bytes that are there may still be persisted by a later sync, so the frame is abandoned as possibly
+        // durable. Only a read that succeeds and returns *other* bytes proves a frame absent; a failed read proves
+        // nothing, so an unreadable offset counts as present. Either way the failure is reported so the caller does not
+        // acknowledge.
+        if let Err(error) = storage.sync(self.shard) {
+            let (absent, present): (Vec<StagedFrame>, Vec<StagedFrame>) = frames.into_iter().partition(|frame| {
+                storage
+                    .read(self.shard, frame.offset, frame.bytes.len() as u32)
+                    .is_ok_and(|stored| stored != frame.bytes)
+            });
+            for frame in &absent {
+                self.queue.abort_flush(frame.region);
+            }
+            self.abandon_possibly_durable(&present, allocator, now, retry);
+            return Err(FlushError::Storage(error));
+        }
+        self.durable_batch_counter += frames.len() as u64;
+        self.writer_local_batch_counter += frames.len() as u64;
+
+        // Verification against what actually landed on media, not the in-memory buffers just built: read each frame
+        // back and require it to be byte-identical to the frame appended, before anything is receipted or acknowledged.
+        // Decoding alone is not enough — a stale or misdirected read can return some *other* valid frame of the same
+        // size, and accepting it would acknowledge events replay will not find. A failed read-back or a mismatch is
+        // handled like a failed durability barrier: the appended bytes may be durable, so every frame's lease is
+        // consumed as potentially-durable — never closed by a void — and the failure is reported so the caller does not
+        // acknowledge. `sync` is the durability barrier and it succeeded, so the frames can already be durable with only
+        // the verification read at fault; `Indeterminate` receipts are recorded for the same reason as the failed-sync
+        // branch, so a client retry of the same delivery is recognised instead of appending a second copy.
+        for frame in &frames {
+            let verified = storage
+                .read(self.shard, frame.offset, frame.bytes.len() as u32)
+                .map_err(FlushError::Storage)
+                .and_then(|stored| {
+                    if stored == frame.bytes {
+                        Ok(())
+                    } else {
+                        Err(FlushError::Format(FormatError::Structural {
+                            rule: "frame read back after sync differs from the frame appended",
+                        }))
+                    }
+                });
+            if let Err(error) = verified {
+                self.abandon_possibly_durable(&frames, allocator, now, retry);
+                return Err(error);
+            }
+        }
+
+        // Durable and verified: only now consume the leases, then advance the durable watermark and release the queue.
         // A deadline crossed by the durability barrier itself (append + sync routinely outlasts the lease window) does
         // not mean anything raced ahead of us — this call has held `allocator` exclusively since `reserve`, so nobody
-        // could have voided this range yet. Accept the already-durable frame rather than voiding a range that already
-        // holds a real event frame.
-        if let Err(error) = allocator.harden(lease.lease_id, clock.monotonic_nanos()) {
-            if error != LeaseError::Expired || allocator.accept_late(lease.lease_id).is_err() {
-                self.queue.abort_flush(region);
+        // could have voided these ranges yet. Accept the already-durable frames rather than voiding ranges that already
+        // hold real event frames.
+        for frame in &frames {
+            if let Err(error) = allocator.harden(frame.lease_id, clock.monotonic_nanos())
+                && (error != LeaseError::Expired || allocator.accept_late(frame.lease_id).is_err())
+            {
+                for claimed in &frames {
+                    self.queue.abort_flush(claimed.region);
+                }
                 return Err(FlushError::Lease(error));
             }
         }
-        watermarks.record_durable(range);
-        self.queue.mark_hardened(region);
+        for frame in &frames {
+            watermarks.record_durable(frame.range);
+            self.queue.mark_hardened(frame.region);
+        }
         self.queue.release_hardened();
 
         // Safe-retry receipts: reconstructable indexes pointing at HEJ.
-        let receipts = self.record_receipts(&events, range, frame_offset, now, StatusClass::Acknowledged, retry);
+        let mut receipts = Vec::new();
+        for frame in &frames {
+            receipts.extend(self.record_receipts(
+                &frame.events,
+                frame.range,
+                frame.offset,
+                now,
+                StatusClass::Acknowledged,
+                retry,
+            ));
+        }
 
         // Append-only: HARDENED becomes COMMITTED immediately — no dependency machinery on the ordinary ingest path.
         let state = match self.route {
@@ -397,16 +423,105 @@ impl WorkerCommitPipeline {
             RouteDependency::Transactional => CommitState::Hardened,
         };
         if state == CommitState::Committed {
-            self.publish_to_overlay(&frame_bytes, overlay)?;
+            for frame in &frames {
+                self.publish_to_overlay(&frame.bytes, overlay)?;
+            }
         }
         Ok(FlushResult {
             range,
             frame_offset,
-            frame_len: frame_bytes.len() as u32,
+            frame_len: frames.iter().map(|frame| frame.bytes.len() as u32).sum(),
             state,
             receipts,
             reason,
         })
+    }
+
+    /// Claims, reserves, builds and appends one frame per flush target's worth of matching pending records until none
+    /// is left, adding each to `frames`; nothing is synced. A frame that fails to build or append has its region
+    /// released and its lease left outstanding, so the range is closed by a void record instead of leaving a permanent
+    /// gap; the frames appended before it stay in `frames` for the caller to settle.
+    fn append_frames(
+        &mut self,
+        allocator: &mut SequenceAllocator,
+        storage: &mut dyn JournalStorage,
+        clock: &dyn MonotonicClock,
+        now: i64,
+        frames: &mut Vec<StagedFrame>,
+    ) -> Result<(), FlushError> {
+        let epoch = allocator.epoch();
+        loop {
+            let (region, records) = self
+                .queue
+                .copy_matching_prefix(self.tenant_id, epoch, self.flush_target_bytes)
+                .map_err(FlushError::Queue)?;
+            if records.is_empty() {
+                if !frames.is_empty() {
+                    return Ok(());
+                }
+                // An empty prefix with records still pending means the queue front belongs to another tenant or epoch.
+                // Nothing was claimed, so those records stay queued for a matching flush instead of being dropped.
+                if self.queue.pending_bytes() > 0 {
+                    return Err(FlushError::MixedTenantOrEpoch);
+                }
+                return Err(FlushError::NothingToFlush);
+            }
+            if !self.queue.claim_for_flush(region) {
+                // Lost the claim to a stealer: the copied bytes are discarded.
+                return if frames.is_empty() {
+                    Err(FlushError::NothingToFlush)
+                } else {
+                    Ok(())
+                };
+            }
+
+            // Reserve the final (epoch, sequence) range under a lease, but do NOT consume the lease yet: the range is
+            // used to build the frame while the lease stays outstanding, so if any step fails before the frame is
+            // durable, the lease is left to expire into a void record (closing the sequence hole) instead of leaving a
+            // permanent gap.
+            let lease = allocator.reserve(records.len() as u64, clock.monotonic_nanos());
+            let events: Vec<EventInput> = records.into_iter().map(|record| record.event).collect();
+            let batch_number = frames.len() as u64 + 1;
+            match self.build_and_append(&events, lease.range, now, batch_number, storage) {
+                Ok((bytes, offset)) => frames.push(StagedFrame {
+                    bytes,
+                    events,
+                    lease_id: lease.lease_id,
+                    offset,
+                    range: lease.range,
+                    region,
+                }),
+                Err(error) => {
+                    self.queue.abort_flush(region);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Gives up on `frames`, whose bytes were appended but never verified durable: each lease is consumed as
+    /// possibly durable, so its range is never voided under a frame that may yet land; each event gets an
+    /// `Indeterminate` receipt, never an acknowledgement, so a client retry of the same delivery is recognised
+    /// instead of appending a second copy; and each claimed region is released.
+    fn abandon_possibly_durable(
+        &mut self,
+        frames: &[StagedFrame],
+        allocator: &mut SequenceAllocator,
+        now: i64,
+        retry: &mut dyn SafeRetryStore,
+    ) {
+        for frame in frames {
+            let _ = allocator.accept_late(frame.lease_id);
+            self.record_receipts(
+                &frame.events,
+                frame.range,
+                frame.offset,
+                now,
+                StatusClass::Indeterminate,
+                retry,
+            );
+            self.queue.abort_flush(frame.region);
+        }
     }
 
     /// Records one safe-retry receipt per event — pointers into HEJ at `frame_offset`, one sequence per row — under
@@ -460,22 +575,18 @@ impl WorkerCommitPipeline {
         Ok(())
     }
 
-    /// Builds the batch payload and HEJ frame for `events` under the leased `range`, then appends and syncs it.
-    /// Returns the frame bytes and its storage offset once durable; the caller verifies the stored bytes by reading
-    /// them back before receipting. The batch-id counters advance only on success, so a failed, aborted flush leaves
-    /// no numbering gap. A failure before `append` returns `Storage` and the range can be safely voided; a `sync`
-    /// failure after a successful `append` returns `SyncAfterAppend`, because the appended bytes may still become
-    /// durable and the range must not be voided.
-    fn build_and_persist(
-        &mut self,
+    /// Builds the batch payload and HEJ frame for `events` under the leased `range`, as this flush's `batch_number`th
+    /// frame, and appends it without syncing. Returns the frame bytes and their storage offset. The batch-id counters
+    /// advance only once the flush's sync succeeds, so a failed, aborted flush leaves no numbering gap.
+    fn build_and_append(
+        &self,
         events: &[EventInput],
         range: SequenceRange,
         now: i64,
+        batch_number: u64,
         storage: &mut dyn JournalStorage,
     ) -> Result<(Vec<u8>, u64), FlushError> {
         let payload = build_batch(events, self.schema_generation, 0).map_err(FlushError::Format)?;
-        let durable_batch_id = self.durable_batch_counter + 1;
-        let writer_local_batch_id = self.writer_local_batch_counter + 1;
         let frame_bytes = build_frame(
             &FrameBuildInput {
                 flags: 0,
@@ -485,8 +596,8 @@ impl WorkerCommitPipeline {
                 first_sequence: range.first_sequence,
                 last_sequence: range.last_sequence,
                 event_count: events.len() as u32,
-                durable_batch_id,
-                writer_local_batch_id,
+                durable_batch_id: self.durable_batch_counter + batch_number,
+                writer_local_batch_id: self.writer_local_batch_counter + batch_number,
                 schema_generation: self.schema_generation,
                 dictionary_generation_hint: 0,
                 created_at_physical: now,
@@ -495,31 +606,7 @@ impl WorkerCommitPipeline {
             &payload,
         )
         .map_err(FlushError::Format)?;
-
         let frame_offset = storage.append(self.shard, &frame_bytes).map_err(FlushError::Storage)?;
-        // Durability barrier per the selected policy (direct-I/O completion or buffered fdatasync-equivalent). A sync
-        // failure leaves the appended bytes in one of two states, and which one it is decides whether the range may be
-        // voided, so the offset is read back to tell them apart: bytes that are not there cannot become durable and the
-        // range is reported as a plain `Storage` failure the caller may void; bytes that are there may still be
-        // persisted by a later sync, and `SyncAfterAppend` keeps the caller from voiding a range the frame may occupy.
-        // Verification of the durable path happens in `flush`, against the bytes read back after a successful sync.
-        if let Err(error) = storage.sync(self.shard) {
-            // Only a read that succeeds and returns *other* bytes proves the frame is absent. A failed read proves
-            // nothing — `append` already succeeded, so the bytes may be there and a later sync may persist them — and
-            // treating it as absence would void a range the frame can still occupy, leaving overlapping event and void
-            // coverage. An unreadable offset is therefore reported as `SyncAfterAppend` too.
-            let absent = storage
-                .read(self.shard, frame_offset, frame_bytes.len() as u32)
-                .is_ok_and(|stored| stored != frame_bytes);
-            return Err(if absent {
-                FlushError::Storage(error)
-            } else {
-                FlushError::SyncAfterAppend { error, frame_offset }
-            });
-        }
-
-        self.durable_batch_counter = durable_batch_id;
-        self.writer_local_batch_counter = writer_local_batch_id;
         Ok((frame_bytes, frame_offset))
     }
 
@@ -538,7 +625,10 @@ impl WorkerCommitPipeline {
     ) -> Result<Vec<SequenceRange>, FlushError> {
         let now = clock.now_nanos();
         let mut voided = Vec::new();
-        for (lease_id, range) in allocator.expired_leases(clock.monotonic_nanos()) {
+        let cutoff = clock.monotonic_nanos();
+        let mut cursor = None;
+        while let Some((lease_id, range)) = allocator.next_expired_after(cutoff, cursor) {
+            cursor = Some(lease_id);
             let durable_batch_id = self.durable_batch_counter + 1;
             let writer_local_batch_id = self.writer_local_batch_counter + 1;
             let frame_bytes = build_frame(

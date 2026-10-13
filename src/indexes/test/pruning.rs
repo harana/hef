@@ -401,15 +401,18 @@ fn indexed_row(i: u64) -> HefRow {
 fn indexed_config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 42,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
         freetext: FreetextDeclaration { fields: Vec::new() },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 5,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan {
             columns: vec![PromotedColumn {
                 name: "amount_promoted".to_owned(),
@@ -427,6 +430,7 @@ fn indexed_config() -> HefBuildConfig {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(7),
+        time_series_bucket_nanos: None,
     }
 }
 
@@ -544,4 +548,69 @@ fn hot_column_prunes_pages_cold_column_falls_back_to_granule_granularity() {
         dropped.drop,
         "a range wholly outside the granule's sequence span must still be dropped without any page-level stats"
     );
+}
+
+#[test]
+fn page_pruning_first_duplicate_wins_with_unsorted_and_out_of_range_ids() {
+    let bounds = |min: i128, max: i128| stats(vec![Statistic::MinMaxBound { column_id: 1, max, min }]);
+    let page_statistics = vec![
+        (2, bounds(100, 200)),
+        (0, bounds(0, 10)),
+        (2, bounds(0, 10)),
+        (9, bounds(100, 200)),
+    ];
+    let kept = prune_pages_in_granule(&filter(vec![eq_clause(1, 5)]), &page_statistics, 3);
+    assert_eq!(
+        kept,
+        vec![0, 1],
+        "page 2's first entry rules it out; page 1 has no stats; page 9 is out of range"
+    );
+}
+
+#[test]
+fn inline_statistics_match_their_vector_forms() {
+    let clauses = [
+        eq_clause(1, 5),
+        eq_clause(1, -3),
+        eq_clause(2, 5),
+        range_clause(1, 3, 8),
+        range_clause(1, 8, 3),
+        range_clause(1, i128::MIN, i128::MAX),
+        presence_clause(1),
+        FilterClause {
+            column_id: 1,
+            predicate: PredicateKind::Membership,
+            value_hi: 9,
+            value_lo: 4,
+        },
+    ];
+    for clause in clauses {
+        for member in [None, Some(clause.value_lo), Some(7), Some(-1)] {
+            let inline = Statistic::SingleMember { column_id: 1, member };
+            let vector = Statistic::PointMembership {
+                column_id: 1,
+                members: member.into_iter().collect(),
+            };
+            assert_eq!(inline.relevant_to(&clause), vector.relevant_to(&clause));
+            assert_eq!(inline.judge(&clause), vector.judge(&clause), "{clause:?} {member:?}");
+            assert_eq!(exactness_of(&inline), exactness_of(&vector));
+            assert!(!inline.keep_confirms_match());
+        }
+        for span in [
+            None,
+            Some((clause.value_lo, clause.value_hi)),
+            Some((6, 7)),
+            Some((9, 2)),
+        ] {
+            let inline = Statistic::SingleSpan { column_id: 1, span };
+            let vector = Statistic::RangeEmptiness {
+                column_id: 1,
+                non_empty_spans: span.into_iter().collect(),
+            };
+            assert_eq!(inline.relevant_to(&clause), vector.relevant_to(&clause));
+            assert_eq!(inline.judge(&clause), vector.judge(&clause), "{clause:?} {span:?}");
+            assert_eq!(exactness_of(&inline), exactness_of(&vector));
+            assert!(!inline.keep_confirms_match());
+        }
+    }
 }

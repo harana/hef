@@ -234,15 +234,18 @@ fn built_file() -> BuiltHef {
     let rows: Vec<HefRow> = (0..40).map(built_file_row).collect();
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
         freetext: FreetextDeclaration { fields: Vec::new() },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 8,
@@ -252,6 +255,7 @@ fn built_file() -> BuiltHef {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(3),
+        time_series_bucket_nanos: None,
     };
     build_hef_file(rows, &config).unwrap()
 }

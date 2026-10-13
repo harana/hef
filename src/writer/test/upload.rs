@@ -1,5 +1,7 @@
 use super::*;
 use crate::artifacts::batch::{EventInput, PayloadInput};
+use crate::artifacts::state_chunk::{ObjectStoreStateChunks, StateKey, build_state_tree, state_get};
+use crate::clock::FixedClock;
 use crate::columns::{FreetextDeclaration, PromotionPlan};
 use crate::error::StorageError;
 use crate::events::variant::VariantValue;
@@ -7,8 +9,11 @@ use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TenantId, Time
 use crate::layout::LayoutTargets;
 use crate::object_store::sim::{ObjectFault, SimObjectStore};
 use crate::object_store::{ETag, StoredObject};
+use crate::security::{StateChunkKey, TenantDek};
 use crate::typed_id::TypedIdTestExt;
 use crate::writer::build::{BuildLifecycle, HefBuildConfig, HefRow, build_hef_file};
+use crate::writer::sim::SimStateChunkLedger;
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 const KEY: &str = "hef/test.hef";
@@ -52,15 +57,18 @@ fn event(i: u64) -> EventInput {
 fn multi_stripe_file() -> BuiltHef {
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 1,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
         freetext: FreetextDeclaration::default(),
         freetext_row_offset_index: false,
         generation_id: 0,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 8,
@@ -70,6 +78,7 @@ fn multi_stripe_file() -> BuiltHef {
             stripe_target_bytes: 512,
         },
         tenant_id: TenantId::new_test_id(9),
+        time_series_bucket_nanos: None,
     };
     let rows = (0..40)
         .map(|i| HefRow {
@@ -196,5 +205,55 @@ fn an_object_already_at_the_key_is_verified_not_uploaded_again() {
     assert!(matches!(
         upload_hef(&other, KEY, &built, u64::MAX),
         Err(PublishFailure::Verification(_))
+    ));
+}
+
+#[test]
+fn state_chunks_go_up_create_only_and_a_stored_chunk_counts_as_stored() {
+    let objects = SimObjectStore::new();
+    let ledger = SimStateChunkLedger::default();
+    let clock = FixedClock::at(1);
+    let tenant = TenantId::new_test_id(9);
+    let key = StateChunkKey::derive(&TenantDek::new([3; 32]));
+    let member = |user: u32| StateKey {
+        state_key_id: user,
+        type_id: 1,
+    };
+    let mut state: BTreeMap<StateKey, u64> = (0..2_000).map(|user| (member(user), u64::from(user))).collect();
+    let first = build_state_tree(&key, &state).unwrap();
+    assert!(first.chunks.len() > 2);
+    assert_eq!(
+        upload_state_chunks(&objects, &ledger, tenant, &first.chunks, &clock).unwrap(),
+        first.chunks.len()
+    );
+    assert_eq!(
+        upload_state_chunks(&objects, &ledger, tenant, &first.chunks, &clock).unwrap(),
+        0
+    );
+
+    state.insert(member(1_000), 99);
+    let second = build_state_tree(&key, &state).unwrap();
+    let new = second.new_chunks_iter(&first).count();
+    assert_eq!(
+        upload_state_chunks(&objects, &ledger, tenant, &second.chunks, &clock).unwrap(),
+        new
+    );
+    assert_eq!(objects.keys().len(), first.chunks.len() + new);
+    let stored = ObjectStoreStateChunks {
+        objects: &objects,
+        tenant_id: tenant,
+    };
+    assert_eq!(state_get(&stored, &key, &second.root, member(1_000)).unwrap(), Some(99));
+    assert_eq!(
+        state_get(&stored, &key, &first.root, member(1_000)).unwrap(),
+        Some(1_000)
+    );
+
+    state.insert(member(1_000), 100);
+    let third = build_state_tree(&key, &state).unwrap();
+    objects.inject(ObjectFault::FailPutIfAbsent);
+    assert!(matches!(
+        upload_state_chunks(&objects, &ledger, tenant, third.new_chunks_iter(&second), &clock),
+        Err(StateChunkError::Storage(_))
     ));
 }

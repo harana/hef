@@ -166,3 +166,27 @@ fn keys_spanning_the_whole_signed_domain_fit_and_look_up_without_overflow() {
     let _ = index.estimate_position(i64::MAX);
     let _ = index.estimate_position(i64::MIN);
 }
+
+/// Keys placed at uneven rows (each the start of a run of rows sharing it) still land within the bound of their row,
+/// and the index decodes, which a long duplicate run handed to `build` would not.
+#[test]
+fn keys_built_at_given_rows_land_within_the_bound_of_those_rows() {
+    let keys: Vec<i64> = (0..200).map(|i| i * i * 7).collect();
+    let mut rows = Vec::new();
+    let mut row = 0u64;
+    for i in 0..200u64 {
+        rows.push(row);
+        row += 1 + (i % 5) * 40;
+    }
+    let index = LearnedPositionIndex::build_at_rows(1, 0, &keys, &rows, row + 100, 4);
+    for (key, row) in keys.iter().zip(&rows) {
+        let window = index.estimate_position(*key);
+        assert!(
+            window.search_from <= *row && *row <= window.search_to,
+            "window [{}, {}] must contain row {row}",
+            window.search_from,
+            window.search_to,
+        );
+    }
+    assert_eq!(LearnedPositionIndex::decode(&index.encode()).unwrap(), index);
+}

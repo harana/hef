@@ -162,3 +162,29 @@ fn local_to_global_map_matches_independent_lookups() {
     assert_eq!(map(&dictionary(&[]), &["a", "a"]), vec![None, None]);
     assert_eq!(map(&global, &[]), Vec::<Option<u64>>::new());
 }
+
+/// Duplicates inside one alphabet and overlap across alphabets collapse to one entry each in the merged order.
+#[test]
+fn merged_alphabets_drop_duplicates_within_and_across_files() {
+    let first: Vec<String> = ["a", "a", "c", "é"].iter().map(|v| (*v).to_owned()).collect();
+    let second: Vec<String> = ["", "b", "c"].iter().map(|v| (*v).to_owned()).collect();
+    let global = GlobalDictionary::from_file_alphabets([first.as_slice(), second.as_slice(), &[]]);
+    for (code, value) in ["", "a", "b", "c", "é"].iter().enumerate() {
+        assert_eq!(global.code_for(value), Some(code as u64));
+    }
+    assert_eq!(
+        global.local_to_global_map(&first),
+        vec![Some(1), Some(1), Some(3), Some(4)]
+    );
+}
+
+/// An unsorted alphabet still yields the sorted union rather than a misordered merge.
+#[test]
+fn an_unsorted_alphabet_still_merges_into_sorted_order() {
+    let first: Vec<String> = ["login", "checkout"].iter().map(|v| (*v).to_owned()).collect();
+    let second: Vec<String> = ["signup", "audit"].iter().map(|v| (*v).to_owned()).collect();
+    let global = GlobalDictionary::from_file_alphabets([first.as_slice(), second.as_slice()]);
+    for (code, value) in ["audit", "checkout", "login", "signup"].iter().enumerate() {
+        assert_eq!(global.code_for(value), Some(code as u64));
+    }
+}

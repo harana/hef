@@ -79,15 +79,18 @@ fn ingest_rows() -> Vec<HefRow> {
 fn config(generation_id: u64) -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: FooterEncryption::Plaintext,
         freetext: FreetextDeclaration { fields: Vec::new() },
         freetext_row_offset_index: false,
         generation_id,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::RewriteOrCompaction,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 128,
@@ -97,6 +100,7 @@ fn config(generation_id: u64) -> HefBuildConfig {
             stripe_target_bytes: 64 * 1024,
         },
         tenant_id: tenant(),
+        time_series_bucket_nanos: None,
     }
 }
 

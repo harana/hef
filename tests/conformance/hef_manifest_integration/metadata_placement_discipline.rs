@@ -29,9 +29,12 @@ fn large_rollup_not_in_manifest() {
         file_id: 0xAA,
         file_type: FileType::HefFile,
         footer_len: None,
+        graph_event_id_filter: None,
+        graph_summary: None,
         optional_feature_flags: 0,
         part_index: 0,
         part_state: PartState::Active,
+        profile: hef::layout::Profile::Event,
         required_feature_flags: 0,
         size_bytes: 1 << 30, // The file is 1 GiB on storage.
         tenant_id: tenant(),

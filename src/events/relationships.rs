@@ -11,7 +11,7 @@
 //!
 //! See: hef-logical-event-model/spec.md
 
-use super::constant::EXTERNAL_ID_MAX_BYTES;
+use super::constant::{EXTERNAL_ID_MAX_BYTES, SUBJECT_SEQUENCE_TARGET_LEN};
 use super::provenance::hex_lower_into;
 use crate::columns::column_ids;
 use crate::error::RelationshipError;
@@ -104,15 +104,27 @@ pub enum TargetIdSpace {
     ExternalId,
     /// A signed protocol's own content-derived event identifier (32 bytes today).
     ProtocolEventId,
+    /// The event's dense sequence number within its subject (a room, say), as a graph-profile file numbers its rows:
+    /// 8 bytes, big-endian, so the stored text sorts in sequence order.
+    SubjectSequence,
 }
 
 impl TargetIdSpace {
+    /// Every space, for iterating over the registry.
+    pub const ALL: [TargetIdSpace; 4] = [
+        TargetIdSpace::EventId,
+        TargetIdSpace::ExternalId,
+        TargetIdSpace::ProtocolEventId,
+        TargetIdSpace::SubjectSequence,
+    ];
+
     /// The stored tag for this space.
     pub const fn as_str(self) -> &'static str {
         match self {
             TargetIdSpace::EventId => "event_id",
             TargetIdSpace::ExternalId => "external_id",
             TargetIdSpace::ProtocolEventId => "protocol_event_id",
+            TargetIdSpace::SubjectSequence => "subject_sequence",
         }
     }
 
@@ -122,6 +134,7 @@ impl TargetIdSpace {
             "event_id" => Some(TargetIdSpace::EventId),
             "external_id" => Some(TargetIdSpace::ExternalId),
             "protocol_event_id" => Some(TargetIdSpace::ProtocolEventId),
+            "subject_sequence" => Some(TargetIdSpace::SubjectSequence),
             _ => None,
         }
     }
@@ -132,6 +145,7 @@ impl TargetIdSpace {
             TargetIdSpace::EventId => Some(EVENT_ID_TARGET_LEN),
             TargetIdSpace::ExternalId => None,
             TargetIdSpace::ProtocolEventId => Some(PROTOCOL_TARGET_LEN),
+            TargetIdSpace::SubjectSequence => Some(SUBJECT_SEQUENCE_TARGET_LEN),
         }
     }
 
@@ -189,6 +203,15 @@ impl RelationshipRef {
             kind,
             space: TargetIdSpace::ProtocolEventId,
             target_ref: protocol_event_id.to_vec(),
+        }
+    }
+
+    /// A reference to an event of the same subject by its dense sequence number.
+    pub fn to_subject_sequence(kind: RelationshipKind, sn: u64) -> Self {
+        Self {
+            kind,
+            space: TargetIdSpace::SubjectSequence,
+            target_ref: sn.to_be_bytes().to_vec(),
         }
     }
 

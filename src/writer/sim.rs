@@ -3,9 +3,12 @@
 //! See: hef-write-path/spec.md
 
 use super::retry::{RetryReceipt, SafeRetryStore, StatusClass};
+use super::state_gc::{StateChunkLedger, StateChunkRecord};
+use crate::error::StorageError;
 use crate::events::TenantId;
 use hashbrown::HashMap;
 use std::collections::BTreeMap;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// An in-memory safe-retry store for tests: it forgets everything when dropped, so production code backs
 /// `SafeRetryStore` with durable storage instead.
@@ -102,6 +105,75 @@ impl SafeRetryStore for SimSafeRetryStore {
                 receipt.status_class == StatusClass::Acknowledged && receipt.expiry_physical_nanos > now_physical_nanos
             })
             .cloned()
+    }
+}
+
+/// An in-memory state chunk ledger for tests: it forgets everything when dropped, so production code backs
+/// `StateChunkLedger` with durable storage instead. One lock serialises every call, which makes `touch` and `claim`
+/// atomic against each other as the interface requires.
+///
+/// See: hef-file-lifecycle/spec.md
+#[derive(Debug, Default)]
+pub struct SimStateChunkLedger {
+    records: Mutex<BTreeMap<[u8; 32], StateChunkRecord>>,
+}
+
+impl SimStateChunkLedger {
+    fn records_mut(&self) -> MutexGuard<'_, BTreeMap<[u8; 32], StateChunkRecord>> {
+        self.records.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn record(address: [u8; 32]) -> StateChunkRecord {
+        StateChunkRecord {
+            address,
+            claimed: false,
+            last_used_nanos: i64::MIN,
+            marked: false,
+        }
+    }
+}
+
+impl StateChunkLedger for SimStateChunkLedger {
+    fn touch(&self, address: &[u8; 32], now_nanos: i64) -> Result<bool, StorageError> {
+        let mut records = self.records_mut();
+        let record = records.entry(*address).or_insert_with(|| Self::record(*address));
+        if record.claimed {
+            return Ok(false);
+        }
+        record.last_used_nanos = record.last_used_nanos.max(now_nanos);
+        Ok(true)
+    }
+
+    fn clear_marks(&self) -> Result<(), StorageError> {
+        for record in self.records_mut().values_mut() {
+            record.marked = false;
+        }
+        Ok(())
+    }
+
+    fn mark(&self, address: &[u8; 32]) -> Result<bool, StorageError> {
+        let mut records = self.records_mut();
+        let record = records.entry(*address).or_insert_with(|| Self::record(*address));
+        Ok(!std::mem::replace(&mut record.marked, true))
+    }
+
+    fn records(&self) -> Result<Vec<StateChunkRecord>, StorageError> {
+        Ok(self.records_mut().values().copied().collect())
+    }
+
+    fn claim(&self, address: &[u8; 32], unused_since_nanos: i64) -> Result<bool, StorageError> {
+        let mut records = self.records_mut();
+        let Some(record) = records.get_mut(address) else {
+            return Ok(false);
+        };
+        let due = !record.claimed && !record.marked && record.last_used_nanos <= unused_since_nanos;
+        record.claimed |= due;
+        Ok(due)
+    }
+
+    fn forget(&self, address: &[u8; 32]) -> Result<(), StorageError> {
+        self.records_mut().remove(address);
+        Ok(())
     }
 }
 

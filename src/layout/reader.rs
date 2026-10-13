@@ -21,7 +21,8 @@ use super::footer::{
     PageStats, PayloadGranule, ResidualCompression, StripeEntry, TextTokenOffsetsEntry, decode_footer,
     decode_marks_page, decode_marks_page_directory, decode_marks_page_extents,
 };
-use super::remote::FileBytes;
+use super::graph::GranuleEdges;
+use super::remote::{FileBytes, RemoteFile};
 use super::{EMPTY_VALUE_ROW_OFFSET, HEADER_BLOCK_LEN, HefHeader, decode_header, optional_features, required_features};
 use crate::artifacts::batch::decode_variant_dictionary;
 use crate::columns::column_ids;
@@ -39,7 +40,6 @@ use crate::events::variant::{KeyDictionary, PathSegment, VariantRef, VariantValu
 use crate::file::bytes::{Reader, slice};
 use crate::file::constant::{TREE_TRAILER_LEN, TREE_TRAILER_MAGIC};
 use crate::file::integrity::RangeFault;
-use crate::indexes::bitmap::RoaringRangeBitmap;
 use crate::indexes::probabilistic::SplitBlockBloomFilter;
 use crate::indexes::rank_select::RankSelect;
 use crate::indexes::text_token::TextTokenIndex;
@@ -274,6 +274,14 @@ struct InflatedResidualSlot {
 struct DictionarySlot {
     bytes: u64,
     dictionary: Arc<KeyDictionary>,
+    last_used: u64,
+}
+
+/// One granule's decoded graph edges, with the same eviction accounting as [`CachedColumnSlot`].
+#[derive(Debug)]
+struct GraphEdgesSlot {
+    bytes: u64,
+    edges: Arc<GranuleEdges>,
     last_used: u64,
 }
 
@@ -823,6 +831,11 @@ impl HefFooter {
                 rule: "header row_count must match exact counts",
             });
         }
+        if header.profile != opened.footer.profile {
+            return Err(FormatError::Structural {
+                rule: "header profile must match footer profile",
+            });
+        }
         Ok(opened)
     }
 
@@ -1076,9 +1089,7 @@ impl HefFooter {
         }
         if fetched_start == 0 && fetched_end == stripe.byte_len {
             // The whole stripe is in hand: its checksum is the seal-authenticated root itself, so hash it directly.
-            let matches = crate::file::integrity::hash_segments(&[fetched])
-                .first()
-                .is_some_and(|root| root.as_bytes() == checksum);
+            let matches = crate::file::integrity::hash_tree(fetched).as_bytes() == checksum;
             if !matches {
                 return Err(RangeFault::Corrupt);
             }
@@ -1638,11 +1649,7 @@ impl StripeVerification {
             Some(matches) => *matches,
             None => {
                 let stripe_bytes = slice(bytes, stripe.file_offset as usize, stripe.byte_len as usize, "stripe")?;
-                *slot.get_or_init(|| {
-                    crate::file::integrity::hash_segments(&[stripe_bytes])
-                        .first()
-                        .is_some_and(|root| root.as_bytes() == checksum)
-                })
+                *slot.get_or_init(|| crate::file::integrity::hash_tree(stripe_bytes).as_bytes() == checksum)
             }
         };
         if matches {
@@ -1712,6 +1719,13 @@ pub struct HefFile {
     /// The file-absolute base offset of each granule's stripe (`StripeEntry.file_offset`), used to turn a mark's
     /// stripe-relative offset back into a file position. Only consulted when `stripe_relative` is set.
     granule_stripe_base: HashMap<u32, u64>,
+    /// Edge blocks decoded once per granule of a graph-profile file, so a walk that steps through one granule many
+    /// times, or walks the same graph again, pays one decode per granule. An accelerator only, like `column_cache`,
+    /// and byte-budgeted the same way.
+    graph_edges: DashMap<u32, GraphEdgesSlot, ahash::RandomState>,
+    /// Running total of `graph_edges`'s slot bytes, kept current on every insert and eviction - see
+    /// `aliased_extent_cache_bytes`.
+    graph_edges_bytes: AtomicU64,
     header: HefHeader,
     /// Inflated spans of compressed residual arenas, keyed by `(granule_id, frame)` — one whole arena per `Zstd3`
     /// granule under frame 0, one frame per seekable granule — held for repeated point reads. An accelerator only,
@@ -1752,6 +1766,9 @@ pub struct HefFile {
     /// bytes per frame, so a whole file's worth costs far less than the decoded blocks `column_cache` budgets, and is
     /// bounded by the file's own granule count.
     residual_seek_tables: DashMap<u32, Arc<SeekTable>, ahash::RandomState>,
+    /// Where each stripe id sits in the footer's stripe directory, built once at open so a lookup by id never scans
+    /// the directory. When an id repeats, the first entry wins, as a front-to-back scan would.
+    stripe_position_by_id: HashMap<u32, usize>,
     /// True when the file declares `STRIPE_RELATIVE_MARKS`: mark, page, and payload-arena offsets are measured from
     /// their stripe's base rather than the start of the file.
     stripe_relative: bool,
@@ -1864,6 +1881,11 @@ impl HefFile {
             usable_optional_features,
             ..
         } = opened_footer;
+        if header.profile != footer.profile {
+            return Err(FormatError::Structural {
+                rule: "header profile must match footer profile",
+            });
+        }
 
         // The manifest seal authenticates the header, exact segment geometry, stripe checksum leaves, gaps, and footer.
         // It is deliberately verified before reading the large stripes, then each stripe is hashed exactly once against
@@ -2059,6 +2081,10 @@ impl HefFile {
             .iter()
             .map(|stripe| (stripe.stripe_id, stripe.file_offset))
             .collect();
+        let mut stripe_position_by_id: HashMap<u32, usize> = HashMap::with_capacity(footer.stripes.len());
+        for (position, stripe) in footer.stripes.iter().enumerate() {
+            stripe_position_by_id.entry(stripe.stripe_id).or_insert(position);
+        }
         let stripe_relative = footer.required_feature_flags & required_features::STRIPE_RELATIVE_MARKS != 0;
         // Under stripe-relative marks, a granule's offsets are measured from its stripe's base. A granule whose stripe
         // id is missing from the directory has no base to add back, so its reads would silently fall back to file
@@ -2123,6 +2149,8 @@ impl HefFile {
             granule_dictionaries: DashMap::default(),
             granule_dictionaries_bytes: AtomicU64::new(0),
             granule_stripe_base,
+            graph_edges: DashMap::default(),
+            graph_edges_bytes: AtomicU64::new(0),
             header,
             inflated_residuals: DashMap::default(),
             inflated_residuals_bytes: AtomicU64::new(0),
@@ -2135,6 +2163,7 @@ impl HefFile {
             residual_seek_tables: DashMap::default(),
             shared_alphabets,
             shared_string_views: DashMap::default(),
+            stripe_position_by_id,
             stripe_relative,
             text_token_cache: DashMap::default(),
             text_token_indexes_by_key,
@@ -2166,7 +2195,7 @@ impl HefFile {
     /// already, and for a lazy open this hashes each stripe the range touches against its footer checksum, the first
     /// time any of its bytes are read. Bytes outside every stripe — the header, the footer, and the alignment gaps —
     /// were verified at open.
-    fn data(&self, position: usize, len: usize, what: &'static str) -> Result<&[u8], FormatError> {
+    pub(super) fn data(&self, position: usize, len: usize, what: &'static str) -> Result<&[u8], FormatError> {
         let file = match &self.bytes {
             FileBytes::Local(file) => file,
             FileBytes::Remote(remote) => return remote.read(position as u64, len, what),
@@ -2188,6 +2217,14 @@ impl HefFile {
             }
         }
         Ok(bytes)
+    }
+
+    /// The remote object this file reads from, or `None` for a file held in memory.
+    pub(super) fn remote(&self) -> Option<&RemoteFile> {
+        match &self.bytes {
+            FileBytes::Local(_) => None,
+            FileBytes::Remote(remote) => Some(remote),
+        }
     }
 
     /// Whether this file frames block presence as tagged side-stream forms. Files written before the
@@ -2232,7 +2269,7 @@ impl HefFile {
     /// Turns a footer-declared offset for `granule_id` into an absolute file position by adding the granule's stripe
     /// base. Offsets come from the untrusted footer, so a sum that overflows refuses as a format error instead of
     /// aborting on the arithmetic; `slice` then bounds the resulting position against the file's actual length.
-    fn file_position(&self, granule_id: u32, offset: u64) -> Result<usize, FormatError> {
+    pub(super) fn file_position(&self, granule_id: u32, offset: u64) -> Result<usize, FormatError> {
         self.stripe_base_for(granule_id)
             .checked_add(offset)
             .and_then(|position| usize::try_from(position).ok())
@@ -3148,7 +3185,8 @@ impl HefFile {
         }
         let others = self.column_cache_bytes.load(Ordering::Relaxed)
             + self.inflated_residuals_bytes.load(Ordering::Relaxed)
-            + self.granule_dictionaries_bytes.load(Ordering::Relaxed);
+            + self.granule_dictionaries_bytes.load(Ordering::Relaxed)
+            + self.graph_edges_bytes.load(Ordering::Relaxed);
         let headroom = self.decoded_cache_budget.saturating_sub(others);
         while self.aliased_extent_cache_bytes.load(Ordering::Relaxed) > headroom
             && !self.aliased_extent_cache.is_empty()
@@ -3376,6 +3414,46 @@ impl HefFile {
         Ok(dictionary)
     }
 
+    /// The decoded edges of granule `granule_id` of a graph-profile file, decoded on first touch and cached per
+    /// granule so later steps of a walk, and later walks, reuse the decode. Fails as [`Self::granule_edges`] does.
+    pub fn cached_granule_edges(&self, granule_id: u32) -> Result<Arc<GranuleEdges>, FormatError> {
+        let tick = self.cache_access_counter.fetch_add(1, Ordering::Relaxed);
+        if let Some(mut slot) = self.graph_edges.get_mut(&granule_id) {
+            slot.last_used = tick;
+            return Ok(Arc::clone(&slot.edges));
+        }
+        let decoded = Arc::new(self.granule_edges(granule_id)?);
+        let bytes = decoded.decoded_bytes();
+        let edges = {
+            let slot = self.graph_edges.entry(granule_id).or_insert(GraphEdgesSlot {
+                bytes,
+                edges: Arc::clone(&decoded),
+                last_used: tick,
+            });
+            if Arc::ptr_eq(&slot.edges, &decoded) {
+                self.graph_edges_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            Arc::clone(&slot.edges)
+        };
+        // The same budget-and-LRU discipline as the column cache: the granule just touched always survives.
+        while self.graph_edges_bytes.load(Ordering::Relaxed) > self.decoded_cache_budget && self.graph_edges.len() > 1 {
+            let Some(evict) = self
+                .graph_edges
+                .iter()
+                .filter(|slot| *slot.key() != granule_id)
+                .min_by_key(|slot| slot.last_used)
+                .map(|slot| *slot.key())
+            else {
+                break;
+            };
+            if let Some((_, evicted)) = self.graph_edges.remove(&evict) {
+                self.graph_edges_bytes.fetch_sub(evicted.bytes, Ordering::Relaxed);
+            }
+        }
+        self.shed_aliased_extents();
+        Ok(edges)
+    }
+
     fn row_payload_flags(&self, granule: &GranuleEntry, row_in_granule: u64) -> Result<u64, FormatError> {
         // Payload flags are dense (one value per row), so the block is decoded once per granule through the cache and
         // indexed directly by row — never re-decoded per row.
@@ -3491,7 +3569,7 @@ impl HefFile {
         // is pinned in the rank_select tests), never by collecting one row id per set bit.
         let read = self.read_column(column_id, granule_id)?;
         let bytes = column_data_bytes(&read.data);
-        let rank = RankSelect::from_bitmap(&RoaringRangeBitmap::from_packed_bits(&read.presence));
+        let rank = RankSelect::from_packed_bits(&read.presence);
         let decoded = Arc::new(CachedColumn { data: read.data, rank });
         let column = {
             let slot = self.column_cache.entry(key).or_insert(CachedColumnSlot {
@@ -3525,6 +3603,66 @@ impl HefFile {
         Ok(column)
     }
 
+    /// The granule row in `from..=to` whose value is `key`, in a string block of `(column_id, granule_id)` that stores
+    /// every one of its `row_count` rows in ascending order. Decodes the block once into the decoded-block cache, so
+    /// repeated lookups into the granule pay only a binary search. Refuses a block that stores only some rows' values.
+    pub(super) fn sorted_string_row(
+        &self,
+        column_id: u32,
+        granule_id: u32,
+        row_count: u32,
+        (from, to): (usize, usize),
+        key: &str,
+    ) -> Result<Option<usize>, FormatError> {
+        let column = self.cached_column(column_id, granule_id)?;
+        let ColumnData::Strings(values) = &column.data else {
+            return Err(FormatError::Structural {
+                rule: "a sorted key column is a string column",
+            });
+        };
+        if values.len() != row_count as usize {
+            return Err(FormatError::Structural {
+                rule: "a sorted key column stores every row's key",
+            });
+        }
+        let end = to.saturating_add(1).min(values.len());
+        let (mut low, mut high) = (from.min(end), end);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            match values.get(middle).flatten() {
+                Some(value) if value < key => low = middle + 1,
+                _ => high = middle,
+            }
+        }
+        Ok((low < end && values.get(low).flatten() == Some(key)).then_some(low))
+    }
+
+    /// The text granule row `row` holds in string block `(column_id, granule_id)`, a block of `row_count` rows, or
+    /// `None` when the row has no value. Decodes the block once into the decoded-block cache, so later reads into the
+    /// same granule cost a lookup instead of a decode.
+    pub(super) fn cached_string_at(
+        &self,
+        column_id: u32,
+        granule_id: u32,
+        row_count: u32,
+        row: u64,
+    ) -> Result<Option<String>, FormatError> {
+        let column = self.cached_column(column_id, granule_id)?;
+        let ColumnData::Strings(values) = &column.data else {
+            return Ok(None);
+        };
+        // A dense block stores one slot per row; a presence-gated one stores only the present rows' values.
+        let position = if values.len() == row_count as usize {
+            Some(row)
+        } else {
+            let (before, present) = column.rank.rank_and_contains(row);
+            present.then_some(before)
+        };
+        Ok(position
+            .and_then(|position| values.get(position as usize).flatten())
+            .map(str::to_owned))
+    }
+
     /// Sizes the decoded-block cache budget, replacing [`DECODED_CACHE_BUDGET_BYTES`]. A caller-supplied working-set
     /// bound, not an operator key; eviction only ever costs a re-decode, never a result.
     pub fn with_decoded_cache_budget(mut self, bytes: u64) -> Self {
@@ -3532,12 +3670,13 @@ impl HefFile {
         self
     }
 
-    /// Decoded bytes currently held by the block, residual, and dictionary caches together. Never feeds a read
+    /// Decoded bytes currently held by the block, residual, dictionary, and graph edge caches together. Never feeds a read
     /// result; it lets tests observe that a long-lived reader's decoded working set stays within its budget.
     pub fn decoded_cache_bytes(&self) -> u64 {
         self.aliased_extent_cache_bytes.load(Ordering::Relaxed)
             + self.column_cache_bytes.load(Ordering::Relaxed)
             + self.granule_dictionaries_bytes.load(Ordering::Relaxed)
+            + self.graph_edges_bytes.load(Ordering::Relaxed)
             + self.inflated_residuals_bytes.load(Ordering::Relaxed)
     }
 
@@ -3554,6 +3693,14 @@ impl HefFile {
         let mut count = self.point_probe_counts.entry((column_id, granule_id)).or_insert(0);
         *count = count.saturating_add(1);
         *count
+    }
+
+    /// The stripe directory entry for `stripe_id`, or `None` when the directory has no such stripe. Looks it up in
+    /// a table built at open, so the cost does not grow with the number of stripes.
+    pub(crate) fn stripe_by_id(&self, stripe_id: u32) -> Option<&StripeEntry> {
+        self.stripe_position_by_id
+            .get(&stripe_id)
+            .and_then(|&position| self.footer().stripes.get(position))
     }
 
     /// Late-materialized payload reconstruction for one final matching row: the deterministic merge of shredded typed
@@ -4020,6 +4167,13 @@ impl HefFile {
                 }
                 Ok(rows)
             }
+            // A graph-profile file numbers its rows by sequence number, so the target names its row directly; any
+            // other file holds no sequence numbers and so cannot hold the target.
+            TargetIdSpace::SubjectSequence => Ok(<[u8; 8]>::try_from(reference.target_ref.as_slice())
+                .ok()
+                .and_then(|target| self.graph_row_of(u64::from_be_bytes(target)))
+                .into_iter()
+                .collect()),
         }
     }
 }

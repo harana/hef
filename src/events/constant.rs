@@ -16,6 +16,9 @@ pub const NANOS_PER_SECOND: i64 = 1_000_000_000;
 /// The longest external identifier (a Matrix event id, say) an event or a relationship target may carry, in bytes.
 pub const EXTERNAL_ID_MAX_BYTES: usize = 255;
 
+/// Byte length of a target in the `subject_sequence` space: a `u64` sequence number, big-endian.
+pub const SUBJECT_SEQUENCE_TARGET_LEN: usize = 8;
+
 /// The largest integer magnitude Matrix canonical JSON admits: 2^53 - 1, the range every JSON parser holds exactly.
 pub const MATRIX_MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
 
