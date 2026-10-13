@@ -7,7 +7,7 @@
 //! design, serves fresh ranges only from batches it has rebuilt and validated locally; there is no forwarding to
 //! another node.
 
-use super::batch::DecodedBatch;
+use super::batch::{DecodedBatch, DecodedEvent};
 use super::frame::HejFrameHeaderV1;
 use super::segment::{ReplayOutcome, ReplayedFrame};
 use super::{BLAKE3_LEN, FRAME_HEADER_LEN};
@@ -16,7 +16,7 @@ use crate::events::provenance::hex_lower;
 use crate::events::{SequenceRange, TenantId};
 use crate::file::bytes::slice;
 use crate::lifecycle::ManifestGeneration;
-use arrow_array::builder::FixedSizeBinaryBuilder;
+use arrow_array::builder::{FixedSizeBinaryBuilder, StringBuilder};
 use arrow_array::*;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use std::collections::BTreeMap;
@@ -182,6 +182,9 @@ pub fn convert_frame(
     }
 
     let rows = decoded.events.len();
+    // Each text column's builder holds its rows' bytes from the start, so appending never regrows it.
+    let text =
+        |len: fn(&DecodedEvent<'_>) -> usize| StringBuilder::with_capacity(rows, decoded.events.iter().map(len).sum());
     let mut tenant_ids = FixedSizeBinaryBuilder::with_capacity(rows, UUID_BYTE_WIDTH);
     let mut epochs = Vec::with_capacity(rows);
     let mut sequences = Vec::with_capacity(rows);
@@ -190,16 +193,16 @@ pub fn convert_frame(
     let mut stream_sequences = Vec::with_capacity(rows);
     let mut occurred = Vec::with_capacity(rows);
     let mut ingested = Vec::with_capacity(rows);
-    let mut sources = Vec::with_capacity(rows);
-    let mut event_types = Vec::with_capacity(rows);
-    let mut entity_types = Vec::with_capacity(rows);
+    let mut sources = text(|event| event.source.len());
+    let mut event_types = text(|event| event.event_type.len());
+    let mut entity_types = text(|event| event.entity_type.len());
     let mut entity_hash_low = Vec::with_capacity(rows);
     let mut entity_hash_high = Vec::with_capacity(rows);
-    let mut entity_ids: Vec<Option<&str>> = Vec::with_capacity(rows);
+    let mut entity_ids = text(|event| event.entity_id.map_or(0, str::len));
     let mut actor_hash_low = Vec::with_capacity(rows);
-    let mut actor_ids: Vec<Option<&str>> = Vec::with_capacity(rows);
+    let mut actor_ids = text(|event| event.actor_id.map_or(0, str::len));
     let mut account_hash_low = Vec::with_capacity(rows);
-    let mut account_ids: Vec<Option<&str>> = Vec::with_capacity(rows);
+    let mut account_ids = text(|event| event.account_id.map_or(0, str::len));
     let mut trace_hash_low = Vec::with_capacity(rows);
     let mut schema_versions = Vec::with_capacity(rows);
     let mut payload_flags = Vec::with_capacity(rows);
@@ -233,16 +236,16 @@ pub fn convert_frame(
         stream_sequences.push(event.fixed.stream_sequence);
         occurred.push(event.fixed.occurred_at_physical);
         ingested.push(event.fixed.ingested_at_physical);
-        sources.push(event.source);
-        event_types.push(event.event_type);
-        entity_types.push(event.entity_type);
+        sources.append_value(event.source);
+        event_types.append_value(event.event_type);
+        entity_types.append_value(event.entity_type);
         entity_hash_low.push(event.fixed.entity_id_hash_low);
         entity_hash_high.push(event.fixed.entity_id_hash_high);
-        entity_ids.push(event.entity_id);
+        entity_ids.append_option(event.entity_id);
         actor_hash_low.push(event.fixed.actor_id_hash_low);
-        actor_ids.push(event.actor_id);
+        actor_ids.append_option(event.actor_id);
         account_hash_low.push(event.fixed.account_id_hash_low);
-        account_ids.push(event.account_id);
+        account_ids.append_option(event.account_id);
         trace_hash_low.push(event.fixed.trace_id_hash_low);
         schema_versions.push(event.fixed.schema_version);
         payload_flags.push(event.variable.payload_flags);
@@ -273,16 +276,16 @@ pub fn convert_frame(
         Arc::new(UInt64Array::from(stream_sequences)),
         Arc::new(TimestampNanosecondArray::from(occurred).with_timezone("UTC")),
         Arc::new(TimestampNanosecondArray::from(ingested).with_timezone("UTC")),
-        Arc::new(StringArray::from(sources)),
-        Arc::new(StringArray::from(event_types)),
-        Arc::new(StringArray::from(entity_types)),
+        Arc::new(sources.finish()),
+        Arc::new(event_types.finish()),
+        Arc::new(entity_types.finish()),
         Arc::new(UInt64Array::from(entity_hash_low)),
         Arc::new(UInt64Array::from(entity_hash_high)),
-        Arc::new(StringArray::from(entity_ids)),
+        Arc::new(entity_ids.finish()),
         Arc::new(UInt64Array::from(actor_hash_low)),
-        Arc::new(StringArray::from(actor_ids)),
+        Arc::new(actor_ids.finish()),
         Arc::new(UInt64Array::from(account_hash_low)),
-        Arc::new(StringArray::from(account_ids)),
+        Arc::new(account_ids.finish()),
         Arc::new(UInt64Array::from(trace_hash_low)),
         Arc::new(UInt32Array::from(schema_versions)),
         Arc::new(UInt32Array::from(payload_flags)),

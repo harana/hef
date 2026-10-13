@@ -3,10 +3,12 @@ use super::super::batch::{EventInput, PayloadInput, build_batch, decode_batch};
 use super::super::frame::{FrameBuildInput, build_frame, decode_frame};
 use super::super::segment::ReplayTail;
 use super::*;
+use crate::events::EventEnvelope;
 use crate::lifecycle::{FileType, HefFileEntry, ManifestGeneration, PartState};
 use crate::typed_id::TypedIdTestExt;
 
-fn payload_refs_of(events: &[EventInput]) -> Vec<u64> {
+/// Converts `events`, written as one frame, into the segment a reader builds from it.
+fn convert_events(events: &[EventInput]) -> LiveOverlaySegment {
     let payload = build_batch(events, 1, 0).unwrap();
     let frame_bytes = build_frame(
         &FrameBuildInput {
@@ -29,10 +31,13 @@ fn payload_refs_of(events: &[EventInput]) -> Vec<u64> {
     .unwrap();
     let (header, payload) = decode_frame(&frame_bytes).unwrap();
     let decoded = decode_batch(payload, header.event_count).unwrap();
-    let segment = convert_frame(&header, &decoded, 1, 1, None, |_, _| false)
+    convert_frame(&header, &decoded, 1, 1, None, |_, _| false)
         .unwrap()
-        .expect("not covered");
-    segment
+        .expect("not covered")
+}
+
+fn payload_refs_of(events: &[EventInput]) -> Vec<u64> {
+    convert_events(events)
         .batch
         .column(21)
         .as_any()
@@ -83,6 +88,46 @@ fn payload_ref_distinguishes_no_payload_from_a_payload_at_arena_offset_zero() {
     assert!(second[0] >> 32 > 0);
     assert_eq!(second[0] & 0xFFFF_FFFF, 0);
     assert_eq!(second[1], 0);
+}
+
+#[test]
+fn text_columns_keep_every_value_null_and_empty_string() {
+    let long = "x".repeat(10_000);
+    let texts = [None, Some(""), Some("caf\u{e9} \u{1F600}"), Some(long.as_str())];
+    let mut events = sample_events(8);
+    for (row, event) in events.iter_mut().enumerate() {
+        let text = |offset: usize| texts[(row + offset) % texts.len()].map(str::to_owned);
+        event.envelope.source = text(1).unwrap_or_default();
+        event.envelope.event_type = text(2).unwrap_or_default();
+        event.envelope.entity_type = text(3).unwrap_or_default();
+        event.envelope.entity_id = text(0);
+        event.envelope.actor_id = text(1);
+        event.envelope.account_id = text(2);
+    }
+    // The segment outlives the frame and decoded batch it was built from, so its columns own their text.
+    let segment = convert_events(&events);
+    let required = |text: fn(&EventEnvelope) -> &str| -> ArrayRef {
+        Arc::new(StringArray::from(
+            events.iter().map(|event| text(&event.envelope)).collect::<Vec<_>>(),
+        ))
+    };
+    let optional = |text: fn(&EventEnvelope) -> Option<&str>| -> ArrayRef {
+        Arc::new(StringArray::from(
+            events.iter().map(|event| text(&event.envelope)).collect::<Vec<_>>(),
+        ))
+    };
+    let expected = [
+        ("source", required(|envelope| envelope.source.as_str())),
+        ("event_type", required(|envelope| envelope.event_type.as_str())),
+        ("entity_type", required(|envelope| envelope.entity_type.as_str())),
+        ("entity_id", optional(|envelope| envelope.entity_id.as_deref())),
+        ("actor_id", optional(|envelope| envelope.actor_id.as_deref())),
+        ("account_id", optional(|envelope| envelope.account_id.as_deref())),
+    ];
+    assert!(Arc::ptr_eq(&segment.batch.schema(), &live_overlay_schema()));
+    for (name, column) in expected {
+        assert_eq!(segment.batch.column_by_name(name).unwrap(), &column, "{name}");
+    }
 }
 
 fn overlay_segment(epoch: u64, first_sequence: u64, count: usize) -> LiveOverlaySegment {
