@@ -74,12 +74,13 @@ impl HefFile {
         }
         for granule in &self.footer().granules {
             let read = self.read_column(column_ids::EXTERNAL_ID, granule.granule_id)?;
-            for (row, hex) in present_strings(&read, granule.row_count as usize) {
+            for_each_present_string(&read, granule.row_count as usize, |row, hex| {
                 let id = hex_simd::decode_to_vec(hex.as_bytes()).map_err(|_| FormatError::Structural {
                     rule: "a stored external id is lowercase hex",
                 })?;
                 ids.push((granule.first_row_ordinal + row as u64, id));
-            }
+                Ok(())
+            })?;
         }
         Ok(ids)
     }
@@ -160,27 +161,35 @@ fn granule_holding(footer: &Footer, row_ordinal: u64) -> Result<&GranuleEntry, F
         })
 }
 
-/// Every present value of a string block with its granule row, in row order, in one walk over the block.
-fn present_strings(read: &ColumnRead, row_count: usize) -> Vec<(usize, &str)> {
+/// Hands every present value of a string block with its granule row to `visit`, in row order, in one walk over the
+/// block without collecting them. Stops at the first error `visit` returns.
+fn for_each_present_string<'a>(
+    read: &'a ColumnRead,
+    row_count: usize,
+    mut visit: impl FnMut(usize, &'a str) -> Result<(), FormatError>,
+) -> Result<(), FormatError> {
     let ColumnData::Strings(values) = &read.data else {
-        return Vec::new();
+        return Ok(());
     };
     if values.len() == row_count {
-        return values
-            .iter()
-            .enumerate()
-            .filter_map(|(row, value)| value.map(|text| (row, text)))
-            .collect();
+        for (row, value) in values.iter().enumerate() {
+            if let Some(text) = value {
+                visit(row, text)?;
+            }
+        }
+        return Ok(());
     }
     let mut dense = values.iter();
-    (0..row_count)
-        .filter(|&row| {
-            read.presence
-                .get(row / 8)
-                .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
-        })
-        .filter_map(|row| dense.next().flatten().map(|text| (row, text)))
-        .collect()
+    for row in 0..row_count {
+        let present = read
+            .presence
+            .get(row / 8)
+            .is_some_and(|byte| byte & (1 << (row % 8)) != 0);
+        if present && let Some(text) = dense.next().flatten() {
+            visit(row, text)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
