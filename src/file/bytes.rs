@@ -182,6 +182,15 @@ impl Writer {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
+    /// Overwrites the four already-written bytes at `offset` with `value` little-endian: for a length field written
+    /// as a placeholder before the bytes it counts. An `offset` whose four bytes are not all written yet leaves the
+    /// buffer unchanged.
+    pub(crate) fn patch_u32(&mut self, offset: usize, value: u32) {
+        if let Some(slot) = self.bytes.get_mut(offset..).and_then(|tail| tail.get_mut(..4)) {
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
     pub fn put_u64(&mut self, value: u64) {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }

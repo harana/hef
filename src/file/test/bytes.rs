@@ -102,6 +102,20 @@ fn clear_empties_the_buffer_without_dropping_its_capacity() {
 }
 
 #[test]
+fn patch_u32_overwrites_only_its_own_four_written_bytes() {
+    let mut writer = Writer::new();
+    writer.put_slice(b"ab");
+    writer.put_u32(0);
+    writer.put_slice(b"cd");
+    writer.patch_u32(2, 0x0403_0201);
+    assert_eq!(writer.bytes(), b"ab\x01\x02\x03\x04cd");
+    // Offsets whose four bytes are not all written yet change nothing and never panic.
+    writer.patch_u32(5, u32::MAX);
+    writer.patch_u32(usize::MAX, u32::MAX);
+    assert_eq!(writer.bytes(), b"ab\x01\x02\x03\x04cd");
+}
+
+#[test]
 fn bulk_u64_read_past_end_is_truncated_not_a_panic() {
     let mut reader = Reader::new(&[0u8; 12]);
     assert_eq!(

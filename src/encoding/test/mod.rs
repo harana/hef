@@ -3362,6 +3362,46 @@ fn xor_float_blocks_round_trip_bit_for_bit_through_the_pipeline() {
 }
 
 #[test]
+fn xor_float_range_reads_equal_the_full_decode_sliced_with_and_without_trailing_compression() {
+    // A random-access block stays uncompressed; a repeating series without random access takes a trailing codec.
+    let periodic: Vec<f64> = (0..4000).map(|i| [1.0, 2.5, 2.5, -7.0][i % 4]).collect();
+    for (values, random_access) in [(memory_utilization_series(3000), true), (periodic, false)] {
+        let block = encode_block_forced_for_conformance(
+            &ColumnData::F64(values.clone()),
+            random_access,
+            CascadeStrategy::DecodeOptimized,
+            Transform::Chimp,
+        )
+        .unwrap();
+        assert_eq!(block.pipeline.transform().unwrap(), Transform::Chimp);
+        assert_eq!(
+            block.pipeline.compression().unwrap() == Compression::None,
+            random_access
+        );
+        let full = decode_block(block.pipeline, &block.bytes).unwrap();
+        let count = values.len();
+        for (start, end) in [
+            (0, 1),
+            (count / 2, count / 2 + 1),
+            (count - 1, count),
+            (10, 250),
+            (0, count),
+            (count - 3, count + 50),
+            (count, count + 1),
+            (count + 10, count + 20),
+            (5, 5),
+            (9, 4),
+        ] {
+            assert_eq!(
+                decode_block_range(block.pipeline, &block.bytes, start, end).unwrap(),
+                slice_column_data(full.clone(), start, end),
+                "rows {start}..{end}"
+            );
+        }
+    }
+}
+
+#[test]
 fn xor_floats_beat_every_existing_float_encoding_on_a_slowly_varying_metric() {
     let values = memory_utilization_series(8192);
     let data = ColumnData::F64(values.clone());
