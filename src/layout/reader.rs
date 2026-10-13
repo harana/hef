@@ -52,6 +52,7 @@ use memchr::memmem;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use zeekstd::SeekTable;
@@ -437,6 +438,22 @@ fn owned_utf8(bytes: &[u8], what: &'static str) -> Result<String, FormatError> {
     simdutf8::basic::from_utf8(bytes)
         .map(str::to_owned)
         .map_err(|_| FormatError::InvalidUtf8 { what })
+}
+
+/// The granules of `granules` whose rows overlap `rows`, as one borrowed run in directory order, found with two binary
+/// searches instead of a pass over the whole directory: from the first granule ending after `rows.start` up to the
+/// first starting at or past `rows.end`.
+///
+/// A granule is in the run exactly when it starts before `rows.end` and ends after `rows.start`, the test a pass over
+/// every granule would apply, so gaps and zero-row granules need no special case, and an empty or reversed range
+/// finds only a granule spanning both of its ends. `granules` must be a directory [`HefFile::open`] accepted,
+/// ascending by `first_row_ordinal` with no overlap, so granule ends never go down and both searches are sound.
+pub(super) fn granules_overlapping_rows<'a>(granules: &'a [GranuleEntry], rows: &Range<u64>) -> &'a [GranuleEntry] {
+    let first = granules.partition_point(|granule| {
+        granule.first_row_ordinal.saturating_add(u64::from(granule.row_count)) <= rows.start
+    });
+    let last = granules.partition_point(|granule| granule.first_row_ordinal < rows.end);
+    granules.get(first..last).unwrap_or_default()
 }
 
 /// How many trailing bytes to read when the manifest entry does not record `footer_len`: a fixed speculative fetch that

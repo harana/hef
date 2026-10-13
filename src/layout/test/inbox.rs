@@ -344,6 +344,39 @@ fn a_queue_read_touches_only_the_granules_holding_the_recipients_rows() {
     assert!(read_with_directory < read_without_directory);
 }
 
+/// Finding a recipient's granules by binary search over the granule directory picks the same granules, in the same
+/// order, as checking every granule against the recipient's row range. Recipients of 20 rows in 16-row granules start
+/// and end both at granule bounds and between them; a recipient with no rows gets none.
+#[test]
+fn a_recipients_granules_are_the_ones_a_full_directory_scan_finds() {
+    let recipients = 50;
+    let file = open(build_hef_file(rows(recipients, recipients * 20), &config(Profile::Inbox, 16)).unwrap());
+    let directory = file.inbox_recipients().unwrap();
+    for index in 0..=recipients {
+        let scanned: Vec<u32> = directory
+            .get(index as usize)
+            .map(|entry| {
+                let end = entry.first_row_ordinal + entry.row_count;
+                file.footer()
+                    .granules
+                    .iter()
+                    .filter(|granule| {
+                        granule.first_row_ordinal < end
+                            && entry.first_row_ordinal < granule.first_row_ordinal + u64::from(granule.row_count)
+                    })
+                    .map(|granule| granule.granule_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let searched: Vec<u32> = recipient_granules(&file, recipient(index), None)
+            .iter()
+            .map(|granule| granule.granule_id)
+            .collect();
+        assert_eq!(searched, scanned, "recipient {index}");
+        assert_eq!(index == recipients, searched.is_empty(), "recipient {index}");
+    }
+}
+
 /// Times an inbox file of 100,000 rows addressed round-robin to 10,000 recipients, in the default granule size:
 /// building it, reading one recipient's queue from a fresh reader with the recipient directory (the inbox file) and
 /// without it (an event file of the same rows), and checking that every recipient has acknowledged the whole file.

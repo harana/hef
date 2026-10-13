@@ -13,7 +13,7 @@ use super::entity_scan::{DeletesAndCorrections, EntityEvent};
 use super::event::read_u64s;
 use super::footer::{GranuleEntry, InboxRecipientEntry};
 use super::optional_features;
-use super::reader::HefFile;
+use super::reader::{HefFile, granules_overlapping_rows};
 use crate::columns::column_ids;
 use crate::deletes::DeletionVector;
 use crate::error::{FormatError, InboxError};
@@ -115,8 +115,7 @@ fn recipient_granules(file: &HefFile, recipient: Recipient, acked: Option<Sequen
         return Vec::new();
     }
     let end = entry.first_row_ordinal.saturating_add(entry.row_count);
-    file.footer()
-        .granules
+    granules_overlapping_rows(&file.footer().granules, &(entry.first_row_ordinal..end))
         .iter()
         .filter(|granule| {
             granule.first_row_ordinal < end
