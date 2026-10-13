@@ -591,22 +591,45 @@ fn push_entry<const N: usize>(
 }
 
 /// The entries of the level above that change when a level's chunks go from `old` to `new`: each first key that
-/// gains or changes its address maps to the new address, and each one that is gone maps to `None`.
+/// gains or changes its address maps to the new address, and each one that is gone maps to `None`. Both lists must be
+/// strictly ascending by first key, as every level's chunks are; they are walked side by side once.
 fn changed_children(
     old: &[(StateKey, [u8; 32])],
     new: &[(StateKey, [u8; 32])],
 ) -> BTreeMap<StateKey, Option<[u8; 32]>> {
-    let firsts: HashSet<&StateKey> = new.iter().map(|(first, _)| first).collect();
-    let before: HashSet<&(StateKey, [u8; 32])> = old.iter().collect();
-    let gone = old
-        .iter()
-        .filter(|(first, _)| !firsts.contains(first))
-        .map(|(first, _)| (*first, None));
-    let added = new
-        .iter()
-        .filter(|child| !before.contains(child))
-        .map(|(first, address)| (*first, Some(*address)));
-    gone.chain(added).collect()
+    let mut changes = BTreeMap::new();
+    let mut old = old.iter().peekable();
+    let mut new = new.iter().peekable();
+    loop {
+        match (old.peek().copied(), new.peek().copied()) {
+            (None, None) => return changes,
+            (Some((old_first, _)), None) => {
+                changes.insert(*old_first, None);
+                old.next();
+            }
+            (None, Some((new_first, new_address))) => {
+                changes.insert(*new_first, Some(*new_address));
+                new.next();
+            }
+            (Some((old_first, old_address)), Some((new_first, new_address))) => match old_first.cmp(new_first) {
+                Ordering::Less => {
+                    changes.insert(*old_first, None);
+                    old.next();
+                }
+                Ordering::Greater => {
+                    changes.insert(*new_first, Some(*new_address));
+                    new.next();
+                }
+                Ordering::Equal => {
+                    if old_address != new_address {
+                        changes.insert(*new_first, Some(*new_address));
+                    }
+                    old.next();
+                    new.next();
+                }
+            },
+        }
+    }
 }
 
 /// Decodes one chunk's plaintext, refusing a bad magic, a nonzero reserved byte, a CRC mismatch, entries that do not

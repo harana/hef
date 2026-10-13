@@ -2,7 +2,7 @@ use super::*;
 use crate::benchmarks::{StateChunkWriteMeasurement, state_chunk_write_gate_passes};
 use crate::security::TenantDek;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const CREATE: u32 = 1;
 const MEMBER: u32 = 2;
@@ -663,4 +663,61 @@ fn borrowed_new_chunks_match_owned_new_chunks() {
     assert!(!borrowed.is_empty());
     assert_eq!(borrowed, after.new_chunks(&base));
     assert_eq!(after.new_chunks_iter(&after).count(), 0);
+}
+
+/// The change map `changed_children` gave before it walked both lists side by side: membership tests against sets of
+/// the new first keys and of the old children.
+fn changed_children_by_sets(
+    old: &[(StateKey, [u8; 32])],
+    new: &[(StateKey, [u8; 32])],
+) -> BTreeMap<StateKey, Option<[u8; 32]>> {
+    let firsts: HashSet<&StateKey> = new.iter().map(|(first, _)| first).collect();
+    let before: HashSet<&(StateKey, [u8; 32])> = old.iter().collect();
+    let gone = old
+        .iter()
+        .filter(|(first, _)| !firsts.contains(first))
+        .map(|(first, _)| (*first, None));
+    let added = new
+        .iter()
+        .filter(|child| !before.contains(child))
+        .map(|(first, address)| (*first, Some(*address)));
+    gone.chain(added).collect()
+}
+
+#[test]
+fn changed_children_matches_comparing_by_sets() {
+    let child = |user: u32, address: u8| (member(user), [address; 32]);
+    let some = vec![child(1, 1), child(3, 3), child(5, 5)];
+    let cases = vec![
+        (vec![], vec![]),
+        (vec![], some.clone()),
+        (some.clone(), vec![]),
+        (some.clone(), some.clone()),
+        (some.clone(), vec![child(2, 2), child(4, 4), child(6, 6)]),
+        (some.clone(), vec![child(1, 1), child(3, 9), child(5, 5)]),
+        (
+            some.clone(),
+            vec![child(0, 0), child(1, 1), child(3, 3), child(5, 5), child(7, 7)],
+        ),
+        (some.clone(), vec![child(3, 3)]),
+    ];
+    for (old, new) in &cases {
+        assert_eq!(changed_children(old, new), changed_children_by_sets(old, new));
+    }
+
+    let mut random = xorshift(0xC41D);
+    let mut level = || -> Vec<(StateKey, [u8; 32])> {
+        let children: BTreeMap<StateKey, u8> = (0..random() % 200)
+            .map(|_| (member((random() % 300) as u32), (random() % 3) as u8))
+            .collect();
+        children
+            .into_iter()
+            .map(|(first, address)| (first, [address; 32]))
+            .collect()
+    };
+    for _ in 0..500 {
+        let old = level();
+        let new = level();
+        assert_eq!(changed_children(&old, &new), changed_children_by_sets(&old, &new));
+    }
 }
