@@ -15,7 +15,7 @@ use crate::writer::build::{
 use crate::writer::compaction::plan_rewrite;
 use crate::writer::constant::{AUDIT_DIGEST_BATCH_ROWS, AUDIT_REWRITE_REFUSED};
 use crate::writer::projection::build_entity_projection;
-use crate::writer::source_form::tests::{plain_row, source_form_config};
+use crate::writer::source_form::tests::{plain_row, source_form_config, source_form_row};
 use std::time::Instant;
 
 fn settings() -> AuditSettings {
@@ -222,7 +222,10 @@ fn reference_chain_end(rows: &[BuildRow], chain_start: [u8; 32]) -> [u8; 32] {
             BuildPayload::Whole(value) => DigestPayload::Value(value),
             _ => panic!("the reference covers empty, object and whole payloads only"),
         };
-        row_hash(&hash, &row_digest(row.epoch, row.sequence, &owned, payload).unwrap())
+        row_hash(
+            &hash,
+            &row_digest(&mut Writer::new(), row.epoch, row.sequence, &owned, payload).unwrap(),
+        )
     })
 }
 
@@ -258,6 +261,34 @@ fn a_bad_row_in_a_later_batch_fails_the_chain() {
     let mut rows: Vec<BuildRow> = (0..7).map(plain_row).collect();
     rows[5].external_id = Some(b"x".to_vec());
     assert!(chain_end(&rows, AUDIT_GENESIS, 3).is_err());
+}
+
+#[test]
+fn one_reused_digest_buffer_matches_a_fresh_buffer_per_row_even_after_a_failed_row() {
+    let too_deep = (0..200).fold(VariantValue::Int(0), |value, _| VariantValue::Array(vec![value]));
+    let mut none = plain_row(3);
+    none.payload = BuildPayload::None;
+    let mut external = plain_row(4);
+    external.payload = BuildPayload::ExternalRef("s3://bucket/\u{e9}v\u{e9}nement".into());
+    let rows = [
+        source_form_row(0, VariantValue::String("x".repeat(20_000))),
+        plain_row(1),
+        source_form_row(2, too_deep),
+        none,
+        source_form_row(5, VariantValue::String("y".repeat(20_000))),
+        external,
+        plain_row(6),
+    ];
+    let mut reused = Writer::new();
+    reused.put_slice(b"stale bytes from somewhere else");
+    for row in &rows {
+        let fresh = build_row_digest(&mut Writer::new(), row);
+        assert_eq!(build_row_digest(&mut reused, row), fresh);
+    }
+    assert!(
+        build_row_digest(&mut Writer::new(), &rows[2]).is_err(),
+        "the deep row fails part way"
+    );
 }
 
 fn footer_len(built: &BuiltHef) -> usize {

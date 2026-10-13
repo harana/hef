@@ -136,42 +136,47 @@ impl<'a> From<&'a EventEnvelope> for DigestEnvelope<'a> {
 
 /// The digest of one row's contents, the half of its hash that does not depend on the rows before it. A function of
 /// the row alone, so the writer and a verifier reading the row back out of the file compute the same digest.
+///
+/// `out` is scratch for the row's encoding, cleared first, so one buffer can serve every row of a run.
 pub(crate) fn row_digest(
+    out: &mut Writer,
     epoch: u64,
     sequence: u64,
     envelope: &EventEnvelope,
     payload: DigestPayload<'_>,
 ) -> Result<[u8; 32], FormatError> {
-    envelope_row_digest(epoch, sequence, &envelope.into(), payload)
+    envelope_row_digest(out, epoch, sequence, &envelope.into(), payload)
 }
 
-/// [`row_digest`] over a borrowed envelope: the one encoder every row digest goes through.
+/// [`row_digest`] over a borrowed envelope: the one encoder every row digest goes through. Clears `out` before
+/// encoding, so bytes left in it by an earlier row, or by one that failed part way, never reach this digest.
 pub(crate) fn envelope_row_digest(
+    out: &mut Writer,
     epoch: u64,
     sequence: u64,
     envelope: &DigestEnvelope<'_>,
     payload: DigestPayload<'_>,
 ) -> Result<[u8; 32], FormatError> {
-    let mut out = Writer::with_capacity(ROW_DIGEST_INPUT_CAPACITY);
+    out.clear();
     out.put_u64(epoch);
     out.put_u64(sequence);
-    put_optional_text(&mut out, envelope.account_id);
+    put_optional_text(out, envelope.account_id);
     out.put_u64(envelope.account_id_hash_low);
-    put_optional_text(&mut out, envelope.actor_id);
+    put_optional_text(out, envelope.actor_id);
     out.put_u64(envelope.actor_id_hash_low);
     out.put_u64(envelope.dedupe_hash_high);
     out.put_u64(envelope.dedupe_hash_low);
-    put_optional_text(&mut out, envelope.entity_id);
+    put_optional_text(out, envelope.entity_id);
     out.put_u64(envelope.entity_id_hash_high);
     out.put_u64(envelope.entity_id_hash_low);
-    put_text(&mut out, envelope.entity_type);
+    put_text(out, envelope.entity_type);
     out.put_u128(envelope.event_id);
-    put_text(&mut out, envelope.event_type);
+    put_text(out, envelope.event_type);
     out.put_u32(envelope.flags);
     out.put_i64(envelope.ingested_at);
     out.put_i64(envelope.occurred_at);
     out.put_u32(envelope.schema_version);
-    put_text(&mut out, envelope.source);
+    put_text(out, envelope.source);
     out.put_u64(envelope.stream_id);
     out.put_u64(envelope.stream_sequence);
     out.put_u128(envelope.tenant_id);
@@ -180,7 +185,7 @@ pub(crate) fn envelope_row_digest(
         DigestPayload::None => out.put_u8(0),
         DigestPayload::External(reference) => {
             out.put_u8(1);
-            put_text(&mut out, reference);
+            put_text(out, reference);
         }
         DigestPayload::Object(fields) => {
             out.put_u8(2);
@@ -189,15 +194,15 @@ pub(crate) fn envelope_row_digest(
                 keys.insert(*name);
                 value.collect_keys(&mut keys);
             }
-            let dictionary = put_dictionary(&mut out, keys)?;
-            encode_object_fields_into(fields, &dictionary, &mut out)?;
+            let dictionary = put_dictionary(out, keys)?;
+            encode_object_fields_into(fields, &dictionary, out)?;
         }
         DigestPayload::Value(value) => {
             out.put_u8(2);
             let mut keys = BTreeSet::new();
             value.collect_keys(&mut keys);
-            let dictionary = put_dictionary(&mut out, keys)?;
-            encode_value_into(value, &dictionary, &mut out)?;
+            let dictionary = put_dictionary(out, keys)?;
+            encode_value_into(value, &dictionary, out)?;
         }
     }
     Ok(*blake3::hash(out.bytes()).as_bytes())
@@ -221,6 +226,7 @@ pub(crate) fn row_hash(prev_row_hash: &[u8; 32], row_digest: &[u8; 32]) -> [u8; 
 /// The hash of `file`'s last row, recomputed from its rows with the first one chained from the trail's start.
 fn recomputed_chain_end(file: &HefFile, trail: &AuditTrail) -> Result<[u8; 32], FormatError> {
     let mut hash = trail.chain_start;
+    let mut out = Writer::with_capacity(ROW_DIGEST_INPUT_CAPACITY);
     for granule in &file.footer().granules {
         let rows = granule.row_count as usize;
         let envelopes = file.granule_envelopes(granule.granule_id)?;
@@ -230,7 +236,10 @@ fn recomputed_chain_end(file: &HefFile, trail: &AuditTrail) -> Result<[u8; 32], 
             (granule.first_row_ordinal..).zip(envelopes.iter().zip(epochs).zip(sequences))
         {
             let payload = file.payload(ordinal)?;
-            hash = row_hash(&hash, &row_digest(epoch, sequence, envelope, (&payload).into())?);
+            hash = row_hash(
+                &hash,
+                &row_digest(&mut out, epoch, sequence, envelope, (&payload).into())?,
+            );
         }
     }
     Ok(hash)
