@@ -1845,9 +1845,19 @@ impl AlpIntTest {
                 negate: false,
                 ranges: alp_equal_range(*n, power).into_iter().collect(),
             },
+            // Merged once here, so duplicate and overlapping values cost nothing per lane and `apply` can answer the
+            // set with one binary search over disjoint, ascending intervals.
             FloatPredicate::InSet(set) => Self {
                 negate: false,
-                ranges: set.iter().filter_map(|n| alp_equal_range(*n, power)).collect(),
+                ranges: merge_intervals_i128(
+                    set.iter()
+                        .filter_map(|n| alp_equal_range(*n, power))
+                        .map(|(lo, hi)| (i128::from(lo), i128::from(hi)))
+                        .collect(),
+                )
+                .into_iter()
+                .filter_map(|(lo, hi)| Some((i64::try_from(lo).ok()?, i64::try_from(hi).ok()?)))
+                .collect(),
             },
             FloatPredicate::NotEquals(n) => Self {
                 negate: true,
@@ -1874,30 +1884,26 @@ impl AlpIntTest {
     }
 
     /// Fills `out` (the stream's padded length) with one verdict per lane: whether the lane's scaled integer falls in
-    /// the translated intervals. The unzigzag and compare ride inside the unpack's lane writes, through the
-    /// runtime-dispatched SIMD kernel.
+    /// the translated intervals, in one pass over the stream however many intervals there are. The unzigzag and
+    /// compare ride inside the unpack's lane writes, through the runtime-dispatched SIMD kernel.
     fn apply(&self, stream: &PackedStream<'_>, out: &mut [bool]) {
         match self.ranges.as_slice() {
             [] => out.fill(false),
-            [(first_lo, first_hi), rest @ ..] => {
-                let (first_lo, first_hi) = (*first_lo, *first_hi);
+            [(lo, hi)] => {
+                let (lo, hi) = (*lo, *hi);
                 stream.unpack_into(out, |packed| {
                     let int = unzigzag(packed);
-                    first_lo <= int && int <= first_hi
+                    lo <= int && int <= hi
                 });
-                if !rest.is_empty() {
-                    let mut scratch = vec![false; out.len()];
-                    for &(lo, hi) in rest {
-                        stream.unpack_into(&mut scratch, |packed| {
-                            let int = unzigzag(packed);
-                            lo <= int && int <= hi
-                        });
-                        for (slot, extra) in out.iter_mut().zip(&scratch) {
-                            *slot |= *extra;
-                        }
-                    }
-                }
             }
+            ranges => stream.unpack_into(out, |packed| {
+                let int = unzigzag(packed);
+                let above = ranges.partition_point(|&(lo, _)| lo <= int);
+                above
+                    .checked_sub(1)
+                    .and_then(|index| ranges.get(index))
+                    .is_some_and(|&(_, hi)| int <= hi)
+            }),
         }
         if self.negate {
             for slot in out.iter_mut() {

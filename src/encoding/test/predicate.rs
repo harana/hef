@@ -972,6 +972,26 @@ fn alp_filter_matches_decode_then_filter_including_exceptions_and_escapes() {
         FloatPredicate::NotEquals(f64::NAN),
         FloatPredicate::InSet(vec![1_234.56, values[1500], f64::NAN, -0.0]),
         FloatPredicate::InSet(Vec::new()),
+        // Unsorted, repeated, adjacent and NaN members, and sets large enough to need the merged-interval search.
+        FloatPredicate::InSet(vec![
+            values[2400],
+            values[10],
+            values[2400],
+            0.0,
+            -0.0,
+            values[10],
+            f64::INFINITY,
+        ]),
+        FloatPredicate::InSet(vec![0.01, 0.02, 0.03, 0.0, f64::NAN, 0.02]),
+        FloatPredicate::InSet(values.iter().step_by(7).rev().copied().collect()),
+        FloatPredicate::InSet(
+            values
+                .iter()
+                .step_by(3)
+                .chain(values.iter().step_by(5))
+                .copied()
+                .collect(),
+        ),
         float_range(Some((-350.0, true)), Some((350.0, false))),
         float_range(Some((-350.0, false)), Some((350.0, true))),
         float_range(None, Some((0.0, true))),
@@ -992,6 +1012,19 @@ fn alp_filter_matches_decode_then_filter_including_exceptions_and_escapes() {
         };
         assert_eq!(mask, reference, "integer-domain answer diverged for {predicate:?}");
     }
+}
+
+/// An ALP `IN` set translates to ascending, disjoint intervals: duplicates and adjacent members collapse once at
+/// translation, so a lane is answered by one search however the set was written.
+#[test]
+fn alp_in_sets_translate_to_merged_intervals() {
+    let power = ALP_POWERS[2];
+    let test = AlpIntTest::translate(
+        &FloatPredicate::InSet(vec![0.05, 0.01, 0.02, 0.01, f64::NAN, -0.03]),
+        power,
+    );
+    assert!(!test.negate);
+    assert_eq!(test.ranges, vec![(-3, -3), (1, 2), (5, 5)]);
 }
 
 /// Free-text notes shaped like the benchmark's: a dense needle in about one value per hundred, a rare one in a
