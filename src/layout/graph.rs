@@ -275,9 +275,17 @@ impl GranuleEdges {
     /// The children of event `sn` along `kind` edges: those in the same file in ascending order, then those from
     /// later files that compaction folded in, in ascending order. Empty for an event this granule does not hold.
     pub fn children(&self, sn: u64, kind: EdgeKind) -> Vec<u64> {
-        let mut children = self.reverse.edges(self.first_sn, sn, kind).to_vec();
-        children.extend_from_slice(self.inbound.edges(self.first_sn, sn, kind));
-        children
+        self.children_iter(sn, kind).collect()
+    }
+
+    /// The same children as [`children`](Self::children), in the same order, read straight from the decoded tables
+    /// without copying them into a new list.
+    pub fn children_iter(&self, sn: u64, kind: EdgeKind) -> impl Iterator<Item = u64> + '_ {
+        self.reverse
+            .edges(self.first_sn, sn, kind)
+            .iter()
+            .chain(self.inbound.edges(self.first_sn, sn, kind))
+            .copied()
     }
 
     /// The chain-cover label of event `sn`, or `None` when the file stores no labels or this granule does not hold
@@ -408,18 +416,21 @@ pub fn encode_graph_blocks(
             .get(range.clone())
             .ok_or(refuse("granule rows beyond the graph"))?;
         let first_sn = graph.first_sn + granule.first_row_ordinal;
-        let forward: Vec<[&[u64]; GRAPH_EDGE_KINDS]> = rows.iter().map(|row| [&row.prev[..], &row.auth[..]]).collect();
         let mut out = Writer::new();
-        encode_csr(&mut out, first_sn, &forward)?;
         encode_csr(
             &mut out,
             first_sn,
-            &slot_lists(reverse.get(range.clone()).unwrap_or_default()),
+            rows.iter().map(|row| [&row.prev[..], &row.auth[..]]),
         )?;
         encode_csr(
             &mut out,
             first_sn,
-            &slot_lists(inbound.get(range.clone()).unwrap_or_default()),
+            slot_lists(reverse.get(range.clone()).unwrap_or_default()),
+        )?;
+        encode_csr(
+            &mut out,
+            first_sn,
+            slot_lists(inbound.get(range.clone()).unwrap_or_default()),
         )?;
         if let Some(cover) = &graph.chain_cover {
             let labels = cover.labels.get(range).unwrap_or_default();
@@ -457,17 +468,21 @@ pub fn state_root_entries(graph: &GraphInput, row_count: u64) -> Result<Vec<Stat
         .collect()
 }
 
-fn slot_lists(lists: &[[Vec<u64>; GRAPH_EDGE_KINDS]]) -> Vec<[&[u64]; GRAPH_EDGE_KINDS]> {
-    lists.iter().map(|[prev, auth]| [&prev[..], &auth[..]]).collect()
+fn slot_lists(lists: &[[Vec<u64>; GRAPH_EDGE_KINDS]]) -> impl ExactSizeIterator<Item = [&[u64]; GRAPH_EDGE_KINDS]> {
+    lists.iter().map(|[prev, auth]| [&prev[..], &auth[..]])
 }
 
-fn encode_csr(out: &mut Writer, first_sn: u64, rows: &[[&[u64]; GRAPH_EDGE_KINDS]]) -> Result<(), FormatError> {
+fn encode_csr<'a>(
+    out: &mut Writer,
+    first_sn: u64,
+    rows: impl ExactSizeIterator<Item = [&'a [u64]; GRAPH_EDGE_KINDS]>,
+) -> Result<(), FormatError> {
     let mut offsets = Vec::with_capacity(rows.len() * GRAPH_EDGE_KINDS + 1);
     let mut deltas = Vec::new();
     offsets.push(0);
     for (source, lists) in (first_sn..).zip(rows) {
         for targets in lists {
-            for &target in *targets {
+            for &target in targets {
                 let delta =
                     i64::try_from(i128::from(source) - i128::from(target)).map_err(|_| FormatError::Structural {
                         rule: "a graph edge spans more sequence numbers than it can store",
@@ -698,11 +713,13 @@ impl EventIdIndex {
                 rule: "graph event id hashes and sequence numbers must decode to u64 columns",
             });
         };
-        let pairs: Vec<(u64, u64)> = hashes.iter().copied().zip(sns.iter().copied()).collect();
         if reader.remaining() != 0
             || hashes.is_empty()
             || hashes.len() != sns.len()
-            || pairs.windows(2).any(|pair| pair.first() >= pair.last())
+            || hashes
+                .windows(2)
+                .zip(sns.windows(2))
+                .any(|(hash, sn)| (hash.first(), sn.first()) >= (hash.last(), sn.last()))
             || sns.iter().any(|sn| !(first_sn..end_sn).contains(sn))
         {
             return Err(FormatError::Structural {

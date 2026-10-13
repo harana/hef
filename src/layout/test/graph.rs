@@ -107,6 +107,21 @@ fn edges_round_trip_through_granule_blocks() {
 }
 
 #[test]
+fn borrowed_children_match_the_owned_list() {
+    let granules = decoded(&graph());
+    for edges in &granules {
+        for sn in 95..210 {
+            for kind in [EdgeKind::Auth, EdgeKind::Prev] {
+                assert_eq!(
+                    edges.children_iter(sn, kind).collect::<Vec<_>>(),
+                    edges.children(sn, kind)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn a_graph_that_breaks_a_rule_is_refused() {
     let cases: Vec<(&str, GraphBreak)> = vec![
         ("parent not earlier", Box::new(|g| g.rows[2].prev = vec![102])),
@@ -619,6 +634,35 @@ fn a_forced_hash_collision_resolves_to_the_event_holding_the_id() {
         only_collider.sn_of(b"$wanted", stored_id).unwrap(),
         None,
         "a hash match whose stored id differs never answers"
+    );
+}
+
+#[test]
+fn the_event_id_index_accepts_equal_hashes_only_with_rising_sequence_numbers() {
+    let filter = BinaryFuseFilter::build(&[7, 9]).unwrap().encode();
+    let decode = |hashes: Vec<u64>, sns: Vec<u64>| {
+        let mut out = Writer::new();
+        EventIdIndex {
+            filter: filter.clone(),
+            hashes,
+            sns,
+        }
+        .encode(&mut out);
+        EventIdIndex::decode(&out.into_bytes(), 0, 100)
+    };
+    assert!(decode(vec![7], vec![3]).is_ok());
+    assert!(decode(vec![7, 9], vec![5, 1]).is_ok());
+    assert!(decode(vec![7, 7], vec![1, 5]).is_ok(), "a hash collision is legitimate");
+    assert!(decode(vec![7, 7], vec![5, 5]).is_err(), "a repeated pair");
+    assert!(
+        decode(vec![7, 7], vec![5, 1]).is_err(),
+        "falling sequence numbers under one hash"
+    );
+    assert!(decode(vec![9, 7], vec![1, 5]).is_err(), "falling hashes");
+    assert!(decode(vec![7, 9], vec![1]).is_err(), "unequal lengths");
+    assert!(
+        decode(vec![7], vec![100]).is_err(),
+        "a sequence number outside the file"
     );
 }
 

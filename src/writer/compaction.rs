@@ -285,7 +285,7 @@ pub fn rebuild_graph_input(sources: &[HefFile], later: &[HefFile]) -> Result<Gra
                     );
                 }
                 for kind in [EdgeKind::Auth, EdgeKind::Prev] {
-                    for child in edges.children(sn, kind) {
+                    for child in edges.children_iter(sn, kind) {
                         if child >= end_sn {
                             inbound.push(GraphEdge {
                                 child,
