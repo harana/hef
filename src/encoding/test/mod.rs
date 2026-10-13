@@ -2994,3 +2994,75 @@ fn xor_floats_are_kept_only_where_they_store_fewer_bytes() {
         encode_block_with_strategy(&ints, false, CascadeStrategy::DecodeOptimized).bytes
     );
 }
+
+/// The run list the RLE encoder used to collect, serialized: the reference the two-pass encoder must match byte for
+/// byte.
+fn reference_rle(values: &[u64]) -> Vec<u8> {
+    let mut runs: Vec<(u64, u32)> = Vec::new();
+    for value in values {
+        match runs.last_mut() {
+            Some((current, count)) if current == value => *count += 1,
+            _ => runs.push((*value, 1)),
+        }
+    }
+    let mut out = Writer::new();
+    out.put_u32(runs.len() as u32);
+    for (value, count) in runs {
+        out.put_u64(value);
+        out.put_u32(count);
+    }
+    out.into_bytes()
+}
+
+#[test]
+fn rle_without_a_run_list_matches_the_collected_runs() {
+    let alternating: Vec<u64> = (0..2_000).map(|i| i % 2).collect();
+    let distinct: Vec<u64> = (0..2_000).collect();
+    let cases: [Vec<u64>; 6] = [
+        vec![],
+        vec![7],
+        vec![3; 9_000],
+        vec![1, 1, 2, 2, 2, 1, u64::MAX, u64::MAX, 0],
+        alternating,
+        distinct,
+    ];
+    for values in cases {
+        let mut out = Writer::new();
+        encode_rle(&values, &mut out);
+        assert_eq!(out.into_bytes(), reference_rle(&values));
+    }
+}
+
+#[test]
+fn signed_plain_and_rle_stream_zigzag_codes_identically_to_a_mapped_copy() {
+    let mut mixed: Vec<i64> = (0..2_500).map(|i| if i % 3 == 0 { -i } else { i / 7 }).collect();
+    mixed.extend([i64::MIN, i64::MAX, i64::MIN, 0]);
+    let cases: [Vec<i64>; 5] = [vec![], vec![-1], vec![i64::MIN; 1_024], vec![5; 1_025], mixed];
+    for values in cases {
+        let mapped: Vec<u64> = values.iter().map(|value| zigzag(*value)).collect();
+        let mut plain = Writer::new();
+        encode_i64_with(Transform::PlainU64, &values, &mut plain);
+        let mut expected_plain = Writer::new();
+        encode_plain_u64(&mapped, &mut expected_plain);
+        assert_eq!(plain.into_bytes(), expected_plain.into_bytes());
+        let mut rle = Writer::new();
+        encode_i64_with(Transform::Rle, &values, &mut rle);
+        assert_eq!(rle.into_bytes(), reference_rle(&mapped));
+    }
+}
+
+#[test]
+fn alp_exception_indexes_pack_identically_to_a_collected_index_vector() {
+    let exceptions: Vec<(u32, u64)> = (0..3_000u32).map(|i| (i * 3 + 1_000, u64::from(i))).collect();
+    let indexes: Vec<u64> = exceptions.iter().map(|(index, _)| u64::from(*index)).collect();
+    let mut expected = Writer::new();
+    encode_for_bitpack(&indexes, &mut expected);
+    let base = indexes.iter().copied().min().unwrap_or(0);
+    let max_delta = indexes.iter().map(|index| index - base).max().unwrap_or(0);
+    let mut actual = Writer::new();
+    actual.put_u64(base);
+    bitpack_with(exceptions.len(), bits_needed(max_delta), &mut actual, |i| {
+        u64::from(exceptions[i].0) - base
+    });
+    assert_eq!(actual.into_bytes(), expected.into_bytes());
+}
