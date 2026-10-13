@@ -3,10 +3,13 @@ use super::super::batch::{EventInput, PayloadInput, build_batch, decode_batch};
 use super::super::frame::{FrameBuildInput, build_frame, decode_frame};
 use super::super::segment::ReplayTail;
 use super::*;
+use crate::events::provenance::{SignatureScheme, SignedEventProvenance, hex_lower};
+use crate::events::{EventEnvelope, TimestampValue};
 use crate::lifecycle::{FileType, HefFileEntry, ManifestGeneration, PartState};
 use crate::typed_id::TypedIdTestExt;
 
-fn payload_refs_of(events: &[EventInput]) -> Vec<u64> {
+/// Converts `events`, written as one frame, into the segment a reader builds from it.
+fn convert_events(events: &[EventInput]) -> LiveOverlaySegment {
     let payload = build_batch(events, 1, 0).unwrap();
     let frame_bytes = build_frame(
         &FrameBuildInput {
@@ -29,10 +32,13 @@ fn payload_refs_of(events: &[EventInput]) -> Vec<u64> {
     .unwrap();
     let (header, payload) = decode_frame(&frame_bytes).unwrap();
     let decoded = decode_batch(payload, header.event_count).unwrap();
-    let segment = convert_frame(&header, &decoded, 1, 1, None, |_, _| false)
+    convert_frame(&header, &decoded, 1, 1, None, |_, _| false)
         .unwrap()
-        .expect("not covered");
-    segment
+        .expect("not covered")
+}
+
+fn payload_refs_of(events: &[EventInput]) -> Vec<u64> {
+    convert_events(events)
         .batch
         .column(21)
         .as_any()
@@ -83,6 +89,130 @@ fn payload_ref_distinguishes_no_payload_from_a_payload_at_arena_offset_zero() {
     assert!(second[0] >> 32 > 0);
     assert_eq!(second[0] & 0xFFFF_FFFF, 0);
     assert_eq!(second[1], 0);
+}
+
+#[test]
+fn text_columns_keep_every_value_null_and_empty_string() {
+    let long = "x".repeat(10_000);
+    let texts = [None, Some(""), Some("caf\u{e9} \u{1F600}"), Some(long.as_str())];
+    let mut events = sample_events(8);
+    for (row, event) in events.iter_mut().enumerate() {
+        let text = |offset: usize| texts[(row + offset) % texts.len()].map(str::to_owned);
+        event.envelope.source = text(1).unwrap_or_default();
+        event.envelope.event_type = text(2).unwrap_or_default();
+        event.envelope.entity_type = text(3).unwrap_or_default();
+        event.envelope.entity_id = text(0);
+        event.envelope.actor_id = text(1);
+        event.envelope.account_id = text(2);
+    }
+    // The segment outlives the frame and decoded batch it was built from, so its columns own their text.
+    let segment = convert_events(&events);
+    let required = |text: fn(&EventEnvelope) -> &str| -> ArrayRef {
+        Arc::new(StringArray::from(
+            events.iter().map(|event| text(&event.envelope)).collect::<Vec<_>>(),
+        ))
+    };
+    let optional = |text: fn(&EventEnvelope) -> Option<&str>| -> ArrayRef {
+        Arc::new(StringArray::from(
+            events.iter().map(|event| text(&event.envelope)).collect::<Vec<_>>(),
+        ))
+    };
+    let expected = [
+        ("source", required(|envelope| envelope.source.as_str())),
+        ("event_type", required(|envelope| envelope.event_type.as_str())),
+        ("entity_type", required(|envelope| envelope.entity_type.as_str())),
+        ("entity_id", optional(|envelope| envelope.entity_id.as_deref())),
+        ("actor_id", optional(|envelope| envelope.actor_id.as_deref())),
+        ("account_id", optional(|envelope| envelope.account_id.as_deref())),
+    ];
+    assert!(Arc::ptr_eq(&segment.batch.schema(), &live_overlay_schema()));
+    for (name, column) in expected {
+        assert_eq!(segment.batch.column_by_name(name).unwrap(), &column, "{name}");
+    }
+}
+
+#[test]
+fn provenance_columns_hold_each_signed_rows_values_and_nulls_elsewhere() {
+    let signed = |row: u8, scheme: SignatureScheme| SignedEventProvenance {
+        author_pubkey: [row; 32],
+        claimed_at: TimestampValue::from_physical_nanos(1_000_000_000 * i64::from(row)),
+        protocol_event_id: [0xA0 | row; 32],
+        protocol_kind: u32::from(row) + 1,
+        scheme,
+        signature: [0xF0 | row; 64],
+    };
+    let unsigned = [false; 5];
+    let all_signed = [true; 5];
+    let mixed = [true, false, false, true, false];
+    let ends = [false, true, false, false, true];
+    for pattern in [unsigned, all_signed, mixed, ends] {
+        let mut events = sample_events(pattern.len());
+        for (row, (event, is_signed)) in events.iter_mut().zip(pattern).enumerate() {
+            let scheme = if row % 2 == 0 {
+                SignatureScheme::Ed25519
+            } else {
+                SignatureScheme::Bip340SchnorrSecp256k1
+            };
+            event.provenance = is_signed.then(|| signed(row as u8, scheme));
+        }
+        let segment = convert_events(&events);
+        if !pattern.contains(&true) {
+            assert!(Arc::ptr_eq(&segment.batch.schema(), &live_overlay_schema()));
+            continue;
+        }
+        assert!(Arc::ptr_eq(
+            &segment.batch.schema(),
+            &live_overlay_schema_with_provenance()
+        ));
+        let provenance: Vec<Option<&SignedEventProvenance>> =
+            events.iter().map(|event| event.provenance.as_ref()).collect();
+        let hex_of = |bytes: fn(&SignedEventProvenance) -> &[u8]| -> ArrayRef {
+            Arc::new(StringArray::from(
+                provenance
+                    .iter()
+                    .map(|signed| signed.map(|signed| hex_lower(bytes(signed))))
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        let expected: [(&str, ArrayRef); 6] = [
+            ("author_pubkey", hex_of(|signed| &signed.author_pubkey)),
+            ("signature", hex_of(|signed| &signed.signature)),
+            (
+                "signature_scheme",
+                Arc::new(StringArray::from(
+                    provenance
+                        .iter()
+                        .map(|signed| signed.map(|signed| signed.scheme.as_str()))
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+            ("protocol_event_id", hex_of(|signed| &signed.protocol_event_id)),
+            (
+                "protocol_kind",
+                Arc::new(Int64Array::from(
+                    provenance
+                        .iter()
+                        .map(|signed| signed.map(|signed| i64::from(signed.protocol_kind)))
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+            (
+                "claimed_at",
+                Arc::new(
+                    TimestampNanosecondArray::from(
+                        provenance
+                            .iter()
+                            .map(|signed| signed.map(|signed| signed.claimed_at.physical_nanos()))
+                            .collect::<Vec<_>>(),
+                    )
+                    .with_timezone("UTC"),
+                ),
+            ),
+        ];
+        for (name, column) in expected {
+            assert_eq!(segment.batch.column_by_name(name).unwrap(), &column, "{name}");
+        }
+    }
 }
 
 fn overlay_segment(epoch: u64, first_sequence: u64, count: usize) -> LiveOverlaySegment {
@@ -426,5 +556,101 @@ fn a_rebuilt_overlay_rejects_a_void_that_overlaps_an_earlier_event_frame() {
     match store.fresh_read(TenantId::new_test_id(7), seq_range(1, 1, 3)) {
         FreshRead::Ready(hits) => assert_eq!(hits.len(), 1, "the first-durable event frame still serves its rows"),
         FreshRead::Behind { missing } => panic!("expected Ready, got Behind {missing:?}"),
+    }
+}
+
+/// What `rebuild_from_replay` decided before it indexed the accepted ranges: a frame is accepted when no earlier
+/// accepted range of its tenant overlaps it.
+fn claim_range_by_scanning(
+    covered: &mut Vec<(TenantId, SequenceRange)>,
+    tenant_id: TenantId,
+    range: SequenceRange,
+) -> bool {
+    if covered
+        .iter()
+        .any(|(claimed_tenant, existing)| *claimed_tenant == tenant_id && existing.overlaps(&range))
+    {
+        return false;
+    }
+    covered.push((tenant_id, range));
+    true
+}
+
+#[test]
+fn claiming_ranges_matches_scanning_every_accepted_range() {
+    let mut state = 0x0E1A_u64;
+    let mut random = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let fixed = [
+        (7, seq_range(1, 10, 20)),
+        (7, seq_range(1, 10, 20)),
+        (7, seq_range(1, 15, 25)),
+        (7, seq_range(1, 5, 10)),
+        (7, seq_range(1, 20, 30)),
+        (7, seq_range(1, 21, 30)),
+        (7, seq_range(1, 0, 9)),
+        (7, seq_range(1, 1, 40)),
+        (8, seq_range(1, 10, 20)),
+        (7, seq_range(2, 10, 20)),
+        (7, seq_range(1, u64::MAX - 1, u64::MAX)),
+        (7, seq_range(1, u64::MAX, u64::MAX)),
+        (7, seq_range(1, 31, u64::MAX - 2)),
+        (7, seq_range(1, 31, u64::MAX - 1)),
+    ];
+    let mut histories: Vec<Vec<(u128, SequenceRange)>> = vec![fixed.to_vec()];
+    for _ in 0..200 {
+        histories.push(
+            (0..random() % 60)
+                .map(|_| {
+                    let first = random() % 100;
+                    let last = first + random() % 12;
+                    (7 + u128::from(random() % 2), seq_range(random() % 2, first, last))
+                })
+                .collect(),
+        );
+    }
+    for history in histories {
+        let mut indexed = BTreeMap::new();
+        let mut scanned = Vec::new();
+        for (tenant, range) in history {
+            let tenant_id = TenantId::new_test_id(tenant);
+            assert_eq!(
+                claim_range(&mut indexed, tenant_id, range),
+                claim_range_by_scanning(&mut scanned, tenant_id, range),
+                "{range:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_rebuilt_overlay_rejects_frames_overlapping_one_already_published() {
+    // The first frame is already HEF-covered, so it builds no segment, but it still won its range: a later
+    // overlapping void or event frame is a rejected duplicate, not a new owner of those sequences.
+    let published = sample_frame(3, 1, 1); // covers 1..=3
+    let late_void = void_frame(1, 2, 4);
+    let late_event = sample_frame(3, 1, 3); // covers 3..=5
+    let replay = ReplayOutcome {
+        frames: vec![
+            replayed_frame(published.clone(), 0),
+            replayed_frame(late_void.clone(), published.len() as u64),
+            replayed_frame(late_event, (published.len() + late_void.len()) as u64),
+        ],
+        segment_chain_blake3: None,
+        tail: ReplayTail::Clean,
+    };
+
+    let mut store = LiveOverlayStore::new();
+    store
+        .rebuild_from_replay(&replay, 1, 1, |_, range| range.first_sequence == 1)
+        .unwrap();
+    assert_eq!(store.segment_count(), 0, "the late event frame is rejected");
+    match store.fresh_read(TenantId::new_test_id(7), seq_range(1, 2, 4)) {
+        FreshRead::Behind { missing } => assert_eq!(missing, seq_range(1, 2, 4), "the late void is rejected"),
+        FreshRead::Ready(_) => panic!("the late void must not claim the published range"),
     }
 }

@@ -130,3 +130,50 @@ fn decode_rejects_out_of_range_and_unsorted_buckets() {
     out.extend_from_slice(&5u32.to_le_bytes()); // equal -> not strictly ascending
     assert!(RangeFilter::decode(&out).is_err());
 }
+
+/// The original collect, sort and dedup builder, kept as the reference the bitmap builder must match byte for byte.
+fn reference_build(keys: &[u64], bucket_count: u32) -> RangeFilter {
+    let bucket_count = bucket_count.max(1);
+    let mut occupied: Vec<u32> = keys
+        .iter()
+        .map(|&key| RangeFilter::bucket_of(key, bucket_count))
+        .collect();
+    occupied.sort_unstable();
+    occupied.dedup();
+    RangeFilter { bucket_count, occupied }
+}
+
+#[test]
+fn bitmap_builder_matches_the_sort_and_dedup_reference() {
+    let mut boundary_keys = vec![0, 1, u64::MAX, u64::MAX - 1];
+    for bucket in [1u64, 63, 64, 65, 4095] {
+        let edge = bucket.wrapping_mul(u64::MAX / 4096);
+        boundary_keys.extend([edge.wrapping_sub(1), edge, edge.wrapping_add(1)]);
+    }
+    let every_bucket: Vec<u64> = (0..4096u64).map(|bucket| bucket << 52).collect();
+    let duplicates: Vec<u64> = make_keys(7, 8).into_iter().cycle().take(5000).collect();
+    let mut permuted = make_keys(11, 2000);
+    permuted.reverse();
+    let inputs = [
+        Vec::new(),
+        vec![42],
+        vec![u64::MIN],
+        vec![u64::MAX],
+        boundary_keys,
+        every_bucket.clone(),
+        duplicates,
+        make_keys(3, 9000),
+        permuted,
+    ];
+    for bucket_count in [0, 1, 63, 64, 65, 4095, 4096, 4097, u32::MAX] {
+        for keys in &inputs {
+            let built = RangeFilter::build_with_buckets(keys, bucket_count);
+            let reference = reference_build(keys, bucket_count);
+            assert_eq!(built.encode(), reference.encode(), "bucket_count {bucket_count}");
+            for (lo, hi) in [(0, u64::MAX), (0, 0), (u64::MAX, u64::MAX), (1 << 40, 1 << 62)] {
+                assert_eq!(built.range_nonempty(lo, hi), reference.range_nonempty(lo, hi));
+            }
+        }
+    }
+    assert_eq!(RangeFilter::build(&every_bucket).occupied.len(), 4096);
+}

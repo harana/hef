@@ -1,6 +1,43 @@
 use super::*;
-use crate::encoding::Compression;
-use std::sync::Arc;
+use crate::encoding::{
+    CascadeStrategy, ColumnData, Compression, ReplayCapture, Transform, decode_block, decode_block_range,
+    encode_block_replayed,
+};
+use std::cell::Cell;
+use std::sync::{Arc, Mutex};
+
+/// Held by every test that installs a process-wide decompressor, so one test's install never lands inside another's.
+static INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// How many blocks [`CountingDecompressor`] has undone on this thread, so parallel tests never see each other's.
+    static UNDONE_ON_THIS_THREAD: Cell<usize> = const { Cell::new(0) };
+}
+
+/// A decompressor that delegates to the software one and counts its calls on the calling thread.
+#[derive(Debug, Clone, Copy, Default)]
+struct CountingDecompressor;
+
+impl Decompressor for CountingDecompressor {
+    fn decompress(&self, compression: Compression, bytes: &[u8]) -> Result<Vec<u8>, crate::error::FormatError> {
+        UNDONE_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+        SoftwareDecompressor.decompress(compression, bytes)
+    }
+
+    fn decompress_into(
+        &self,
+        compression: Compression,
+        bytes: &[u8],
+        plain: &mut Vec<u8>,
+    ) -> Result<(), crate::error::FormatError> {
+        UNDONE_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+        SoftwareDecompressor.decompress_into(compression, bytes, plain)
+    }
+
+    fn backend(&self) -> DecompressorBackend {
+        DecompressorBackend::Software
+    }
+}
 
 /// A decompressor that delegates to the software one but reports a different backend label — stands in for a
 /// hardware-backed decompressor in tests without needing a device. Because it returns exactly the software bytes,
@@ -175,6 +212,7 @@ fn software_rejects_an_lz4_block_that_inflates_short_of_its_size_prefix() {
 /// the stand-in delegates to software, so the bytes are identical regardless.
 #[test]
 fn active_decompressor_defaults_to_software_and_swaps_when_installed() {
+    let _installing = INSTALL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     // Before any install, the default is the software decompressor.
     assert_eq!(active_decompressor().backend(), DecompressorBackend::Software);
 
@@ -313,4 +351,46 @@ fn the_inflate_buffer_is_retained_up_to_its_bound() {
     assert_eq!(with_inflate_buffer(|buffer| buffer.as_ptr()), pointer);
     with_inflate_buffer(|buffer| buffer.reserve_exact(MAX_RETAINED_INFLATE_BYTES + 1));
     assert!(with_inflate_buffer(|buffer| buffer.capacity()) <= MAX_RETAINED_INFLATE_BYTES);
+}
+
+/// A range read of a compressed block with no per-row fast path undoes the trailing stage once, not once to dispatch
+/// and again for the full decode, and still returns exactly the rows a full decode would.
+#[test]
+fn a_compressed_fallback_range_read_decompresses_once() {
+    let _installing = INSTALL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let values: Vec<u64> = (0..8192u64).map(|i| (i % 64) * 7).collect();
+    install_decompressor(Arc::new(CountingDecompressor));
+    for compression in [Compression::Lz4, Compression::Zstd1, Compression::Zstd3] {
+        let capture = ReplayCapture {
+            compression,
+            decoded_len: 8192 * 8,
+            fsst: None,
+            raw_len: 8192 * 8,
+            transform: Transform::ForBitpack,
+        };
+        let (block, replayed) = encode_block_replayed(
+            &ColumnData::U64(values.clone()),
+            false,
+            CascadeStrategy::DecodeOptimized,
+            Some(&capture),
+            None,
+        );
+        assert!(replayed);
+        assert_eq!(block.pipeline.compression().unwrap(), compression);
+        assert_eq!(
+            decode_block(block.pipeline, &block.bytes).unwrap(),
+            ColumnData::U64(values.clone())
+        );
+        for (start, end) in [(0, 1), (100, 2_000), (0, values.len()), (8_000, values.len())] {
+            UNDONE_ON_THIS_THREAD.with(|count| count.set(0));
+            let rows = decode_block_range(block.pipeline, &block.bytes, start, end).unwrap();
+            assert_eq!(
+                UNDONE_ON_THIS_THREAD.with(Cell::get),
+                1,
+                "{compression:?} {start}..{end}"
+            );
+            assert_eq!(rows, ColumnData::U64(values[start..end].to_vec()));
+        }
+    }
+    install_decompressor(Arc::new(SoftwareDecompressor));
 }

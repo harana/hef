@@ -86,8 +86,9 @@ impl GenerationDelta {
         let (upserted_files, removed_file_ids) = diff(&checkpoint.files, &next.files, |entry| entry.file_id);
         let (added_artifacts, removed_artifact_keys) =
             diff(&checkpoint.index_artifacts, &next.index_artifacts, |artifact| {
-                artifact.object_key.clone()
+                artifact.object_key.as_str()
             });
+        let removed_artifact_keys = removed_artifact_keys.into_iter().map(str::to_owned).collect();
         Self {
             added_artifacts,
             checkpoint: checkpoint.generation,
@@ -120,7 +121,12 @@ impl GenerationDelta {
 }
 
 /// The items of `next` that are new or changed relative to `base`, and the keys of the `base` items `next` dropped.
-fn diff<T: Clone + PartialEq, K: Eq + Hash>(base: &[T], next: &[T], key: impl Fn(&T) -> K) -> (Vec<T>, Vec<K>) {
+/// `key` may borrow from the items, so string keys are compared without being copied.
+fn diff<'a, T: Clone + PartialEq, K: Eq + Hash>(
+    base: &'a [T],
+    next: &'a [T],
+    key: impl Fn(&'a T) -> K,
+) -> (Vec<T>, Vec<K>) {
     let base_by_key: HashMap<K, &T> = base.iter().map(|item| (key(item), item)).collect();
     let next_keys: HashSet<K> = next.iter().map(&key).collect();
     let changed = next

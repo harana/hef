@@ -120,3 +120,30 @@ fn a_forged_plain_length_is_rejected() {
     let err = decompress(&packed).unwrap_err();
     assert!(matches!(err, FormatError::Structural { .. }));
 }
+
+/// One buffer reused across pages, including a malformed one in between, holds exactly what the allocating
+/// [`decompress`] returns for each valid page: no stale prefix or partial earlier page leaks through, and a warmed
+/// buffer keeps its allocation.
+#[test]
+fn decompressing_into_a_reused_buffer_matches_the_allocating_decode() {
+    let large = multi_granule_bytes();
+    let pages = [compress(&large), compress(b"tiny"), compress(&[]), compress(&large)];
+    let mut plain = b"stale".to_vec();
+    for packed in &pages {
+        decompress_into(packed, &mut plain).unwrap();
+        assert_eq!(plain, decompress(packed).unwrap());
+    }
+
+    let warmed = plain.capacity();
+    decompress_into(&pages[0], &mut plain).unwrap();
+    assert_eq!(plain.capacity(), warmed);
+
+    let mut corrupt = pages[0].clone();
+    corrupt.truncate(corrupt.len() - 40);
+    assert_eq!(
+        decompress_into(&corrupt, &mut plain).unwrap_err(),
+        decompress(&corrupt).unwrap_err()
+    );
+    decompress_into(&pages[1], &mut plain).unwrap();
+    assert_eq!(plain, b"tiny");
+}

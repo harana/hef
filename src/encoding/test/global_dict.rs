@@ -125,6 +125,44 @@ fn an_empty_file_set_has_no_codes() {
     assert_eq!(global.code_for("login"), None);
 }
 
+/// Sorted and unsorted local alphabets map slot for slot exactly as independent lookups do: duplicates right after a
+/// hit or a miss, values below, between and above the dictionary, empty and Unicode strings, long shared prefixes,
+/// and an empty dictionary or local slice.
+#[test]
+fn local_to_global_map_matches_independent_lookups() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move |bound: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) % bound
+    };
+    let pool: Vec<String> = (0..200u64)
+        .map(|i| match i % 4 {
+            0 => format!("{i:04}"),
+            1 => format!("shared-prefix-{}-{i:04}", "x".repeat(40)),
+            2 => format!("\u{e9}t\u{e9}-{i}"),
+            _ => String::new(),
+        })
+        .collect();
+    for _ in 0..200 {
+        let global: BTreeSet<String> = (0..next(60)).map(|_| pool[next(200) as usize].clone()).collect();
+        let global = GlobalDictionary::from_sorted(global.into_iter().collect());
+        let mut local: Vec<String> = (0..next(40)).map(|_| pool[next(200) as usize].clone()).collect();
+        let independent = |local: &[String]| local.iter().map(|value| global.code_for(value)).collect::<Vec<_>>();
+        assert_eq!(global.local_to_global_map(&local), independent(&local));
+        local.sort();
+        assert_eq!(global.local_to_global_map(&local), independent(&local));
+    }
+    let global = dictionary(&["b", "d", "f"]);
+    assert_eq!(
+        map(&global, &["a", "b", "b", "c", "c", "d", "g", "g"]),
+        vec![None, Some(0), Some(0), None, None, Some(1), None, None]
+    );
+    assert_eq!(map(&dictionary(&[]), &["a", "a"]), vec![None, None]);
+    assert_eq!(map(&global, &[]), Vec::<Option<u64>>::new());
+}
+
 /// Duplicates inside one alphabet and overlap across alphabets collapse to one entry each in the merged order.
 #[test]
 fn merged_alphabets_drop_duplicates_within_and_across_files() {

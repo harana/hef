@@ -294,10 +294,23 @@ pub fn build_state_tree(key: &StateChunkKey, entries: &BTreeMap<StateKey, u64>) 
     let entry_count = u32::try_from(entries.len()).map_err(|_| FormatError::Structural {
         rule: "a state map holds at most u32::MAX keys",
     })?;
-    let leaves: Vec<(StateKey, [u8; 8])> = entries.iter().map(|(key, sn)| (*key, sn.to_le_bytes())).collect();
     let mut chunks = Vec::new();
+    let mut parents = Vec::new();
+    let mut open = Vec::with_capacity(STATE_CHUNK_MAX_BYTES / STATE_LEAF_ENTRY_LEN);
+    for (entry_key, sn) in entries {
+        push_entry(
+            key,
+            0,
+            (*entry_key, sn.to_le_bytes()),
+            &mut open,
+            &mut parents,
+            &mut chunks,
+        )?;
+    }
+    if !open.is_empty() || parents.is_empty() {
+        parents.push(seal_chunk(key, 0, &open, &mut chunks)?);
+    }
     let mut level = 0u8;
-    let mut parents = seal_level(key, level, &leaves, &mut chunks)?;
     while parents.len() > 1 {
         level += 1;
         parents = seal_level(key, level, &parents, &mut chunks)?;
@@ -518,7 +531,6 @@ fn update_level<const N: usize>(
     changes: &BTreeMap<StateKey, Option<[u8; N]>>,
     sealed: &mut Vec<SealedStateChunk>,
 ) -> Result<(ChunkList, i64), StateChunkError> {
-    let entry_len = 8 + N;
     let mut chunks = Vec::with_capacity(old.len());
     let mut added = 0i64;
     let mut pending = changes.iter().peekable();
@@ -532,7 +544,6 @@ fn update_level<const N: usize>(
         chunks.extend_from_slice(old.get(next..start).unwrap_or_default());
         next = start;
         let mut open: Vec<(StateKey, [u8; N])> = Vec::new();
-        let mut bytes = 0;
         loop {
             // Chunk `next` holds the keys before the next chunk's first key; merge in the changes that fall there.
             let bound = old.get(next + 1).map(|(first, _)| *first);
@@ -541,27 +552,21 @@ fn update_level<const N: usize>(
                 None => Vec::new(),
             };
             next += 1;
-            let mut merged = Vec::with_capacity(stored.len());
             let mut stored = stored.into_iter().peekable();
             while let Some((&change_key, &value)) =
                 pending.next_if(|(change_key, _)| bound.is_none_or(|bound| **change_key < bound))
             {
                 while let Some(entry) = stored.next_if(|(stored_key, _)| *stored_key < change_key) {
-                    merged.push(entry);
+                    push_entry(key, level, entry, &mut open, &mut chunks, sealed)?;
                 }
                 let replaced = stored.next_if(|(stored_key, _)| *stored_key == change_key).is_some();
                 added += i64::from(value.is_some()) - i64::from(replaced);
-                merged.extend(value.map(|value| (change_key, value)));
-            }
-            merged.extend(stored);
-            for (entry_key, value) in merged {
-                open.push((entry_key, value));
-                bytes += entry_len;
-                if ends_chunk(level, entry_key, entry_len, bytes) {
-                    chunks.push(seal_chunk(key, level, &open, sealed)?);
-                    open.clear();
-                    bytes = 0;
+                if let Some(value) = value {
+                    push_entry(key, level, (change_key, value), &mut open, &mut chunks, sealed)?;
                 }
+            }
+            for entry in stored {
+                push_entry(key, level, entry, &mut open, &mut chunks, sealed)?;
             }
             if next >= old.len() {
                 if !open.is_empty() {
@@ -578,23 +583,66 @@ fn update_level<const N: usize>(
     Ok((chunks, added))
 }
 
+/// Adds `entry` to `open`, the chunk being cut at `level`, and when the entry ends that chunk seals it into `sealed`,
+/// appends its first key and address to `chunks` and empties `open` for the next one.
+fn push_entry<const N: usize>(
+    key: &StateChunkKey,
+    level: u8,
+    entry: (StateKey, [u8; N]),
+    open: &mut Vec<(StateKey, [u8; N])>,
+    chunks: &mut ChunkList,
+    sealed: &mut Vec<SealedStateChunk>,
+) -> Result<(), FormatError> {
+    let entry_len = 8 + N;
+    let (entry_key, _) = entry;
+    open.push(entry);
+    if ends_chunk(level, entry_key, entry_len, open.len() * entry_len) {
+        chunks.push(seal_chunk(key, level, open, sealed)?);
+        open.clear();
+    }
+    Ok(())
+}
+
 /// The entries of the level above that change when a level's chunks go from `old` to `new`: each first key that
-/// gains or changes its address maps to the new address, and each one that is gone maps to `None`.
+/// gains or changes its address maps to the new address, and each one that is gone maps to `None`. Both lists must be
+/// strictly ascending by first key, as every level's chunks are; they are walked side by side once.
 fn changed_children(
     old: &[(StateKey, [u8; 32])],
     new: &[(StateKey, [u8; 32])],
 ) -> BTreeMap<StateKey, Option<[u8; 32]>> {
-    let firsts: HashSet<&StateKey> = new.iter().map(|(first, _)| first).collect();
-    let before: HashSet<&(StateKey, [u8; 32])> = old.iter().collect();
-    let gone = old
-        .iter()
-        .filter(|(first, _)| !firsts.contains(first))
-        .map(|(first, _)| (*first, None));
-    let added = new
-        .iter()
-        .filter(|child| !before.contains(child))
-        .map(|(first, address)| (*first, Some(*address)));
-    gone.chain(added).collect()
+    let mut changes = BTreeMap::new();
+    let mut old = old.iter().peekable();
+    let mut new = new.iter().peekable();
+    loop {
+        match (old.peek().copied(), new.peek().copied()) {
+            (None, None) => return changes,
+            (Some((old_first, _)), None) => {
+                changes.insert(*old_first, None);
+                old.next();
+            }
+            (None, Some((new_first, new_address))) => {
+                changes.insert(*new_first, Some(*new_address));
+                new.next();
+            }
+            (Some((old_first, old_address)), Some((new_first, new_address))) => match old_first.cmp(new_first) {
+                Ordering::Less => {
+                    changes.insert(*old_first, None);
+                    old.next();
+                }
+                Ordering::Greater => {
+                    changes.insert(*new_first, Some(*new_address));
+                    new.next();
+                }
+                Ordering::Equal => {
+                    if old_address != new_address {
+                        changes.insert(*new_first, Some(*new_address));
+                    }
+                    old.next();
+                    new.next();
+                }
+            },
+        }
+    }
 }
 
 /// Decodes one chunk's plaintext, refusing a bad magic, a nonzero reserved byte, a CRC mismatch, entries that do not

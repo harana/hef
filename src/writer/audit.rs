@@ -12,8 +12,10 @@ use super::constant::{AUDIT_DIGEST_BATCH_ROWS, AUDIT_REWRITE_REFUSED};
 use super::projection::RowOrder;
 use crate::error::FormatError;
 use crate::events::variant::{VariantRef, VariantValue};
+use crate::file::bytes::Writer;
 use crate::layout::Profile;
 use crate::layout::audit::{DigestEnvelope, DigestPayload, envelope_row_digest, row_hash};
+use crate::layout::constant::ROW_DIGEST_INPUT_CAPACITY;
 use crate::layout::footer::{AuditTrail, ObjectLockRetention};
 use rayon::prelude::*;
 
@@ -80,12 +82,16 @@ pub(crate) fn audit_trail(
 
 /// The hash of the last of `rows`, chained from `chain_start`. Digests up to `batch_rows` rows at a time in parallel
 /// into one reused buffer and folds each batch into the chain in row order, so the scratch stays bounded however many
-/// rows the file holds. The first row that fails to digest fails the whole chain.
+/// rows the file holds. Each parallel job encodes its rows through one buffer of its own rather than one per row. The
+/// first row that fails to digest fails the whole chain.
 fn chain_end(rows: &[BuildRow], chain_start: [u8; 32], batch_rows: usize) -> Result<[u8; 32], FormatError> {
     let mut digests = Vec::with_capacity(batch_rows.min(rows.len()));
     let mut hash = chain_start;
     for batch in rows.chunks(batch_rows) {
-        batch.par_iter().map(build_row_digest).collect_into_vec(&mut digests);
+        batch
+            .par_iter()
+            .map_init(|| Writer::with_capacity(ROW_DIGEST_INPUT_CAPACITY), build_row_digest)
+            .collect_into_vec(&mut digests);
         for digest in digests.drain(..) {
             hash = row_hash(&hash, &digest?);
         }
@@ -94,7 +100,7 @@ fn chain_end(rows: &[BuildRow], chain_start: [u8; 32], batch_rows: usize) -> Res
 }
 
 /// The digest of one row as the verifier will read it back: its envelope, and its payload in decoded form.
-fn build_row_digest(row: &BuildRow) -> Result<[u8; 32], FormatError> {
+fn build_row_digest(out: &mut Writer, row: &BuildRow) -> Result<[u8; 32], FormatError> {
     if row.external_id.is_some()
         || row.matrix_provenance.is_some()
         || row.provenance.is_some()
@@ -144,7 +150,7 @@ fn build_row_digest(row: &BuildRow) -> Result<[u8; 32], FormatError> {
         tenant_id: envelope.tenant_id.uuid().as_u128(),
         trace_id_hash_low: envelope.trace_id_hash_low,
     };
-    envelope_row_digest(row.epoch, row.sequence, &envelope, payload)
+    envelope_row_digest(out, row.epoch, row.sequence, &envelope, payload)
 }
 
 #[cfg(test)]

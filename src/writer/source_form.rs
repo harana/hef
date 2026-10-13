@@ -19,7 +19,6 @@ use crate::events::relationships::RelationshipKind;
 use crate::indexes::probabilistic::SplitBlockBloomFilter;
 use crate::indexes::stable_hash;
 use crate::layout::footer::{ExternalIdEntry, Footer, ReferenceFilterEntry};
-use std::borrow::Cow;
 
 /// One granule's block of one source-form column: the column id, a presence bitmap with one bit per row, and the
 /// present rows' values in row order.
@@ -95,20 +94,16 @@ fn carries(row: &BuildRow, column_id: u32) -> bool {
 }
 
 /// One row's stored text for a source-form column, or `None` when the row carries no value for it.
-fn stored_text(row: &BuildRow, column_id: u32) -> Result<Option<Cow<'_, str>>, FormatError> {
+fn stored_text(row: &BuildRow, column_id: u32) -> Result<Option<&str>, FormatError> {
     Ok(match column_id {
         column_ids::MATRIX_ROOM_VERSION => row
             .matrix_provenance
             .as_ref()
-            .map(|provenance| Cow::Borrowed(provenance.room_version())),
-        column_ids::SIGNER_SIGNATURES => row
-            .matrix_provenance
-            .as_ref()
-            .map(|provenance| Cow::Owned(SignerSignature::join(provenance.signatures()))),
+            .map(|provenance| provenance.room_version()),
         column_ids::RAW_PAYLOAD => match &row.raw_payload {
-            Some(bytes) => Some(Cow::Borrowed(
-                simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "raw payload" })?,
-            )),
+            Some(bytes) => {
+                Some(simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "raw payload" })?)
+            }
             None => None,
         },
         _ => None,
@@ -118,6 +113,21 @@ fn stored_text(row: &BuildRow, column_id: u32) -> Result<Option<Cow<'_, str>>, F
 fn column_block(rows: &[BuildRow], column_id: u32) -> Result<SourceFormBlock, FormatError> {
     let mut presence = vec![0u8; rows.len().div_ceil(8)];
     let mut values = StringColumn::new();
+    if column_id == column_ids::SIGNER_SIGNATURES {
+        let mut scratch = String::new();
+        for (index, row) in rows.iter().enumerate() {
+            let Some(provenance) = &row.matrix_provenance else {
+                continue;
+            };
+            scratch.clear();
+            SignerSignature::join_into(provenance.signatures(), &mut scratch);
+            if let Some(byte) = presence.get_mut(index / 8) {
+                *byte |= 1 << (index % 8);
+            }
+            values.push(Some(&scratch));
+        }
+        return Ok((column_id, presence, ColumnData::Strings(values)));
+    }
     if column_id == column_ids::EXTERNAL_ID {
         let mut scratch = String::new();
         for (index, row) in rows.iter().enumerate() {
@@ -141,7 +151,7 @@ fn column_block(rows: &[BuildRow], column_id: u32) -> Result<SourceFormBlock, Fo
             if let Some(byte) = presence.get_mut(index / 8) {
                 *byte |= 1 << (index % 8);
             }
-            values.push(Some(&*text));
+            values.push(Some(text));
         }
     }
     Ok((column_id, presence, ColumnData::Strings(values)))
