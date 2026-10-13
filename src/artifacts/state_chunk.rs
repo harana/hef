@@ -518,7 +518,6 @@ fn update_level<const N: usize>(
     changes: &BTreeMap<StateKey, Option<[u8; N]>>,
     sealed: &mut Vec<SealedStateChunk>,
 ) -> Result<(ChunkList, i64), StateChunkError> {
-    let entry_len = 8 + N;
     let mut chunks = Vec::with_capacity(old.len());
     let mut added = 0i64;
     let mut pending = changes.iter().peekable();
@@ -532,7 +531,6 @@ fn update_level<const N: usize>(
         chunks.extend_from_slice(old.get(next..start).unwrap_or_default());
         next = start;
         let mut open: Vec<(StateKey, [u8; N])> = Vec::new();
-        let mut bytes = 0;
         loop {
             // Chunk `next` holds the keys before the next chunk's first key; merge in the changes that fall there.
             let bound = old.get(next + 1).map(|(first, _)| *first);
@@ -541,27 +539,21 @@ fn update_level<const N: usize>(
                 None => Vec::new(),
             };
             next += 1;
-            let mut merged = Vec::with_capacity(stored.len());
             let mut stored = stored.into_iter().peekable();
             while let Some((&change_key, &value)) =
                 pending.next_if(|(change_key, _)| bound.is_none_or(|bound| **change_key < bound))
             {
                 while let Some(entry) = stored.next_if(|(stored_key, _)| *stored_key < change_key) {
-                    merged.push(entry);
+                    push_entry(key, level, entry, &mut open, &mut chunks, sealed)?;
                 }
                 let replaced = stored.next_if(|(stored_key, _)| *stored_key == change_key).is_some();
                 added += i64::from(value.is_some()) - i64::from(replaced);
-                merged.extend(value.map(|value| (change_key, value)));
-            }
-            merged.extend(stored);
-            for (entry_key, value) in merged {
-                open.push((entry_key, value));
-                bytes += entry_len;
-                if ends_chunk(level, entry_key, entry_len, bytes) {
-                    chunks.push(seal_chunk(key, level, &open, sealed)?);
-                    open.clear();
-                    bytes = 0;
+                if let Some(value) = value {
+                    push_entry(key, level, (change_key, value), &mut open, &mut chunks, sealed)?;
                 }
+            }
+            for entry in stored {
+                push_entry(key, level, entry, &mut open, &mut chunks, sealed)?;
             }
             if next >= old.len() {
                 if !open.is_empty() {
@@ -576,6 +568,26 @@ fn update_level<const N: usize>(
     }
     chunks.extend_from_slice(old.get(next..).unwrap_or_default());
     Ok((chunks, added))
+}
+
+/// Adds `entry` to `open`, the chunk being cut at `level`, and when the entry ends that chunk seals it into `sealed`,
+/// appends its first key and address to `chunks` and empties `open` for the next one.
+fn push_entry<const N: usize>(
+    key: &StateChunkKey,
+    level: u8,
+    entry: (StateKey, [u8; N]),
+    open: &mut Vec<(StateKey, [u8; N])>,
+    chunks: &mut ChunkList,
+    sealed: &mut Vec<SealedStateChunk>,
+) -> Result<(), FormatError> {
+    let entry_len = 8 + N;
+    let (entry_key, _) = entry;
+    open.push(entry);
+    if ends_chunk(level, entry_key, entry_len, open.len() * entry_len) {
+        chunks.push(seal_chunk(key, level, open, sealed)?);
+        open.clear();
+    }
+    Ok(())
 }
 
 /// The entries of the level above that change when a level's chunks go from `old` to `new`: each first key that
