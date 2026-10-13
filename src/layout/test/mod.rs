@@ -289,3 +289,43 @@ fn the_xor_float_bit_is_known_but_declared_only_by_files_that_use_it() {
     assert_eq!(optional_features::TIME_SERIES_ROLLUPS, 1 << 13);
     assert_eq!(optional_features::TIME_SERIES_ROLLUPS & !optional_features::KNOWN, 0);
 }
+
+#[test]
+fn presence_run_and_position_forms_encode_exact_bytes() {
+    let encode = |presence: &[u8], rows: u32| {
+        let mut out = crate::file::bytes::Writer::new();
+        super::encode_presence(presence, rows, &mut out);
+        out.into_bytes()
+    };
+    let words = |tag: u8, values: &[u32]| {
+        let mut out = crate::file::bytes::Writer::new();
+        out.put_u8(tag);
+        for &value in values {
+            out.put_u32(value);
+        }
+        out.into_bytes()
+    };
+
+    // Runs crossing a byte boundary, one ending on the last row; padding bits past row 4092 are ignored.
+    let mut clustered = vec![0u8; 512];
+    for row in (6..10).chain(4090..4096) {
+        clustered[row / 8] |= 1 << (row % 8);
+    }
+    assert_eq!(
+        encode(&clustered, 4093),
+        words(super::presence_forms::SET_RUNS, &[2, 6, 4, 4090, 3])
+    );
+
+    // Scattered rows; a short bitmap leaves the missing rows absent.
+    let mut scattered = vec![0u8; 400];
+    for row in [3usize, 900, 2001, 3199] {
+        scattered[row / 8] |= 1 << (row % 8);
+    }
+    assert_eq!(
+        encode(&scattered, 4096),
+        words(super::presence_forms::SET_POSITIONS, &[4, 3, 900, 2001, 3199])
+    );
+
+    // A nonempty bitmap over zero rows counts as fully present.
+    assert_eq!(encode(&[0u8], 0), vec![super::presence_forms::ALL_PRESENT]);
+}
