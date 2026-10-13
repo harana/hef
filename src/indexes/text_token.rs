@@ -19,7 +19,6 @@ use crate::indexes::{Exactness, stable_hash, stable_hash_ascii_lowercase};
 use hashbrown::HashSet;
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::VecDeque;
 
 /// Format tag at the front of an encoded [`TextTokenIndex`].
 const TEXT_TOKEN_MAGIC: u32 = 0x5454_4b31; // "TTK1"
@@ -43,6 +42,9 @@ const TRIGRAM_CODE_MASK: usize = (1 << TRIGRAM_CODE_BITS) - 1;
 
 /// Words in the bitmap that holds one bit per trigram code: 2^21 bits, 256 KiB.
 const TRIGRAM_BITMAP_WORDS: usize = 1 << (TRIGRAM_CODE_BITS - 6);
+
+/// Words in the summary that holds one bit per trigram bitmap word: 32,768 bits, 4 KiB.
+const TRIGRAM_SUMMARY_WORDS: usize = TRIGRAM_BITMAP_WORDS >> 6;
 
 /// A build whose token-hash set grew past this many slots (8 MiB of table) hands the set back to the allocator instead
 /// of keeping it for the thread's next block, so one block of unusually many distinct tokens does not pin that memory
@@ -247,8 +249,12 @@ fn is_ascii_token_separator(byte: u8) -> bool {
 ///
 /// See: hef-query-metadata-and-indexes/spec.md
 struct BuildScratch {
+    /// One bit per word of `trigrams`, set once that word holds any trigram, so draining visits only those words.
+    occupied_words: [u64; TRIGRAM_SUMMARY_WORDS],
     /// Hashes of every key that is not a three-byte ASCII key.
     other_hashes: HashSet<u64>,
+    /// How many bits of `trigrams` are set.
+    trigram_count: usize,
     /// One bit per case-folded ASCII trigram code, set once the trigram has been seen; drained and cleared by
     /// [`BuildScratch::build_filter`].
     trigrams: Vec<u64>,
@@ -257,7 +263,9 @@ struct BuildScratch {
 impl BuildScratch {
     fn new() -> Self {
         BuildScratch {
+            occupied_words: [0; TRIGRAM_SUMMARY_WORDS],
             other_hashes: HashSet::new(),
+            trigram_count: 0,
             trigrams: vec![0; TRIGRAM_BITMAP_WORDS],
         }
     }
@@ -326,23 +334,42 @@ impl BuildScratch {
     }
 
     fn mark_trigram(&mut self, code: usize) {
-        if let Some(word) = self.trigrams.get_mut(code >> 6) {
-            *word |= 1u64 << (code & 63);
+        let word_index = code >> 6;
+        if let Some(word) = self.trigrams.get_mut(word_index) {
+            let bit = 1u64 << (code & 63);
+            if *word & bit == 0 {
+                *word |= bit;
+                self.trigram_count += 1;
+                if let Some(summary) = self.occupied_words.get_mut(word_index >> 6) {
+                    *summary |= 1u64 << (word_index & 63);
+                }
+            }
         }
     }
 
     /// Hashes every distinct key seen into a filter sized for exactly that many keys, leaving the scratch empty for the
-    /// next build. The bitmap is cleared word by word as it is drained, so emptying it costs nothing beyond the walk
-    /// that finds its set bits.
+    /// next build. Only the bitmap words the summary marks as occupied are visited, and each is cleared as it is
+    /// drained, so emptying the bitmap costs nothing beyond the walk that finds its set bits.
     fn build_filter(&mut self) -> SplitBlockBloomFilter {
-        let key_count = self.other_hashes.len()
-            + self
-                .trigrams
-                .iter()
-                .map(|word| word.count_ones() as usize)
-                .sum::<usize>();
-        let trigram_hashes = self.trigrams.iter_mut().enumerate().flat_map(|(word_index, word)| {
-            let mut bits = std::mem::take(word);
+        let key_count = self.other_hashes.len() + self.trigram_count;
+        let trigrams = &mut self.trigrams;
+        let occupied_word_indexes = self
+            .occupied_words
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(summary_index, summary)| {
+                let mut occupied = std::mem::take(summary);
+                std::iter::from_fn(move || {
+                    if occupied == 0 {
+                        return None;
+                    }
+                    let word_index = (summary_index << 6) | occupied.trailing_zeros() as usize;
+                    occupied &= occupied - 1;
+                    Some(word_index)
+                })
+            });
+        let trigram_hashes = occupied_word_indexes.flat_map(|word_index| {
+            let mut bits = trigrams.get_mut(word_index).map(std::mem::take).unwrap_or(0);
             std::iter::from_fn(move || {
                 if bits == 0 {
                     return None;
@@ -358,6 +385,7 @@ impl BuildScratch {
             BITS_PER_TOKEN,
         );
         self.other_hashes.clear();
+        self.trigram_count = 0;
         filter
     }
 }
@@ -420,28 +448,20 @@ fn fold_for_ngrams(text: &str) -> Cow<'_, str> {
 /// Produces all n-grams of length `n` (character n-grams) from `text`. For `n = 3` (trigrams) this yields every
 /// 3-character window, which is the standard index for substring / `CONTAINS` predicates.
 ///
-/// Slides a window of `n + 1` char-boundary byte offsets (the sentinel `text.len()` standing in for the boundary past
-/// the last char) across `text` one position at a time, rather than first collecting every char's `(position, char)`
-/// pair into a `Vec` the size of the whole value — the window is the only state carried between steps.
+/// Walks two cursors over `text`'s char-boundary byte offsets (the sentinel `text.len()` standing in for the boundary
+/// past the last char), the second started `n` boundaries ahead of the first, and pairs them up into windows — the two
+/// cursors are the only state carried between steps, so nothing is allocated whatever `n` is.
 pub fn ngrams(text: &str, n: usize) -> impl Iterator<Item = &str> {
-    let mut boundaries = text
-        .char_indices()
+    char_boundaries(text)
+        .zip(char_boundaries(text).skip(n))
+        .map_while(move |(start, stop)| text.get(start..stop))
+}
+
+/// The byte offset of every char in `text`, followed by `text.len()` for the boundary past the last one.
+fn char_boundaries(text: &str) -> impl Iterator<Item = usize> {
+    text.char_indices()
         .map(|(pos, _)| pos)
-        .chain(std::iter::once(text.len()));
-    let mut window: VecDeque<usize> = (&mut boundaries).take(n + 1).collect();
-    std::iter::from_fn(move || {
-        if window.len() <= n {
-            return None;
-        }
-        let start = *window.front()?;
-        let stop = *window.get(n)?;
-        let ngram = text.get(start..stop);
-        window.pop_front();
-        if let Some(next) = boundaries.next() {
-            window.push_back(next);
-        }
-        ngram
-    })
+        .chain(std::iter::once(text.len()))
 }
 
 /// Hashes a token to a `u64` for insertion into / lookup in the backing filter. Uses the SplitMix64 finalizer seeded
