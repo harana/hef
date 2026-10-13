@@ -133,8 +133,8 @@ impl HefFile {
             })
             .collect::<Result<Vec<bool>, _>>()?;
         let aliased = !self.aliased_extents.is_empty();
-        let mut window: Vec<ScanGranule> = Vec::with_capacity(granule_ids.len());
-        let mut blocks: Vec<ScanBlock> = Vec::with_capacity(granule_ids.len().saturating_mul(column_ids.len()));
+        let mut window: Vec<ScanGranule> = Vec::new();
+        let mut blocks: Vec<ScanBlock> = Vec::new();
         let mut window_used = 0u64;
         for &granule_id in granule_ids {
             let row_count = self

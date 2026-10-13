@@ -209,3 +209,17 @@ fn anti_join_via_difference_matches_select_gather() {
         assert_eq!(rs.rank(physical), k as u64);
     }
 }
+
+#[test]
+fn from_bitmap_leaves_its_input_usable_and_agrees_with_from_packed_bits() {
+    let bits = [0b1010_0101u8, 0xff, 0x00, 0b0101_1010];
+    let source = RoaringRangeBitmap::from_packed_bits(&bits);
+    let borrowed = RankSelect::from_bitmap(&source);
+    let owned = RankSelect::from_packed_bits(&bits);
+    assert_eq!(source, RoaringRangeBitmap::from_packed_bits(&bits));
+    assert_eq!(borrowed.total(), owned.total());
+    for position in 0..=32 {
+        assert_eq!(borrowed.rank(position), owned.rank(position));
+        assert_eq!(borrowed.select(position), owned.select(position));
+    }
+}

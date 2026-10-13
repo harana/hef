@@ -277,3 +277,41 @@ fn seeding_the_cache_from_the_mirror_opens_its_files_with_no_tail_request() {
     mirror.seed_cache(&untouched, generation + 1, &[entry]);
     assert_eq!(untouched.memory_bytes(), 0);
 }
+
+#[test]
+fn seeding_shares_the_mirror_tail_with_every_cache_instead_of_copying_it() {
+    let (file_id, tail, entry) = built_tail(22);
+    let generation = 5;
+    let mirror = FooterMirror::open(&FooterMirror::build(generation, &[(file_id, tail.clone())])).unwrap();
+    let first = BlockCache::new(1 << 20, None);
+    let second = BlockCache::new(1 << 20, None);
+    mirror.seed_cache(&first, generation, std::slice::from_ref(&entry));
+    mirror.seed_cache(&first, generation, std::slice::from_ref(&entry));
+    mirror.seed_cache(&second, generation, std::slice::from_ref(&entry));
+    let range = entry.tail_range();
+    let key = BlockKey {
+        file_id,
+        kind: BlockKind::Footer,
+        len: range.len,
+        offset: range.start,
+        tenant_id: entry.tenant_id,
+    };
+    let held = mirror.shared_tail(file_id, generation).unwrap().clone();
+    let in_first = first.get(&key).unwrap();
+    let in_second = second.get(&key).unwrap();
+    assert!(Arc::ptr_eq(&held, &in_first));
+    assert!(Arc::ptr_eq(&held, &in_second));
+    assert_eq!(
+        first.memory_bytes(),
+        tail.len() as u64,
+        "repeated seeding replaces, never double-counts"
+    );
+
+    drop(held);
+    drop(mirror);
+    assert_eq!(
+        &first.get(&key).unwrap()[..],
+        &tail[..],
+        "the cache keeps the tail after the mirror is gone"
+    );
+}

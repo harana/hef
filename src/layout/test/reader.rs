@@ -137,6 +137,7 @@ fn file_with_mark(mark: ColumnMark, bytes: Vec<u8>, usable_optional_features: u6
         residual_seek_tables: DashMap::default(),
         shared_alphabets: HashMap::new(),
         shared_string_views: DashMap::new(),
+        stripe_position_by_id: HashMap::new(),
         stripe_relative: false,
         text_token_cache: DashMap::default(),
         text_token_indexes_by_key: HashMap::new(),
