@@ -233,12 +233,12 @@ fn state_chunks_go_up_create_only_and_a_stored_chunk_counts_as_stored() {
 
     state.insert(member(1_000), 99);
     let second = build_state_tree(&key, &state).unwrap();
-    let new = second.new_chunks(&first);
+    let new = second.new_chunks_iter(&first).count();
     assert_eq!(
         upload_state_chunks(&objects, &ledger, tenant, &second.chunks, &clock).unwrap(),
-        new.len()
+        new
     );
-    assert_eq!(objects.keys().len(), first.chunks.len() + new.len());
+    assert_eq!(objects.keys().len(), first.chunks.len() + new);
     let stored = ObjectStoreStateChunks {
         objects: &objects,
         tenant_id: tenant,
@@ -253,7 +253,7 @@ fn state_chunks_go_up_create_only_and_a_stored_chunk_counts_as_stored() {
     let third = build_state_tree(&key, &state).unwrap();
     objects.inject(ObjectFault::FailPutIfAbsent);
     assert!(matches!(
-        upload_state_chunks(&objects, &ledger, tenant, &third.new_chunks(&second), &clock),
+        upload_state_chunks(&objects, &ledger, tenant, third.new_chunks_iter(&second), &clock),
         Err(StateChunkError::Storage(_))
     ));
 }

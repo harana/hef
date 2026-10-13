@@ -61,15 +61,15 @@ pub(crate) fn upload_hef(
 /// written again. Returns how many chunks this call wrote.
 ///
 /// Pass the whole tree, or only the chunks its predecessor lacked
-/// ([`StateTree::new_chunks`](crate::artifacts::state_chunk::StateTree::new_chunks)) when that predecessor's root is
+/// ([`StateTree::new_chunks_iter`](crate::artifacts::state_chunk::StateTree::new_chunks_iter)) when that predecessor's root is
 /// recorded in a file of the head catalogue generation or was uploaded within the state chunk grace period: a sweep
 /// keeps exactly those. Fails with [`StateChunkError::BeingDeleted`] when a sweep is deleting one of the chunks;
 /// retry after the sweep.
-pub fn upload_state_chunks(
+pub fn upload_state_chunks<'a>(
     objects: &dyn ObjectStore,
     ledger: &dyn StateChunkLedger,
     tenant_id: TenantId,
-    chunks: &[SealedStateChunk],
+    chunks: impl IntoIterator<Item = &'a SealedStateChunk>,
     clock: &dyn Clock,
 ) -> Result<usize, StateChunkError> {
     let now = clock.now_nanos();

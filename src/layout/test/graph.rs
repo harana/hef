@@ -505,11 +505,13 @@ fn replaying_a_100k_member_room() {
         };
         state.insert(state_key, sn);
         let tree = build_state_tree(&key, &state).unwrap();
-        let new = match &previous {
-            Some(previous) => tree.new_chunks(previous),
-            None => tree.chunks.clone(),
+        state_chunk_bytes += match &previous {
+            Some(previous) => tree
+                .new_chunks_iter(previous)
+                .map(|chunk| chunk.bytes.len() as u64)
+                .sum::<u64>(),
+            None => tree.chunks.iter().map(|chunk| chunk.bytes.len() as u64).sum::<u64>(),
         };
-        state_chunk_bytes += new.iter().map(|chunk| chunk.bytes.len() as u64).sum::<u64>();
         roots.insert(sn, tree.root);
         previous = Some(tree);
     }
