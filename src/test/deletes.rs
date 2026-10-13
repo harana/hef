@@ -442,3 +442,118 @@ fn forged_deletion_vector_bytes_refuse_instead_of_decoding_wrong() {
     forged.extend_from_slice(&(1u64 << 33).to_le_bytes());
     assert!(decode_deletion_vector(&forged).is_err(), "decode bomb refuses");
 }
+
+/// The encoder as it stood before the positional form wrote runs directly: the ordinal array, or a
+/// `RoaringRangeBitmap` built from the runs, encoded, and appended after the tag.
+fn encoding_through_a_built_bitmap(vector: &DeletionVector) -> (DeletionVectorWireForm, Vec<u8>) {
+    let ordinals: Vec<u64> = vector.iter().collect();
+    if ordinals.len() < DELETION_VECTOR_ORDINAL_ARRAY_MAX as usize
+        && ordinals.iter().all(|ordinal| *ordinal <= u64::from(u32::MAX))
+    {
+        let mut out = vec![1u8];
+        out.extend_from_slice(&(ordinals.len() as u32).to_le_bytes());
+        for ordinal in ordinals {
+            out.extend_from_slice(&(ordinal as u32).to_le_bytes());
+        }
+        return (DeletionVectorWireForm::OrdinalArray, out);
+    }
+    let mut out = vec![2u8];
+    out.extend_from_slice(&RoaringRangeBitmap::from_ranges(vector.deleted_runs.iter().copied()).encode());
+    (DeletionVectorWireForm::PositionalRoaring, out)
+}
+
+/// Marks `ordinals` in a scrambled order, each one twice, so the result exercises out-of-order and repeated marks.
+fn scrambled_vector_of(ordinals: &[u64]) -> DeletionVector {
+    let mut order: Vec<u64> = ordinals.iter().chain(ordinals.iter()).copied().collect();
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    for i in (1..order.len()).rev() {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        order.swap(i, (state >> 33) as usize % (i + 1));
+    }
+    vector_of(&order)
+}
+
+fn assert_encodes_like_a_built_bitmap(name: &str, vector: &DeletionVector, form: DeletionVectorWireForm) {
+    let (actual_form, bytes) = encode_deletion_vector(vector);
+    let (expected_form, expected_bytes) = encoding_through_a_built_bitmap(vector);
+    assert_eq!(actual_form, form, "{name}: form");
+    assert_eq!(actual_form, expected_form, "{name}: form matches the reference");
+    assert_eq!(bytes, expected_bytes, "{name}: bytes match the reference");
+    if form == DeletionVectorWireForm::PositionalRoaring {
+        assert_eq!(
+            bytes.len(),
+            5 + 16 * vector.deleted_runs.len(),
+            "{name}: tag, count, and 16 bytes per run"
+        );
+    }
+    let decoded = decode_deletion_vector(&bytes).unwrap();
+    assert_eq!(decoded.deleted_runs, vector.deleted_runs, "{name}: round trip");
+    assert_eq!(
+        decoded.deleted_count(),
+        vector.deleted_count(),
+        "{name}: round-trip count"
+    );
+}
+
+#[test]
+fn the_positional_form_writes_the_same_bytes_as_a_built_bitmap() {
+    let array = DeletionVectorWireForm::OrdinalArray;
+    let roaring = DeletionVectorWireForm::PositionalRoaring;
+    let scattered = |count: u64| (0..count).map(|i| i * 2).collect::<Vec<_>>();
+
+    assert_encodes_like_a_built_bitmap("empty", &DeletionVector::new(), array);
+    assert_encodes_like_a_built_bitmap("sparse", &vector_of(&[3, 17, 4_000, 90_000]), array);
+    assert_encodes_like_a_built_bitmap("4095 rows", &vector_of(&scattered(4_095)), array);
+    assert_encodes_like_a_built_bitmap("4096 rows", &vector_of(&scattered(4_096)), roaring);
+    assert_encodes_like_a_built_bitmap("4097 rows", &vector_of(&scattered(4_097)), roaring);
+    assert_encodes_like_a_built_bitmap("4096 contiguous", &vector_of(&(0..4_096).collect::<Vec<_>>()), roaring);
+
+    let mut spans = DeletionVector::new();
+    spans.mark_range(RowRange {
+        start: 10,
+        end: 5_000_000,
+    });
+    spans.mark_range(RowRange {
+        start: 6_000_000,
+        end: 9_000_000,
+    });
+    spans.mark_range(RowRange {
+        start: 1 << 40,
+        end: (1 << 40) + 100,
+    });
+    assert_encodes_like_a_built_bitmap("long spans", &spans, roaring);
+
+    let mut disjoint = DeletionVector::new();
+    for i in 0..50_000u64 {
+        disjoint.mark_range(RowRange {
+            start: i * 10,
+            end: i * 10 + 1 + i % 7,
+        });
+    }
+    assert_eq!(disjoint.deleted_runs.len(), 50_000);
+    assert_encodes_like_a_built_bitmap("many disjoint runs", &disjoint, roaring);
+
+    let beyond_u32 = vector_of(&[5, u64::from(u32::MAX), u64::from(u32::MAX) + 1, u64::MAX - 1]);
+    assert_encodes_like_a_built_bitmap("ordinal above u32", &beyond_u32, roaring);
+}
+
+#[test]
+fn scrambled_and_repeated_marks_encode_to_the_same_bytes_as_sorted_marks() {
+    let mut ordinals: Vec<u64> = (0..3_000).map(|i| i * 3).collect();
+    ordinals.extend(10_000..12_000);
+    ordinals.push(u64::from(u32::MAX) + 7);
+    for count in [100, 4_095, 4_096, 4_097, ordinals.len()] {
+        let sorted = vector_of(&ordinals[..count]);
+        let scrambled = scrambled_vector_of(&ordinals[..count]);
+        let name = format!("{count} ordinals");
+        assert_eq!(
+            encode_deletion_vector(&scrambled),
+            encode_deletion_vector(&sorted),
+            "{name}"
+        );
+        let form = encode_deletion_vector(&sorted).0;
+        assert_encodes_like_a_built_bitmap(&name, &scrambled, form);
+    }
+}
