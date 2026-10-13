@@ -54,7 +54,7 @@ pub fn seal_subject_rows(rows: &mut [BuildRow], keys: &dyn SubjectKeyStore) -> R
 /// [`VariantValue::Object`]. Fields already sorted and unique are encoded where they lie; otherwise they are normalized
 /// the way an object map would hold them (sorted by name, the last of a repeated name wins).
 fn encode_object(fields: &[(FieldName, VariantValue)]) -> Result<EncodedPayload, SubjectPayloadError> {
-    if !fields.windows(2).all(|pair| *pair[0].0 < *pair[1].0) {
+    if !fields.iter().zip(fields.iter().skip(1)).all(|(a, b)| *a.0 < *b.0) {
         return encode(&VariantValue::Object(
             fields
                 .iter()
