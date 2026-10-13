@@ -7,16 +7,17 @@
 //! design, serves fresh ranges only from batches it has rebuilt and validated locally; there is no forwarding to
 //! another node.
 
-use super::batch::DecodedBatch;
+use super::batch::{DecodedBatch, DecodedEvent};
 use super::frame::HejFrameHeaderV1;
 use super::segment::{ReplayOutcome, ReplayedFrame};
 use super::{BLAKE3_LEN, FRAME_HEADER_LEN};
 use crate::error::FormatError;
-use crate::events::provenance::hex_lower;
+use crate::events::constant::{PROTOCOL_ID_BYTES, SIGNATURE_BYTES};
+use crate::events::provenance::{SignedEventProvenance, hex_lower_into};
 use crate::events::{SequenceRange, TenantId};
 use crate::file::bytes::slice;
 use crate::lifecycle::ManifestGeneration;
-use arrow_array::builder::FixedSizeBinaryBuilder;
+use arrow_array::builder::{FixedSizeBinaryBuilder, StringBuilder};
 use arrow_array::*;
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use std::collections::BTreeMap;
@@ -182,6 +183,9 @@ pub fn convert_frame(
     }
 
     let rows = decoded.events.len();
+    // Each text column's builder holds its rows' bytes from the start, so appending never regrows it.
+    let text =
+        |len: fn(&DecodedEvent<'_>) -> usize| StringBuilder::with_capacity(rows, decoded.events.iter().map(len).sum());
     let mut tenant_ids = FixedSizeBinaryBuilder::with_capacity(rows, UUID_BYTE_WIDTH);
     let mut epochs = Vec::with_capacity(rows);
     let mut sequences = Vec::with_capacity(rows);
@@ -190,16 +194,16 @@ pub fn convert_frame(
     let mut stream_sequences = Vec::with_capacity(rows);
     let mut occurred = Vec::with_capacity(rows);
     let mut ingested = Vec::with_capacity(rows);
-    let mut sources = Vec::with_capacity(rows);
-    let mut event_types = Vec::with_capacity(rows);
-    let mut entity_types = Vec::with_capacity(rows);
+    let mut sources = text(|event| event.source.len());
+    let mut event_types = text(|event| event.event_type.len());
+    let mut entity_types = text(|event| event.entity_type.len());
     let mut entity_hash_low = Vec::with_capacity(rows);
     let mut entity_hash_high = Vec::with_capacity(rows);
-    let mut entity_ids: Vec<Option<&str>> = Vec::with_capacity(rows);
+    let mut entity_ids = text(|event| event.entity_id.map_or(0, str::len));
     let mut actor_hash_low = Vec::with_capacity(rows);
-    let mut actor_ids: Vec<Option<&str>> = Vec::with_capacity(rows);
+    let mut actor_ids = text(|event| event.actor_id.map_or(0, str::len));
     let mut account_hash_low = Vec::with_capacity(rows);
-    let mut account_ids: Vec<Option<&str>> = Vec::with_capacity(rows);
+    let mut account_ids = text(|event| event.account_id.map_or(0, str::len));
     let mut trace_hash_low = Vec::with_capacity(rows);
     let mut schema_versions = Vec::with_capacity(rows);
     let mut payload_flags = Vec::with_capacity(rows);
@@ -207,13 +211,8 @@ pub fn convert_frame(
     let mut flags = Vec::with_capacity(rows);
     let mut dedupe_low = Vec::with_capacity(rows);
     let mut dedupe_high = Vec::with_capacity(rows);
-    let carries_provenance = decoded.events.iter().any(|event| event.provenance.is_some());
-    let mut author_pubkeys: Vec<Option<String>> = Vec::with_capacity(rows);
-    let mut signatures: Vec<Option<String>> = Vec::with_capacity(rows);
-    let mut signature_schemes: Vec<Option<&str>> = Vec::with_capacity(rows);
-    let mut protocol_event_ids: Vec<Option<String>> = Vec::with_capacity(rows);
-    let mut protocol_kinds: Vec<Option<i64>> = Vec::with_capacity(rows);
-    let mut claimed_at: Vec<Option<i64>> = Vec::with_capacity(rows);
+    let signed = decoded.events.iter().filter(|event| event.provenance.is_some()).count();
+    let mut provenance = (signed > 0).then(|| ProvenanceColumns::new(rows, signed));
 
     for (row_index, event) in decoded.events.iter().enumerate() {
         tenant_ids
@@ -233,16 +232,16 @@ pub fn convert_frame(
         stream_sequences.push(event.fixed.stream_sequence);
         occurred.push(event.fixed.occurred_at_physical);
         ingested.push(event.fixed.ingested_at_physical);
-        sources.push(event.source);
-        event_types.push(event.event_type);
-        entity_types.push(event.entity_type);
+        sources.append_value(event.source);
+        event_types.append_value(event.event_type);
+        entity_types.append_value(event.entity_type);
         entity_hash_low.push(event.fixed.entity_id_hash_low);
         entity_hash_high.push(event.fixed.entity_id_hash_high);
-        entity_ids.push(event.entity_id);
+        entity_ids.append_option(event.entity_id);
         actor_hash_low.push(event.fixed.actor_id_hash_low);
-        actor_ids.push(event.actor_id);
+        actor_ids.append_option(event.actor_id);
         account_hash_low.push(event.fixed.account_id_hash_low);
-        account_ids.push(event.account_id);
+        account_ids.append_option(event.account_id);
         trace_hash_low.push(event.fixed.trace_id_hash_low);
         schema_versions.push(event.fixed.schema_version);
         payload_flags.push(event.variable.payload_flags);
@@ -253,14 +252,8 @@ pub fn convert_frame(
         flags.push(event.fixed.flags);
         dedupe_low.push(event.fixed.dedupe_hash_low);
         dedupe_high.push(event.fixed.dedupe_hash_high);
-        if carries_provenance {
-            let signed = event.provenance.as_ref();
-            author_pubkeys.push(signed.map(|signed| hex_lower(&signed.author_pubkey)));
-            signatures.push(signed.map(|signed| hex_lower(&signed.signature)));
-            signature_schemes.push(signed.map(|signed| signed.scheme.as_str()));
-            protocol_event_ids.push(signed.map(|signed| hex_lower(&signed.protocol_event_id)));
-            protocol_kinds.push(signed.map(|signed| i64::from(signed.protocol_kind)));
-            claimed_at.push(signed.map(|signed| signed.claimed_at.physical_nanos()));
+        if let Some(provenance) = provenance.as_mut() {
+            provenance.append(event.provenance.as_ref());
         }
     }
 
@@ -273,16 +266,16 @@ pub fn convert_frame(
         Arc::new(UInt64Array::from(stream_sequences)),
         Arc::new(TimestampNanosecondArray::from(occurred).with_timezone("UTC")),
         Arc::new(TimestampNanosecondArray::from(ingested).with_timezone("UTC")),
-        Arc::new(StringArray::from(sources)),
-        Arc::new(StringArray::from(event_types)),
-        Arc::new(StringArray::from(entity_types)),
+        Arc::new(sources.finish()),
+        Arc::new(event_types.finish()),
+        Arc::new(entity_types.finish()),
         Arc::new(UInt64Array::from(entity_hash_low)),
         Arc::new(UInt64Array::from(entity_hash_high)),
-        Arc::new(StringArray::from(entity_ids)),
+        Arc::new(entity_ids.finish()),
         Arc::new(UInt64Array::from(actor_hash_low)),
-        Arc::new(StringArray::from(actor_ids)),
+        Arc::new(actor_ids.finish()),
         Arc::new(UInt64Array::from(account_hash_low)),
-        Arc::new(StringArray::from(account_ids)),
+        Arc::new(account_ids.finish()),
         Arc::new(UInt64Array::from(trace_hash_low)),
         Arc::new(UInt32Array::from(schema_versions)),
         Arc::new(UInt32Array::from(payload_flags)),
@@ -291,18 +284,12 @@ pub fn convert_frame(
         Arc::new(UInt64Array::from(dedupe_low)),
         Arc::new(UInt64Array::from(dedupe_high)),
     ];
-    let schema = if carries_provenance {
-        columns.extend::<Vec<ArrayRef>>(vec![
-            Arc::new(StringArray::from(author_pubkeys)),
-            Arc::new(StringArray::from(signatures)),
-            Arc::new(StringArray::from(signature_schemes)),
-            Arc::new(StringArray::from(protocol_event_ids)),
-            Arc::new(Int64Array::from(protocol_kinds)),
-            Arc::new(TimestampNanosecondArray::from(claimed_at).with_timezone("UTC")),
-        ]);
-        live_overlay_schema_with_provenance()
-    } else {
-        live_overlay_schema()
+    let schema = match provenance {
+        Some(provenance) => {
+            columns.extend(provenance.finish());
+            live_overlay_schema_with_provenance()
+        }
+        None => live_overlay_schema(),
     };
     let batch = RecordBatch::try_new(schema, columns).map_err(|_| FormatError::Structural {
         rule: "LiveOverlay RecordBatch construction failed",
@@ -326,6 +313,73 @@ pub fn convert_frame(
     };
     validate_segment(&segment, header)?;
     Ok(Some(segment))
+}
+
+/// The signed-event provenance columns of a frame holding at least one signed event, filled one row at a time. A
+/// frame with none never makes one, so an unsigned frame spends nothing on them.
+///
+/// See: hef-write-path/spec.md
+struct ProvenanceColumns {
+    author_pubkeys: StringBuilder,
+    claimed_at: Vec<Option<i64>>,
+    /// One buffer every hex value is encoded through on its way into its column, so no row allocates its own string.
+    hex: String,
+    protocol_event_ids: StringBuilder,
+    protocol_kinds: Vec<Option<i64>>,
+    signature_schemes: StringBuilder,
+    signatures: StringBuilder,
+}
+
+impl ProvenanceColumns {
+    /// Room for `rows` rows, `signed` of them signed.
+    fn new(rows: usize, signed: usize) -> Self {
+        let hex_of = |bytes: usize| StringBuilder::with_capacity(rows, signed.saturating_mul(2 * bytes));
+        Self {
+            author_pubkeys: hex_of(PROTOCOL_ID_BYTES),
+            claimed_at: Vec::with_capacity(rows),
+            hex: String::with_capacity(2 * SIGNATURE_BYTES),
+            protocol_event_ids: hex_of(PROTOCOL_ID_BYTES),
+            protocol_kinds: Vec::with_capacity(rows),
+            signature_schemes: StringBuilder::with_capacity(rows, 0),
+            signatures: hex_of(SIGNATURE_BYTES),
+        }
+    }
+
+    /// Adds one row: `signed`'s values, or a null in every column for an unsigned event.
+    fn append(&mut self, signed: Option<&SignedEventProvenance>) {
+        let Some(signed) = signed else {
+            self.author_pubkeys.append_null();
+            self.signatures.append_null();
+            self.signature_schemes.append_null();
+            self.protocol_event_ids.append_null();
+            self.protocol_kinds.push(None);
+            self.claimed_at.push(None);
+            return;
+        };
+        let mut append_hex = |column: &mut StringBuilder, bytes: &[u8]| {
+            self.hex.clear();
+            hex_lower_into(bytes, &mut self.hex);
+            column.append_value(&self.hex);
+        };
+        append_hex(&mut self.author_pubkeys, &signed.author_pubkey);
+        append_hex(&mut self.signatures, &signed.signature);
+        append_hex(&mut self.protocol_event_ids, &signed.protocol_event_id);
+        self.signature_schemes.append_value(signed.scheme.as_str());
+        self.protocol_kinds.push(Some(i64::from(signed.protocol_kind)));
+        self.claimed_at.push(Some(signed.claimed_at.physical_nanos()));
+    }
+
+    /// The finished columns, in the order the provenance schema lists them.
+    fn finish(mut self) -> [ArrayRef; 6] {
+        [
+            Arc::new(self.author_pubkeys.finish()),
+            Arc::new(self.signatures.finish()),
+            Arc::new(self.signature_schemes.finish()),
+            Arc::new(self.protocol_event_ids.finish()),
+            Arc::new(Int64Array::from(self.protocol_kinds)),
+            Arc::new(TimestampNanosecondArray::from(self.claimed_at).with_timezone("UTC")),
+        ]
+    }
 }
 
 /// The conversion-contract acceptance check: a reader rejects a segment whose Arrow row count differs from the frame's
@@ -399,7 +453,7 @@ impl LiveOverlayStore {
         let mut chain: Option<[u8; BLAKE3_LEN]> = None;
         // The ranges accepted so far, per tenant: sequence identity includes the tenant, so one tenant's frame never
         // arbitrates against another's identically numbered range.
-        let mut covered: Vec<(TenantId, SequenceRange)> = Vec::new();
+        let mut covered = BTreeMap::new();
         for ReplayedFrame {
             header, frame_bytes, ..
         } in &replay.frames
@@ -413,13 +467,9 @@ impl LiveOverlayStore {
                 first_sequence: header.first_sequence,
                 last_sequence: header.last_sequence,
             };
-            if covered
-                .iter()
-                .any(|(tenant_id, existing)| *tenant_id == header.tenant_id && existing.overlaps(&range))
-            {
+            if !claim_range(&mut covered, header.tenant_id, range) {
                 continue;
             }
-            covered.push((header.tenant_id, range));
             if header.is_void_record() {
                 self.publish_void(header.tenant_id, range);
                 continue;
@@ -507,6 +557,28 @@ impl LiveOverlayStore {
     pub fn segments(&self) -> impl Iterator<Item = &LiveOverlaySegment> {
         self.segments.values()
     }
+}
+
+/// Records `range` as `tenant_id`'s when no range already in `covered` overlaps it, and says whether it did. `covered`
+/// maps each accepted range's `(tenant, epoch, first sequence)` to its last sequence; its ranges never overlap, so only
+/// the nearest one starting at or before `range` and the nearest one starting after it can.
+fn claim_range(covered: &mut BTreeMap<(TenantId, u64, u64), u64>, tenant_id: TenantId, range: SequenceRange) -> bool {
+    let start = (tenant_id, range.epoch, range.first_sequence);
+    let same_epoch =
+        |(claimed_tenant, epoch, _): &(TenantId, u64, u64)| *claimed_tenant == tenant_id && *epoch == range.epoch;
+    let before = covered
+        .range(..=start)
+        .next_back()
+        .is_some_and(|(claimed, last)| same_epoch(claimed) && *last >= range.first_sequence);
+    let after = covered
+        .range(start..)
+        .next()
+        .is_some_and(|(claimed, _)| same_epoch(claimed) && claimed.2 <= range.last_sequence);
+    if before || after {
+        return false;
+    }
+    covered.insert(start, range.last_sequence);
+    true
 }
 
 #[cfg(test)]
