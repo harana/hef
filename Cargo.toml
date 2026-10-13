@@ -34,6 +34,7 @@ lz4_flex = "0.13.1"
 memchr = "2"
 miniz_oxide = "0.9.1"
 multiversion = "0.8"
+prost-reflect = "0.16.5"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -50,6 +51,8 @@ zstd = "0.13.3"
 
 [dev-dependencies]
 criterion = "0.8.2"
+prost = "0.14"
+prost-types = "0.14"
 rkyv = "0.8.18"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 tempfile = "3"
