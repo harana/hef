@@ -171,11 +171,10 @@ impl TextTokenIndex {
     /// Serializes the index to bytes (magic, flags, then the Bloom filter bytes). Pairs with
     /// [`TextTokenIndex::decode`].
     pub fn encode(&self) -> Vec<u8> {
-        let filter_bytes = self.filter.encode();
-        let mut out = Writer::with_capacity(TEXT_TOKEN_HEADER_BYTES + filter_bytes.len());
+        let mut out = Writer::with_capacity(TEXT_TOKEN_HEADER_BYTES + self.filter.encoded_len());
         out.put_u32(TEXT_TOKEN_MAGIC);
         out.put_u32(if self.has_ngrams { 1 } else { 0 });
-        out.put_slice(&filter_bytes);
+        self.filter.encode_into(&mut out);
         out.into_bytes()
     }
 

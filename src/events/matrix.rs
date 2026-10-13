@@ -238,12 +238,13 @@ fn redacted_canonical(rules: RoomRules, event: &Map<String, Value>) -> Result<Ve
 }
 
 fn content_digest(event: &Map<String, Value>) -> Result<[u8; 32], ProvenanceError> {
-    let mut stripped = event.clone();
-    stripped.remove("hashes");
-    stripped.remove("signatures");
-    stripped.remove("unsigned");
     let mut out = String::new();
-    push_canonical(&mut out, &Value::Object(stripped))?;
+    push_canonical_object(
+        &mut out,
+        event
+            .iter()
+            .filter(|(key, _)| !matches!(key.as_str(), "hashes" | "signatures" | "unsigned")),
+    )?;
     Ok(sha256_digest(out.as_bytes()))
 }
 
@@ -307,25 +308,30 @@ fn push_canonical(out: &mut String, value: &Value) -> Result<(), ProvenanceError
             }
             out.push(']');
         }
-        Value::Object(fields) => {
-            // Byte order of UTF-8 keys is code point order, which is what canonical JSON sorts by. Sorted here rather
-            // than trusting the map's own order, which depends on how serde_json was built.
-            let mut keys: Vec<&String> = fields.keys().collect();
-            keys.sort_unstable();
-            out.push('{');
-            for (index, key) in keys.into_iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                push_json_string(out, key);
-                out.push(':');
-                if let Some(field) = fields.get(key) {
-                    push_canonical(out, field)?;
-                }
-            }
-            out.push('}');
-        }
+        Value::Object(fields) => push_canonical_object(out, fields.iter())?,
     }
+    Ok(())
+}
+
+/// Appends an object made of `fields` in canonical JSON, borrowing each key and value.
+fn push_canonical_object<'a>(
+    out: &mut String,
+    fields: impl Iterator<Item = (&'a String, &'a Value)>,
+) -> Result<(), ProvenanceError> {
+    // Byte order of UTF-8 keys is code point order, which is what canonical JSON sorts by. Sorted here rather than
+    // trusting the map's own order, which depends on how serde_json was built.
+    let mut fields: Vec<(&String, &Value)> = fields.collect();
+    fields.sort_unstable_by_key(|(key, _)| *key);
+    out.push('{');
+    for (index, (key, field)) in fields.into_iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        push_json_string(out, key);
+        out.push(':');
+        push_canonical(out, field)?;
+    }
+    out.push('}');
     Ok(())
 }
 

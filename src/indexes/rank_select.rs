@@ -34,7 +34,6 @@ impl RankSelect {
         Self::from_runs(bitmap.ranges().to_vec())
     }
 
-    /// Builds the index over an owned, sorted run list, keeping that allocation rather than copying it.
     fn from_runs(runs: Vec<RowRange>) -> Self {
         let mut cumulative = Vec::with_capacity(runs.len());
         let mut acc = 0u64;

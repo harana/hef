@@ -96,9 +96,20 @@ impl NdvSketch {
     pub fn merge(&mut self, other: &NdvSketch) {
         match (&mut self.exact, &other.exact) {
             (Some(mine), Some(theirs)) => {
-                mine.extend(theirs.iter().copied());
-                if mine.len() > NDV_EXACT_MAX {
-                    self.exact = None;
+                if mine.len() + theirs.len() <= NDV_EXACT_MAX {
+                    mine.extend(theirs.iter().copied());
+                } else {
+                    let room = NDV_EXACT_MAX.saturating_sub(mine.len());
+                    let absent = theirs
+                        .iter()
+                        .filter(|hash| !mine.contains(*hash))
+                        .take(room + 1)
+                        .count();
+                    if absent > room {
+                        self.exact = None;
+                    } else {
+                        mine.extend(theirs.iter().copied());
+                    }
                 }
             }
             _ => self.exact = None,

@@ -378,3 +378,36 @@ fn difference_result_is_canonical() {
     // Empty b run has no effect; a should come back intact as one run.
     assert_eq!(diff.ranges(), &[RowRange { start: 0, end: 20 }]);
 }
+
+#[test]
+fn index_encode_matches_hand_built_bytes() {
+    let mut index = BitmapIndex::new();
+    index.insert(0, [0, 1, 2, 9]);
+    index.insert(u64::MAX, [5]);
+    let mut expected = Writer::new();
+    expected.put_u32(2);
+    for value in [0u64, u64::MAX] {
+        let block = index.bitmap(value).unwrap().encode();
+        expected.put_u64(value);
+        expected.put_u32(block.len() as u32);
+        expected.put_slice(&block);
+    }
+    assert_eq!(index.encode(), expected.into_bytes());
+    assert_eq!(BitmapIndex::new().encode(), vec![0, 0, 0, 0]);
+}
+
+#[test]
+fn from_ranges_merges_overlapping_touching_and_drops_empty() {
+    let r = |start, end| RowRange { end, start };
+    let bitmap = RoaringRangeBitmap::from_ranges([
+        r(10, 12),
+        r(0, 3),
+        r(3, 5),
+        r(7, 7),
+        r(11, 20),
+        r(u64::MAX - 1, u64::MAX),
+        r(0, 1),
+    ]);
+    assert_eq!(bitmap.ranges(), &[r(0, 5), r(10, 20), r(u64::MAX - 1, u64::MAX)]);
+    assert!(RoaringRangeBitmap::from_ranges([r(4, 4), r(9, 2)]).is_empty());
+}

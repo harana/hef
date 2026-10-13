@@ -5,9 +5,10 @@
 
 use crate::artifacts::batch::EncodedPayload;
 use crate::error::SubjectPayloadError;
-use crate::events::variant::{KeyDictionary, VariantValue, encode_value};
+use crate::events::variant::{KeyDictionary, VariantValue, encode_object_fields_into, encode_value};
+use crate::file::bytes::Writer;
 use crate::security::{SubjectKeyStore, seal_subject_payload};
-use crate::writer::build::{BuildPayload, BuildRow};
+use crate::writer::build::{BuildPayload, BuildRow, FieldName};
 use std::collections::BTreeSet;
 
 /// Seals the payload of every row that names a subject under that subject's key from `keys`, then clears the row's
@@ -34,12 +35,7 @@ pub fn seal_subject_rows(rows: &mut [BuildRow], keys: &dyn SubjectKeyStore) -> R
                 continue;
             }
             BuildPayload::Object(fields) => {
-                encoded_here = encode(&VariantValue::Object(
-                    fields
-                        .iter()
-                        .map(|(name, value)| (name.to_string(), value.clone()))
-                        .collect(),
-                ))?;
+                encoded_here = encode_object(fields)?;
                 &encoded_here
             }
             BuildPayload::Whole(value) => {
@@ -52,6 +48,36 @@ pub fn seal_subject_rows(rows: &mut [BuildRow], keys: &dyn SubjectKeyStore) -> R
         row.subject = None;
     }
     Ok(())
+}
+
+/// Encodes the object made of `fields`, giving the same bytes and dictionary as encoding the equivalent
+/// [`VariantValue::Object`]. Fields already sorted and unique are encoded where they lie; otherwise they are normalized
+/// the way an object map would hold them (sorted by name, the last of a repeated name wins).
+fn encode_object(fields: &[(FieldName, VariantValue)]) -> Result<EncodedPayload, SubjectPayloadError> {
+    if !fields.iter().zip(fields.iter().skip(1)).all(|(a, b)| *a.0 < *b.0) {
+        return encode(&VariantValue::Object(
+            fields
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.clone()))
+                .collect(),
+        ));
+    }
+    let mut keys = BTreeSet::new();
+    let borrowed: Vec<(&str, &VariantValue)> = fields
+        .iter()
+        .map(|(name, value)| {
+            keys.insert(&**name);
+            value.collect_keys(&mut keys);
+            (&**name, value)
+        })
+        .collect();
+    let dictionary = KeyDictionary::build(keys.into_iter().map(str::to_owned));
+    let mut out = Writer::new();
+    encode_object_fields_into(&borrowed, &dictionary, &mut out).map_err(SubjectPayloadError::Format)?;
+    Ok(EncodedPayload {
+        bytes: out.into_bytes(),
+        dictionary,
+    })
 }
 
 /// Encodes `value` against a key dictionary of exactly the keys it uses.

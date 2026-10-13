@@ -430,3 +430,19 @@ fn trigram_code_round_trips_through_its_hash() {
         );
     }
 }
+
+#[test]
+fn encode_matches_header_plus_standalone_filter_bytes() {
+    for (values, ngrams) in [
+        (vec![], false),
+        (vec!["hello world", "héllo wörld"], true),
+        (vec!["a"; 500], false),
+    ] {
+        let index = TextTokenIndex::build_from_values(&values, ngrams);
+        let mut expected = Writer::with_capacity(0);
+        expected.put_u32(TEXT_TOKEN_MAGIC);
+        expected.put_u32(u32::from(ngrams));
+        expected.put_slice(&index.filter.encode());
+        assert_eq!(index.encode(), expected.into_bytes());
+    }
+}

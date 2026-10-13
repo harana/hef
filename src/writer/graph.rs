@@ -79,12 +79,11 @@ pub fn resolve_graph(
 }
 
 /// The `prev` and `auth` references `row` declares, each with the edge kind it records, in declaration order.
-fn declared(row: &BuildRow) -> Vec<(EdgeKind, &RelationshipRef)> {
+fn declared(row: &BuildRow) -> impl Iterator<Item = (EdgeKind, &RelationshipRef)> + '_ {
     row.relationships
         .iter()
         .flat_map(|relationships| relationships.refs())
         .filter_map(|reference| Some((EdgeKind::of(reference.kind)?, reference)))
-        .collect()
 }
 
 #[cfg(test)]
