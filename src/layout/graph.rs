@@ -275,9 +275,17 @@ impl GranuleEdges {
     /// The children of event `sn` along `kind` edges: those in the same file in ascending order, then those from
     /// later files that compaction folded in, in ascending order. Empty for an event this granule does not hold.
     pub fn children(&self, sn: u64, kind: EdgeKind) -> Vec<u64> {
-        let mut children = self.reverse.edges(self.first_sn, sn, kind).to_vec();
-        children.extend_from_slice(self.inbound.edges(self.first_sn, sn, kind));
-        children
+        self.children_iter(sn, kind).collect()
+    }
+
+    /// The same children as [`children`](Self::children), in the same order, read straight from the decoded tables
+    /// without allocating. Empty for an event this granule does not hold.
+    pub fn children_iter(&self, sn: u64, kind: EdgeKind) -> impl Iterator<Item = u64> + '_ {
+        self.reverse
+            .edges(self.first_sn, sn, kind)
+            .iter()
+            .chain(self.inbound.edges(self.first_sn, sn, kind))
+            .copied()
     }
 
     /// The chain-cover label of event `sn`, or `None` when the file stores no labels or this granule does not hold
