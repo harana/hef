@@ -30,7 +30,11 @@ const NO_STORED_LEADING: u32 = u32::MAX;
 
 /// Writes `values` as one Chimp block.
 pub(super) fn encode_chimp(values: &[f64], out: &mut Writer) {
-    let mut bits = BitWriter::default();
+    out.put_u32(values.len() as u32);
+    let length_at = out.len();
+    out.put_u32(0);
+    let stream_start = out.len();
+    let mut bits = BitWriter::new(out);
     let mut previous = 0u64;
     let mut stored_leading = NO_STORED_LEADING;
     for (index, value) in values.iter().enumerate() {
@@ -66,16 +70,23 @@ pub(super) fn encode_chimp(values: &[f64], out: &mut Writer) {
             stored_leading = leading;
         }
     }
-    let stream = bits.finish();
-    out.put_u32(values.len() as u32);
-    out.put_u32(stream.len() as u32);
-    out.put_slice(&stream);
+    bits.finish();
+    let stream_len = out.len() - stream_start;
+    out.patch_u32(length_at, stream_len as u32);
 }
 
 /// Reads one Chimp block back into its values. Refuses a count the stream is too short to hold before allocating
 /// for it, a malformed control sequence, a stream that ends mid-value, and any bytes or set padding bits past the
 /// last value.
 pub(super) fn decode_chimp(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
+    decode_chimp_range(reader, 0, usize::MAX)
+}
+
+/// Reads one Chimp block but keeps only the values at positions `[start, end)`, clipped to the block, so a narrow
+/// read allocates for the values it returns rather than for the whole block. Every value is still decoded in order,
+/// and the block is checked exactly as [`decode_chimp`] checks it whatever range is asked for, so a fault before or
+/// after the range is still refused.
+pub(super) fn decode_chimp_range(reader: &mut Reader<'_>, start: usize, end: usize) -> Result<Vec<f64>, FormatError> {
     let count = reader.u32("chimp value count")? as usize;
     let len = reader.u32("chimp stream length")? as usize;
     let stream = reader.take(len, "chimp stream")?;
@@ -96,11 +107,14 @@ pub(super) fn decode_chimp(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatEr
         });
     }
     let mut bits = BitReader { bit: 0, bytes: stream };
-    let mut values = Vec::with_capacity(count);
+    let keep = start..end;
+    let mut values = Vec::with_capacity(end.min(count).saturating_sub(start));
     let mut previous = bits.take(64)?;
-    values.push(f64::from_bits(previous));
+    if keep.contains(&0) {
+        values.push(f64::from_bits(previous));
+    }
     let mut stored_leading = NO_STORED_LEADING;
-    for _ in 1..count {
+    for index in 1..count {
         let xor = match bits.take(2)? {
             0b00 => {
                 stored_leading = NO_STORED_LEADING;
@@ -132,7 +146,9 @@ pub(super) fn decode_chimp(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatEr
             }
         };
         previous ^= xor;
-        values.push(f64::from_bits(previous));
+        if keep.contains(&index) {
+            values.push(f64::from_bits(previous));
+        }
     }
     if bits.bit.div_ceil(8) != stream.len() || bits.padding()? != 0 {
         return Err(FormatError::Structural {
@@ -157,16 +173,23 @@ fn leading_zeros_for(code: u64) -> u32 {
     CHIMP_LEADING_ZEROS.get(code as usize).copied().unwrap_or(0)
 }
 
-/// Packs bit fields most significant bit first.
-#[derive(Default)]
-struct BitWriter {
+/// Packs bit fields most significant bit first, straight onto the end of the block being written.
+struct BitWriter<'a> {
     /// Holds the `pending` bits not yet written out, in its low bits; never more than seven between calls.
     accumulator: u128,
-    bytes: Vec<u8>,
+    out: &'a mut Writer,
     pending: u32,
 }
 
-impl BitWriter {
+impl<'a> BitWriter<'a> {
+    fn new(out: &'a mut Writer) -> Self {
+        Self {
+            accumulator: 0,
+            out,
+            pending: 0,
+        }
+    }
+
     /// Appends the low `width` bits of `value`, `width` at most 64.
     fn put(&mut self, value: u64, width: u32) {
         if width == 0 {
@@ -181,17 +204,16 @@ impl BitWriter {
         self.pending += width;
         while self.pending >= 8 {
             self.pending -= 8;
-            self.bytes.push((self.accumulator >> self.pending) as u8);
+            self.out.put_u8((self.accumulator >> self.pending) as u8);
         }
         self.accumulator &= (1u128 << self.pending) - 1;
     }
 
-    /// The packed bytes, the last one padded with zero bits.
-    fn finish(mut self) -> Vec<u8> {
+    /// Writes out the last, partly filled byte, padded with zero bits.
+    fn finish(self) {
         if self.pending > 0 {
-            self.bytes.push((self.accumulator << (8 - self.pending)) as u8);
+            self.out.put_u8((self.accumulator << (8 - self.pending)) as u8);
         }
-        self.bytes
     }
 }
 

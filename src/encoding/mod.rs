@@ -38,7 +38,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use zstd::{bulk::Compressor as ZstdCompressor, zstd_safe::compress_bound};
 
-use chimp::{decode_chimp, encode_chimp};
+use chimp::{decode_chimp, decode_chimp_range, encode_chimp};
 pub(crate) use presence::{PresenceRank, count_present_before, count_set_bits, present_position};
 use scratch::{with_arena_buffer, with_unpack_buffer};
 use sidecar::{PrefixKey, StringFingerprint};
@@ -4743,8 +4743,9 @@ fn slice_column_data(data: ColumnData, start: usize, end: usize) -> ColumnData {
 /// For ALP float blocks and FSST or raw string blocks this loads only the bytes that cover the requested rows: the
 /// FastLanes vectors that span `[start, end)` for ALP, and the value slice identified by the offset table for the two
 /// string arenas. Under the seekable Zstandard family those blocks go further and decompress only the frames that slice
-/// falls in, leaving the rest of the page compressed. All other encodings fall back to a full decode followed by a
-/// slice, since their formats do not carry per-row offsets.
+/// falls in, leaving the rest of the page compressed. Chimp float blocks still decode every value in order, but keep
+/// only the requested rows. All other encodings fall back to a full decode followed by a slice, since their formats do
+/// not carry per-row offsets.
 ///
 /// The result equals `decode_block(pipeline, bytes)[start..end]` in every case.
 pub fn decode_block_range(
@@ -4802,6 +4803,10 @@ pub fn decode_block_range_shared(
                     start,
                     end,
                 )?))
+            }
+            (ValueKind::F64, Transform::Chimp) => {
+                let mut reader = Reader::new(body);
+                Ok(ColumnData::F64(decode_chimp_range(&mut reader, start, end)?))
             }
             (ValueKind::String, Transform::DictionaryString) => Ok(ColumnData::Strings(
                 decode_dictionary_string_range(body, pipeline.side_stream()?, shared, start, end)?,
