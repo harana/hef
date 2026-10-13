@@ -234,19 +234,30 @@ impl SignerSignature {
 
     /// The stored text of several signatures: one entry per line, in the given order.
     pub fn join(signatures: &[SignerSignature]) -> String {
+        let mut out = String::new();
+        Self::join_into(signatures, &mut out);
+        out
+    }
+
+    /// [`join`](Self::join), appended to `out` after whatever it already holds, so a caller writing many rows can
+    /// reuse one buffer instead of allocating a fresh string per row.
+    pub(crate) fn join_into(signatures: &[SignerSignature], out: &mut String) {
         // One entry is its three text fields, four spaces, and both hex fields; entries are newline-separated.
         let length = signatures
             .iter()
-            .map(|entry| {
-                entry.scheme.as_str().len()
-                    + entry.signer.len()
-                    + entry.key_id.len()
-                    + 4
-                    + 2 * (PROTOCOL_ID_BYTES + SIGNATURE_BYTES)
-            })
-            .sum::<usize>()
-            + signatures.len().saturating_sub(1);
-        let mut out = String::with_capacity(length);
+            .try_fold(signatures.len().saturating_sub(1), |total, entry| {
+                entry
+                    .scheme
+                    .as_str()
+                    .len()
+                    .checked_add(entry.signer.len())?
+                    .checked_add(entry.key_id.len())?
+                    .checked_add(4 + 2 * (PROTOCOL_ID_BYTES + SIGNATURE_BYTES))?
+                    .checked_add(total)
+            });
+        if let Some(length) = length {
+            out.reserve(length);
+        }
         for (index, entry) in signatures.iter().enumerate() {
             if index > 0 {
                 out.push('\n');
@@ -257,11 +268,10 @@ impl SignerSignature {
             out.push(' ');
             out.push_str(&entry.key_id);
             out.push(' ');
-            hex_lower_into(&entry.public_key, &mut out);
+            hex_lower_into(&entry.public_key, out);
             out.push(' ');
-            hex_lower_into(&entry.signature, &mut out);
+            hex_lower_into(&entry.signature, out);
         }
-        out
     }
 
     /// Reads [`join`](Self::join)'s text back into its signatures.
