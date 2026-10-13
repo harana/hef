@@ -175,7 +175,7 @@ impl MemoryTier {
         let slot = *self.entries.get(key)?;
         self.unlink(slot);
         self.push_most_recent(slot);
-        self.slots[slot].bytes.clone()
+        self.slots.get(slot)?.bytes.clone()
     }
 
     fn insert(&mut self, key: BlockKey, bytes: Arc<[u8]>) {
@@ -186,8 +186,9 @@ impl MemoryTier {
         let slot = match self.entries.get(&key) {
             Some(&slot) => {
                 self.unlink(slot);
-                let replaced = self.slots[slot].bytes.replace(bytes);
-                self.held_bytes -= replaced.map_or(0, |replaced| replaced.len() as u64);
+                if let Some(replaced) = self.slots.get_mut(slot).and_then(|entry| entry.bytes.replace(bytes)) {
+                    self.held_bytes -= replaced.len() as u64;
+                }
                 slot
             }
             None => {
@@ -197,9 +198,13 @@ impl MemoryTier {
                     newer: None,
                     older: None,
                 };
-                let slot = match self.free_slots.pop() {
-                    Some(slot) => {
-                        self.slots[slot] = fresh;
+                let reused = self
+                    .free_slots
+                    .pop()
+                    .and_then(|slot| Some((slot, self.slots.get_mut(slot)?)));
+                let slot = match reused {
+                    Some((slot, entry)) => {
+                        *entry = fresh;
                         slot
                     }
                     None => {
@@ -218,8 +223,10 @@ impl MemoryTier {
             let Some(oldest) = self.least_recent.filter(|&oldest| oldest != slot) else {
                 break;
             };
-            let oldest_key = self.slots[oldest].key;
-            self.entries.remove(&oldest_key);
+            if let Some(entry) = self.slots.get(oldest) {
+                let oldest_key = entry.key;
+                self.entries.remove(&oldest_key);
+            }
             self.release(oldest);
         }
     }
@@ -227,29 +234,34 @@ impl MemoryTier {
     /// Unlinks a slot already removed from `entries`, gives back its bytes and keeps it for reuse.
     fn release(&mut self, slot: usize) {
         self.unlink(slot);
-        let bytes = self.slots[slot].bytes.take();
-        self.held_bytes -= bytes.map_or(0, |bytes| bytes.len() as u64);
+        if let Some(bytes) = self.slots.get_mut(slot).and_then(|entry| entry.bytes.take()) {
+            self.held_bytes -= bytes.len() as u64;
+        }
         self.free_slots.push(slot);
     }
 
     fn unlink(&mut self, slot: usize) {
-        let MemorySlot { newer, older, .. } = self.slots[slot];
-        match newer {
-            Some(newer) => self.slots[newer].older = older,
+        let Some(entry) = self.slots.get_mut(slot) else {
+            return;
+        };
+        let (newer, older) = (entry.newer.take(), entry.older.take());
+        match newer.and_then(|newer| self.slots.get_mut(newer)) {
+            Some(entry) => entry.older = older,
             None => self.most_recent = older,
         }
-        match older {
-            Some(older) => self.slots[older].newer = newer,
+        match older.and_then(|older| self.slots.get_mut(older)) {
+            Some(entry) => entry.newer = newer,
             None => self.least_recent = newer,
         }
-        self.slots[slot].newer = None;
-        self.slots[slot].older = None;
     }
 
     fn push_most_recent(&mut self, slot: usize) {
-        self.slots[slot].older = self.most_recent;
-        match self.most_recent {
-            Some(previous) => self.slots[previous].newer = Some(slot),
+        let most_recent = self.most_recent;
+        if let Some(entry) = self.slots.get_mut(slot) {
+            entry.older = most_recent;
+        }
+        match most_recent.and_then(|previous| self.slots.get_mut(previous)) {
+            Some(entry) => entry.newer = Some(slot),
             None => self.least_recent = Some(slot),
         }
         self.most_recent = Some(slot);

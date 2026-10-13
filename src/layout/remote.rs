@@ -923,7 +923,7 @@ impl RemoteGraph {
             }
             latencies.len().min(GRAPH_HEDGE_SAMPLES)
         };
-        let samples = &mut buffer[..count];
+        let samples = buffer.get_mut(..count).unwrap_or_default();
         let rank = (count * 95).div_ceil(100).saturating_sub(1);
         (*samples.select_nth_unstable(rank).1).max(floor)
     }

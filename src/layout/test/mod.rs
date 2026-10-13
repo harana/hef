@@ -1,5 +1,6 @@
 use super::*;
 use crate::events::TenantId;
+use crate::file::bytes::Writer;
 use crate::typed_id::TypedIdTestExt;
 
 /// A header for a file spanning epochs `min_epoch..=max_epoch`, starting at `min_sequence` in its first epoch and ending
@@ -293,12 +294,12 @@ fn the_xor_float_bit_is_known_but_declared_only_by_files_that_use_it() {
 #[test]
 fn presence_run_and_position_forms_encode_exact_bytes() {
     let encode = |presence: &[u8], rows: u32| {
-        let mut out = crate::file::bytes::Writer::new();
+        let mut out = Writer::new();
         super::encode_presence(presence, rows, &mut out);
         out.into_bytes()
     };
     let words = |tag: u8, values: &[u32]| {
-        let mut out = crate::file::bytes::Writer::new();
+        let mut out = Writer::new();
         out.put_u8(tag);
         for &value in values {
             out.put_u32(value);
