@@ -2,17 +2,23 @@
 //!
 //! Every accepted body is converted to the canonical value before it is written to the journal; the original source
 //! bytes are not kept, unless the stream opts into the raw-payload column that stores them beside the canonical value.
-//! JSON, Protobuf, and raw-bytes converters are wired up; Protobuf decodes against the message schema the ingest route
-//! registered for the stream. The Avro and MessagePack converters land with the connector-service work (design D7). The single-format rule is already
-//! enforced everywhere: the journal rejects every other payload encoding.
+//! JSON, Protobuf, rkyv, and raw-bytes converters are wired up; Protobuf decodes against the message schema the ingest
+//! route registered for the stream, and an rkyv body is an archived [`VariantValue`]. The Avro and MessagePack
+//! converters land with the connector-service work (design D7). The single-format rule is already enforced everywhere:
+//! the journal rejects every other payload encoding.
 
+use super::constant::RKYV_MAX_SUBTREE_DEPTH;
 use super::envelope::TimestampValue;
-use super::variant::{MAX_DEPTH, VariantValue};
+use super::variant::{ArchivedVariantValue, MAX_DEPTH, VariantValue};
 use crate::error::FormatError;
 use prost_reflect::{DynamicMessage, EnumDescriptor, MapKey, MessageDescriptor, ReflectMessage, Value};
+use rkyv::rancor::Error as RkyvError;
+use rkyv::util::AlignedVec;
+use rkyv::validation::{Validator, archive::ArchiveValidator, shared::SharedValidator};
 use serde::de::{Deserialize, DeserializeSeed, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::num::NonZeroUsize;
 
 /// Source formats accepted at the ingest edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +28,8 @@ pub enum SourceFormat<'a> {
     Protobuf(&'a MessageDescriptor),
     /// Raw or undecodable binary bodies: stored as a single Variant binary scalar.
     RawBytes,
+    /// A [`VariantValue`] serialized with `rkyv::to_bytes`, validated before it is read.
+    Rkyv,
 }
 
 /// Transcodes one source body into the canonical variant value. Deterministic: object keys collect into the shared
@@ -61,6 +69,40 @@ pub fn transcode_with_scratch(
             protobuf_message(message)
         }
         SourceFormat::RawBytes => Ok(VariantValue::Binary(body.to_vec())),
+        SourceFormat::Rkyv => rkyv_body(body),
+    }
+}
+
+/// Validates an archived [`VariantValue`] and reads it out. rkyv reads values in place, so the body is first copied
+/// to an address aligned for the archive's widest field. Validation follows at most [`RKYV_MAX_SUBTREE_DEPTH`]
+/// nested hops, so a hostile body cannot exhaust the stack, and a value nested past [`MAX_DEPTH`] is refused as JSON's
+/// is.
+fn rkyv_body(body: &[u8]) -> Result<VariantValue, FormatError> {
+    let mut aligned = AlignedVec::<16>::with_capacity(body.len());
+    aligned.extend_from_slice(body);
+    let mut validator = Validator::new(
+        ArchiveValidator::with_max_depth(&aligned, NonZeroUsize::new(RKYV_MAX_SUBTREE_DEPTH)),
+        SharedValidator::new(),
+    );
+    let value = rkyv::api::access_with_context::<ArchivedVariantValue, _, RkyvError>(&aligned, &mut validator)
+        .and_then(rkyv::deserialize::<VariantValue, RkyvError>)
+        .map_err(|_| FormatError::Structural {
+            rule: "declared-rkyv ingest body is not a valid archived variant value",
+        })?;
+    if nesting_depth(&value) > MAX_DEPTH {
+        return Err(FormatError::Structural {
+            rule: "declared-rkyv ingest body exceeds the maximum nesting depth",
+        });
+    }
+    Ok(value)
+}
+
+/// How many arrays and objects deep `value` nests; a scalar is 0.
+fn nesting_depth(value: &VariantValue) -> usize {
+    match value {
+        VariantValue::Array(items) => 1 + items.iter().map(nesting_depth).max().unwrap_or(0),
+        VariantValue::Object(fields) => 1 + fields.values().map(nesting_depth).max().unwrap_or(0),
+        _ => 0,
     }
 }
 

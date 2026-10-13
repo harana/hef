@@ -21,7 +21,9 @@ pub struct StreamId(pub u64);
 
 /// A timestamp-like logical value. Physically encoded as signed nanoseconds since Unix epoch UTC; the logical name
 /// stays unit-neutral.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, rkyv::Archive, rkyv::Deserialize, rkyv::Serialize,
+)]
 pub struct TimestampValue {
     physical_nanos: i64,
 }

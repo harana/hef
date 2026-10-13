@@ -1,6 +1,6 @@
 //! Byte-length constants for the signature schemes signed protocol events are verified against, shared between the
 //! live provenance code and its deterministic test signer, plus the bounds on external identifiers and the Matrix
-//! room versions the engine re-verifies.
+//! room versions the engine re-verifies, and the stack bound on validating an rkyv ingest body.
 
 /// The byte length of a public key, a protocol event id, or any other 32-byte value this scheme hashes, hashes over,
 /// or keys with: BIP-340's x-only public keys, the SHA-256 digests they sign, and secp256k1 private-key scalars are
@@ -24,3 +24,8 @@ pub const MATRIX_MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
 
 /// The Matrix room versions whose redaction and event-id rules this engine re-verifies, oldest first.
 pub const MATRIX_ROOM_VERSIONS: [&str; 11] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"];
+
+/// How many out-of-line hops (into a nested array, object B-tree node, or long string) rkyv validation follows down
+/// one path of an ingest body before refusing it. Validation recurses once per hop, so this bounds its stack use; it
+/// leaves room for a value nested to the variant depth limit with several hops per level.
+pub const RKYV_MAX_SUBTREE_DEPTH: usize = 1024;

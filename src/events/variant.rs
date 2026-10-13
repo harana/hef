@@ -134,9 +134,17 @@ impl KeyDictionary {
 }
 
 /// A decoded (or to-be-encoded) variant value. Objects are key-sorted, so encoding is deterministic.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// A Rust producer can send it as an ingest body as is: serialize it with `rkyv::to_bytes` and ingest the bytes as
+/// [`SourceFormat::Rkyv`](super::transcode::SourceFormat::Rkyv).
+#[derive(Debug, Clone, PartialEq, rkyv::Archive, rkyv::Deserialize, rkyv::Serialize)]
+#[rkyv(
+    bytecheck(bounds(__C: rkyv::validation::ArchiveContext)),
+    deserialize_bounds(__D::Error: rkyv::rancor::Source),
+    serialize_bounds(__S: rkyv::ser::Writer + rkyv::ser::Allocator, __S::Error: rkyv::rancor::Source)
+)]
 pub enum VariantValue {
-    Array(Vec<VariantValue>),
+    Array(#[rkyv(omit_bounds)] Vec<VariantValue>),
     Binary(Vec<u8>),
     Bool(bool),
     Decimal { unscaled: i128, scale: u8 },
@@ -144,7 +152,7 @@ pub enum VariantValue {
     Float(f32),
     Int(i64),
     Null,
-    Object(BTreeMap<String, VariantValue>),
+    Object(#[rkyv(omit_bounds)] BTreeMap<String, VariantValue>),
     String(String),
     Timestamp(TimestampValue),
     Uuid(u128),

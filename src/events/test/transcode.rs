@@ -1,3 +1,4 @@
+use super::super::constant::RKYV_MAX_SUBTREE_DEPTH;
 use super::super::envelope::TimestampValue;
 use super::super::variant::{KeyDictionary, MAX_DEPTH, VariantValue, encode_value};
 use super::{SourceFormat, transcode};
@@ -398,4 +399,127 @@ fn protobuf_keeps_deeply_nested_messages() {
         }
     }
     assert_eq!(depth, 92);
+}
+
+fn nested_arrays(depth: usize) -> VariantValue {
+    let mut value = VariantValue::Int(1);
+    for _ in 0..depth {
+        value = VariantValue::Array(vec![value]);
+    }
+    value
+}
+
+fn rkyv_bytes(value: &VariantValue) -> Vec<u8> {
+    rkyv::to_bytes::<rkyv::rancor::Error>(value).unwrap().to_vec()
+}
+
+#[test]
+fn rkyv_body_reads_back_every_value_kind() {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "array".to_owned(),
+        VariantValue::Array(vec![VariantValue::Null, VariantValue::Bool(true)]),
+    );
+    fields.insert("binary".to_owned(), VariantValue::Binary(vec![0, 1, 0xff]));
+    fields.insert(
+        "decimal".to_owned(),
+        VariantValue::Decimal {
+            unscaled: i128::MIN,
+            scale: 7,
+        },
+    );
+    fields.insert("double".to_owned(), VariantValue::Double(-2.5));
+    fields.insert("float".to_owned(), VariantValue::Float(1.25));
+    fields.insert("int".to_owned(), VariantValue::Int(i64::MAX));
+    fields.insert(
+        "string".to_owned(),
+        VariantValue::String("a string longer than the inline limit".to_owned()),
+    );
+    fields.insert(
+        "timestamp".to_owned(),
+        VariantValue::Timestamp(TimestampValue::from_physical_nanos(-1)),
+    );
+    fields.insert("uuid".to_owned(), VariantValue::Uuid(u128::MAX - 1));
+    let value = VariantValue::Object(fields);
+    let body = rkyv_bytes(&value);
+    assert_eq!(transcode(SourceFormat::Rkyv, &body).unwrap(), value);
+
+    // The caller's bytes need not be aligned: start them one byte into a buffer.
+    let mut shifted = vec![0];
+    shifted.extend_from_slice(&body);
+    assert_eq!(transcode(SourceFormat::Rkyv, shifted.get(1..).unwrap()).unwrap(), value);
+}
+
+#[test]
+fn rkyv_body_that_does_not_validate_is_rejected() {
+    let error = transcode(SourceFormat::Rkyv, b"not an archive").unwrap_err();
+    assert!(matches!(
+        error,
+        FormatError::Structural {
+            rule: "declared-rkyv ingest body is not a valid archived variant value"
+        }
+    ));
+    let mut body = rkyv_bytes(&VariantValue::String(
+        "a string longer than the inline limit".to_owned(),
+    ));
+    let text = body.iter().position(|&byte| byte == b'a').unwrap();
+    body[text] = 0xff;
+    assert!(transcode(SourceFormat::Rkyv, &body).is_err());
+}
+
+#[test]
+fn rkyv_nesting_boundary_matches_the_variant_depth_limit() {
+    // Wide objects with long keys take several validation hops per level; MAX_DEPTH of them must still fit.
+    let mut value = VariantValue::Int(1);
+    for _ in 0..MAX_DEPTH {
+        let mut fields = BTreeMap::new();
+        for key in 0..200 {
+            fields.insert(
+                format!("a key longer than the inline limit {key:03}"),
+                VariantValue::Null,
+            );
+        }
+        fields.insert("next".to_owned(), value);
+        value = VariantValue::Object(fields);
+    }
+    let accepted = transcode(SourceFormat::Rkyv, &rkyv_bytes(&value)).unwrap();
+    let mut keys = std::collections::BTreeSet::new();
+    accepted.collect_keys(&mut keys);
+    let dictionary = KeyDictionary::build(keys.into_iter().map(str::to_owned));
+    assert!(encode_value(&accepted, &dictionary).is_ok());
+
+    let error = transcode(SourceFormat::Rkyv, &rkyv_bytes(&nested_arrays(MAX_DEPTH + 1))).unwrap_err();
+    assert!(matches!(
+        error,
+        FormatError::Structural {
+            rule: "declared-rkyv ingest body exceeds the maximum nesting depth"
+        }
+    ));
+}
+
+#[test]
+fn deeply_nested_rkyv_body_is_rejected_without_exhausting_the_stack() {
+    // Just under the validation bound: validated and read back on the test thread's stack, then refused for depth.
+    let near_bound = rkyv_bytes(&nested_arrays(RKYV_MAX_SUBTREE_DEPTH - 2));
+    assert!(transcode(SourceFormat::Rkyv, &near_bound).is_err());
+
+    // Far past it: building the body needs a deep stack, refusing it does not.
+    let hostile = std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(|| {
+            let value = nested_arrays(20 * RKYV_MAX_SUBTREE_DEPTH);
+            let body = rkyv_bytes(&value);
+            drop(value);
+            body
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let error = transcode(SourceFormat::Rkyv, &hostile).unwrap_err();
+    assert!(matches!(
+        error,
+        FormatError::Structural {
+            rule: "declared-rkyv ingest body is not a valid archived variant value"
+        }
+    ));
 }
