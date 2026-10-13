@@ -10,7 +10,7 @@ use super::error::LeaseError;
 use crate::artifacts::watermark::FIRST_SEQUENCE;
 use crate::events::SequenceRange;
 use hashbrown::HashSet;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, ops::Bound};
 
 /// The low-load force-commit idle target: 50 µs internal maximum unless benchmark gates prove a better value. Not an
 /// operator knob.
@@ -106,6 +106,21 @@ impl SequenceAllocator {
             .filter(|(_, lease)| now_monotonic_nanos > lease.deadline_monotonic_nanos)
             .map(|(id, lease)| (*id, lease.range))
             .collect()
+    }
+
+    /// The first lease with an id greater than `after` (or the first of all, when `after` is `None`) whose deadline
+    /// has passed at `now_monotonic_nanos`, without removing it. Lets a caller walk expired leases one at a time with
+    /// only a cursor, instead of copying every expired lease up front.
+    pub(crate) fn next_expired_after(
+        &self,
+        now_monotonic_nanos: u64,
+        after: Option<u64>,
+    ) -> Option<(u64, SequenceRange)> {
+        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+        self.outstanding
+            .range((start, Bound::Unbounded))
+            .find(|(_, lease)| now_monotonic_nanos > lease.deadline_monotonic_nanos)
+            .map(|(id, lease)| (*id, lease.range))
     }
 
     /// Retires a lease once its abandoned range has been closed by a durable void record, returning that range. Fails

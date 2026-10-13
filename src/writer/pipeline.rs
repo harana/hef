@@ -538,7 +538,10 @@ impl WorkerCommitPipeline {
     ) -> Result<Vec<SequenceRange>, FlushError> {
         let now = clock.now_nanos();
         let mut voided = Vec::new();
-        for (lease_id, range) in allocator.expired_leases(clock.monotonic_nanos()) {
+        let cutoff = clock.monotonic_nanos();
+        let mut cursor = None;
+        while let Some((lease_id, range)) = allocator.next_expired_after(cutoff, cursor) {
+            cursor = Some(lease_id);
             let durable_batch_id = self.durable_batch_counter + 1;
             let writer_local_batch_id = self.writer_local_batch_counter + 1;
             let frame_bytes = build_frame(
