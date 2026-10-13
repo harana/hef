@@ -1183,3 +1183,53 @@ fn a_scan_fans_out_only_over_several_granules_worth_a_worker_each() {
     assert!(!scan_in_parallel(8, PARALLEL_SCAN_MIN_GRANULE_BYTES - 1));
     assert!(scan_in_parallel(2, PARALLEL_SCAN_MIN_GRANULE_BYTES));
 }
+
+/// Multi-needle and case-insensitive matching gives the same verdict as checking each needle on its own, on both sides
+/// of the one-word stack mark (63/64/65 needles) and well past it, with repeated, overlapping and empty needles, empty
+/// values and multibyte text.
+#[test]
+fn multi_needle_matching_agrees_with_per_needle_checks_across_mark_sizes() {
+    let contains_each = |needles: &[String], value: &str, fold: bool| {
+        let value = if fold {
+            value.to_ascii_lowercase()
+        } else {
+            value.to_owned()
+        };
+        needles.iter().all(|needle| {
+            let needle = if fold {
+                needle.to_ascii_lowercase()
+            } else {
+                needle.clone()
+            };
+            value.contains(&needle)
+        })
+    };
+    let all: String = (0..200).map(|i| format!("<{i}>")).collect();
+    let values = [
+        String::new(),
+        all.clone(),
+        all.to_ascii_uppercase(),
+        all.replace("<64>", ""),
+        format!("\u{e9}\u{e9}{all}\u{1F600}"),
+        "abcabc".to_owned(),
+    ];
+    for count in [1usize, 2, 63, 64, 65, 130] {
+        let mut needles: Vec<String> = (0..count).map(|i| format!("<{}>", i % 66)).collect();
+        if count > 1 {
+            needles[count - 1] = String::new();
+        }
+        for case_insensitive in [false, true] {
+            let matcher = ContainsMatcher::new(needles.clone(), case_insensitive);
+            for value in &values {
+                assert_eq!(
+                    matcher.matches(value),
+                    contains_each(&needles, value, case_insensitive),
+                    "{count} needles, case-insensitive {case_insensitive}"
+                );
+            }
+        }
+    }
+    let overlapping = ContainsMatcher::new(vec!["abca".to_owned(), "cab".to_owned(), "\u{e9}".to_owned()], true);
+    assert!(!overlapping.matches("abcabc"));
+    assert!(overlapping.matches("ABCABC\u{e9}"));
+}

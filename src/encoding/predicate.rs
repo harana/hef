@@ -130,12 +130,22 @@ impl ContainsMatcher {
         }
     }
 
+    /// Up to 64 needles mark into one word on the stack, so the common query allocates nothing per value; larger
+    /// needle sets fall back to a heap mark of exactly the words they need.
     fn matches_automaton(&self, automaton: &AhoCorasick, value: &[u8]) -> bool {
-        let mut seen = vec![0u64; self.mark_words()];
-        for hit in automaton.find_overlapping_iter(value) {
-            set_bit(&mut seen, hit.pattern().as_usize());
+        match self.mark_words() {
+            0 | 1 => self.marks_every_needle(automaton, value, &mut [0u64; 1]),
+            words => self.marks_every_needle(automaton, value, &mut vec![0u64; words]),
         }
-        all_bits_set(&seen, self.needles.len())
+    }
+
+    /// Marks each needle `automaton` finds in `value` into `seen`, all clear on entry, and reports whether every
+    /// needle was found.
+    fn marks_every_needle(&self, automaton: &AhoCorasick, value: &[u8], seen: &mut [u64]) -> bool {
+        for hit in automaton.find_overlapping_iter(value) {
+            set_bit(seen, hit.pattern().as_usize());
+        }
+        all_bits_set(seen, self.needles.len())
     }
 
     /// How many 64-bit words hold one value's "which needles were seen" mark.
