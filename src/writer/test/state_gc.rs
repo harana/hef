@@ -97,13 +97,13 @@ fn world() -> World {
         roots: RootsByFile(HashMap::new()),
     };
     upload(&world, &world.old.chunks).unwrap();
-    upload(&world, &world.new.new_chunks(&world.old)).unwrap();
+    upload(&world, world.new.new_chunks_iter(&world.old)).unwrap();
     let mut world = world;
     world.roots.0.insert(1, vec![world.new.root]);
     world
 }
 
-fn upload(world: &World, chunks: &[SealedStateChunk]) -> Result<usize, StateChunkError> {
+fn upload<'a>(world: &World, chunks: impl IntoIterator<Item = &'a SealedStateChunk>) -> Result<usize, StateChunkError> {
     upload_state_chunks(&world.objects, &world.ledger, tenant(), chunks, &world.clock)
 }
 
@@ -123,8 +123,7 @@ fn sweep(world: &World) -> Result<StateChunkSweep, StateChunkError> {
 fn orphans(world: &World) -> Vec<[u8; 32]> {
     let mut orphans: Vec<[u8; 32]> = world
         .old
-        .new_chunks(&world.new)
-        .iter()
+        .new_chunks_iter(&world.new)
         .map(|chunk| chunk.address)
         .collect();
     orphans.sort_unstable();

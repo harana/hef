@@ -135,7 +135,7 @@ fn a_one_key_change_rewrites_one_to_three_chunks() {
     let mut removed = state;
     removed.remove(&member(77));
     for changed in [updated, inserted, removed] {
-        let new = build(&changed).new_chunks(&base).len();
+        let new = build(&changed).new_chunks_iter(&base).count();
         assert!((1..=3).contains(&new), "{new} chunks rewritten");
     }
 }
@@ -649,4 +649,18 @@ fn descent_bytes(store: &CountingChunks, root: &StateRoot, state_key: StateKey) 
             }
         }
     }
+}
+
+#[test]
+fn borrowed_new_chunks_match_owned_new_chunks() {
+    let state: BTreeMap<StateKey, u64> = (0..5_000).map(|user| (member(user), u64::from(user))).collect();
+    let base = build(&state);
+    let mut changed = state;
+    changed.insert(member(2_500), 9);
+    changed.insert(member(9_000), 9);
+    let after = build(&changed);
+    let borrowed: Vec<SealedStateChunk> = after.new_chunks_iter(&base).cloned().collect();
+    assert!(!borrowed.is_empty());
+    assert_eq!(borrowed, after.new_chunks(&base));
+    assert_eq!(after.new_chunks_iter(&after).count(), 0);
 }
