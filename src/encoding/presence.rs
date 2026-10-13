@@ -53,39 +53,51 @@ pub(crate) fn present_position(bitmap: &[u8], row: usize) -> Option<usize> {
 
 /// Answers "does this row carry a value, and where does that value sit" for a presence bitmap probed many times over.
 ///
-/// Built in one pass, it holds the running present-count at each byte of the bitmap, so a probe costs one table read
-/// plus a popcount of the row's own byte. Counting the prefix per probe instead costs the whole prefix each time,
-/// which over a granule's rows is quadratic in the row count.
+/// Built in one pass, it holds the running present-count at each 64-bit word of the bitmap, so a probe costs one table
+/// read plus a popcount of the bits ahead of the row in its own word. Counting the prefix per probe instead costs the
+/// whole prefix each time, which over a granule's rows is quadratic in the row count.
 ///
 /// See: hef-encodings-and-compression/spec.md
 #[derive(Debug)]
 pub(crate) struct PresenceRank {
-    present_before_byte: Vec<u32>,
+    /// One entry per eight bitmap bytes; the last word may be partial.
+    present_before_word: Vec<u32>,
 }
 
 impl PresenceRank {
     /// Indexes `bitmap`, which every later probe must pass back in.
     pub(crate) fn new(bitmap: &[u8]) -> Self {
-        let mut present_before_byte = Vec::with_capacity(bitmap.len());
+        let mut present_before_word = Vec::with_capacity(bitmap.len().div_ceil(8));
         let mut running = 0u32;
-        for byte in bitmap {
-            present_before_byte.push(running);
-            running += byte.count_ones();
+        for word in bitmap.chunks(8) {
+            present_before_word.push(running);
+            running += load_word(word).count_ones();
         }
-        Self { present_before_byte }
+        Self { present_before_word }
     }
 
     /// The dense position of `row` among the present rows of `bitmap` — the bitmap this rank was built over — or
     /// `None` when the row carries no value.
     pub(crate) fn position(&self, bitmap: &[u8], row: usize) -> Option<usize> {
         let byte = *bitmap.get(row / 8)?;
-        let bit = 1u8 << (row % 8);
-        if byte & bit == 0 {
+        if byte & (1u8 << (row % 8)) == 0 {
             return None;
         }
-        let before_byte = *self.present_before_byte.get(row / 8)? as usize;
-        Some(before_byte + (byte & (bit - 1)).count_ones() as usize)
+        let word_index = row / 64;
+        let before_word = *self.present_before_word.get(word_index)? as usize;
+        let start = word_index * 8;
+        let word = load_word(bitmap.get(start..(start + 8).min(bitmap.len()))?);
+        let below_row = (1u64 << (row % 64)) - 1;
+        Some(before_word + (word & below_row).count_ones() as usize)
     }
+}
+
+/// Reads up to eight bitmap bytes as one little-endian word, so bit `n` of the word is bit `n % 8` of byte `n / 8`; a
+/// short final chunk is padded with unset bits.
+fn load_word(bytes: &[u8]) -> u64 {
+    let mut word = [0u8; 8];
+    word[..bytes.len()].copy_from_slice(bytes);
+    u64::from_le_bytes(word)
 }
 
 #[cfg(test)]

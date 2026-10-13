@@ -236,6 +236,127 @@ fn out_of_range_targets_are_refused() {
     assert_eq!(edges.children(10, EdgeKind::Prev), [11]);
 }
 
+/// The targets one table resolves to when they are collected into their own vector, as the decoder once did: no
+/// source is counted for a table with no edges, every slot's source is counted for one with edges (an empty slot's
+/// too), and each delta is resolved and checked in slot order. `None` where that decode refuses the table.
+fn targets_in_a_separate_vector(
+    offsets: &[u64],
+    deltas: &[i64],
+    first_sn: u64,
+    allowed: &dyn Fn(u64, u64) -> bool,
+) -> Option<Vec<u64>> {
+    let mut targets = Vec::with_capacity(deltas.len());
+    if deltas.is_empty() {
+        return Some(targets);
+    }
+    for (slot, pair) in offsets.windows(2).enumerate() {
+        let source = first_sn.checked_add((slot / GRAPH_EDGE_KINDS) as u64)?;
+        for &delta in &deltas[pair[0] as usize..pair[1] as usize] {
+            let target = u64::try_from(i128::from(source) - i128::from(delta))
+                .ok()
+                .filter(|&target| allowed(source, target))?;
+            targets.push(target);
+        }
+    }
+    Some(targets)
+}
+
+/// Rebuilding targets inside the decoded delta buffer gives exactly the tables, and the refusals, that collecting them
+/// into a second vector gives, over pseudo-random blocks: empty and fanned-out slots, sources near zero and near
+/// `u64::MAX` (where an empty slot's source can overflow), extreme deltas, and targets at 0 and `u64::MAX`.
+#[test]
+fn targets_rebuilt_in_place_match_a_separate_target_vector() {
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move |bound: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % bound
+    };
+    let (mut accepted, mut refused) = (0, 0);
+    for case in 0..4000 {
+        // A clean case writes only deltas its table can accept, so most clean blocks decode; a noisy one mixes in
+        // extremes and slots with no acceptable target, so most noisy blocks are refused.
+        let noisy = next(2) == 0;
+        let rows = next(6) as u32 + 1;
+        let first_sn = [0, 10, 1 << 40, u64::MAX - 3][next(4) as usize];
+        let file_end_sn = first_sn.saturating_add(u64::from(rows));
+        let rules: [&dyn Fn(u64, u64) -> bool; 3] = [
+            &|source: u64, target: u64| target < source,
+            &|source: u64, target: u64| source < target && target < file_end_sn,
+            &|_: u64, target: u64| target >= file_end_sn,
+        ];
+        let mut tables: Vec<(Vec<u64>, Vec<i64>)> = Vec::new();
+        for table in 0..3 {
+            let mut offsets = vec![0u64];
+            let mut deltas = Vec::new();
+            for slot in 0..rows as usize * GRAPH_EDGE_KINDS {
+                let source = first_sn.wrapping_add((slot / GRAPH_EDGE_KINDS) as u64);
+                let to = |target: u64| i64::try_from(i128::from(source) - i128::from(target)).unwrap_or(i64::MIN);
+                let reachable = match table {
+                    0 => source > 0,
+                    1 => source.saturating_add(1) < file_end_sn,
+                    _ => true,
+                };
+                let fan_out = if !noisy && !reachable {
+                    0
+                } else if next(8) == 0 {
+                    6
+                } else {
+                    next(4).saturating_sub(1)
+                };
+                for _ in 0..fan_out {
+                    let delta = match (noisy.then(|| next(10)), table) {
+                        (Some(0), _) => i64::MIN,
+                        (Some(1), _) => i64::MAX,
+                        (Some(2), _) => to(0),
+                        (Some(3), _) => to(u64::MAX),
+                        (_, 0) => to(source.saturating_sub(1 + next(8))),
+                        (_, 1) => to(source.saturating_add(1 + next(8)).min(file_end_sn.saturating_sub(1))),
+                        _ => to(file_end_sn.saturating_add(next(8))),
+                    };
+                    deltas.push(delta);
+                }
+                offsets.push(deltas.len() as u64);
+            }
+            tables.push((offsets, deltas));
+        }
+        let block = raw_block([
+            (tables[0].0.as_slice(), tables[0].1.as_slice()),
+            (tables[1].0.as_slice(), tables[1].1.as_slice()),
+            (tables[2].0.as_slice(), tables[2].1.as_slice()),
+        ]);
+        let expected: Option<Vec<Vec<u64>>> = tables
+            .iter()
+            .zip(rules)
+            .map(|((offsets, deltas), allowed)| targets_in_a_separate_vector(offsets, deltas, first_sn, allowed))
+            .collect();
+        let decoded = decode_granule_edges(&block, first_sn, rows, file_end_sn, false);
+        match expected {
+            Some(targets) => {
+                let edges = decoded.unwrap_or_else(|error| panic!("case {case}: {error:?}"));
+                let csrs = [&edges.forward, &edges.reverse, &edges.inbound];
+                for ((csr, (offsets, _)), targets) in csrs.into_iter().zip(&tables).zip(targets) {
+                    assert_eq!(&csr.offsets, offsets, "case {case}");
+                    assert_eq!(csr.targets, targets, "case {case}");
+                }
+                accepted += 1;
+            }
+            None => {
+                assert!(
+                    matches!(decoded, Err(FormatError::RefOutOfRange { .. })),
+                    "case {case}: {decoded:?}"
+                );
+                refused += 1;
+            }
+        }
+    }
+    assert!(
+        accepted >= 200 && refused >= 200,
+        "accepted {accepted}, refused {refused}"
+    );
+}
+
 fn graph_config(rows_per_granule: usize, graph: Option<GraphInput>) -> HefBuildConfig {
     let mut config = source_form_config(rows_per_granule);
     config.graph = graph;
