@@ -869,7 +869,9 @@ fn decode_csr(
             rule: "graph targets must hold exactly the edge count",
         });
     }
-    let mut targets = Vec::with_capacity(deltas.len());
+    // Each delta is overwritten by its target in place: the i64 buffer is reinterpreted as u64 rather than copied into
+    // a second, freshly allocated vector. The offsets checked above give every element exactly one slot.
+    let mut targets: Vec<u64> = bytemuck::cast_vec(deltas);
     for (slot, pair) in offsets.windows(2).enumerate() {
         let (Some(&start), Some(&end)) = (pair.first(), pair.last()) else {
             continue;
@@ -879,14 +881,14 @@ fn decode_csr(
             .ok_or(FormatError::RefOutOfRange {
                 what: "graph event sequence number",
             })?;
-        for &delta in deltas.get(start as usize..end as usize).unwrap_or_default() {
-            let target = u64::try_from(i128::from(source) - i128::from(delta))
+        for word in targets.get_mut(start as usize..end as usize).unwrap_or_default() {
+            let delta = *word as i64;
+            *word = u64::try_from(i128::from(source) - i128::from(delta))
                 .ok()
                 .filter(|&target| allowed(source, target))
                 .ok_or(FormatError::RefOutOfRange {
                     what: "graph edge target",
                 })?;
-            targets.push(target);
         }
     }
     Ok(Csr { offsets, targets })
