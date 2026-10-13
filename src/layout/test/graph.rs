@@ -107,6 +107,22 @@ fn edges_round_trip_through_granule_blocks() {
 }
 
 #[test]
+fn borrowed_children_match_the_collected_children() {
+    let granules = decoded(&graph());
+    for granule in &granules {
+        for sn in 95..210 {
+            for kind in [EdgeKind::Auth, EdgeKind::Prev] {
+                assert_eq!(
+                    granule.children_iter(sn, kind).collect::<Vec<_>>(),
+                    granule.children(sn, kind),
+                    "event {sn} {kind:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn a_graph_that_breaks_a_rule_is_refused() {
     let cases: Vec<(&str, GraphBreak)> = vec![
         ("parent not earlier", Box::new(|g| g.rows[2].prev = vec![102])),
