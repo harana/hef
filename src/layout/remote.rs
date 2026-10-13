@@ -912,19 +912,20 @@ impl RemoteGraph {
     /// below the caller's floor, and the floor alone until enough batches have been timed.
     fn hedge_delay(&self) -> u64 {
         let floor = self.options.hedge_floor_nanos;
-        let mut samples: Vec<u64> = self
-            .latencies
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .copied()
-            .collect();
-        if samples.len() < GRAPH_HEDGE_MIN_SAMPLES {
-            return floor;
-        }
-        samples.sort_unstable();
-        let rank = (samples.len() * 95).div_ceil(100).saturating_sub(1);
-        samples.get(rank).copied().unwrap_or(floor).max(floor)
+        let mut buffer = [0u64; GRAPH_HEDGE_SAMPLES];
+        let count = {
+            let latencies = self.latencies.lock().unwrap_or_else(PoisonError::into_inner);
+            if latencies.len() < GRAPH_HEDGE_MIN_SAMPLES {
+                return floor;
+            }
+            for (slot, sample) in buffer.iter_mut().zip(latencies.iter()) {
+                *slot = *sample;
+            }
+            latencies.len().min(GRAPH_HEDGE_SAMPLES)
+        };
+        let samples = buffer.get_mut(..count).unwrap_or_default();
+        let rank = (count * 95).div_ceil(100).saturating_sub(1);
+        (*samples.select_nth_unstable(rank).1).max(floor)
     }
 
     fn record(&self, nanos: i64) {

@@ -25,7 +25,7 @@ const MIRROR_SECTION_FIXED_OVERHEAD_BYTES: usize = 56;
 #[derive(Debug)]
 struct MirrorSection {
     generation: u64,
-    tail_bytes: Vec<u8>,
+    tail_bytes: Arc<[u8]>,
 }
 
 /// An opened footer-mirror object: every section that passed its own BLAKE3 check, keyed by `file_id`. A section
@@ -77,7 +77,7 @@ impl FooterMirror {
                     file_id,
                     MirrorSection {
                         generation,
-                        tail_bytes: tail_bytes.to_vec(),
+                        tail_bytes: Arc::from(tail_bytes),
                     },
                 );
             }
@@ -93,7 +93,7 @@ impl FooterMirror {
     pub fn seed_cache(&self, cache: &BlockCache, generation: u64, entries: &[HefFileEntry]) {
         for entry in entries {
             let range = entry.tail_range();
-            if let Some(tail_bytes) = self.tail_bytes(entry.file_id, generation)
+            if let Some(tail_bytes) = self.shared_tail(entry.file_id, generation)
                 && range.exact
                 && tail_bytes.len() as u64 == range.len
             {
@@ -104,7 +104,7 @@ impl FooterMirror {
                     offset: range.start,
                     tenant_id: entry.tenant_id,
                 };
-                cache.insert(key, Arc::from(tail_bytes));
+                cache.insert(key, Arc::clone(tail_bytes));
             }
         }
     }
@@ -113,10 +113,16 @@ impl FooterMirror {
     /// signal [`open_footer`] needs to decide whether to use the mirror or fall back to a per-file tail read (a
     /// section whose BLAKE3 failed to verify was already dropped by [`FooterMirror::open`]).
     fn tail_bytes(&self, file_id: u128, generation: u64) -> Option<&[u8]> {
+        self.shared_tail(file_id, generation).map(|tail| &tail[..])
+    }
+
+    /// The same tail as [`FooterMirror::tail_bytes`], as the shared buffer the mirror holds, so seeding a cache hands
+    /// it over without copying.
+    fn shared_tail(&self, file_id: u128, generation: u64) -> Option<&Arc<[u8]>> {
         self.sections
             .get(&file_id)
             .filter(|section| section.generation == generation)
-            .map(|section| section.tail_bytes.as_slice())
+            .map(|section| &section.tail_bytes)
     }
 }
 

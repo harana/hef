@@ -236,35 +236,40 @@ impl HefFile {
             });
         }
         let range = from_nanos..to_nanos;
-        let mut buckets: BTreeMap<i64, FloatAggregate> = BTreeMap::new();
         let rollups = self.time_series_rollups().and_then(|rollups| {
             let column = rollups.column_ids.binary_search(&column_id).ok()?;
             (rollups.bucket_nanos == bucket_nanos).then_some((rollups, column))
         });
+        let mut buckets: BTreeMap<i64, FloatAggregate> = BTreeMap::new();
+        let mut total = FloatAggregate::default();
         match rollups {
             Some((rollups, column)) => {
                 let width = i128::from(bucket_nanos);
                 let (from, to) = (i128::from(from_nanos), i128::from(to_nanos));
-                for bucket in &rollups.buckets {
-                    let start = i128::from(bucket.bucket) * width;
-                    let end = start + width;
-                    if end <= from || to <= start {
-                        continue;
-                    }
-                    if from <= start && end <= to {
-                        let aggregate = bucket.aggregates.get(column).copied().unwrap_or_default();
-                        buckets.insert(bucket.bucket, aggregate);
+                let start = |bucket: &RollupBucket| i128::from(bucket.bucket) * width;
+                let first = rollups.buckets.partition_point(|bucket| start(bucket) + width <= from);
+                let last = rollups.buckets.partition_point(|bucket| start(bucket) < to);
+                // The buckets are in time order, so merging each as it comes keeps the bucket totals in time order.
+                for bucket in rollups.buckets.get(first..last).unwrap_or_default() {
+                    let start = start(bucket);
+                    if from <= start && start + width <= to {
+                        total.merge(&bucket.aggregates.get(column).copied().unwrap_or_default());
                     } else {
                         let rows = bucket.first_row_ordinal..bucket.first_row_ordinal + bucket.row_count;
                         self.scan_buckets(column_id, &rows, &range, bucket_nanos, &mut buckets)?;
+                        for aggregate in buckets.values() {
+                            total.merge(aggregate);
+                        }
+                        buckets.clear();
                     }
                 }
             }
-            None => self.scan_buckets(column_id, &(0..u64::MAX), &range, bucket_nanos, &mut buckets)?,
-        }
-        let mut total = FloatAggregate::default();
-        for aggregate in buckets.values() {
-            total.merge(aggregate);
+            None => {
+                self.scan_buckets(column_id, &(0..u64::MAX), &range, bucket_nanos, &mut buckets)?;
+                for aggregate in buckets.values() {
+                    total.merge(aggregate);
+                }
+            }
         }
         Ok(total)
     }

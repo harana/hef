@@ -54,7 +54,17 @@ fn an_external_id_finds_its_row_through_the_index() {
         "the newest row answers"
     );
     assert_eq!(file.external_id(1).unwrap(), None);
-    assert_eq!(file.external_ids().unwrap().len(), 5);
+    assert_eq!(
+        file.external_ids().unwrap(),
+        vec![
+            (0, b"$first".to_vec()),
+            (2, long_id.clone()),
+            (3, b"$dup".to_vec()),
+            (4, b"$last".to_vec()),
+            (5, b"$dup".to_vec()),
+        ],
+        "every granule's ids, in row order, duplicates kept and missing ids skipped"
+    );
 }
 
 #[test]
@@ -397,4 +407,65 @@ fn external_id_lookup_against_sqlite() {
     }
     let lookup = started.elapsed() / probes as u32;
     println!("sqlite: {size} B, built in {build_time:?}; per lookup: whole row {lookup:?}");
+}
+
+fn visited(read: &ColumnRead, row_count: usize) -> Vec<(usize, String)> {
+    let mut seen = Vec::new();
+    for_each_present_string(read, row_count, |row, text| {
+        seen.push((row, text.to_string()));
+        Ok(())
+    })
+    .unwrap();
+    seen
+}
+
+#[test]
+fn present_strings_walk_dense_and_presence_gated_blocks_in_row_order() {
+    let mut dense = StringColumn::new();
+    dense.push(Some("a"));
+    dense.push(None);
+    dense.push(Some("c"));
+    let read = ColumnRead {
+        data: ColumnData::Strings(dense),
+        presence: Vec::new(),
+    };
+    assert_eq!(visited(&read, 3), vec![(0, "a".into()), (2, "c".into())]);
+
+    let mut sparse = StringColumn::new();
+    sparse.push(Some("h"));
+    sparse.push(None);
+    sparse.push(Some("j"));
+    let read = ColumnRead {
+        data: ColumnData::Strings(sparse),
+        presence: vec![0b1000_0000, 0b0000_0011],
+    };
+    assert_eq!(
+        visited(&read, 20),
+        vec![(7, "h".into()), (9, "j".into())],
+        "a present None still consumes its dense entry; rows past the bitmap are absent"
+    );
+
+    let read = ColumnRead {
+        data: ColumnData::Strings(StringColumn::new()),
+        presence: vec![0xff],
+    };
+    assert_eq!(visited(&read, 8), vec![], "missing dense entries are skipped");
+}
+
+#[test]
+fn present_strings_stop_at_the_first_error() {
+    let mut dense = StringColumn::new();
+    dense.push(Some("a"));
+    dense.push(Some("b"));
+    let read = ColumnRead {
+        data: ColumnData::Strings(dense),
+        presence: Vec::new(),
+    };
+    let mut calls = 0;
+    let result = for_each_present_string(&read, 2, |_, _| {
+        calls += 1;
+        Err(FormatError::Structural { rule: "stop" })
+    });
+    assert!(result.is_err());
+    assert_eq!(calls, 1);
 }

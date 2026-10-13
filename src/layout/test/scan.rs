@@ -305,3 +305,26 @@ fn projected_scan_of_nothing_is_empty_but_well_formed() {
     .unwrap();
     assert_eq!(delivered, 0);
 }
+
+/// Duplicate granule and column IDs come back as asked, once per mention and in order, whether the scan runs as one
+/// window or as many one-granule windows.
+#[test]
+fn projected_scan_repeats_duplicate_ids_across_many_windows() {
+    let file = file(40, 6);
+    let columns = all_columns(&file);
+    let first = *columns.first().unwrap();
+    let asked_columns = vec![first, first];
+    let granules = all_granules(&file);
+    let asked_granules: Vec<u32> = granules.iter().chain(&granules).copied().collect();
+    for window_bytes in [1, SCAN_WINDOW_BYTES] {
+        let batches = collect(&file, &asked_columns, &asked_granules, false, window_bytes).unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.granule_id).collect::<Vec<_>>(),
+            asked_granules
+        );
+        for batch in &batches {
+            assert_eq!(batch.columns.len(), 2);
+            assert_eq!(flatten(&batch.columns[0]), flatten(&batch.columns[1]));
+        }
+    }
+}

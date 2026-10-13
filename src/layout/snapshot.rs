@@ -205,11 +205,7 @@ impl HefFile {
         };
         for granule in footer.granules.get(candidates).unwrap_or_default() {
             // Fetches the granule's whole stripe in one request; every read below is then served from it.
-            if let Some(stripe) = footer
-                .stripes
-                .iter()
-                .find(|stripe| stripe.stripe_id == granule.stripe_id)
-            {
+            if let Some(stripe) = self.stripe_by_id(granule.stripe_id) {
                 self.data(stripe.file_offset as usize, stripe.byte_len as usize, "snapshot stripe")?;
             }
             let first_row = granule.first_row_ordinal;

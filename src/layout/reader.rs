@@ -1089,9 +1089,7 @@ impl HefFooter {
         }
         if fetched_start == 0 && fetched_end == stripe.byte_len {
             // The whole stripe is in hand: its checksum is the seal-authenticated root itself, so hash it directly.
-            let matches = crate::file::integrity::hash_segments(&[fetched])
-                .first()
-                .is_some_and(|root| root.as_bytes() == checksum);
+            let matches = crate::file::integrity::hash_tree(fetched).as_bytes() == checksum;
             if !matches {
                 return Err(RangeFault::Corrupt);
             }
@@ -1651,11 +1649,7 @@ impl StripeVerification {
             Some(matches) => *matches,
             None => {
                 let stripe_bytes = slice(bytes, stripe.file_offset as usize, stripe.byte_len as usize, "stripe")?;
-                *slot.get_or_init(|| {
-                    crate::file::integrity::hash_segments(&[stripe_bytes])
-                        .first()
-                        .is_some_and(|root| root.as_bytes() == checksum)
-                })
+                *slot.get_or_init(|| crate::file::integrity::hash_tree(stripe_bytes).as_bytes() == checksum)
             }
         };
         if matches {
@@ -1772,6 +1766,9 @@ pub struct HefFile {
     /// bytes per frame, so a whole file's worth costs far less than the decoded blocks `column_cache` budgets, and is
     /// bounded by the file's own granule count.
     residual_seek_tables: DashMap<u32, Arc<SeekTable>, ahash::RandomState>,
+    /// Where each stripe id sits in the footer's stripe directory, built once at open so a lookup by id never scans
+    /// the directory. When an id repeats, the first entry wins, as a front-to-back scan would.
+    stripe_position_by_id: HashMap<u32, usize>,
     /// True when the file declares `STRIPE_RELATIVE_MARKS`: mark, page, and payload-arena offsets are measured from
     /// their stripe's base rather than the start of the file.
     stripe_relative: bool,
@@ -2084,6 +2081,10 @@ impl HefFile {
             .iter()
             .map(|stripe| (stripe.stripe_id, stripe.file_offset))
             .collect();
+        let mut stripe_position_by_id: HashMap<u32, usize> = HashMap::with_capacity(footer.stripes.len());
+        for (position, stripe) in footer.stripes.iter().enumerate() {
+            stripe_position_by_id.entry(stripe.stripe_id).or_insert(position);
+        }
         let stripe_relative = footer.required_feature_flags & required_features::STRIPE_RELATIVE_MARKS != 0;
         // Under stripe-relative marks, a granule's offsets are measured from its stripe's base. A granule whose stripe
         // id is missing from the directory has no base to add back, so its reads would silently fall back to file
@@ -2162,6 +2163,7 @@ impl HefFile {
             residual_seek_tables: DashMap::default(),
             shared_alphabets,
             shared_string_views: DashMap::default(),
+            stripe_position_by_id,
             stripe_relative,
             text_token_cache: DashMap::default(),
             text_token_indexes_by_key,
@@ -3691,6 +3693,14 @@ impl HefFile {
         let mut count = self.point_probe_counts.entry((column_id, granule_id)).or_insert(0);
         *count = count.saturating_add(1);
         *count
+    }
+
+    /// The stripe directory entry for `stripe_id`, or `None` when the directory has no such stripe. Looks it up in
+    /// a table built at open, so the cost does not grow with the number of stripes.
+    pub(crate) fn stripe_by_id(&self, stripe_id: u32) -> Option<&StripeEntry> {
+        self.stripe_position_by_id
+            .get(&stripe_id)
+            .and_then(|&position| self.footer().stripes.get(position))
     }
 
     /// Late-materialized payload reconstruction for one final matching row: the deterministic merge of shredded typed

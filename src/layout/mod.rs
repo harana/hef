@@ -73,42 +73,50 @@ pub fn encode_presence(presence: &[u8], row_count: u32, out: &mut Writer) {
         return;
     }
     let rows = row_count as usize;
-    let set: Vec<usize> = (0..rows)
-        .filter(|row| presence.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0))
-        .collect();
-    if set.len() == rows {
+    let is_set = |row: usize| presence.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0);
+    let (mut set_count, mut run_count) = (0usize, 0usize);
+    for row in 0..rows {
+        if is_set(row) {
+            set_count += 1;
+            if row == 0 || !is_set(row - 1) {
+                run_count += 1;
+            }
+        }
+    }
+    if set_count == rows {
         out.put_u8(presence_forms::ALL_PRESENT);
         return;
     }
-    if set.is_empty() {
+    if set_count == 0 {
         out.put_u8(presence_forms::ALL_ABSENT);
         return;
     }
-    let mut runs: Vec<(u32, u32)> = Vec::new();
-    for &row in &set {
-        match runs.last_mut() {
-            Some((start, len)) if *start as usize + *len as usize == row => *len += 1,
-            _ => runs.push((row as u32, 1)),
-        }
-    }
     let raw_size = 4 + presence.len();
-    let runs_size = 4 + runs.len() * 8;
-    let positions_size = 4 + set.len() * 4;
+    let runs_size = 4 + run_count * 8;
+    let positions_size = 4 + set_count * 4;
     if raw_size <= runs_size && raw_size <= positions_size {
         out.put_u8(presence_forms::RAW);
         out.put_u32(presence.len() as u32);
         out.put_slice(presence);
     } else if runs_size <= positions_size {
         out.put_u8(presence_forms::SET_RUNS);
-        out.put_u32(runs.len() as u32);
-        for (start, len) in runs {
-            out.put_u32(start);
-            out.put_u32(len);
+        out.put_u32(run_count as u32);
+        let mut start = None;
+        for row in 0..=rows {
+            match (start, row < rows && is_set(row)) {
+                (None, true) => start = Some(row),
+                (Some(first), false) => {
+                    out.put_u32(first as u32);
+                    out.put_u32((row - first) as u32);
+                    start = None;
+                }
+                _ => {}
+            }
         }
     } else {
         out.put_u8(presence_forms::SET_POSITIONS);
-        out.put_u32(set.len() as u32);
-        for row in set {
+        out.put_u32(set_count as u32);
+        for row in (0..rows).filter(|&row| is_set(row)) {
             out.put_u32(row as u32);
         }
     }

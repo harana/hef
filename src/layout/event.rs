@@ -8,7 +8,7 @@ use super::reader::{ColumnRead, HefFile, PayloadRead};
 use crate::artifacts::batch::{PAYLOAD_FLAG_EXTERNAL_REF, decode_variant_dictionary};
 use crate::artifacts::overlay::LiveOverlaySegment;
 use crate::columns::column_ids;
-use crate::encoding::ColumnData;
+use crate::encoding::{ColumnData, StringColumn};
 use crate::error::FormatError;
 use crate::events::variant::VariantRef;
 use crate::events::{EventEnvelope, EventFlags, EventId, SequencePoint, StreamId, TimestampValue};
@@ -23,10 +23,7 @@ impl HefFile {
     pub fn envelope(&self, row_ordinal: u64) -> Result<EventEnvelope, FormatError> {
         let granule = self.granule_for_row(row_ordinal)?;
         let index = row_ordinal - granule.first_row_ordinal;
-        self.granule_envelopes(granule.granule_id)?
-            .into_iter()
-            .nth(index as usize)
-            .ok_or(FormatError::RefOutOfRange { what: "row ordinal" })
+        EnvelopeColumns::read(self, granule.granule_id)?.envelope(self, index as usize)
     }
 
     /// The event stored at `row_ordinal`: its envelope and its payload, the two halves the writer was handed.
@@ -37,73 +34,8 @@ impl HefFile {
     /// The envelopes of every event in one granule, in row order. Reading a run of rows from the same granule through
     /// this decodes each envelope column once instead of once per row.
     pub fn granule_envelopes(&self, granule_id: u32) -> Result<Vec<EventEnvelope>, FormatError> {
-        let rows = self
-            .footer()
-            .granules
-            .iter()
-            .find(|granule| granule.granule_id == granule_id)
-            .ok_or(FormatError::RefOutOfRange { what: "granule id" })?
-            .row_count as usize;
-        let u64s = |column_id| read_u64s(self, column_id, granule_id, rows);
-        let dictionary = &self.footer().dictionaries;
-        let entry = |values: &[String], id: u64| {
-            values.get(id as usize).cloned().ok_or(FormatError::RefOutOfRange {
-                what: "file dictionary id",
-            })
-        };
-        let stream_id = u64s(column_ids::STREAM_ID)?;
-        let stream_sequence = u64s(column_ids::STREAM_SEQUENCE)?;
-        let occurred_at = read_i64s(self, column_ids::OCCURRED_AT, granule_id, rows)?;
-        let ingested_at = read_i64s(self, column_ids::INGESTED_AT, granule_id, rows)?;
-        let source_id = u64s(column_ids::SOURCE_ID)?;
-        let event_type_id = u64s(column_ids::EVENT_TYPE_ID)?;
-        let entity_type_id = u64s(column_ids::ENTITY_TYPE_ID)?;
-        let entity_id_hash_low = u64s(column_ids::ENTITY_ID_HASH_LOW)?;
-        let entity_id_hash_high = u64s(column_ids::ENTITY_ID_HASH_HIGH)?;
-        let flags = u64s(column_ids::FLAGS)?;
-        let schema_version = u64s(column_ids::SCHEMA_VERSION)?;
-        let event_id = read_u128s(self, column_ids::EVENT_ID, granule_id, rows)?;
-        let entity_id = read_strings(self, column_ids::ENTITY_ID, granule_id, rows)?;
-        let actor_id = read_strings(self, column_ids::ACTOR_ID, granule_id, rows)?;
-        let account_id = read_strings(self, column_ids::ACCOUNT_ID, granule_id, rows)?;
-        let actor_id_hash_low = u64s(column_ids::ACTOR_ID_HASH_LOW)?;
-        let account_id_hash_low = u64s(column_ids::ACCOUNT_ID_HASH_LOW)?;
-        let trace_id_hash_low = u64s(column_ids::TRACE_ID_HASH_LOW)?;
-        let dedupe_hash_low = u64s(column_ids::DEDUPE_HASH_LOW)?;
-        let dedupe_hash_high = u64s(column_ids::DEDUPE_HASH_HIGH)?;
-        let tenant_id = self.header().tenant_id;
-        let mut envelopes = Vec::with_capacity(rows);
-        let mut entity_id = entity_id.into_iter();
-        let mut actor_id = actor_id.into_iter();
-        let mut account_id = account_id.into_iter();
-        for row in 0..rows {
-            // Every column was checked above to hold exactly `rows` values, so each lookup is in bounds.
-            let at = |values: &[u64]| values.get(row).copied().unwrap_or_default();
-            envelopes.push(EventEnvelope {
-                account_id: account_id.next().flatten(),
-                account_id_hash_low: at(&account_id_hash_low),
-                actor_id: actor_id.next().flatten(),
-                actor_id_hash_low: at(&actor_id_hash_low),
-                dedupe_hash_high: at(&dedupe_hash_high),
-                dedupe_hash_low: at(&dedupe_hash_low),
-                entity_id: entity_id.next().flatten(),
-                entity_id_hash_high: at(&entity_id_hash_high),
-                entity_id_hash_low: at(&entity_id_hash_low),
-                entity_type: entry(dictionary.entity_type.as_slice(), at(&entity_type_id))?,
-                event_id: EventId::from_uuid(Uuid::from_u128(event_id.get(row).copied().unwrap_or_default())),
-                event_type: entry(dictionary.event_type.as_slice(), at(&event_type_id))?,
-                flags: EventFlags(at(&flags) as u32),
-                ingested_at: TimestampValue::from_physical_nanos(ingested_at.get(row).copied().unwrap_or_default()),
-                occurred_at: TimestampValue::from_physical_nanos(occurred_at.get(row).copied().unwrap_or_default()),
-                schema_version: at(&schema_version) as u32,
-                source: entry(dictionary.source.as_slice(), at(&source_id))?,
-                stream_id: StreamId(at(&stream_id)),
-                stream_sequence: at(&stream_sequence),
-                tenant_id,
-                trace_id_hash_low: at(&trace_id_hash_low),
-            });
-        }
-        Ok(envelopes)
+        let columns = EnvelopeColumns::read(self, granule_id)?;
+        (0..columns.rows).map(|row| columns.envelope(self, row)).collect()
     }
 
     /// The granules of this file that can hold events of the entity whose identity hashes are given, at or between
@@ -139,7 +71,9 @@ impl HefFile {
             }
             None => (true, false),
         };
-        let candidates: Vec<(&GranuleEntry, bool)> = self
+        // Each candidate carries its granule, whether it holds only the entity, and the upper bound on the entity's
+        // rows in it, tightened below by the reverse pass.
+        let mut candidates: Vec<(&GranuleEntry, bool, SequencePoint)> = self
             .granules_for_entity_hash(entity_id_hash_low)
             .into_iter()
             .filter_map(|granule| {
@@ -147,31 +81,34 @@ impl HefFile {
                     admits(column_ids::ENTITY_ID_HASH_LOW, granule.granule_id, entity_id_hash_low);
                 let (high_admits, high_only) =
                     admits(column_ids::ENTITY_ID_HASH_HIGH, granule.granule_id, entity_id_hash_high);
-                (low_admits && high_admits).then_some((granule, low_only && high_only))
+                (low_admits && high_admits).then_some((granule, low_only && high_only, last_point(granule)))
             })
             .collect();
         // Whether a file is in `(epoch, sequence)` order or entity order, one entity's rows run through it in
         // `(epoch, sequence)` order. So the entity's rows in a mixed granule come after every row of the last
-        // granule before it that holds only the entity, and before every row of the next such granule after it.
+        // granule before it that holds only the entity, and before every row of the next such granule after it. A
+        // reverse pass carries the next such granule's first point, a forward pass the previous one's last point.
+        let mut next_first = None;
+        for (granule, only_entity, highest) in candidates.iter_mut().rev() {
+            if *only_entity {
+                next_first = Some(first_point(granule));
+            } else if let Some(next_first) = next_first {
+                *highest = (*highest).min(next_first);
+            }
+        }
+        let mut previous_last = None;
         candidates
-            .iter()
-            .enumerate()
-            .filter(|&(index, &(granule, only_entity))| {
+            .into_iter()
+            .filter(|&(granule, only_entity, highest)| {
                 let mut lowest = first_point(granule);
-                let mut highest = last_point(granule);
-                if !only_entity {
-                    let before = candidates.get(..index).unwrap_or_default();
-                    if let Some(&(previous, _)) = before.iter().rev().find(|(_, only)| *only) {
-                        lowest = lowest.max(last_point(previous));
-                    }
-                    let after = candidates.get(index + 1..).unwrap_or_default();
-                    if let Some(&(next, _)) = after.iter().find(|(_, only)| *only) {
-                        highest = highest.min(first_point(next));
-                    }
+                if only_entity {
+                    previous_last = Some(last_point(granule));
+                } else if let Some(previous_last) = previous_last {
+                    lowest = lowest.max(previous_last);
                 }
                 lowest <= highest && lowest <= to && from <= highest
             })
-            .map(|(_, &(granule, _))| granule)
+            .map(|(granule, _, _)| granule)
             .collect()
     }
 
@@ -321,34 +258,165 @@ fn read_u128s(file: &HefFile, column_id: u32, granule_id: u32, rows: usize) -> R
     }
 }
 
-/// One granule's block of a nullable string column, one entry per row: a block that stores only its present values
-/// is spread back out through its presence bitmap.
-fn read_strings(
-    file: &HefFile,
-    column_id: u32,
-    granule_id: u32,
-    rows: usize,
-) -> Result<Vec<Option<String>>, FormatError> {
+/// One granule's block of a nullable string column as stored: the presence bitmap that spreads a block storing only
+/// its present values back out over the rows, and the values.
+fn read_strings(file: &HefFile, column_id: u32, granule_id: u32) -> Result<(Vec<u8>, StringColumn), FormatError> {
     let ColumnRead { data, presence } = file.read_column(column_id, granule_id)?;
     let ColumnData::Strings(values) = data else {
         return Err(FormatError::Structural {
             rule: "an envelope identity column holds strings",
         });
     };
-    if values.len() == rows {
-        return Ok(values.iter().map(|value| value.map(str::to_owned)).collect());
-    }
-    let mut dense = values.iter();
-    Ok((0..rows)
-        .map(|row| {
-            let present = presence.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0);
-            if present {
-                dense.next().flatten().map(str::to_owned)
-            } else {
-                None
-            }
+    Ok((presence, values))
+}
+
+/// The value at `row` of a nullable string column read by [`read_strings`] for a granule of `rows` rows.
+fn string_at((presence, values): &(Vec<u8>, StringColumn), rows: usize, row: usize) -> Option<String> {
+    let present = |row: usize| presence.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0);
+    let index = if values.len() == rows {
+        row
+    } else if present(row) {
+        (0..row).filter(|&row| present(row)).count()
+    } else {
+        return None;
+    };
+    values.get(index).flatten().map(str::to_owned)
+}
+
+/// The file dictionary entry named by row `row` of a dictionary-id column.
+fn dictionary_entry<'a>(values: &'a [String], ids: &[u64], row: usize) -> Result<&'a str, FormatError> {
+    let id = ids.get(row).copied().unwrap_or_default();
+    values
+        .get(id as usize)
+        .map(String::as_str)
+        .ok_or(FormatError::RefOutOfRange {
+            what: "file dictionary id",
         })
-        .collect())
+}
+
+/// Every envelope column of one granule, decoded and checked once, so one row's envelope or all of them can be built
+/// from it.
+///
+/// See: hef-apis/spec.md
+struct EnvelopeColumns {
+    account_id: (Vec<u8>, StringColumn),
+    account_id_hash_low: Vec<u64>,
+    actor_id: (Vec<u8>, StringColumn),
+    actor_id_hash_low: Vec<u64>,
+    dedupe_hash_high: Vec<u64>,
+    dedupe_hash_low: Vec<u64>,
+    entity_id: (Vec<u8>, StringColumn),
+    entity_id_hash_high: Vec<u64>,
+    entity_id_hash_low: Vec<u64>,
+    entity_type_id: Vec<u64>,
+    event_id: Vec<u128>,
+    event_type_id: Vec<u64>,
+    flags: Vec<u64>,
+    ingested_at: Vec<i64>,
+    occurred_at: Vec<i64>,
+    rows: usize,
+    schema_version: Vec<u64>,
+    source_id: Vec<u64>,
+    stream_id: Vec<u64>,
+    stream_sequence: Vec<u64>,
+    trace_id_hash_low: Vec<u64>,
+}
+
+impl EnvelopeColumns {
+    /// Decodes granule `granule_id`'s envelope columns and checks every row's dictionary ids, so a bad id anywhere in
+    /// the granule fails the read whichever row is asked for.
+    fn read(file: &HefFile, granule_id: u32) -> Result<Self, FormatError> {
+        let rows = file
+            .footer()
+            .granules
+            .iter()
+            .find(|granule| granule.granule_id == granule_id)
+            .ok_or(FormatError::RefOutOfRange { what: "granule id" })?
+            .row_count as usize;
+        let u64s = |column_id| read_u64s(file, column_id, granule_id, rows);
+        let stream_id = u64s(column_ids::STREAM_ID)?;
+        let stream_sequence = u64s(column_ids::STREAM_SEQUENCE)?;
+        let occurred_at = read_i64s(file, column_ids::OCCURRED_AT, granule_id, rows)?;
+        let ingested_at = read_i64s(file, column_ids::INGESTED_AT, granule_id, rows)?;
+        let source_id = u64s(column_ids::SOURCE_ID)?;
+        let event_type_id = u64s(column_ids::EVENT_TYPE_ID)?;
+        let entity_type_id = u64s(column_ids::ENTITY_TYPE_ID)?;
+        let entity_id_hash_low = u64s(column_ids::ENTITY_ID_HASH_LOW)?;
+        let entity_id_hash_high = u64s(column_ids::ENTITY_ID_HASH_HIGH)?;
+        let flags = u64s(column_ids::FLAGS)?;
+        let schema_version = u64s(column_ids::SCHEMA_VERSION)?;
+        let event_id = read_u128s(file, column_ids::EVENT_ID, granule_id, rows)?;
+        let entity_id = read_strings(file, column_ids::ENTITY_ID, granule_id)?;
+        let actor_id = read_strings(file, column_ids::ACTOR_ID, granule_id)?;
+        let account_id = read_strings(file, column_ids::ACCOUNT_ID, granule_id)?;
+        let actor_id_hash_low = u64s(column_ids::ACTOR_ID_HASH_LOW)?;
+        let account_id_hash_low = u64s(column_ids::ACCOUNT_ID_HASH_LOW)?;
+        let trace_id_hash_low = u64s(column_ids::TRACE_ID_HASH_LOW)?;
+        let dedupe_hash_low = u64s(column_ids::DEDUPE_HASH_LOW)?;
+        let dedupe_hash_high = u64s(column_ids::DEDUPE_HASH_HIGH)?;
+        let dictionary = &file.footer().dictionaries;
+        for row in 0..rows {
+            dictionary_entry(&dictionary.entity_type, &entity_type_id, row)?;
+            dictionary_entry(&dictionary.event_type, &event_type_id, row)?;
+            dictionary_entry(&dictionary.source, &source_id, row)?;
+        }
+        Ok(Self {
+            account_id,
+            account_id_hash_low,
+            actor_id,
+            actor_id_hash_low,
+            dedupe_hash_high,
+            dedupe_hash_low,
+            entity_id,
+            entity_id_hash_high,
+            entity_id_hash_low,
+            entity_type_id,
+            event_id,
+            event_type_id,
+            flags,
+            ingested_at,
+            occurred_at,
+            rows,
+            schema_version,
+            source_id,
+            stream_id,
+            stream_sequence,
+            trace_id_hash_low,
+        })
+    }
+
+    /// The envelope at `row` of the granule, cloning only that row's strings.
+    fn envelope(&self, file: &HefFile, row: usize) -> Result<EventEnvelope, FormatError> {
+        if row >= self.rows {
+            return Err(FormatError::RefOutOfRange { what: "row ordinal" });
+        }
+        // Every column was checked to hold exactly `rows` values, so each lookup is in bounds.
+        let at = |values: &[u64]| values.get(row).copied().unwrap_or_default();
+        let dictionary = &file.footer().dictionaries;
+        Ok(EventEnvelope {
+            account_id: string_at(&self.account_id, self.rows, row),
+            account_id_hash_low: at(&self.account_id_hash_low),
+            actor_id: string_at(&self.actor_id, self.rows, row),
+            actor_id_hash_low: at(&self.actor_id_hash_low),
+            dedupe_hash_high: at(&self.dedupe_hash_high),
+            dedupe_hash_low: at(&self.dedupe_hash_low),
+            entity_id: string_at(&self.entity_id, self.rows, row),
+            entity_id_hash_high: at(&self.entity_id_hash_high),
+            entity_id_hash_low: at(&self.entity_id_hash_low),
+            entity_type: dictionary_entry(&dictionary.entity_type, &self.entity_type_id, row)?.to_owned(),
+            event_id: EventId::from_uuid(Uuid::from_u128(self.event_id.get(row).copied().unwrap_or_default())),
+            event_type: dictionary_entry(&dictionary.event_type, &self.event_type_id, row)?.to_owned(),
+            flags: EventFlags(at(&self.flags) as u32),
+            ingested_at: TimestampValue::from_physical_nanos(self.ingested_at.get(row).copied().unwrap_or_default()),
+            occurred_at: TimestampValue::from_physical_nanos(self.occurred_at.get(row).copied().unwrap_or_default()),
+            schema_version: at(&self.schema_version) as u32,
+            source: dictionary_entry(&dictionary.source, &self.source_id, row)?.to_owned(),
+            stream_id: StreamId(at(&self.stream_id)),
+            stream_sequence: at(&self.stream_sequence),
+            tenant_id: file.header().tenant_id,
+            trace_id_hash_low: at(&self.trace_id_hash_low),
+        })
+    }
 }
 
 #[cfg(test)]
