@@ -3,6 +3,7 @@ use crate::benchmarks::{XorFloatMeasurement, xor_float_gate_passes};
 use crate::file::bytes::{Reader, Writer};
 use arrow_array::Array;
 use miniz_oxide::deflate::compress_to_vec;
+use std::collections::BTreeMap;
 
 /// A transform chosen from a sample can encode the full block larger than simply writing the values out — which for
 /// the format's own metadata columns, a handful of values each, was the normal case rather than the unlucky one.
@@ -3266,6 +3267,87 @@ fn alp_rd_split_kernel_matches_a_linear_dictionary_search() {
             }
         }
     }
+}
+
+/// The ALP-RD split search must pick exactly the width, dictionary, and estimate of the original map-based search:
+/// same candidate order, same count-then-key ranking, same strict-improvement rule.
+#[test]
+fn alp_rd_choose_split_matches_the_map_based_reference() {
+    fn reference(sample: &[f64]) -> (u32, Vec<u16>, usize) {
+        let mut best: Option<(u32, Vec<u16>, usize)> = None;
+        for right_width in ALP_RD_MIN_RIGHT_WIDTH..=ALP_RD_MAX_RIGHT_WIDTH {
+            let mut counts: BTreeMap<u16, usize> = BTreeMap::new();
+            for value in sample {
+                *counts.entry((value.to_bits() >> right_width) as u16).or_default() += 1;
+            }
+            let mut ranked: Vec<(u16, usize)> = counts.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            ranked.truncate(ALP_RD_MAX_DICT_LEN);
+            let covered: usize = ranked.iter().map(|(_, count)| count).sum();
+            let dict: Vec<u16> = ranked.into_iter().map(|(left, _)| left).collect();
+            let exceptions = sample.len() - covered;
+            let code_bits = bits_needed(dict.len().saturating_sub(1) as u64) as usize;
+            let estimate = 2
+                + 2 * dict.len()
+                + 4
+                + exceptions * 6
+                + (sample.len() * (code_bits + right_width as usize)).div_ceil(8);
+            if best.as_ref().is_none_or(|(_, _, current)| estimate < *current) {
+                best = Some((right_width, dict, estimate));
+            }
+        }
+        best.unwrap_or((ALP_RD_MAX_RIGHT_WIDTH, Vec::new(), usize::MAX))
+    }
+    // A left part (top 16 bits) over random low bits, so each width sees a different grouping.
+    let with_left = |left: u64, i: u64| f64::from_bits((left << 48) | (mix(i) >> 16));
+    // Keys 0..=6 appear three times per cycle and keys 7..=9 twice, so three keys tie for the last dictionary slot.
+    let boundary_key = |i: u64| {
+        let j = i % 27;
+        if j < 21 { j / 3 } else { 7 + (j - 21) / 2 }
+    };
+    let specials = [
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        f64::from_bits(0x7FF8_0000_0000_0001),
+        f64::from_bits(0x7FF0_0000_0000_0001),
+        f64::from_bits(0xFFFF_FFFF_FFFF_FFFF),
+        f64::from_bits(1),
+        f64::from_bits(0x000F_FFFF_FFFF_FFFF),
+        f64::from_bits(0x8000_0000_0000_0001),
+        f64::MIN_POSITIVE,
+        f64::MAX,
+    ];
+    let shapes: [&dyn Fn(u64) -> f64; 9] = [
+        &|_| 1.5,
+        &|i| with_left(0x4000 + i % 8, i),
+        &|i| with_left(0x4000 + i % 9, i),
+        &|i| with_left(0x4000 + boundary_key(i), i),
+        &|i| with_left(0xFFFF - boundary_key(i), i),
+        &|i| with_left(0x4000 + mix(i ^ 0xABCD) % 12, i),
+        &|i| f64::from_bits(mix(i)),
+        &|i| {
+            if i % 2 == 0 {
+                specials[(mix(i) % specials.len() as u64) as usize]
+            } else {
+                f64::from_bits(0x4000_0000_0000_0000 | (mix(i) >> 12))
+            }
+        },
+        &|i| f64::from_bits(((0x3FF + mix(i) % 4) << 52) | (mix(i + 1) >> 12)),
+    ];
+    for size in [0u64, 1, 7, 8, 9, 16, 128, 1023, 1024, 4096] {
+        for (shape_index, shape) in shapes.iter().enumerate() {
+            let sample: Vec<f64> = (0..size).map(shape).collect();
+            assert_eq!(
+                alp_rd_choose_split(&sample),
+                reference(&sample),
+                "size {size}, shape {shape_index}"
+            );
+        }
+    }
+    assert_eq!(alp_rd_choose_split(&[]), (ALP_RD_MIN_RIGHT_WIDTH, Vec::new(), 6));
 }
 
 #[test]

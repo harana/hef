@@ -1521,26 +1521,56 @@ fn decode_byte_stream_split(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatE
 /// estimated encoded size, plus that estimate in bytes so selection can weigh ALP-RD against the other float
 /// fallbacks. Deterministic: candidate widths are tried in a fixed order and ties keep the first winner.
 fn alp_rd_choose_split(sample: &[f64]) -> (u32, Vec<u16>, usize) {
-    let mut best: Option<(u32, Vec<u16>, usize)> = None;
+    let mut lefts: Vec<u16> = Vec::with_capacity(sample.len());
+    let mut best_dict = [0u16; ALP_RD_MAX_DICT_LEN];
+    let mut best_dict_len = 0;
+    let mut best_estimate = usize::MAX;
+    let mut best_width = ALP_RD_MAX_RIGHT_WIDTH;
     for right_width in ALP_RD_MIN_RIGHT_WIDTH..=ALP_RD_MAX_RIGHT_WIDTH {
-        let mut counts: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
-        for value in sample {
-            *counts.entry((value.to_bits() >> right_width) as u16).or_default() += 1;
+        lefts.clear();
+        lefts.extend(sample.iter().map(|value| (value.to_bits() >> right_width) as u16));
+        lefts.sort_unstable();
+        // Top dictionary entries by count descending, then left part ascending. Runs arrive in ascending key order,
+        // so a new run lands after every kept entry whose count is at least its own.
+        let mut top_counts = [0usize; ALP_RD_MAX_DICT_LEN];
+        let mut top_keys = [0u16; ALP_RD_MAX_DICT_LEN];
+        let mut top_len = 0;
+        let mut start = 0;
+        while start < lefts.len() {
+            let key = lefts[start];
+            let mut end = start + 1;
+            while end < lefts.len() && lefts[end] == key {
+                end += 1;
+            }
+            let count = end - start;
+            start = end;
+            let position = top_counts[..top_len]
+                .iter()
+                .position(|&kept| kept < count)
+                .unwrap_or(top_len);
+            if position == ALP_RD_MAX_DICT_LEN {
+                continue;
+            }
+            let shifted_end = top_len.min(ALP_RD_MAX_DICT_LEN - 1);
+            top_counts.copy_within(position..shifted_end, position + 1);
+            top_keys.copy_within(position..shifted_end, position + 1);
+            top_counts[position] = count;
+            top_keys[position] = key;
+            top_len = (top_len + 1).min(ALP_RD_MAX_DICT_LEN);
         }
-        let mut ranked: Vec<(u16, usize)> = counts.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        ranked.truncate(ALP_RD_MAX_DICT_LEN);
-        let covered: usize = ranked.iter().map(|(_, count)| count).sum();
-        let dict: Vec<u16> = ranked.into_iter().map(|(left, _)| left).collect();
+        let covered: usize = top_counts[..top_len].iter().sum();
         let exceptions = sample.len() - covered;
-        let code_bits = bits_needed(dict.len().saturating_sub(1) as u64) as usize;
+        let code_bits = bits_needed(top_len.saturating_sub(1) as u64) as usize;
         let estimate =
-            2 + 2 * dict.len() + 4 + exceptions * 6 + (sample.len() * (code_bits + right_width as usize)).div_ceil(8);
-        if best.as_ref().is_none_or(|(_, _, current)| estimate < *current) {
-            best = Some((right_width, dict, estimate));
+            2 + 2 * top_len + 4 + exceptions * 6 + (sample.len() * (code_bits + right_width as usize)).div_ceil(8);
+        if estimate < best_estimate {
+            best_dict = top_keys;
+            best_dict_len = top_len;
+            best_estimate = estimate;
+            best_width = right_width;
         }
     }
-    best.unwrap_or((ALP_RD_MAX_RIGHT_WIDTH, Vec::new(), usize::MAX))
+    (best_width, best_dict[..best_dict_len].to_vec(), best_estimate)
 }
 
 /// Splits one run of floats at `right_width`, writing each value's masked right part into `rights` and its left part's
