@@ -238,6 +238,46 @@ pub(crate) fn verify_declared_data_commitments(
     stripe_checksums: &[[u8; 32]],
     gaps: &[IntegrityGapEntry],
 ) -> Result<Vec<DataCommitment>, FormatError> {
+    if data_end <= bytes.len()
+        && let Ok(declared) = declared_data_commitments(data_end, stripes, stripe_checksums, gaps)
+        && declared_gaps_match_bytes(bytes, &declared)
+    {
+        return Ok(declared);
+    }
+    verify_by_recomputing(bytes, data_end, stripes, stripe_checksums, gaps)
+}
+
+/// True when every gap leaf hashes to its declared digest and no two gaps touch, so the declared partition is exactly
+/// the one [`data_commitments`] would recompute: maximal gaps between stripes, each covering the bytes it names.
+fn declared_gaps_match_bytes(bytes: &[u8], commitments: &[DataCommitment]) -> bool {
+    let mut previous_was_gap = false;
+    commitments.iter().all(|commitment| {
+        let is_gap = commitment.kind == SegmentKind::Gap;
+        let adjacent_gaps = is_gap && previous_was_gap;
+        previous_was_gap = is_gap;
+        if !is_gap {
+            return true;
+        }
+        let (Ok(start), Ok(len)) = (usize::try_from(commitment.offset), usize::try_from(commitment.len)) else {
+            return false;
+        };
+        !adjacent_gaps
+            && start
+                .checked_add(len)
+                .and_then(|end| bytes.get(start..end))
+                .is_some_and(|gap| crate::file::integrity::hash_tree(gap).as_bytes() == &commitment.digest)
+    })
+}
+
+/// Rebuilds the full partition from bytes and compares it with the declared one. Only reached for a file the direct
+/// check rejected, so a malformed file reports the same error it always has.
+fn verify_by_recomputing(
+    bytes: &[u8],
+    data_end: usize,
+    stripes: &[StripeEntry],
+    stripe_checksums: &[[u8; 32]],
+    gaps: &[IntegrityGapEntry],
+) -> Result<Vec<DataCommitment>, FormatError> {
     let computed = data_commitments(bytes, data_end, stripes, stripe_checksums)?;
     let declared = declared_data_commitments(data_end, stripes, stripe_checksums, gaps)?;
     if computed != declared {
@@ -428,6 +468,92 @@ mod tests {
         assert_eq!(
             data_commitments_with(bytes.len(), &[stripe(1, base + 2, 3)], &[[1; 32]], |_| None),
             Err(FormatError::Truncated { what: "data gap" })
+        );
+    }
+
+    fn declared_gap(bytes: &[u8], range: std::ops::Range<usize>) -> IntegrityGapEntry {
+        IntegrityGapEntry {
+            blake3: *crate::file::integrity::hash_tree(&bytes[range.clone()]).as_bytes(),
+            byte_len: range.len() as u64,
+            file_offset: range.start as u64,
+        }
+    }
+
+    fn assert_same_as_recomputing(
+        bytes: &[u8],
+        data_end: usize,
+        stripes: &[StripeEntry],
+        checksums: &[[u8; 32]],
+        gaps: &[IntegrityGapEntry],
+    ) -> Result<Vec<DataCommitment>, FormatError> {
+        let verified = verify_declared_data_commitments(bytes, data_end, stripes, checksums, gaps);
+        assert_eq!(
+            verified,
+            verify_by_recomputing(bytes, data_end, stripes, checksums, gaps)
+        );
+        verified
+    }
+
+    #[test]
+    fn declared_gaps_verify_exactly_like_the_recomputed_partition() {
+        let bytes = gapped_bytes();
+        let end = bytes.len();
+        let base = HEADER_BLOCK_LEN;
+        let stripes = [stripe(3, base + 12, 5), stripe(1, base + 2, 3), stripe(2, base + 5, 4)];
+        let checksums = [[3; 32], [1; 32], [2; 32]];
+        let leading = declared_gap(&bytes, base..base + 2);
+        let interior = declared_gap(&bytes, base + 9..base + 12);
+        let trailing = declared_gap(&bytes, base + 17..end);
+        let gaps = [trailing, leading, interior];
+
+        let verified = assert_same_as_recomputing(&bytes, end, &stripes, &checksums, &gaps).unwrap();
+        assert_eq!(verified, data_commitments(&bytes, end, &stripes, &checksums).unwrap());
+
+        let whole = [stripe(1, base, 20)];
+        assert!(assert_same_as_recomputing(&bytes, end, &whole, &[[1; 32]], &[]).is_ok());
+        let only_gap = [declared_gap(&bytes, base..end)];
+        assert!(assert_same_as_recomputing(&bytes, end, &[], &[], &only_gap).is_ok());
+        assert!(assert_same_as_recomputing(&bytes, base, &[], &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn malformed_declared_gaps_fail_with_the_recomputed_partitions_error() {
+        let bytes = gapped_bytes();
+        let end = bytes.len();
+        let base = HEADER_BLOCK_LEN;
+        let stripes = [stripe(1, base + 2, 3), stripe(2, base + 5, 4), stripe(3, base + 12, 5)];
+        let checksums = [[1; 32], [2; 32], [3; 32]];
+        let leading = declared_gap(&bytes, base..base + 2);
+        let interior = declared_gap(&bytes, base + 9..base + 12);
+        let trailing = declared_gap(&bytes, base + 17..end);
+        let split = [
+            leading,
+            declared_gap(&bytes, base + 9..base + 10),
+            declared_gap(&bytes, base + 10..base + 12),
+            trailing,
+        ];
+        let mut wrong_digest = [leading, interior, trailing];
+        wrong_digest[1].blake3[0] ^= 1;
+        let zero_length = [leading, interior, trailing, declared_gap(&bytes, end..end)];
+        let cases: [(&[IntegrityGapEntry], usize); 6] = [
+            (&split, end),
+            (&wrong_digest, end),
+            (&[leading, trailing], end),
+            (&zero_length, end),
+            (&[leading, interior, trailing], end + 1),
+            (&[], base - 1),
+        ];
+        for (gaps, data_end) in cases {
+            assert!(assert_same_as_recomputing(&bytes, data_end, &stripes, &checksums, gaps).is_err());
+        }
+        assert!(assert_same_as_recomputing(&bytes, end, &stripes, &checksums[..2], &[]).is_err());
+
+        let mut changed = bytes.clone();
+        changed[base + 10] ^= 1;
+        let gaps = [leading, interior, trailing];
+        assert_eq!(
+            assert_same_as_recomputing(&changed, end, &stripes, &checksums, &gaps),
+            Err(FormatError::Blake3Mismatch { scope: "data gap" })
         );
     }
 }
