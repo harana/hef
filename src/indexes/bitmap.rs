@@ -131,18 +131,13 @@ impl RoaringRangeBitmap {
     pub fn from_ranges<I: IntoIterator<Item = RowRange>>(ranges: I) -> Self {
         let mut runs: Vec<RowRange> = ranges.into_iter().filter(|r| !r.is_empty()).collect();
         runs.sort_unstable_by_key(|r| (r.start, r.end));
-        let mut kept = 0usize;
-        for i in 0..runs.len() {
-            let range = runs[i];
-            match kept.checked_sub(1).map(|last| &mut runs[last]) {
-                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
-                _ => {
-                    runs[kept] = range;
-                    kept += 1;
-                }
+        runs.dedup_by(|range, last| {
+            let merges = range.start <= last.end;
+            if merges {
+                last.end = last.end.max(range.end);
             }
-        }
-        runs.truncate(kept);
+            merges
+        });
         Self { runs }
     }
 

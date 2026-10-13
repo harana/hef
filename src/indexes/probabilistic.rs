@@ -536,7 +536,7 @@ impl BinaryFuseFilter {
     }
 
     /// Validates encoded bytes and returns the borrowed fingerprint array, seed and segment length.
-    fn parse(bytes: &[u8]) -> Result<(&[u8], u64, u32), FormatError> {
+    pub(crate) fn parse(bytes: &[u8]) -> Result<(&[u8], u64, u32), FormatError> {
         let mut reader = Reader::new(bytes);
         if reader.u32("binary fuse magic")? != BINARY_FUSE_MAGIC {
             return Err(FormatError::Structural {
