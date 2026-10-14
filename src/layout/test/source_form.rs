@@ -68,6 +68,47 @@ fn an_external_id_finds_its_row_through_the_index() {
 }
 
 #[test]
+fn external_id_lookups_match_whole_binary_ids_across_granules() {
+    let ids: Vec<Vec<u8>> = vec![
+        vec![0x00, 0xff, 0x10],
+        vec![0x00, 0xff],
+        vec![0x00, 0xff, 0x10, 0x00],
+        vec![b'L'; 255],
+        vec![0x00, 0xff],
+    ];
+    let mut rows: Vec<BuildRow> = ids.iter().enumerate().map(|(i, id)| with_id(i as u64, id)).collect();
+    rows.push(plain_row(ids.len() as u64));
+    let built = build_hef_file(rows, &source_form_config(2)).unwrap();
+    for budget in [0, u64::MAX] {
+        // A zero budget evicts every other block on each read; the borrowed text must outlive that.
+        let file = HefFile::open(built.bytes.clone(), Some(&built.file_seal))
+            .unwrap()
+            .with_decoded_cache_budget(budget);
+        assert_eq!(file.footer().granules.len(), 3);
+        for (expected, id) in [
+            (vec![0], &ids[0]),
+            (vec![1, 4], &ids[1]),
+            (vec![2], &ids[2]),
+            (vec![3], &ids[3]),
+        ] {
+            assert_eq!(
+                file.rows_with_external_id(id).unwrap(),
+                expected,
+                "a prefix or extension never matches"
+            );
+            assert_eq!(file.row_by_external_id(id).unwrap(), expected.last().copied());
+        }
+        assert_eq!(file.rows_with_external_id(&[0x00]).unwrap(), Vec::<u64>::new());
+        assert_eq!(file.row_by_external_id(&[]).unwrap(), None);
+    }
+
+    let without = build_hef_file((0..4).map(plain_row).collect::<Vec<_>>(), &source_form_config(2)).unwrap();
+    let without = HefFile::open(without.bytes, Some(&without.file_seal)).unwrap();
+    assert_eq!(without.row_by_external_id(&ids[0]).unwrap(), None);
+    assert_eq!(without.rows_with_external_id(&ids[0]).unwrap(), Vec::<u64>::new());
+}
+
+#[test]
 fn prev_and_auth_references_round_trip_and_reverse_lookups_skip_granules() {
     let target: &[u8] = b"$abc:example.org";
     let rows: Vec<BuildRow> = (0..8u64)
