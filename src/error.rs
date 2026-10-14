@@ -222,9 +222,13 @@ pub enum SubjectPayloadError {
 }
 
 /// Why reading one entity's events back failed: a stored file or overlay batch was malformed, the application's store
-/// of deletes and corrections could not answer, or a correction names an event the scan was not given.
+/// of deletes and corrections could not answer, or a correction names an event the scan was not given or loops back
+/// on itself.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum EntityScanError {
+    /// Following an event's corrections led back to an event already on the chain, so it has no latest version.
+    #[error("correction chain loops back to the event at epoch {epoch} sequence {sequence}")]
+    CorrectionCycle { epoch: u64, sequence: u64 },
     /// The correcting event lives in none of the files or overlay segments the scan was handed, so neither the
     /// superseded event nor its correction can be served.
     #[error("correcting event at epoch {epoch} sequence {sequence} is in none of the scanned files or the overlay")]

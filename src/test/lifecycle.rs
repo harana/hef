@@ -136,6 +136,99 @@ fn finished_files_other_states_and_other_tenants_are_never_candidates() {
     assert!(plan_compaction_cycle(&policy(), &generation, TenantId::new_test_id(7)).is_empty());
 }
 
+fn in_epoch(mut entry: HefFileEntry, epoch: u64) -> HefFileEntry {
+    entry.coverage.epoch = epoch;
+    entry
+}
+
+fn with_profile(mut entry: HefFileEntry, profile: Profile) -> HefFileEntry {
+    entry.profile = profile;
+    entry
+}
+
+fn job_ids(files: Vec<HefFileEntry>) -> Vec<Vec<u128>> {
+    plan_compaction_cycle(&policy(), &generation(files), TenantId::new_test_id(7))
+        .into_iter()
+        .map(|job| job.file_ids)
+        .collect()
+}
+
+#[test]
+fn equal_small_files_in_different_epochs_are_never_merged_together() {
+    // Two equal small files double their largest input, so as neighbours in one epoch they would merge; across epochs
+    // the merge could never be published, because one merge covers one contiguous range of one epoch.
+    assert!(
+        job_ids(vec![
+            entry(1, 100, 100, PartState::Active),
+            in_epoch(entry(2, 100, 100, PartState::Active), 2),
+        ])
+        .is_empty()
+    );
+    assert_eq!(
+        job_ids(vec![
+            entry(1, 100, 100, PartState::Active),
+            entry(2, 200, 100, PartState::Active),
+            in_epoch(entry(3, 100, 100, PartState::Active), 2),
+            in_epoch(entry(4, 200, 100, PartState::Active), 2),
+        ]),
+        [vec![1, 2], vec![3, 4]]
+    );
+}
+
+#[test]
+fn a_gap_in_coverage_splits_a_run() {
+    // Sequences 300 to 399 are not covered by any file, so the files either side of the gap merge separately.
+    assert_eq!(
+        job_ids(vec![
+            entry(1, 100, 100, PartState::Active),
+            entry(2, 200, 100, PartState::Active),
+            entry(3, 400, 100, PartState::Active),
+            entry(4, 500, 100, PartState::Active),
+        ]),
+        [vec![1, 2], vec![3, 4]]
+    );
+    assert!(
+        job_ids(vec![
+            entry(1, 100, 100, PartState::Active),
+            entry(2, 300, 100, PartState::Active),
+        ])
+        .is_empty()
+    );
+}
+
+#[test]
+fn a_change_of_profile_splits_a_run() {
+    assert_eq!(
+        job_ids(vec![
+            entry(1, 100, 100, PartState::Active),
+            entry(2, 200, 100, PartState::Active),
+            with_profile(entry(3, 300, 100, PartState::Active), Profile::TimeSeries),
+            with_profile(entry(4, 400, 100, PartState::Active), Profile::TimeSeries),
+        ]),
+        [vec![1, 2], vec![3, 4]]
+    );
+}
+
+#[test]
+fn audit_files_are_never_planned() {
+    assert!(
+        job_ids(vec![
+            with_profile(entry(1, 100, 100, PartState::Active), Profile::Audit),
+            with_profile(entry(2, 200, 100, PartState::Active), Profile::Audit),
+        ])
+        .is_empty()
+    );
+    // An audit file between two event files is a gap in the event files' coverage, not a member of their run.
+    assert!(
+        job_ids(vec![
+            entry(1, 100, 100, PartState::Active),
+            with_profile(entry(2, 200, 100, PartState::Active), Profile::Audit),
+            entry(3, 300, 100, PartState::Active),
+        ])
+        .is_empty()
+    );
+}
+
 #[test]
 fn repeated_cycles_converge_without_thrashing() {
     // Apply each cycle's jobs (replace the merged files with one output) and count merges. Convergence must reach
@@ -158,11 +251,16 @@ fn repeated_cycles_converge_without_thrashing() {
                 .position(|entry| job.file_ids.contains(&entry.file_id))
                 .unwrap();
             let sequence = files[first].coverage.first_sequence;
+            let last_sequence = files
+                .iter()
+                .filter(|entry| job.file_ids.contains(&entry.file_id))
+                .map(|entry| entry.coverage.last_sequence)
+                .max()
+                .unwrap();
             files.retain(|entry| !job.file_ids.contains(&entry.file_id));
-            files.insert(
-                first,
-                entry(next_id, sequence, job.expected_output_bytes, PartState::Active),
-            );
+            let mut merged = entry(next_id, sequence, job.expected_output_bytes, PartState::Active);
+            merged.coverage.last_sequence = last_sequence;
+            files.insert(first, merged);
             next_id += 1;
         }
     }

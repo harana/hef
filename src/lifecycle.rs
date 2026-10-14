@@ -248,8 +248,9 @@ pub struct CompactionJob {
 /// Plans one tenant's compaction cycle: which runs of sequence-adjacent small files merge now, and which wait.
 ///
 /// Candidates are the tenant's `Active` base event files below the roll byte target, in ascending sequence order (graph
-/// files merge per subject instead, through [`plan_graph_compaction_cycle`]); a
-/// finished (roll-target-sized) file breaks a run. From the front of each run the planner takes up to
+/// files merge per subject instead, through [`plan_graph_compaction_cycle`], and audit files are never compacted); a
+/// finished (roll-target-sized) file breaks a run, and so does a change of epoch or profile or a gap in coverage, since
+/// one merge must cover one contiguous range of one kind of file. From the front of each run the planner takes up to
 /// `max_merge_width` files and schedules them only when the doubling bound holds — the combined bytes reach
 /// `min_output_over_largest` times the largest input, or the roll target — so a trickle tenant's newest small file is
 /// never rewritten at every cycle just because it has one small neighbour. At most `max_jobs_per_cycle` jobs are
@@ -275,24 +276,30 @@ pub fn plan_compaction_cycle(
             entry.tenant_id == tenant_id
                 && entry.part_state == PartState::Active
                 && entry.file_type == FileType::HefFile
-                && entry.profile != Profile::Graph
+                && !matches!(entry.profile, Profile::Audit | Profile::Graph)
         })
         .collect();
     candidates.sort_by_key(|entry| (entry.coverage.epoch, entry.coverage.first_sequence));
+    let follows_on = |last: &HefFileEntry, next: &HefFileEntry| {
+        last.coverage.epoch == next.coverage.epoch
+            && last.profile == next.profile
+            && last.coverage.last_sequence.checked_add(1) == Some(next.coverage.first_sequence)
+    };
 
     let mut jobs = Vec::new();
     let mut run: Vec<&HefFileEntry> = Vec::new();
     // One trailing sentinel flushes the final run through the same path as an interior break.
     for entry in candidates.iter().copied().map(Some).chain([None]) {
-        let small = entry.is_some_and(|entry| entry.size_bytes < policy.roll_target_bytes);
-        if small {
-            if let Some(entry) = entry {
-                run.push(entry);
-            }
+        let small = entry.filter(|entry| entry.size_bytes < policy.roll_target_bytes);
+        if let Some(next) = small
+            && run.last().is_none_or(|last| follows_on(last, next))
+        {
+            run.push(next);
             continue;
         }
-        // A finished file (or the end of the candidates) closes the current run; schedule what qualifies. The window
-        // slides so one larger-but-unfinished file at the head of a run does not block its small tail from merging.
+        // A finished file, a small file that does not follow on from the run, or the end of the candidates closes the
+        // current run; schedule what qualifies. The window slides so one larger-but-unfinished file at the head of a
+        // run does not block its small tail from merging.
         let mut start = 0usize;
         while jobs.len() < policy.max_jobs_per_cycle && start + 2 <= run.len() {
             let window = &run[start..run.len().min(start + policy.max_merge_width)];
@@ -312,6 +319,8 @@ pub fn plan_compaction_cycle(
             }
         }
         run.clear();
+        // A small file that closed the run starts the next one.
+        run.extend(small);
     }
     jobs
 }

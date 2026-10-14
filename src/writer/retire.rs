@@ -27,7 +27,7 @@ use crate::clock::Clock;
 use crate::error::PublishError;
 use crate::events::{SequenceRange, TenantId};
 use crate::invariants::PublishedSet;
-use crate::layout::Profile;
+use crate::layout::{Profile, decode_header};
 use crate::lifecycle::{FileType, GraphFileSummary, HefFileEntry, ManifestGeneration, PartState, Retirement};
 use crate::object_store::{ObjectStore, constant::MIN_MULTIPART_PART_BYTES, hef_object_key};
 use hashbrown::HashSet;
@@ -70,6 +70,11 @@ impl HefPublisher {
     /// rebases and retries; if an input was meanwhile replaced by someone else, the publication is refused and the
     /// uploaded object is left unreferenced. An audit file is never compacted: an audit input or output is refused
     /// before anything is uploaded.
+    ///
+    /// The output must also hold every row of its inputs: before anything is uploaded, each input's stored header is
+    /// read from `objects`, and the output must hold as many rows as the inputs together, from the same first to the
+    /// same last `(epoch, sequence)`. Sequences an input covers without rows (void records) count on neither side, so
+    /// an input whose coverage ends in a void merges normally. An output that drops rows is refused.
     #[expect(
         clippy::too_many_arguments,
         reason = "the compaction publish wires every interface exactly once"
@@ -90,6 +95,7 @@ impl HefPublisher {
         let (_, head) = published.head().map_err(PublishFailure::Publish)?;
         let coverage = merged_coverage(&head, inputs, config.tenant_id)?;
         self.verify_staged(&built, config, &coverage)?;
+        verify_rows_preserved(&built, inputs, config.tenant_id, objects)?;
         publish_in_place_of(
             built,
             config,
@@ -453,6 +459,47 @@ fn merged_coverage(
         merged.last_sequence = range.last_sequence;
     }
     Ok(merged)
+}
+
+/// Checks that `built` holds every row of the `inputs`, read from each input's stored header: as many rows as the
+/// inputs hold together, from the same first to the same last `(epoch, sequence)`. Sequences covered only by void
+/// records carry no rows on either side, so they never make a faithful merge look short.
+fn verify_rows_preserved(
+    built: &BuiltHef,
+    inputs: &[u128],
+    tenant_id: TenantId,
+    objects: &dyn ObjectStore,
+) -> Result<(), PublishFailure> {
+    let mut row_count = 0u64;
+    let mut bounds: Option<((u64, u64), (u64, u64))> = None;
+    for input in inputs {
+        let stored = objects
+            .get(&hef_object_key(tenant_id, *input))
+            .map_err(PublishFailure::Storage)?
+            .ok_or(PublishFailure::Verification(
+                "a compaction input's stored file is missing",
+            ))?;
+        let header = decode_header(&stored.bytes).map_err(PublishFailure::Format)?;
+        if header.file_id != *input || header.tenant_id != tenant_id {
+            return Err(PublishFailure::Verification(
+                "a compaction input's stored file is a different file",
+            ));
+        }
+        let first = (header.min_epoch, header.min_sequence);
+        let last = (header.max_epoch, header.max_sequence);
+        row_count = row_count.saturating_add(header.row_count);
+        bounds = Some(bounds.map_or((first, last), |(low, high)| (low.min(first), high.max(last))));
+    }
+    let output_bounds = (
+        (built.header.min_epoch, built.header.min_sequence),
+        (built.header.max_epoch, built.header.max_sequence),
+    );
+    if built.header.row_count != row_count || bounds != Some(output_bounds) {
+        return Err(PublishFailure::Verification(
+            "the compaction output does not hold every row of its inputs",
+        ));
+    }
+    Ok(())
 }
 
 /// Writes `next` and moves the head to it from `head_id`. `Ok(true)` when this call published it; `Ok(false)` when the

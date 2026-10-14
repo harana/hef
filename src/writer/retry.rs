@@ -77,7 +77,8 @@ pub trait SafeRetryStore {
 
     /// Rebuilds missing rows from HEJ after recovery: dedupe hashes and sequence positions come from the replayed
     /// frames themselves. Rows that disagree with HEJ event bytes are repaired (HEJ wins for event replay); rows HEJ
-    /// does not cover are untouched.
+    /// does not cover are untouched. An `Indeterminate` row whose frame is found in the replayed journal is settled as
+    /// `Acknowledged`, since the frame is now known to be durable.
     fn reconstruct_from_replay(&mut self, frames: &[ReplayedFrame], shard: ShardId, guard_expiry_physical_nanos: i64) {
         for frame in frames {
             if frame.header.is_void_record() {
@@ -108,11 +109,16 @@ pub trait SafeRetryStore {
                     dedupe: (event.fixed.dedupe_hash_low, event.fixed.dedupe_hash_high),
                 };
                 match self.lookup(header.tenant_id, delivery_identity) {
-                    Some(existing) if existing.commit == truth.commit && existing.dedupe == truth.dedupe => {
+                    Some(existing)
+                        if existing.commit == truth.commit
+                            && existing.dedupe == truth.dedupe
+                            && existing.status_class != StatusClass::Indeterminate =>
+                    {
                         // Row agrees with HEJ: keep it (status/expiry are the mutable index's own business).
                     }
                     _ => {
-                        // Missing or disagreeing: HEJ is authoritative; the row is rebuilt from the journal.
+                        // Missing, disagreeing, or indeterminate: HEJ is authoritative; the row is rebuilt from the
+                        // journal.
                         self.record(truth);
                     }
                 }

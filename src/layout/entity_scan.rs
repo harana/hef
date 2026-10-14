@@ -31,6 +31,9 @@ use std::ops::RangeInclusive;
 /// See: hef-deletes-and-corrections/spec.md
 pub trait DeletesAndCorrections {
     /// The rows deleted from the stored file `file_id`, in that file's own row ordinals, or `None` when none are.
+    /// The vector may also mark rows a replacement superseded, as `latest_corrected_deletion_vector` computes them: a
+    /// scan reads the mark on a replaced row as its supersession and still serves the replacement. A mark on a row
+    /// whose payload would be served, including an amended original, always drops the event.
     fn deletion_vector(&self, tenant_id: TenantId, file_id: u128) -> Result<Option<DeletionVector>, EntityScanError>;
 
     /// True when the event at `point` was written as a correction of another event. A scan serves it in place of the
@@ -100,7 +103,9 @@ impl EntityScan {
     /// Hand it the files of the snapshot being read - files of another tenant are ignored - and the overlay of
     /// fresher rows. Deleted rows are left out and corrected events come back as their latest correction, both as
     /// recorded in `deletes`: a retraction drops the event, a replacement serves the correcting event, and an amendment
-    /// serves the original with the amendment's payload fields laid over its own.
+    /// serves the original with the amendment's payload fields laid over its own. Corrections of corrections are
+    /// followed to the end of the chain, applied in order; a retraction anywhere on the chain, or a deleted row whose
+    /// payload would be served, drops the event. A chain that loops back on itself is refused with `CorrectionCycle`.
     pub fn run(
         &self,
         files: &[&HefFile],
@@ -143,36 +148,13 @@ impl EntityScan {
             if self.limit.is_some_and(|limit| events.len() >= limit) {
                 break;
             }
-            if let RowSource::File { file, row_ordinal, .. } = candidate.source
-                && deletion_vectors
-                    .get(file)
-                    .and_then(Option::as_ref)
-                    .is_some_and(|vector| vector.is_deleted(row_ordinal))
-            {
-                continue;
-            }
             if deletes.is_correction(self.tenant_id, candidate.point)? {
                 continue;
             }
-            let (envelope, payload) = reader.read(candidate.source)?;
-            let served = match deletes.latest_correction(self.tenant_id, envelope.event_id)? {
-                None => Some((envelope, payload)),
-                Some(correction) => {
-                    let at = SequencePoint {
-                        epoch: correction.correction_epoch,
-                        sequence: correction.correction_sequence,
-                    };
-                    match correction.correction_type {
-                        CorrectionType::Amendment => {
-                            let (_, changes) = reader.read(locate(at, &files, &segments)?)?;
-                            Some((envelope, amend(payload, changes)))
-                        }
-                        CorrectionType::Replacement => Some(reader.read(locate(at, &files, &segments)?)?),
-                        CorrectionType::Retraction => None,
-                    }
-                }
-            };
-            if let Some((envelope, payload)) = served {
+            let event = reader.read(candidate.source)?;
+            if let Some((envelope, payload)) =
+                self.latest_version(candidate.source, event, deletes, &deletion_vectors, &mut reader)?
+            {
                 events.push(EntityEvent {
                     envelope,
                     payload,
@@ -181,6 +163,62 @@ impl EntityScan {
             }
         }
         Ok(events)
+    }
+
+    /// Follows `event`'s corrections hop by hop to its latest version, or `None` when that version is not served.
+    ///
+    /// A replacement swaps in the correcting event, an amendment lays its payload fields over the version before it,
+    /// in chain order, and a retraction anywhere on the chain drops the event. A deletion mark on any row whose
+    /// payload the served version is built from drops the event, so a deleted payload is never served; a mark on a
+    /// row a later replacement discarded reads as its supersession, as a latest-corrected deletion vector records it.
+    fn latest_version(
+        &self,
+        source: RowSource,
+        event: (EventEnvelope, PayloadRead),
+        deletes: &dyn DeletesAndCorrections,
+        deletion_vectors: &[Option<DeletionVector>],
+        reader: &mut EventReader<'_>,
+    ) -> Result<Option<(EventEnvelope, PayloadRead)>, EntityScanError> {
+        let (files, segments) = (reader.files, reader.segments);
+        let (mut envelope, mut base) = event;
+        let mut amendments = Vec::new();
+        let mut current = envelope.event_id;
+        let mut on_chain = vec![current];
+        let mut served_rows = vec![source];
+        while let Some(correction) = deletes.latest_correction(self.tenant_id, current)? {
+            let at = SequencePoint {
+                epoch: correction.correction_epoch,
+                sequence: correction.correction_sequence,
+            };
+            if correction.correction_type == CorrectionType::Retraction {
+                return Ok(None);
+            }
+            let row = locate(at, files, segments)?;
+            let (correcting, changes) = reader.read(row)?;
+            current = correcting.event_id;
+            if on_chain.contains(&current) {
+                return Err(EntityScanError::CorrectionCycle {
+                    epoch: at.epoch,
+                    sequence: at.sequence,
+                });
+            }
+            on_chain.push(current);
+            if correction.correction_type == CorrectionType::Amendment {
+                amendments.push(changes);
+            } else if let Some(last) = amendments.last_mut() {
+                *last = changes;
+                served_rows.pop();
+            } else {
+                envelope = correcting;
+                base = changes;
+                served_rows.clear();
+            }
+            served_rows.push(row);
+        }
+        if served_rows.iter().any(|row| is_deleted(deletion_vectors, *row)) {
+            return Ok(None);
+        }
+        Ok(Some((envelope, amendments.into_iter().fold(base, amend))))
     }
 
     /// Adds the rows of `file` that belong to the entity and fall in the range.
@@ -355,6 +393,17 @@ fn locate(
             epoch: point.epoch,
             sequence: point.sequence,
         })
+}
+
+/// True when `source` is a file row the file's deletion vector deletes. Overlay rows carry no deletion vector.
+fn is_deleted(deletion_vectors: &[Option<DeletionVector>], source: RowSource) -> bool {
+    match source {
+        RowSource::File { file, row_ordinal, .. } => deletion_vectors
+            .get(file)
+            .and_then(Option::as_ref)
+            .is_some_and(|vector| vector.is_deleted(row_ordinal)),
+        RowSource::Overlay { .. } => false,
+    }
 }
 
 /// An amendment laid over the event it amends: payload fields the amendment carries replace the original's, the rest

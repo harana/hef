@@ -22,7 +22,7 @@ use super::{
 use crate::error::FormatError;
 use crate::events::variant::VariantValue;
 use crate::file::bytes::{Reader, Writer, slice};
-use crate::layout::reader::PayloadRead;
+use crate::layout::reader::{ColumnRead, PayloadRead};
 use hashbrown::HashSet;
 use std::sync::OnceLock;
 use std::{borrow::Cow, collections::BTreeMap};
@@ -197,8 +197,10 @@ impl DecodedPage {
                 }
             }
             DecodedPage::RangeFilter(filter) => {
-                let lo = u64::try_from(clause.value_lo.max(0)).ok()?;
-                let hi = u64::try_from(clause.value_hi.max(0)).ok()?;
+                // A bound below zero answers nothing: negative i64 values never enter the key space (see
+                // `membership_keys`), so the filter cannot prove such a range empty.
+                let lo = u64::try_from(clause.value_lo).ok()?;
+                let hi = u64::try_from(clause.value_hi).ok()?;
                 Statistic::SingleSpan {
                     column_id: clause.column_id,
                     span: filter
@@ -553,7 +555,7 @@ pub fn build_membership_artifact(
     ))
 }
 
-/// The filter keys one decoded column block contributes to a membership, range, or bitmap artifact, or `None` for a
+/// The filter keys one decoded column block contributes to a membership or range artifact, or `None` for a
 /// column type the u64 key space cannot carry: hashed bytes for strings, the value itself for u64, the non-negative
 /// values for i64.
 fn membership_keys(data: &crate::encoding::ColumnData) -> Option<Cow<'_, [u64]>> {
@@ -571,6 +573,59 @@ fn membership_keys(data: &crate::encoding::ColumnData) -> Option<Cow<'_, [u64]>>
         }
         _ => return None,
     })
+}
+
+/// The filter key of every stored value of one decoded column block, in stored order, or `None` for a column type the
+/// u64 key space cannot carry: the keys of [`membership_keys`], except that a null string or a negative i64 keeps its
+/// place as `None`, so position `i` still names stored value `i`.
+fn stored_keys(data: &crate::encoding::ColumnData) -> Option<Vec<Option<u64>>> {
+    Some(match data {
+        crate::encoding::ColumnData::Strings(values) => values
+            .iter()
+            .map(|value| value.map(|value| super::stable_hash(value.as_bytes())))
+            .collect(),
+        crate::encoding::ColumnData::U64(values) => values.iter().map(|value| Some(*value)).collect(),
+        crate::encoding::ColumnData::I64(values) => values.iter().map(|value| u64::try_from(*value).ok()).collect(),
+        _ => return None,
+    })
+}
+
+/// The granule-relative row each stored value of a column block sits at: stored position `i` is row `i` for a dense
+/// block, or the `i`-th set presence bit for a presence-gated one.
+fn stored_rows(read: &ColumnRead, row_count: u32) -> Vec<u64> {
+    if read.presence.is_empty() {
+        (0..read.data.row_count() as u64).collect()
+    } else {
+        (0..u64::from(row_count))
+            .filter(|row| {
+                read.presence
+                    .get((row / 8) as usize)
+                    .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
+            })
+            .collect()
+    }
+}
+
+/// One granule's value-to-rows bitmap index (row ids granule-relative), or `None` for a column type the u64 key space
+/// cannot carry. Each value is paired with its own row before values without a key are dropped, so a dropped value
+/// never shifts the rows of the values after it.
+fn granule_bitmap(read: &ColumnRead, row_count: u32) -> Option<BitmapIndex> {
+    let keys = stored_keys(&read.data)?;
+    let rows = stored_rows(read, row_count);
+    // Group the granule's rows by value first, then record each value once: inserting row by row would rebuild that
+    // value's bitmap on every row, which is quadratic in exactly the dense low-cardinality columns this artifact
+    // targets.
+    let mut rows_by_value: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (key, row) in keys.into_iter().zip(rows) {
+        if let Some(key) = key {
+            rows_by_value.entry(key).or_default().push(row);
+        }
+    }
+    let mut index = BitmapIndex::new();
+    for (value, value_rows) in rows_by_value {
+        index.insert(value, value_rows);
+    }
+    Some(index)
 }
 
 /// Extends the coverage range list by one granule, merging it into the last range when contiguous.
@@ -706,6 +761,8 @@ pub fn build_learned_position_artifact(
     error_bound: u64,
 ) -> Result<IndexArtifact, FormatError> {
     let mut keys: Vec<i64> = Vec::new();
+    let mut rows: Vec<u64> = Vec::new();
+    let mut row_count = 0u64;
     let mut granule_ranges: Vec<(u32, u32)> = Vec::new();
     for granule in &file.footer().granules {
         let read = file.read_column(column_id, granule.granule_id)?;
@@ -716,6 +773,13 @@ pub fn build_learned_position_artifact(
         };
         extend_granule_ranges(&mut granule_ranges, granule.granule_id);
         keys.extend_from_slice(values);
+        // The model names file row ordinals, so a null row keeps its place instead of shifting later values down.
+        rows.extend(
+            stored_rows(&read, granule.row_count)
+                .into_iter()
+                .map(|row| granule.first_row_ordinal + row),
+        );
+        row_count = row_count.max(granule.first_row_ordinal + u64::from(granule.row_count));
     }
     if keys.windows(2).any(|pair| pair[1] < pair[0]) {
         return Err(FormatError::Structural {
@@ -741,7 +805,7 @@ pub fn build_learned_position_artifact(
             projection_id: 0,
         },
         vec![ArtifactPage {
-            bytes: LearnedPositionIndex::build(column_id, 0, &keys, error_bound).encode(),
+            bytes: LearnedPositionIndex::build_at_rows(column_id, 0, &keys, &rows, row_count, error_bound).encode(),
             first_granule,
             last_granule,
         }],
@@ -760,35 +824,9 @@ pub fn build_bitmap_artifact(
     let mut granule_ranges: Vec<(u32, u32)> = Vec::new();
     for granule in &file.footer().granules {
         let read = file.read_column(column_id, granule.granule_id)?;
-        let Some(keys) = membership_keys(&read.data) else {
+        let Some(index) = granule_bitmap(&read, granule.row_count) else {
             continue;
         };
-        // Map each stored value back to its granule-relative row: stored position i is row i for a dense column, or
-        // the i-th set presence bit for a presence-gated one.
-        let mut present_rows = (0..u64::from(granule.row_count)).filter(|row| {
-            read.presence
-                .get((row / 8) as usize)
-                .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
-        });
-        // Group the granule's rows by value first, then record each value once: inserting row by row would rebuild
-        // that value's bitmap on every row, which is quadratic in exactly the dense low-cardinality columns this
-        // artifact targets.
-        let mut rows_by_value: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-        for (position, key) in keys.iter().enumerate() {
-            let row = if read.presence.is_empty() {
-                position as u64
-            } else {
-                let Some(row) = present_rows.next() else {
-                    break;
-                };
-                row
-            };
-            rows_by_value.entry(*key).or_default().push(row);
-        }
-        let mut index = BitmapIndex::new();
-        for (value, value_rows) in rows_by_value {
-            index.insert(value, value_rows);
-        }
         extend_granule_ranges(&mut granule_ranges, granule.granule_id);
         pages.push(ArtifactPage {
             bytes: index.encode(),

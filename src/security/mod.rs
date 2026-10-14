@@ -463,13 +463,28 @@ impl SealedContentKey {
     /// use this directly only to open sealed blocks or when the caller persists and resumes the epoch itself. A fresh
     /// instance at a previously used epoch can repeat a nonce.
     pub fn new(content_key: ContentKey, key_epoch: u64, scheme: AeadScheme) -> Self {
-        Self::with_epoch_range(content_key, key_epoch, u64::MAX, scheme)
+        Self::unchecked_epoch_range(content_key, key_epoch, u64::MAX, scheme)
     }
 
     /// Wraps `content_key` sealing under epochs `key_epoch..epoch_limit` only. A durable keystore hands these out,
     /// one reserved range per checkout, so no two checkouts can ever seal under the same epoch. The caller must have
-    /// durably reserved `key_epoch..epoch_limit` for this key before calling.
-    pub fn with_epoch_range(content_key: ContentKey, key_epoch: u64, epoch_limit: u64, scheme: AeadScheme) -> Self {
+    /// durably reserved `key_epoch..epoch_limit` for this key before calling. Returns `None` when the range is empty
+    /// or inverted (`key_epoch >= epoch_limit`): such a reservation owns no epoch to seal under.
+    pub fn with_epoch_range(
+        content_key: ContentKey,
+        key_epoch: u64,
+        epoch_limit: u64,
+        scheme: AeadScheme,
+    ) -> Option<Self> {
+        if key_epoch >= epoch_limit {
+            return None;
+        }
+        Some(Self::unchecked_epoch_range(content_key, key_epoch, epoch_limit, scheme))
+    }
+
+    /// Builds the key without checking the range; [`encrypt`](Self::encrypt) still refuses any epoch at or past
+    /// `epoch_limit`.
+    fn unchecked_epoch_range(content_key: ContentKey, key_epoch: u64, epoch_limit: u64, scheme: AeadScheme) -> Self {
         Self {
             content_key,
             epoch_limit,
@@ -499,6 +514,9 @@ impl SealedContentKey {
     /// epoch another checkout may own — check out a fresh sealing key to continue.
     pub fn encrypt(&mut self, block_id: u64, file_id: u128, plaintext: &[u8]) -> Option<Vec<u8>> {
         let mut state = self.lock_state();
+        if state.key_epoch >= self.epoch_limit {
+            return None;
+        }
         let mut nonce = BlockNonce::derive(self.scheme, block_id, state.key_epoch);
         while state.sealed_nonces.contains(&nonce.bytes) {
             let next_epoch = state.key_epoch.checked_add(1).filter(|next| *next < self.epoch_limit)?;
