@@ -1521,26 +1521,56 @@ fn decode_byte_stream_split(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatE
 /// estimated encoded size, plus that estimate in bytes so selection can weigh ALP-RD against the other float
 /// fallbacks. Deterministic: candidate widths are tried in a fixed order and ties keep the first winner.
 fn alp_rd_choose_split(sample: &[f64]) -> (u32, Vec<u16>, usize) {
-    let mut best: Option<(u32, Vec<u16>, usize)> = None;
+    let mut lefts: Vec<u16> = Vec::with_capacity(sample.len());
+    // Dictionary entries as (count, left part), plus how many are real.
+    let mut best_top = [(0usize, 0u16); ALP_RD_MAX_DICT_LEN];
+    let mut best_len = 0;
+    let mut best_estimate = usize::MAX;
+    let mut best_width = ALP_RD_MAX_RIGHT_WIDTH;
     for right_width in ALP_RD_MIN_RIGHT_WIDTH..=ALP_RD_MAX_RIGHT_WIDTH {
-        let mut counts: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
-        for value in sample {
-            *counts.entry((value.to_bits() >> right_width) as u16).or_default() += 1;
+        lefts.clear();
+        lefts.extend(sample.iter().map(|value| (value.to_bits() >> right_width) as u16));
+        lefts.sort_unstable();
+        // Top dictionary entries by count descending, then left part ascending. Runs arrive in ascending key order,
+        // so a new run lands after every kept entry whose count is at least its own.
+        let mut top = [(0usize, 0u16); ALP_RD_MAX_DICT_LEN];
+        let mut top_len = 0;
+        for run in lefts.chunk_by(|a, b| a == b) {
+            let Some(&key) = run.first() else {
+                continue;
+            };
+            let count = run.len();
+            let position = top
+                .get(..top_len)
+                .unwrap_or_default()
+                .iter()
+                .position(|&(kept, _)| kept < count)
+                .unwrap_or(top_len);
+            let Some(tail) = top.get_mut(position..).filter(|tail| !tail.is_empty()) else {
+                continue;
+            };
+            // Shift the lower-ranked entries down one slot; the last one falls off a full dictionary.
+            tail.rotate_right(1);
+            if let Some(slot) = tail.first_mut() {
+                *slot = (count, key);
+            }
+            top_len = (top_len + 1).min(ALP_RD_MAX_DICT_LEN);
         }
-        let mut ranked: Vec<(u16, usize)> = counts.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        ranked.truncate(ALP_RD_MAX_DICT_LEN);
-        let covered: usize = ranked.iter().map(|(_, count)| count).sum();
-        let dict: Vec<u16> = ranked.into_iter().map(|(left, _)| left).collect();
+        let kept = top.get(..top_len).unwrap_or_default();
+        let covered: usize = kept.iter().map(|&(count, _)| count).sum();
         let exceptions = sample.len() - covered;
-        let code_bits = bits_needed(dict.len().saturating_sub(1) as u64) as usize;
+        let code_bits = bits_needed(top_len.saturating_sub(1) as u64) as usize;
         let estimate =
-            2 + 2 * dict.len() + 4 + exceptions * 6 + (sample.len() * (code_bits + right_width as usize)).div_ceil(8);
-        if best.as_ref().is_none_or(|(_, _, current)| estimate < *current) {
-            best = Some((right_width, dict, estimate));
+            2 + 2 * top_len + 4 + exceptions * 6 + (sample.len() * (code_bits + right_width as usize)).div_ceil(8);
+        if estimate < best_estimate {
+            best_top = top;
+            best_len = top_len;
+            best_estimate = estimate;
+            best_width = right_width;
         }
     }
-    best.unwrap_or((ALP_RD_MAX_RIGHT_WIDTH, Vec::new(), usize::MAX))
+    let dict = best_top.iter().take(best_len).map(|&(_, key)| key).collect();
+    (best_width, dict, best_estimate)
 }
 
 /// Splits one run of floats at `right_width`, writing each value's masked right part into `rights` and its left part's
@@ -1717,25 +1747,22 @@ struct NullStream {
     row_count: usize,
 }
 
-/// Sets bits `[start, end)` in a packed little-endian bitmap, byte-filling whole bytes and masking only the two
-/// partial edge bytes rather than setting one bit at a time.
-fn set_bit_range(bits: &mut [u8], start: usize, end: usize) {
-    if start >= end {
-        return;
+/// Calls `emit(start, end)` for each maximal `[start, end)` run of present rows, in row order.
+fn each_present_run(presence: &[bool], mut emit: impl FnMut(usize, usize)) {
+    let mut run_start: Option<usize> = None;
+    for (index, &present) in presence.iter().enumerate() {
+        match (present, run_start) {
+            (true, None) => run_start = Some(index),
+            (false, Some(start)) => {
+                emit(start, index);
+                run_start = None;
+            }
+            _ => {}
+        }
     }
-    let start_byte = start / 8;
-    let end_byte = (end - 1) / 8;
-    let low = start % 8;
-    let high = (end - 1) % 8;
-    if start_byte == end_byte {
-        bits[start_byte] |= (0xFFu8 << low) & (0xFFu8 >> (7 - high));
-        return;
+    if let Some(start) = run_start {
+        emit(start, presence.len());
     }
-    bits[start_byte] |= 0xFFu8 << low;
-    for byte in &mut bits[start_byte + 1..end_byte] {
-        *byte = 0xFF;
-    }
-    bits[end_byte] |= 0xFFu8 >> (7 - high);
 }
 
 impl NullStream {
@@ -1743,27 +1770,33 @@ impl NullStream {
     /// bytes, the run form when it undercuts the raw bitmap, the raw bitmap otherwise. Deterministic, so
     /// byte-identical encodes across nodes hold unchanged.
     fn from_values(values: &StringColumn) -> Self {
-        let mut runs: Vec<(u32, u32)> = Vec::new();
-        for (index, value) in values.iter().enumerate() {
-            if value.is_some() {
-                let index = index as u32;
-                match runs.last_mut() {
-                    Some(run) if run.1 == index => run.1 = index + 1,
-                    _ => runs.push((index, index + 1)),
-                }
-            }
+        // First pass counts only, so the run list or bitmap is allocated once, for the form actually chosen.
+        let presence = values.presence();
+        let row_count = presence.len();
+        let mut present_count = 0usize;
+        let mut run_count = 0usize;
+        let mut previous_present = false;
+        for &present in presence {
+            present_count += usize::from(present);
+            run_count += usize::from(present && !previous_present);
+            previous_present = present;
         }
-        let row_count = values.len();
-        let form = if runs.is_empty() {
+        let form = if present_count == 0 {
             NullStreamForm::AllAbsent
-        } else if runs == [(0, row_count as u32)] {
+        } else if present_count == row_count {
             NullStreamForm::AllPresent
-        } else if 4 + runs.len() * 8 < row_count.div_ceil(8) {
+        } else if 4 + run_count * 8 < row_count.div_ceil(8) {
+            let mut runs: Vec<(u32, u32)> = Vec::with_capacity(run_count);
+            each_present_run(presence, |start, end| runs.push((start as u32, end as u32)));
             NullStreamForm::Runs(runs)
         } else {
+            // LSB-0: row `8 * byte + bit` is bit `bit` of byte `byte`.
             let mut raw = vec![0u8; row_count.div_ceil(8)];
-            for &(start, end) in &runs {
-                set_bit_range(&mut raw, start as usize, end as usize);
+            for (byte, rows) in raw.iter_mut().zip(presence.chunks(8)) {
+                *byte = rows
+                    .iter()
+                    .enumerate()
+                    .fold(0u8, |bits, (bit, &present)| bits | (u8::from(present) << bit));
             }
             NullStreamForm::Raw(raw)
         };
@@ -2193,10 +2226,12 @@ fn encode_fsst_string(
     out: &mut Writer,
 ) -> Result<(SideStream, Option<FsstTable>, Vec<usize>), FormatError> {
     NullStream::from_values(values).write(out);
-    let corpus: Vec<&[u8]> = present.iter().map(|value| value.as_bytes()).collect();
     let table = match replay {
         Some(table) => Cow::Borrowed(table),
-        None => Cow::Owned(FsstTable(fsst::Compressor::train(&corpus))),
+        None => {
+            let corpus: Vec<&[u8]> = present.iter().map(|value| value.as_bytes()).collect();
+            Cow::Owned(FsstTable(fsst::Compressor::train(&corpus)))
+        }
     };
     let compressor = &table.0;
     let symbols = compressor.symbol_table();
@@ -2206,21 +2241,28 @@ fn encode_fsst_string(
         out.put_u64(symbol.to_u64());
         out.put_u8(*length);
     }
+    out.put_u32(present.len() as u32);
+    // The offset table is reserved up front and each end offset patched in once its value's compressed bytes are
+    // appended, so the compressed values land in `out` directly instead of in a separate buffer copied in after.
+    let offsets_start = out.len();
+    out.reserve_bytes((present.len() + 1) * 4);
     let mut scratch = Vec::new();
-    let mut arena = Vec::new();
-    let mut compressed_lens = Vec::with_capacity(corpus.len());
-    for value in &corpus {
-        compress_fsst_value(compressor, value, &mut scratch);
-        compressed_lens.push(scratch.len());
-        arena.extend_from_slice(&scratch);
+    let mut offset = 0u32;
+    for (index, value) in present.iter().enumerate() {
+        compress_fsst_value(compressor, value.as_bytes(), &mut scratch);
+        offset = u32::try_from(scratch.len())
+            .ok()
+            .and_then(|len| offset.checked_add(len))
+            .ok_or(FormatError::Structural {
+                rule: "string arena offsets exceed the u32 range the format stores",
+            })?;
+        out.put_slice(&scratch);
+        out.patch_u32(offsets_start + (index + 1) * 4, offset);
     }
     let trained = match table {
         Cow::Owned(table) => Some(table),
         Cow::Borrowed(_) => None,
     };
-    out.put_u32(present.len() as u32);
-    write_offsets(compressed_lens.into_iter(), out)?;
-    out.put_slice(&arena);
     if !fsst_value_keys_pay(present) {
         return Ok((SideStream::None, trained, Vec::new()));
     }
@@ -3252,16 +3294,16 @@ fn choose_string_transform(present: &[&str]) -> Transform {
     if present.is_empty() {
         return Transform::RawString;
     }
-    let sample = transform_sample(present);
-    let sample: &[&str] = sample.as_deref().unwrap_or(present);
-    let mut distinct: Vec<&str> = sample.to_vec();
+    // A long block's sample is already owned, so it is sorted in place; only a short block's slice is copied.
+    let mut distinct: Vec<&str> = transform_sample(present).unwrap_or_else(|| present.to_vec());
+    let sample_len = distinct.len();
+    // Low cardinality: dictionary. High-cardinality short strings: FSST. Long/opaque strings: raw arena + offsets.
+    let average_len = distinct.iter().map(|value| value.len()).sum::<usize>() / sample_len.max(1);
     distinct.sort_unstable();
     distinct.dedup();
-    // Low cardinality: dictionary. High-cardinality short strings: FSST. Long/opaque strings: raw arena + offsets.
-    let average_len = sample.iter().map(|value| value.len()).sum::<usize>() / sample.len().max(1);
-    if distinct.len() * DICTIONARY_MAX_CARDINALITY_DIVISOR <= sample.len() {
+    if distinct.len() * DICTIONARY_MAX_CARDINALITY_DIVISOR <= sample_len {
         Transform::DictionaryString
-    } else if average_len <= FSST_MAX_AVERAGE_VALUE_LEN && sample.len() >= FSST_MIN_SAMPLE_COUNT {
+    } else if average_len <= FSST_MAX_AVERAGE_VALUE_LEN && sample_len >= FSST_MIN_SAMPLE_COUNT {
         Transform::FsstString
     } else {
         Transform::RawString

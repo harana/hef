@@ -284,15 +284,11 @@ impl RoaringRangeBitmap {
     }
 
     fn encoded_len(&self) -> usize {
-        RUN_COUNT_PREFIX_BYTES + self.runs.len() * ENCODED_ROW_RANGE_BYTES
+        encoded_runs_len(self.runs.len())
     }
 
     fn encode_into(&self, out: &mut Writer) {
-        out.put_u32(self.runs.len() as u32);
-        for run in &self.runs {
-            out.put_u64(run.start);
-            out.put_u64(run.end);
-        }
+        put_encoded_runs(out, &self.runs);
     }
 
     /// Reads a bitmap back from [`encode`](Self::encode)'s bytes. Refuses on truncated input or on runs that are
@@ -318,6 +314,21 @@ impl RoaringRangeBitmap {
             runs.push(RowRange { start, end });
         }
         Ok(Self { runs })
+    }
+}
+
+/// How many bytes [`put_encoded_runs`] writes for `run_count` runs.
+pub(crate) fn encoded_runs_len(run_count: usize) -> usize {
+    RUN_COUNT_PREFIX_BYTES + run_count * ENCODED_ROW_RANGE_BYTES
+}
+
+/// Appends `runs` to `out` in the exact bytes [`RoaringRangeBitmap::encode`] produces, without building a bitmap first.
+/// The caller must pass runs already in canonical sorted, disjoint, non-adjacent form, or the bytes will not decode.
+pub(crate) fn put_encoded_runs(out: &mut Writer, runs: &[RowRange]) {
+    out.put_u32(runs.len() as u32);
+    for run in runs {
+        out.put_u64(run.start);
+        out.put_u64(run.end);
     }
 }
 

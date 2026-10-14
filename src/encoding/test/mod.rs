@@ -3,6 +3,7 @@ use crate::benchmarks::{XorFloatMeasurement, xor_float_gate_passes};
 use crate::file::bytes::{Reader, Writer};
 use arrow_array::Array;
 use miniz_oxide::deflate::compress_to_vec;
+use std::collections::BTreeMap;
 
 /// A transform chosen from a sample can encode the full block larger than simply writing the values out — which for
 /// the format's own metadata columns, a handful of values each, was the normal case rather than the unlucky one.
@@ -950,6 +951,153 @@ fn null_stream_picks_the_smallest_form() {
     );
     // Alternating presence would need 2048 runs, so the raw one-bit-per-row bitmap wins: 5 + 512 bytes.
     assert_eq!(encoded_len(&string_values_with_nulls(4096, |i| i % 2 == 0)), 517);
+}
+
+/// The null-stream derivation as it stood before the counting first pass: build every present-row run, then pick the
+/// form from them. Kept here as the reference the current derivation must match byte for byte.
+fn reference_null_stream(values: &StringColumn) -> NullStream {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        if value.is_some() {
+            let index = index as u32;
+            match runs.last_mut() {
+                Some(run) if run.1 == index => run.1 = index + 1,
+                _ => runs.push((index, index + 1)),
+            }
+        }
+    }
+    let row_count = values.len();
+    let form = if runs.is_empty() {
+        NullStreamForm::AllAbsent
+    } else if runs == [(0, row_count as u32)] {
+        NullStreamForm::AllPresent
+    } else if 4 + runs.len() * 8 < row_count.div_ceil(8) {
+        NullStreamForm::Runs(runs)
+    } else {
+        let mut raw = vec![0u8; row_count.div_ceil(8)];
+        for &(start, end) in &runs {
+            for row in start as usize..end as usize {
+                raw[row / 8] |= 1 << (row % 8);
+            }
+        }
+        NullStreamForm::Raw(raw)
+    };
+    NullStream { form, row_count }
+}
+
+/// A named presence pattern: whether row `i` carries a value.
+type RowShape = (&'static str, Box<dyn Fn(usize) -> bool>);
+
+/// The counting first pass must choose the same form and write the same bytes as the reference derivation for every
+/// null pattern, including the run/raw size tie (which the raw bitmap wins) and patterns ending on byte boundaries.
+#[test]
+fn null_stream_matches_the_reference_derivation() {
+    let mut patterns: Vec<(String, StringColumn)> = vec![
+        ("empty".into(), string_values_with_nulls(0, |_| true)),
+        ("single present".into(), string_values_with_nulls(1, |_| true)),
+        ("single absent".into(), string_values_with_nulls(1, |_| false)),
+    ];
+    for row_count in [7usize, 8, 9, 15, 16, 17, 63, 64, 65, 100, 255, 256, 257, 1000, 4096] {
+        let shapes: [RowShape; 12] = [
+            ("all present", Box::new(|_| true)),
+            ("all absent", Box::new(|_| false)),
+            ("alternating", Box::new(|i| i % 2 == 0)),
+            ("alternating odd", Box::new(|i| i % 2 == 1)),
+            ("sparse present", Box::new(|i| i % 97 == 3)),
+            ("sparse absent", Box::new(|i| i % 89 != 5)),
+            ("clusters", Box::new(|i| (i / 40) % 3 == 0)),
+            ("leading nulls", Box::new(move |i| i >= row_count / 3)),
+            ("trailing nulls", Box::new(move |i| i < row_count - row_count / 3)),
+            ("byte-aligned blocks", Box::new(|i| (i / 8) % 2 == 0)),
+            ("first row only", Box::new(|i| i == 0)),
+            ("last row only", Box::new(move |i| i + 1 == row_count)),
+        ];
+        for (shape, present) in shapes {
+            patterns.push((
+                format!("{shape} x{row_count}"),
+                string_values_with_nulls(row_count, present),
+            ));
+        }
+    }
+    // Run/raw size equality: 4 + 8 * runs == ceil(rows / 8). One run ties at 12 bitmap bytes (89..=96 rows) and two
+    // runs at 20 bytes (153..=160 rows); the rows just outside each range probe both sides of the tie.
+    for (row_count, run_count) in [
+        (88usize, 1usize),
+        (89, 1),
+        (96, 1),
+        (97, 1),
+        (152, 2),
+        (153, 2),
+        (160, 2),
+        (161, 2),
+    ] {
+        patterns.push((
+            format!("tie {run_count} runs x{row_count}"),
+            string_values_with_nulls(row_count, move |i| i < 10 || (run_count == 2 && (20..30).contains(&i))),
+        ));
+    }
+    for (name, values) in patterns {
+        let actual = NullStream::from_values(&values);
+        let expected = reference_null_stream(&values);
+        assert_eq!(actual, expected, "{name}: form");
+        let mut actual_bytes = Writer::new();
+        actual.write(&mut actual_bytes);
+        let mut expected_bytes = Writer::new();
+        expected.write(&mut expected_bytes);
+        assert_eq!(actual_bytes.into_bytes(), expected_bytes.into_bytes(), "{name}: bytes");
+    }
+}
+
+/// The string-transform choice as it stood before the sample was sorted in place: copy the sample into a second
+/// vector to count distinct values. Kept here as the reference the current choice must match.
+fn reference_string_transform(present: &[&str]) -> Transform {
+    if present.is_empty() {
+        return Transform::RawString;
+    }
+    let sample = transform_sample(present);
+    let sample: &[&str] = sample.as_deref().unwrap_or(present);
+    let mut distinct: Vec<&str> = sample.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let average_len = sample.iter().map(|value| value.len()).sum::<usize>() / sample.len().max(1);
+    if distinct.len() * DICTIONARY_MAX_CARDINALITY_DIVISOR <= sample.len() {
+        Transform::DictionaryString
+    } else if average_len <= FSST_MAX_AVERAGE_VALUE_LEN && sample.len() >= FSST_MIN_SAMPLE_COUNT {
+        Transform::FsstString
+    } else {
+        Transform::RawString
+    }
+}
+
+/// Sorting the owned sample in place must pick the same transform as the reference for every block size around the
+/// sample-size boundary, across low and high cardinality and short and long values, and leave the caller's values
+/// untouched.
+#[test]
+fn string_transform_choice_matches_the_reference() {
+    for size in [0usize, 1, 15, 16, 1023, 1024, 1025, 5000, 20_000] {
+        for cardinality in [1usize, 3, 250, 256, 257, usize::MAX] {
+            for pad in [0usize, 40, 60, 64, 65, 200] {
+                let owned: Vec<String> = (0..size)
+                    .map(|i| {
+                        let key = if cardinality == usize::MAX {
+                            i
+                        } else {
+                            (i * 7) % cardinality
+                        };
+                        format!("{key}{}", "x".repeat(pad + (i % 3)))
+                    })
+                    .collect();
+                let present: Vec<&str> = owned.iter().map(String::as_str).collect();
+                let before = present.clone();
+                assert_eq!(
+                    choose_string_transform(&present),
+                    reference_string_transform(&present),
+                    "size {size}, cardinality {cardinality}, pad {pad}"
+                );
+                assert_eq!(present, before, "caller's values must stay in their order");
+            }
+        }
+    }
 }
 
 /// Every string transform must round-trip under every null side-stream form, and the zero-copy view decode must
@@ -3268,6 +3416,87 @@ fn alp_rd_split_kernel_matches_a_linear_dictionary_search() {
     }
 }
 
+/// The ALP-RD split search must pick exactly the width, dictionary, and estimate of the original map-based search:
+/// same candidate order, same count-then-key ranking, same strict-improvement rule.
+#[test]
+fn alp_rd_choose_split_matches_the_map_based_reference() {
+    fn reference(sample: &[f64]) -> (u32, Vec<u16>, usize) {
+        let mut best: Option<(u32, Vec<u16>, usize)> = None;
+        for right_width in ALP_RD_MIN_RIGHT_WIDTH..=ALP_RD_MAX_RIGHT_WIDTH {
+            let mut counts: BTreeMap<u16, usize> = BTreeMap::new();
+            for value in sample {
+                *counts.entry((value.to_bits() >> right_width) as u16).or_default() += 1;
+            }
+            let mut ranked: Vec<(u16, usize)> = counts.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            ranked.truncate(ALP_RD_MAX_DICT_LEN);
+            let covered: usize = ranked.iter().map(|(_, count)| count).sum();
+            let dict: Vec<u16> = ranked.into_iter().map(|(left, _)| left).collect();
+            let exceptions = sample.len() - covered;
+            let code_bits = bits_needed(dict.len().saturating_sub(1) as u64) as usize;
+            let estimate = 2
+                + 2 * dict.len()
+                + 4
+                + exceptions * 6
+                + (sample.len() * (code_bits + right_width as usize)).div_ceil(8);
+            if best.as_ref().is_none_or(|(_, _, current)| estimate < *current) {
+                best = Some((right_width, dict, estimate));
+            }
+        }
+        best.unwrap_or((ALP_RD_MAX_RIGHT_WIDTH, Vec::new(), usize::MAX))
+    }
+    // A left part (top 16 bits) over random low bits, so each width sees a different grouping.
+    let with_left = |left: u64, i: u64| f64::from_bits((left << 48) | (mix(i) >> 16));
+    // Keys 0..=6 appear three times per cycle and keys 7..=9 twice, so three keys tie for the last dictionary slot.
+    let boundary_key = |i: u64| {
+        let j = i % 27;
+        if j < 21 { j / 3 } else { 7 + (j - 21) / 2 }
+    };
+    let specials = [
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        f64::from_bits(0x7FF8_0000_0000_0001),
+        f64::from_bits(0x7FF0_0000_0000_0001),
+        f64::from_bits(0xFFFF_FFFF_FFFF_FFFF),
+        f64::from_bits(1),
+        f64::from_bits(0x000F_FFFF_FFFF_FFFF),
+        f64::from_bits(0x8000_0000_0000_0001),
+        f64::MIN_POSITIVE,
+        f64::MAX,
+    ];
+    let shapes: [&dyn Fn(u64) -> f64; 9] = [
+        &|_| 1.5,
+        &|i| with_left(0x4000 + i % 8, i),
+        &|i| with_left(0x4000 + i % 9, i),
+        &|i| with_left(0x4000 + boundary_key(i), i),
+        &|i| with_left(0xFFFF - boundary_key(i), i),
+        &|i| with_left(0x4000 + mix(i ^ 0xABCD) % 12, i),
+        &|i| f64::from_bits(mix(i)),
+        &|i| {
+            if i % 2 == 0 {
+                specials[(mix(i) % specials.len() as u64) as usize]
+            } else {
+                f64::from_bits(0x4000_0000_0000_0000 | (mix(i) >> 12))
+            }
+        },
+        &|i| f64::from_bits(((0x3FF + mix(i) % 4) << 52) | (mix(i + 1) >> 12)),
+    ];
+    for size in [0u64, 1, 7, 8, 9, 16, 128, 1023, 1024, 4096] {
+        for (shape_index, shape) in shapes.iter().enumerate() {
+            let sample: Vec<f64> = (0..size).map(shape).collect();
+            assert_eq!(
+                alp_rd_choose_split(&sample),
+                reference(&sample),
+                "size {size}, shape {shape_index}"
+            );
+        }
+    }
+    assert_eq!(alp_rd_choose_split(&[]), (ALP_RD_MIN_RIGHT_WIDTH, Vec::new(), 6));
+}
+
 #[test]
 fn presence_rank_and_present_position_agree_with_a_prefix_count() {
     // Every third row present, over enough rows to cross several bitmap bytes.
@@ -3520,4 +3749,152 @@ fn alp_exception_indexes_pack_identically_to_a_collected_index_vector() {
         u64::from(exceptions[i].0) - base
     });
     assert_eq!(actual.into_bytes(), expected.into_bytes());
+}
+
+/// The FSST block layout as it was written before the encoder stopped staging the compressed values in a separate
+/// buffer: every value compressed into a side arena with its length recorded, then the count, the offset table, and
+/// the arena copied in behind them. The encoder's output must match it byte for byte.
+fn reference_fsst_block(values: &StringColumn, replay: Option<&FsstTable>) -> (Vec<u8>, SideStream, Vec<usize>) {
+    let present = present_values(values);
+    let mut out = Writer::new();
+    NullStream::from_values(values).write(&mut out);
+    let corpus: Vec<&[u8]> = present.iter().map(|value| value.as_bytes()).collect();
+    let trained;
+    let compressor = match replay {
+        Some(table) => &table.0,
+        None => {
+            trained = fsst::Compressor::train(&corpus);
+            &trained
+        }
+    };
+    out.put_u16(compressor.symbol_table().len() as u16);
+    for (symbol, length) in compressor.symbol_table().iter().zip(compressor.symbol_lengths().iter()) {
+        out.put_u64(symbol.to_u64());
+        out.put_u8(*length);
+    }
+    let mut scratch = Vec::new();
+    let mut arena = Vec::new();
+    let mut compressed_lens = Vec::new();
+    for value in &corpus {
+        compress_fsst_value(compressor, value, &mut scratch);
+        compressed_lens.push(scratch.len());
+        arena.extend_from_slice(&scratch);
+    }
+    out.put_u32(present.len() as u32);
+    write_offsets(compressed_lens.into_iter(), &mut out).unwrap();
+    out.put_slice(&arena);
+    if !fsst_value_keys_pay(&present) {
+        return (out.into_bytes(), SideStream::None, Vec::new());
+    }
+    let prefixes_start = out.len();
+    for value in &present {
+        out.put_slice(&PrefixKey::of(value).to_stored());
+    }
+    let fingerprints_start = out.len();
+    for value in &present {
+        out.put_u32(StringFingerprint::of(value.as_bytes()).to_bits());
+    }
+    (
+        out.into_bytes(),
+        SideStream::FsstValueKeys,
+        vec![prefixes_start, fingerprints_start],
+    )
+}
+
+/// String columns covering the FSST encoder's edge cases: no rows, only nulls, present empty strings, alternating
+/// nulls, multibyte text, values long enough to earn the per-value keys, and text the table mostly has to escape.
+fn fsst_layout_columns() -> Vec<(&'static str, StringColumn)> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let escape_heavy: StringColumn = (0..300)
+        .map(|_| {
+            let text: String = (0..24)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    char::from_u32(0x20 + (state >> 40) as u32 % 0x2_0000).unwrap_or('?')
+                })
+                .collect();
+            Some(text)
+        })
+        .collect();
+    vec![
+        ("empty", StringColumn::new()),
+        ("all null", (0..50).map(|_| None::<&str>).collect()),
+        (
+            "present empty strings",
+            (0..60).map(|i| Some(if i % 3 == 0 { "" } else { "abc" })).collect(),
+        ),
+        (
+            "alternating nulls",
+            (0..400)
+                .map(|i| (i % 2 == 0).then(|| format!("user-{i:05}@example.com")))
+                .collect(),
+        ),
+        (
+            "multibyte unicode",
+            (0..200)
+                .map(|i| {
+                    Some(format!(
+                        "Gr\u{fc}\u{df}e {i} \u{65e5}\u{672c}\u{8a9e} \u{1f680} {}",
+                        i * 7
+                    ))
+                })
+                .collect(),
+        ),
+        (
+            "long strings",
+            (0..120)
+                .map(|i| (i % 5 != 0).then(|| format!("{i}:").repeat(40) + &"lorem ipsum dolor sit amet ".repeat(8)))
+                .collect(),
+        ),
+        ("escape heavy", escape_heavy),
+    ]
+}
+
+/// A block that trains its own table lays out the same bytes, frame breaks, and side stream the arena-staging
+/// encoder did, and hands back the table it trained.
+#[test]
+fn fsst_trained_block_bytes_match_the_reference_layout() {
+    for (name, values) in fsst_layout_columns() {
+        let (expected, expected_side, expected_breaks) = reference_fsst_block(&values, None);
+        let present = present_values(&values);
+        let mut out = Writer::new();
+        let (side, trained, breaks) = encode_fsst_string(&values, &present, None, &mut out).unwrap();
+        assert_eq!(out.into_bytes(), expected, "{name}: bytes");
+        assert_eq!(side, expected_side, "{name}: side stream");
+        assert_eq!(breaks, expected_breaks, "{name}: frame breaks");
+        if name == "long strings" {
+            assert_eq!(
+                side,
+                SideStream::FsstValueKeys,
+                "long values must exercise the per-value keys"
+            );
+        }
+        let corpus: Vec<&[u8]> = present.iter().map(|value| value.as_bytes()).collect();
+        assert_eq!(
+            fsst_table_entries(&trained.expect("a block without a replay table trains one")),
+            fsst_table_entries(&FsstTable(fsst::Compressor::train(&corpus))),
+            "{name}: trained table"
+        );
+    }
+}
+
+/// A block compressed with a replayed table lays out the same bytes the arena-staging encoder did and trains
+/// nothing, including when the replayed table was trained on unrelated text and has to escape most bytes.
+#[test]
+fn fsst_replayed_block_bytes_match_the_reference_layout() {
+    let training: Vec<String> = (0..300).map(|i| format!("user-{i:05}@example.com")).collect();
+    let corpus: Vec<&[u8]> = training.iter().map(|value| value.as_bytes()).collect();
+    let table = FsstTable(fsst::Compressor::train(&corpus));
+    for (name, values) in fsst_layout_columns() {
+        let (expected, expected_side, expected_breaks) = reference_fsst_block(&values, Some(&table));
+        let present = present_values(&values);
+        let mut out = Writer::new();
+        let (side, trained, breaks) = encode_fsst_string(&values, &present, Some(&table), &mut out).unwrap();
+        assert_eq!(out.into_bytes(), expected, "{name}: bytes");
+        assert_eq!(side, expected_side, "{name}: side stream");
+        assert_eq!(breaks, expected_breaks, "{name}: frame breaks");
+        assert!(trained.is_none(), "{name}: a replayed block trains no table");
+    }
 }

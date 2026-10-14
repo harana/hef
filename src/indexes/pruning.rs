@@ -514,8 +514,7 @@ pub fn prune_pages_in_granule(
     (0..total_page_count)
         .filter(|page_idx| {
             let stats = stats_by_page.get(page_idx).copied().unwrap_or(&no_stats);
-            let expr = build_pruning_expression(filter, stats);
-            !evaluate(&expr, stats).drop
+            page_could_match(filter, stats)
         })
         .collect()
 }
@@ -533,6 +532,25 @@ pub fn plan_query(query: &Query, declared: &GranuleStatistics) -> QueryPlan {
     QueryPlan::Scan {
         pruning: build_pruning_expression(&query.filter, declared),
     }
+}
+
+/// Whether a page survives the filter: the same keep/drop verdict as `evaluate(&build_pruning_expression(filter,
+/// stats), stats)`, computed by borrowing instead of building and discarding an expression per page.
+///
+/// Each relevant clause/statistic pair is judged against the page's first statistic of the same kind and column, exactly
+/// as `evaluate` looks up a term's statistic, and the search stops at the first `ProvenAbsent`.
+fn page_could_match(filter: &Filter, stats: &GranuleStatistics) -> bool {
+    !filter.clauses.iter().any(|clause| {
+        stats
+            .statistics
+            .iter()
+            .filter(|statistic| statistic.relevant_to(clause))
+            .any(|statistic| {
+                stats
+                    .matching(statistic)
+                    .is_some_and(|own| own.judge(clause) == StatVerdict::ProvenAbsent)
+            })
+    })
 }
 
 /// The exactness of the SkipIndex a statistic comes from.
