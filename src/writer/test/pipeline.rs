@@ -1399,3 +1399,184 @@ fn a_retry_after_the_guard_window_is_queued_again() {
         Submission::Ready
     );
 }
+
+/// Storage that counts its syncs and appends and fails the append numbered `fail_append`, so a test can watch how one
+/// flush of several frames uses the durability barrier.
+struct CountingStorage {
+    appends: u32,
+    fail_append: Option<u32>,
+    inner: SimJournalStorage,
+    syncs: u32,
+}
+
+impl CountingStorage {
+    fn new(fail_append: Option<u32>) -> Self {
+        Self {
+            appends: 0,
+            fail_append,
+            inner: SimJournalStorage::new(),
+            syncs: 0,
+        }
+    }
+}
+
+impl crate::invariants::JournalStorage for CountingStorage {
+    fn append(&mut self, shard: ShardId, frame: &[u8]) -> Result<u64, crate::error::StorageError> {
+        self.appends += 1;
+        if self.fail_append == Some(self.appends) {
+            return Err(crate::error::StorageError::InjectedFault { kind: "append" });
+        }
+        self.inner.append(shard, frame)
+    }
+
+    fn sync(&mut self, shard: ShardId) -> Result<(), crate::error::StorageError> {
+        self.syncs += 1;
+        self.inner.sync(shard)
+    }
+
+    fn truncate(&mut self, shard: ShardId, len: u64) -> Result<(), crate::error::StorageError> {
+        self.inner.truncate(shard, len)
+    }
+
+    fn read(&self, shard: ShardId, offset: u64, len: u32) -> Result<Vec<u8>, crate::error::StorageError> {
+        self.inner.read(shard, offset, len)
+    }
+
+    fn extent(&self, shard: ShardId) -> Result<u64, crate::error::StorageError> {
+        self.inner.extent(shard)
+    }
+
+    fn atomicity(&self, shard: ShardId) -> Result<crate::invariants::ShardAtomicity, crate::error::StorageError> {
+        self.inner.atomicity(shard)
+    }
+}
+
+/// Queues events until more than three flush targets' worth are pending, and returns how many it queued.
+fn queue_past_three_targets(worker: &mut WorkerCommitPipeline, retry: &mut SimSafeRetryStore, clock: &SimClock) -> u64 {
+    let mut count = 0;
+    while worker.queue().pending_bytes() <= 3 * u64::from(crate::artifacts::DEFAULT_FLUSH_TARGET) {
+        worker.submit(event(count), 1, retry, clock).unwrap();
+        count += 1;
+    }
+    count
+}
+
+#[test]
+fn a_burst_past_the_flush_target_commits_as_several_frames_behind_one_sync() {
+    let clock = SimClock::new(61);
+    let mut storage = CountingStorage::new(None);
+    let mut allocator = SequenceAllocator::new(1);
+    let mut watermarks = WatermarkTracker::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
+    let mut worker = pipeline();
+    let count = queue_past_three_targets(&mut worker, &mut retry, &clock);
+    let result = worker
+        .flush(
+            FlushReason::Target,
+            &mut allocator,
+            &mut storage,
+            &mut watermarks,
+            &mut retry,
+            &mut overlay,
+            &clock,
+        )
+        .unwrap();
+    assert_eq!(
+        storage.syncs, 1,
+        "every frame of the flush shares one durability barrier"
+    );
+    assert!(storage.appends >= 4, "{} frames", storage.appends);
+    assert_eq!((result.range.first_sequence, result.range.last_sequence), (1, count));
+    assert_eq!(result.receipts.len() as u64, count);
+    assert_eq!(
+        watermarks.commit_watermark(),
+        Some(SequencePoint {
+            epoch: 1,
+            sequence: count
+        })
+    );
+    assert_eq!(worker.queue().pending_bytes(), 0);
+
+    // The frames replay in order, each a normal frame covering the next sequences, and the result spans them all.
+    let replay = replay_segment(&storage.inner, ShardId(0), 1, 1).unwrap();
+    assert_eq!(replay.tail, ReplayTail::Clean);
+    assert_eq!(replay.frames.len() as u32, storage.appends);
+    let mut next = 1;
+    for frame in &replay.frames {
+        assert_eq!(frame.header.first_sequence, next);
+        assert!(frame.header.frame_len <= crate::artifacts::MAX_NORMAL_FRAME);
+        next = frame.header.last_sequence + 1;
+    }
+    assert_eq!(next, count + 1);
+    assert_eq!(
+        result.frame_offset + u64::from(result.frame_len),
+        storage.inner.extent(ShardId(0)).unwrap()
+    );
+    // Each receipt points at the frame that holds its event.
+    for receipt in &result.receipts {
+        let frame = replay
+            .frames
+            .iter()
+            .find(|frame| (frame.header.first_sequence..=frame.header.last_sequence).contains(&receipt.commit.sequence))
+            .unwrap();
+        assert_eq!(receipt.frame_offset, frame.offset);
+        assert_eq!(receipt.status_class, StatusClass::Acknowledged);
+    }
+}
+
+#[test]
+fn a_frame_failing_to_append_mid_flush_leaves_the_frames_before_it_possibly_durable() {
+    let clock = SimClock::new(67);
+    let mut storage = CountingStorage::new(Some(2));
+    let mut allocator = SequenceAllocator::new(1);
+    let mut watermarks = WatermarkTracker::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
+    let mut worker = pipeline();
+    let count = queue_past_three_targets(&mut worker, &mut retry, &clock);
+    let error = worker
+        .flush(
+            FlushReason::Target,
+            &mut allocator,
+            &mut storage,
+            &mut watermarks,
+            &mut retry,
+            &mut overlay,
+            &clock,
+        )
+        .unwrap_err();
+    assert!(matches!(error, FlushError::Storage(_)));
+    assert_eq!(storage.syncs, 0, "nothing is synced once a frame fails to append");
+    assert_eq!(watermarks.commit_watermark(), None);
+
+    // The first frame was appended, so a later sync may persist it: its events are receipted `Indeterminate`, never
+    // acknowledged, and its range is consumed rather than voided. The failed frame's range is left to a void record,
+    // and the records after it were never claimed, so they stay queued.
+    let first = retry.lookup(TenantId::new_test_id(9), (5000, 1)).unwrap();
+    assert_eq!(first.status_class, StatusClass::Indeterminate);
+    assert!(retry.lookup(TenantId::new_test_id(9), (5000 + count - 1, 1)).is_none());
+    assert!(worker.queue().pending_bytes() > 0);
+    assert_eq!(allocator.outstanding_leases(), 1);
+    clock.advance(super::super::reserve::LEASE_NANOS + 1);
+    let voided = worker
+        .commit_voids(&mut allocator, &mut storage, &mut watermarks, &mut overlay, &clock)
+        .unwrap();
+    assert_eq!(voided.len(), 1);
+    assert!(voided[0].first_sequence > first.commit.sequence);
+
+    // A later flush commits the records still queued after the voided range.
+    let result = worker
+        .flush(
+            FlushReason::Target,
+            &mut allocator,
+            &mut storage,
+            &mut watermarks,
+            &mut retry,
+            &mut overlay,
+            &clock,
+        )
+        .unwrap();
+    assert_eq!(result.range.first_sequence, voided[0].last_sequence + 1);
+    assert_eq!(worker.queue().pending_bytes(), 0);
+}

@@ -130,12 +130,22 @@ impl ContainsMatcher {
         }
     }
 
+    /// Up to 64 needles mark into one word on the stack, so the common query allocates nothing per value; larger
+    /// needle sets fall back to a heap mark of exactly the words they need.
     fn matches_automaton(&self, automaton: &AhoCorasick, value: &[u8]) -> bool {
-        let mut seen = vec![0u64; self.mark_words()];
-        for hit in automaton.find_overlapping_iter(value) {
-            set_bit(&mut seen, hit.pattern().as_usize());
+        match self.mark_words() {
+            0 | 1 => self.marks_every_needle(automaton, value, &mut [0u64; 1]),
+            words => self.marks_every_needle(automaton, value, &mut vec![0u64; words]),
         }
-        all_bits_set(&seen, self.needles.len())
+    }
+
+    /// Marks each needle `automaton` finds in `value` into `seen`, all clear on entry, and reports whether every
+    /// needle was found.
+    fn marks_every_needle(&self, automaton: &AhoCorasick, value: &[u8], seen: &mut [u64]) -> bool {
+        for hit in automaton.find_overlapping_iter(value) {
+            set_bit(seen, hit.pattern().as_usize());
+        }
+        all_bits_set(seen, self.needles.len())
     }
 
     /// How many 64-bit words hold one value's "which needles were seen" mark.
@@ -1249,20 +1259,36 @@ fn interval_contains(intervals: &[(u64, u64)], value: u64) -> bool {
 
 /// Sorts `intervals` by `lo` and merges every overlapping or adjacent pair into one, so a later membership test walks
 /// a minimal, non-overlapping, ascending set instead of the original (possibly overlapping) list.
-fn merge_intervals(mut intervals: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+fn merge_intervals(intervals: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    merge_intervals_in_place(intervals, |hi| hi.saturating_add(1))
+}
+
+/// Sorts `intervals` by `lo` and merges every pair where the next `lo` is at most `after(last_hi)`, reusing the input
+/// vector's storage instead of allocating a second one. `after` is the value just past a bound, saturating at the
+/// type's maximum, so an interval ending at the maximum still absorbs any later one.
+fn merge_intervals_in_place<T: Copy + Ord>(mut intervals: Vec<(T, T)>, after: fn(T) -> T) -> Vec<(T, T)> {
     intervals.sort_unstable_by_key(|&(lo, _)| lo);
-    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(intervals.len());
-    for (lo, hi) in intervals {
-        match merged.last_mut() {
-            Some((_, last_hi)) if lo <= last_hi.saturating_add(1) => {
+    let mut len: usize = 0;
+    for read in 0..intervals.len() {
+        let Some(&(lo, hi)) = intervals.get(read) else {
+            break;
+        };
+        match len.checked_sub(1).and_then(|last| intervals.get_mut(last)) {
+            Some((_, last_hi)) if lo <= after(*last_hi) => {
                 if hi > *last_hi {
                     *last_hi = hi;
                 }
             }
-            _ => merged.push((lo, hi)),
+            _ => {
+                if let Some(slot) = intervals.get_mut(len) {
+                    *slot = (lo, hi);
+                }
+                len += 1;
+            }
         }
     }
-    merged
+    intervals.truncate(len);
+    intervals
 }
 
 /// A [`PackedLaneTest`]'s ranges, merged once at translate time so a lane's verdict is a couple of binary searches
@@ -1605,20 +1631,8 @@ fn filter_decimal128_block(body: &[u8], predicate: &NumericPredicate) -> Result<
 
 /// Sorts `intervals` by `lo` and merges every overlapping or adjacent pair into one — the `i128` domain's counterpart
 /// to [`merge_intervals`].
-fn merge_intervals_i128(mut intervals: Vec<(i128, i128)>) -> Vec<(i128, i128)> {
-    intervals.sort_unstable_by_key(|&(lo, _)| lo);
-    let mut merged: Vec<(i128, i128)> = Vec::with_capacity(intervals.len());
-    for (lo, hi) in intervals {
-        match merged.last_mut() {
-            Some((_, last_hi)) if lo <= last_hi.saturating_add(1) => {
-                if hi > *last_hi {
-                    *last_hi = hi;
-                }
-            }
-            _ => merged.push((lo, hi)),
-        }
-    }
-    merged
+fn merge_intervals_i128(intervals: Vec<(i128, i128)>) -> Vec<(i128, i128)> {
+    merge_intervals_in_place(intervals, |hi| hi.saturating_add(1))
 }
 
 /// Whether `value` falls in any of `intervals` — the `i128` domain's counterpart to [`interval_contains`].
@@ -1835,9 +1849,19 @@ impl AlpIntTest {
                 negate: false,
                 ranges: alp_equal_range(*n, power).into_iter().collect(),
             },
+            // Merged once here, so duplicate and overlapping values cost nothing per lane and `apply` can answer the
+            // set with one binary search over disjoint, ascending intervals.
             FloatPredicate::InSet(set) => Self {
                 negate: false,
-                ranges: set.iter().filter_map(|n| alp_equal_range(*n, power)).collect(),
+                ranges: merge_intervals_i128(
+                    set.iter()
+                        .filter_map(|n| alp_equal_range(*n, power))
+                        .map(|(lo, hi)| (i128::from(lo), i128::from(hi)))
+                        .collect(),
+                )
+                .into_iter()
+                .filter_map(|(lo, hi)| Some((i64::try_from(lo).ok()?, i64::try_from(hi).ok()?)))
+                .collect(),
             },
             FloatPredicate::NotEquals(n) => Self {
                 negate: true,
@@ -1864,30 +1888,26 @@ impl AlpIntTest {
     }
 
     /// Fills `out` (the stream's padded length) with one verdict per lane: whether the lane's scaled integer falls in
-    /// the translated intervals. The unzigzag and compare ride inside the unpack's lane writes, through the
-    /// runtime-dispatched SIMD kernel.
+    /// the translated intervals, in one pass over the stream however many intervals there are. The unzigzag and
+    /// compare ride inside the unpack's lane writes, through the runtime-dispatched SIMD kernel.
     fn apply(&self, stream: &PackedStream<'_>, out: &mut [bool]) {
         match self.ranges.as_slice() {
             [] => out.fill(false),
-            [(first_lo, first_hi), rest @ ..] => {
-                let (first_lo, first_hi) = (*first_lo, *first_hi);
+            [(lo, hi)] => {
+                let (lo, hi) = (*lo, *hi);
                 stream.unpack_into(out, |packed| {
                     let int = unzigzag(packed);
-                    first_lo <= int && int <= first_hi
+                    lo <= int && int <= hi
                 });
-                if !rest.is_empty() {
-                    let mut scratch = vec![false; out.len()];
-                    for &(lo, hi) in rest {
-                        stream.unpack_into(&mut scratch, |packed| {
-                            let int = unzigzag(packed);
-                            lo <= int && int <= hi
-                        });
-                        for (slot, extra) in out.iter_mut().zip(&scratch) {
-                            *slot |= *extra;
-                        }
-                    }
-                }
             }
+            ranges => stream.unpack_into(out, |packed| {
+                let int = unzigzag(packed);
+                let above = ranges.partition_point(|&(lo, _)| lo <= int);
+                above
+                    .checked_sub(1)
+                    .and_then(|index| ranges.get(index))
+                    .is_some_and(|&(_, hi)| int <= hi)
+            }),
         }
         if self.negate {
             for slot in out.iter_mut() {

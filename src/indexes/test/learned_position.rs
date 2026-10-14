@@ -1,4 +1,6 @@
-use crate::indexes::learned_position::{LearnedPositionIndex, plan_learned_seek};
+use crate::file::bytes::Writer;
+use crate::indexes::learned_position::{LEARNED_POSITION_MAGIC, LearnedPositionIndex, Segment, plan_learned_seek};
+use crate::layout::footer::SortDirection;
 
 fn uniform_keys(start: i64, step: i64, count: usize) -> Vec<i64> {
     (0..count as i64).map(|i| start + i * step).collect()
@@ -165,4 +167,87 @@ fn keys_spanning_the_whole_signed_domain_fit_and_look_up_without_overflow() {
     // A query at the opposite extreme from the matching segment's key_lo is the other overflow path.
     let _ = index.estimate_position(i64::MAX);
     let _ = index.estimate_position(i64::MIN);
+}
+
+/// Keys placed at uneven rows (each the start of a run of rows sharing it) still land within the bound of their row,
+/// and the index decodes, which a long duplicate run handed to `build` would not.
+#[test]
+fn keys_built_at_given_rows_land_within_the_bound_of_those_rows() {
+    let keys: Vec<i64> = (0..200).map(|i| i * i * 7).collect();
+    let mut rows = Vec::new();
+    let mut row = 0u64;
+    for i in 0..200u64 {
+        rows.push(row);
+        row += 1 + (i % 5) * 40;
+    }
+    let index = LearnedPositionIndex::build_at_rows(1, 0, &keys, &rows, row + 100, 4);
+    for (key, row) in keys.iter().zip(&rows) {
+        let window = index.estimate_position(*key);
+        assert!(
+            window.search_from <= *row && *row <= window.search_to,
+            "window [{}, {}] must contain row {row}",
+            window.search_from,
+            window.search_to,
+        );
+    }
+    assert_eq!(LearnedPositionIndex::decode(&index.encode()).unwrap(), index);
+}
+
+/// The encoder as it stood before it could write into a caller's buffer, field by field: what every encoding must
+/// still match byte for byte.
+fn encode_field_by_field(index: &LearnedPositionIndex) -> Vec<u8> {
+    let mut out = Writer::new();
+    out.put_u32(LEARNED_POSITION_MAGIC);
+    out.put_u32(index.column_id);
+    out.put_u32(index.projection_id);
+    out.put_u8(match index.direction {
+        SortDirection::Ascending => 0,
+        SortDirection::Descending => 1,
+    });
+    out.put_u64(index.error_bound);
+    out.put_u64(index.row_count);
+    out.put_u32(index.segments.len() as u32);
+    for segment in &index.segments {
+        out.put_u64(segment.intercept.to_bits());
+        out.put_i64(segment.key_lo);
+        out.put_u64(segment.slope.to_bits());
+    }
+    out.into_bytes()
+}
+
+#[test]
+fn encoding_matches_the_field_by_field_layout_and_its_predicted_length() {
+    let cubes: Vec<i64> = (0..300).map(|i| i * i * i).collect();
+    let many = LearnedPositionIndex::build(2, 0, &cubes, 0);
+    assert!(many.segments.len() > 10);
+    let mut descending = LearnedPositionIndex::build(9, 3, &uniform_keys(-50, 3, 40), 2);
+    descending.direction = SortDirection::Descending;
+    let mut odd_floats = LearnedPositionIndex::build(4, 1, &[7], 0);
+    odd_floats.segments.push(Segment {
+        intercept: -0.0,
+        key_lo: i64::MAX - 1,
+        slope: f64::from_bits(0x7FF8_0000_0000_0001),
+    });
+    odd_floats.segments.push(Segment {
+        intercept: f64::INFINITY,
+        key_lo: i64::MAX,
+        slope: f64::NEG_INFINITY,
+    });
+    for index in [
+        LearnedPositionIndex::build(1, 0, &[], 4),
+        LearnedPositionIndex::build(1, 0, &[42], 4),
+        many,
+        descending,
+        odd_floats,
+    ] {
+        let bytes = index.encode();
+        assert_eq!(bytes, encode_field_by_field(&index));
+        assert_eq!(index.encoded_len(), bytes.len());
+
+        let mut framed = Writer::new();
+        framed.put_slice(b"prefix");
+        index.encode_into(&mut framed);
+        assert_eq!(framed.bytes().get(..6), Some(&b"prefix"[..]));
+        assert_eq!(framed.bytes().get(6..), Some(&bytes[..]));
+    }
 }

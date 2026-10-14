@@ -47,16 +47,22 @@ impl PathPresenceIndex {
     /// deterministic function of the hash multiset, so any node building over the same rows produces byte-identical
     /// bits. Duplicate hashes are harmless.
     pub fn build(path_hashes: &[u64]) -> Self {
+        Self::build_from_hashes(path_hashes.iter().copied(), path_hashes.len())
+    }
+
+    /// Builds the same index as [`PathPresenceIndex::build`] from an iterator of `hash_count` path hashes, so a
+    /// caller holding the hashes in a set or computing them on the fly needs no intermediate vector. `hash_count` sizes
+    /// the filter and must equal the number of hashes the iterator yields.
+    pub(crate) fn build_from_hashes(path_hashes: impl IntoIterator<Item = u64>, hash_count: usize) -> Self {
         PathPresenceIndex {
-            filter: SplitBlockBloomFilter::build(path_hashes, BITS_PER_PATH),
+            filter: SplitBlockBloomFilter::build_from_iter(path_hashes, hash_count, BITS_PER_PATH),
         }
     }
 
     /// Builds a path-presence index directly from path strings, hashing each with [`hash_path`]. Convenience wrapper
     /// over [`PathPresenceIndex::build`].
     pub fn build_from_paths(paths: &[&str]) -> Self {
-        let hashes: Vec<u64> = paths.iter().map(|&p| hash_path(p)).collect();
-        Self::build(&hashes)
+        Self::build_from_hashes(paths.iter().map(|&p| hash_path(p)), paths.len())
     }
 
     /// Reports whether this block might contain rows where payload path `path` is present. A `false` answer is certain
@@ -80,10 +86,9 @@ impl PathPresenceIndex {
 
     /// Serializes the index to bytes (magic then the Bloom filter bytes). Pairs with [`PathPresenceIndex::decode`].
     pub fn encode(&self) -> Vec<u8> {
-        let filter_bytes = self.filter.encode();
-        let mut out = Writer::with_capacity(PATH_PRESENCE_HEADER_BYTES + filter_bytes.len());
+        let mut out = Writer::with_capacity(PATH_PRESENCE_HEADER_BYTES + self.filter.encoded_len());
         out.put_u32(PATH_PRESENCE_MAGIC);
-        out.put_slice(&filter_bytes);
+        self.filter.encode_into(&mut out);
         out.into_bytes()
     }
 

@@ -67,15 +67,18 @@ fn event(sequence: u64) -> EventInput {
 fn config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: FooterEncryption::Plaintext,
         freetext: FreetextDeclaration { fields: Vec::new() },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: 8,
@@ -85,6 +88,7 @@ fn config() -> HefBuildConfig {
             stripe_target_bytes: 4096,
         },
         tenant_id: tenant(),
+        time_series_bucket_nanos: None,
     }
 }
 
@@ -151,4 +155,46 @@ fn an_overlay_row_reads_back_as_the_event_that_was_written() {
         assert_eq!(read, PayloadRead::Value(payload(41 + row as u64)));
     }
     assert!(segment.event(events.len()).is_err(), "a row past the end is refused");
+}
+
+/// A single-row envelope read agrees with the same row of its granule's bulk read, first and last rows included.
+#[test]
+fn a_single_row_envelope_matches_its_granule_envelopes() {
+    let rows: Vec<HefRow> = (1..=30)
+        .map(|sequence| HefRow {
+            epoch: 1,
+            event: event(sequence),
+            sequence,
+        })
+        .collect();
+    let built = build_hef_file(rows, &config()).unwrap();
+    let file = HefFile::open(built.bytes, Some(&built.file_seal)).unwrap();
+    for granule in &file.footer().granules {
+        let bulk = file.granule_envelopes(granule.granule_id).unwrap();
+        assert_eq!(bulk.len(), granule.row_count as usize);
+        for (index, envelope) in bulk.iter().enumerate() {
+            let ordinal = granule.first_row_ordinal + index as u64;
+            assert_eq!(&file.envelope(ordinal).unwrap(), envelope, "row {ordinal}");
+        }
+    }
+}
+
+/// A presence-mapped nullable string column spreads its stored values back over the rows it marks present.
+#[test]
+fn string_at_maps_dense_and_presence_mapped_values() {
+    let mut dense = StringColumn::new();
+    for value in [Some("a"), None, Some("c")] {
+        dense.push(value);
+    }
+    let dense = (vec![0b101], dense);
+    assert_eq!(string_at(&dense, 3, 0).as_deref(), Some("a"));
+    assert_eq!(string_at(&dense, 3, 1), None);
+    assert_eq!(string_at(&dense, 3, 2).as_deref(), Some("c"));
+    let mut sparse = StringColumn::new();
+    for value in [Some("b"), Some("d")] {
+        sparse.push(value);
+    }
+    let sparse = (vec![0b1010], sparse);
+    let read: Vec<_> = (0..4).map(|row| string_at(&sparse, 4, row)).collect();
+    assert_eq!(read, [None, Some("b".to_owned()), None, Some("d".to_owned())]);
 }

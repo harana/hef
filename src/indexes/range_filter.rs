@@ -27,6 +27,10 @@ const RANGE_FILTER_MAGIC: u32 = 0x5247_4631; // "RGF1"
 /// stored set small while still resolving a query range to a narrow slice of the key space.
 pub const DEFAULT_BUCKET_COUNT: u32 = 4096;
 
+/// Words in the fixed occupancy bitmap a builder uses for bucket counts up to [`DEFAULT_BUCKET_COUNT`]: one bit per
+/// bucket, 512 bytes of scratch however many keys arrive.
+const OCCUPANCY_WORDS: usize = (DEFAULT_BUCKET_COUNT / 64) as usize;
+
 /// A succinct summary of which slices of the key space a block touched, used to rule the block out for a range query
 /// that misses every touched slice.
 ///
@@ -55,9 +59,33 @@ impl RangeFilter {
     /// building over the same keys produces byte-identical bytes. Duplicate keys are harmless.
     pub fn build_with_buckets(keys: &[u64], bucket_count: u32) -> Self {
         let bucket_count = bucket_count.max(1);
-        let mut occupied: Vec<u32> = keys.iter().map(|&key| Self::bucket_of(key, bucket_count)).collect();
-        occupied.sort_unstable();
-        occupied.dedup();
+        if keys.is_empty() {
+            return RangeFilter {
+                bucket_count,
+                occupied: Vec::new(),
+            };
+        }
+        if bucket_count > DEFAULT_BUCKET_COUNT {
+            let mut occupied: Vec<u32> = keys.iter().map(|&key| Self::bucket_of(key, bucket_count)).collect();
+            occupied.sort_unstable();
+            occupied.dedup();
+            return RangeFilter { bucket_count, occupied };
+        }
+        let mut words = [0u64; OCCUPANCY_WORDS];
+        for &key in keys {
+            let bucket = Self::bucket_of(key, bucket_count);
+            if let Some(word) = words.get_mut((bucket / 64) as usize) {
+                *word |= 1u64 << (bucket % 64);
+            }
+        }
+        let mut occupied = Vec::with_capacity(words.iter().map(|word| word.count_ones() as usize).sum());
+        for (index, &word) in words.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                occupied.push(index as u32 * 64 + bits.trailing_zeros());
+                bits &= bits - 1;
+            }
+        }
         RangeFilter { bucket_count, occupied }
     }
 

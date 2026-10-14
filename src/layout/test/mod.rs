@@ -1,5 +1,6 @@
 use super::*;
 use crate::events::TenantId;
+use crate::file::bytes::Writer;
 use crate::typed_id::TypedIdTestExt;
 
 /// A header for a file spanning epochs `min_epoch..=max_epoch`, starting at `min_sequence` in its first epoch and ending
@@ -21,6 +22,7 @@ fn spanning_header(min_epoch: u64, max_epoch: u64, min_sequence: u64, max_sequen
         min_ingested_at_physical: 0,
         min_occurred_at_physical: 0,
         min_sequence,
+        profile: crate::layout::Profile::Event,
         projection_count: 1,
         row_count: 1,
         tenant_id: TenantId::new_test_id(1),
@@ -210,4 +212,121 @@ fn presence_frame_decoding_follows_the_declared_feature() {
     let compressed_bytes = compressed.into_bytes();
     let decoded = super::decode_presence_frame(&mut Reader::new(&compressed_bytes), 10, true).unwrap();
     assert_eq!(decoded, bitmap);
+}
+
+const PROFILES: [Profile; 7] = [
+    Profile::Audit,
+    Profile::Event,
+    Profile::Graph,
+    Profile::Inbox,
+    Profile::Log,
+    Profile::Snapshot,
+    Profile::TimeSeries,
+];
+
+fn header_len_word(block: &[u8]) -> usize {
+    u32::from_le_bytes(block[8..12].try_into().unwrap()) as usize
+}
+
+#[test]
+fn every_profile_round_trips_through_the_header() {
+    for profile in PROFILES {
+        let mut header = spanning_header(1, 1, 1, 10);
+        header.profile = profile;
+        assert_eq!(decode_header(&encode_header(&header)).unwrap(), header);
+        assert_eq!(Profile::from_u8(profile.code()).unwrap(), profile);
+    }
+}
+
+#[test]
+fn profile_codes_are_explicit_and_distinct() {
+    let codes: Vec<u8> = PROFILES.iter().map(|profile| profile.code()).collect();
+    assert_eq!(codes, vec![3, 0, 1, 5, 4, 2, 6]);
+}
+
+#[test]
+fn an_event_header_keeps_the_original_layout_and_other_profiles_do_not() {
+    let event = encode_header(&spanning_header(1, 1, 1, 10));
+    assert_eq!(header_len_word(&event), HEADER_FIXED_LEN);
+    let mut graph = spanning_header(1, 1, 1, 10);
+    graph.profile = Profile::Graph;
+    // A reader from before profiles requires exactly `HEADER_FIXED_LEN` and so refuses a graph header.
+    assert_eq!(header_len_word(&encode_header(&graph)), PROFILED_HEADER_FIXED_LEN);
+}
+
+#[test]
+fn an_unknown_header_profile_code_is_a_structural_error() {
+    let mut header = spanning_header(1, 1, 1, 10);
+    header.profile = Profile::Graph;
+    let mut block = encode_header(&header);
+    let profile_at = PROFILED_HEADER_FIXED_LEN - 8 - 32 - 1;
+    assert_eq!(block[profile_at], Profile::Graph.code());
+    block[profile_at] = 0xEE;
+    let crc = crate::file::integrity::crc64_nvme(&block[..profile_at + 1]);
+    block[profile_at + 1..profile_at + 9].copy_from_slice(&crc.to_le_bytes());
+    let digest = blake3::hash(&block[..profile_at + 9]);
+    block[profile_at + 9..profile_at + 41].copy_from_slice(digest.as_bytes());
+    assert_eq!(
+        decode_header(&block).unwrap_err(),
+        FormatError::Structural {
+            rule: "unknown profile"
+        }
+    );
+    assert!(Profile::from_u8(7).is_err());
+}
+
+#[test]
+fn graph_bits_are_known_but_not_declared_by_every_file() {
+    assert_eq!(required_features::GRAPH & required_features::ALL, 0);
+    assert_eq!(required_features::GRAPH & !required_features::KNOWN, 0);
+    assert_eq!(required_features::GRAPH, ((1 << 29) - 1) & !((1 << 23) - 1));
+}
+
+#[test]
+fn the_xor_float_bit_is_known_but_declared_only_by_files_that_use_it() {
+    assert_eq!(required_features::XOR_FLOAT_BLOCKS, 1 << 30);
+    assert_eq!(required_features::XOR_FLOAT_BLOCKS & required_features::ALL, 0);
+    assert_eq!(required_features::XOR_FLOAT_BLOCKS & !required_features::KNOWN, 0);
+    assert_eq!(optional_features::TIME_SERIES_ROLLUPS, 1 << 13);
+    assert_eq!(optional_features::TIME_SERIES_ROLLUPS & !optional_features::KNOWN, 0);
+}
+
+#[test]
+fn presence_run_and_position_forms_encode_exact_bytes() {
+    let encode = |presence: &[u8], rows: u32| {
+        let mut out = Writer::new();
+        super::encode_presence(presence, rows, &mut out);
+        out.into_bytes()
+    };
+    let words = |tag: u8, values: &[u32]| {
+        let mut out = Writer::new();
+        out.put_u8(tag);
+        for &value in values {
+            out.put_u32(value);
+        }
+        out.into_bytes()
+    };
+
+    // Runs crossing a byte boundary, one ending on the last row; padding bits past row 4092 are ignored.
+    let mut clustered = vec![0u8; 512];
+    for row in (6..10).chain(4090..4096) {
+        clustered[row / 8] |= 1 << (row % 8);
+    }
+    assert_eq!(
+        encode(&clustered, 4093),
+        words(super::presence_forms::SET_RUNS, &[2, 6, 4, 4090, 3])
+    );
+
+    // Scattered rows; a short bitmap leaves the missing rows absent.
+    let mut scattered = vec![0u8; 400];
+    for row in [3usize, 900, 2001, 3199] {
+        scattered[row / 8] |= 1 << (row % 8);
+    }
+    assert_eq!(
+        encode(&scattered, 4096),
+        words(super::presence_forms::SET_POSITIONS, &[4, 3, 900, 2001, 3199])
+    );
+
+    // A nonempty bitmap over zero rows counts as fully present.
+    assert_eq!(encode(&[0u8], 0), vec![super::presence_forms::ALL_PRESENT]);
 }

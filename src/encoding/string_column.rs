@@ -85,6 +85,12 @@ impl StringColumn {
             })
     }
 
+    /// One flag per row, in order: whether that row carries a value. Cheaper than [`iter`](Self::iter) when only
+    /// presence matters, since no text is sliced.
+    pub(crate) fn presence(&self) -> &[bool] {
+        &self.present
+    }
+
     /// Only the rows that carry a value, in order — the dense value list every string encoding stores.
     pub fn iter_present(&self) -> impl Iterator<Item = &str> + '_ {
         self.iter().flatten()

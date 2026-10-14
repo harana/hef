@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::VecDeque;
 
 #[test]
 fn whole_token_lookup_has_no_false_negatives() {
@@ -429,4 +430,173 @@ fn trigram_code_round_trips_through_its_hash() {
             "window {window:?}"
         );
     }
+}
+
+#[test]
+fn encode_matches_header_plus_standalone_filter_bytes() {
+    for (values, ngrams) in [
+        (vec![], false),
+        (vec!["hello world", "héllo wörld"], true),
+        (vec!["a"; 500], false),
+    ] {
+        let index = TextTokenIndex::build_from_values(&values, ngrams);
+        let mut expected = Writer::with_capacity(0);
+        expected.put_u32(TEXT_TOKEN_MAGIC);
+        expected.put_u32(u32::from(ngrams));
+        expected.put_slice(&index.filter.encode());
+        assert_eq!(index.encode(), expected.into_bytes());
+    }
+}
+
+/// The n-gram iterator as it stood before the two-cursor walk: a queue of `n + 1` char boundaries slid across the
+/// text. The cursor form must yield exactly its windows, borrowed from the same bytes.
+fn reference_ngrams(text: &str, n: usize) -> Vec<&str> {
+    let mut boundaries = text
+        .char_indices()
+        .map(|(pos, _)| pos)
+        .chain(std::iter::once(text.len()));
+    let mut window: VecDeque<usize> = (&mut boundaries).take(n + 1).collect();
+    let mut out = Vec::new();
+    while window.len() > n {
+        out.push(&text[window[0]..window[n]]);
+        window.pop_front();
+        if let Some(next) = boundaries.next() {
+            window.push_back(next);
+        }
+    }
+    out
+}
+
+/// Each window's byte range within `text`, so two window lists can be compared by position and not only by content.
+fn byte_ranges(text: &str, windows: &[&str]) -> Vec<(usize, usize)> {
+    windows
+        .iter()
+        .map(|window| {
+            let start = window.as_ptr() as usize - text.as_ptr() as usize;
+            (start, start + window.len())
+        })
+        .collect()
+}
+
+#[test]
+fn ngrams_matches_the_boundary_queue_reference() {
+    let texts = [
+        "",
+        "a",
+        "ab",
+        "abc",
+        "abcde",
+        "hello world",
+        "héllo wörld",
+        "ΒΟΣΚΟΣ",
+        "中文字符",
+        "e\u{301}a\u{301}",
+        "👍🏽 ok 🎉",
+        "x中y👍z",
+    ];
+    for text in texts {
+        for n in 0..=8 {
+            let windows: Vec<&str> = ngrams(text, n).collect();
+            let expected = reference_ngrams(text, n);
+            assert_eq!(windows, expected, "text {text:?}, n {n}");
+            assert_eq!(
+                byte_ranges(text, &windows),
+                byte_ranges(text, &expected),
+                "text {text:?}, n {n}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ngrams_of_zero_length_are_empty_at_every_boundary() {
+    let windows: Vec<&str> = ngrams("aé中", 0).collect();
+    assert_eq!(windows, ["", "", "", ""]);
+    assert_eq!(byte_ranges("aé中", &windows), [(0, 0), (1, 1), (3, 3), (6, 6)]);
+}
+
+#[test]
+fn ngrams_over_exactly_n_chars_is_the_whole_text() {
+    let windows: Vec<&str> = ngrams("é中👍", 3).collect();
+    assert_eq!(windows, ["é中👍"]);
+}
+
+#[test]
+fn ngrams_can_be_consumed_partially() {
+    let mut windows = ngrams("ünïcödé", 3);
+    assert_eq!(windows.next(), Some("ünï"));
+    assert_eq!(windows.next(), Some("nïc"));
+    drop(windows);
+    assert_eq!(ngrams("ünïcödé", 3).nth(4), Some("ödé"));
+    assert_eq!(ngrams("ünïcödé", 3).nth(5), None);
+}
+
+#[test]
+fn trigram_count_and_occupied_words_track_the_marked_bits() {
+    // Codes on bitmap-word and summary-word boundaries, plus repeats and several bits in one word.
+    let codes = [
+        0,
+        0,
+        1,
+        63,
+        64,
+        64 * 63,
+        64 * 64,
+        64 * 64 + 5,
+        TRIGRAM_CODE_MASK - 1,
+        TRIGRAM_CODE_MASK,
+        TRIGRAM_CODE_MASK,
+    ];
+    let mut scratch = BuildScratch::new();
+    for code in codes {
+        scratch.mark_trigram(code);
+    }
+    let marked: Vec<usize> = (0..=TRIGRAM_CODE_MASK)
+        .filter(|&code| scratch.trigrams[code >> 6] & (1u64 << (code & 63)) != 0)
+        .collect();
+    assert_eq!(marked.len(), 9);
+    assert_eq!(scratch.trigram_count, marked.len());
+    for (word_index, &word) in scratch.trigrams.iter().enumerate() {
+        let summary_bit = scratch.occupied_words[word_index >> 6] & (1u64 << (word_index & 63)) != 0;
+        assert_eq!(summary_bit, word != 0, "word {word_index}");
+    }
+    let hashes: Vec<u64> = marked.iter().map(|&code| trigram_hash(code)).collect();
+    assert_eq!(
+        scratch.build_filter(),
+        SplitBlockBloomFilter::build(&hashes, BITS_PER_TOKEN)
+    );
+    assert_eq!(scratch.trigram_count, 0);
+    assert!(scratch.trigrams.iter().all(|&word| word == 0));
+    assert!(scratch.occupied_words.iter().all(|&word| word == 0));
+}
+
+#[test]
+fn back_to_back_dense_sparse_and_empty_builds_leave_no_stale_trigrams() {
+    // Every three-character token over this alphabet occupies many bitmap words; the builds after it on the same
+    // thread must see none of them.
+    let alphabet: Vec<char> = "abcdefghij-Z9".chars().collect();
+    let alphabet: &[char] = &alphabet;
+    let dense: Vec<String> = alphabet
+        .iter()
+        .flat_map(|&a| {
+            alphabet
+                .iter()
+                .flat_map(move |&b| alphabet.iter().map(move |&c| format!("{a}{b}{c}")))
+        })
+        .collect();
+    let dense: Vec<&str> = dense.iter().map(String::as_str).collect();
+    let builds: [&[&str]; 5] = [&dense, &["zz top"], &[], &dense, &["ünïcode"]];
+    for values in builds {
+        for include_ngrams in [true, false] {
+            assert_eq!(
+                TextTokenIndex::build_from_values(values, include_ngrams).encode(),
+                reference_build(values, include_ngrams).encode(),
+                "include_ngrams {include_ngrams}"
+            );
+        }
+    }
+    let on_another_thread = std::thread::spawn(|| TextTokenIndex::build_from_values(&["omega"], true).encode())
+        .join()
+        .unwrap();
+    assert_eq!(on_another_thread, reference_build(&["omega"], true).encode());
 }

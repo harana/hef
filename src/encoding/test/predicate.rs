@@ -972,6 +972,26 @@ fn alp_filter_matches_decode_then_filter_including_exceptions_and_escapes() {
         FloatPredicate::NotEquals(f64::NAN),
         FloatPredicate::InSet(vec![1_234.56, values[1500], f64::NAN, -0.0]),
         FloatPredicate::InSet(Vec::new()),
+        // Unsorted, repeated, adjacent and NaN members, and sets large enough to need the merged-interval search.
+        FloatPredicate::InSet(vec![
+            values[2400],
+            values[10],
+            values[2400],
+            0.0,
+            -0.0,
+            values[10],
+            f64::INFINITY,
+        ]),
+        FloatPredicate::InSet(vec![0.01, 0.02, 0.03, 0.0, f64::NAN, 0.02]),
+        FloatPredicate::InSet(values.iter().step_by(7).rev().copied().collect()),
+        FloatPredicate::InSet(
+            values
+                .iter()
+                .step_by(3)
+                .chain(values.iter().step_by(5))
+                .copied()
+                .collect(),
+        ),
         float_range(Some((-350.0, true)), Some((350.0, false))),
         float_range(Some((-350.0, false)), Some((350.0, true))),
         float_range(None, Some((0.0, true))),
@@ -992,6 +1012,19 @@ fn alp_filter_matches_decode_then_filter_including_exceptions_and_escapes() {
         };
         assert_eq!(mask, reference, "integer-domain answer diverged for {predicate:?}");
     }
+}
+
+/// An ALP `IN` set translates to ascending, disjoint intervals: duplicates and adjacent members collapse once at
+/// translation, so a lane is answered by one search however the set was written.
+#[test]
+fn alp_in_sets_translate_to_merged_intervals() {
+    let power = ALP_POWERS[2];
+    let test = AlpIntTest::translate(
+        &FloatPredicate::InSet(vec![0.05, 0.01, 0.02, 0.01, f64::NAN, -0.03]),
+        power,
+    );
+    assert!(!test.negate);
+    assert_eq!(test.ranges, vec![(-3, -3), (1, 2), (5, 5)]);
 }
 
 /// Free-text notes shaped like the benchmark's: a dense needle in about one value per hundred, a rare one in a
@@ -1182,4 +1215,156 @@ fn a_scan_fans_out_only_over_several_granules_worth_a_worker_each() {
     assert!(!scan_in_parallel(1, u64::MAX));
     assert!(!scan_in_parallel(8, PARALLEL_SCAN_MIN_GRANULE_BYTES - 1));
     assert!(scan_in_parallel(2, PARALLEL_SCAN_MIN_GRANULE_BYTES));
+}
+
+/// Multi-needle and case-insensitive matching gives the same verdict as checking each needle on its own, on both sides
+/// of the one-word stack mark (63/64/65 needles) and well past it, with repeated, overlapping and empty needles, empty
+/// values and multibyte text.
+#[test]
+fn multi_needle_matching_agrees_with_per_needle_checks_across_mark_sizes() {
+    let contains_each = |needles: &[String], value: &str, fold: bool| {
+        let value = if fold {
+            value.to_ascii_lowercase()
+        } else {
+            value.to_owned()
+        };
+        needles.iter().all(|needle| {
+            let needle = if fold {
+                needle.to_ascii_lowercase()
+            } else {
+                needle.clone()
+            };
+            value.contains(&needle)
+        })
+    };
+    let all: String = (0..200).map(|i| format!("<{i}>")).collect();
+    let values = [
+        String::new(),
+        all.clone(),
+        all.to_ascii_uppercase(),
+        all.replace("<64>", ""),
+        format!("\u{e9}\u{e9}{all}\u{1F600}"),
+        "abcabc".to_owned(),
+    ];
+    for count in [1usize, 2, 63, 64, 65, 130] {
+        let mut needles: Vec<String> = (0..count).map(|i| format!("<{}>", i % 66)).collect();
+        if count > 1 {
+            needles[count - 1] = String::new();
+        }
+        for case_insensitive in [false, true] {
+            let matcher = ContainsMatcher::new(needles.clone(), case_insensitive);
+            for value in &values {
+                assert_eq!(
+                    matcher.matches(value),
+                    contains_each(&needles, value, case_insensitive),
+                    "{count} needles, case-insensitive {case_insensitive}"
+                );
+            }
+        }
+    }
+    let overlapping = ContainsMatcher::new(vec!["abca".to_owned(), "cab".to_owned(), "\u{e9}".to_owned()], true);
+    assert!(!overlapping.matches("abcabc"));
+    assert!(overlapping.matches("ABCABC\u{e9}"));
+}
+
+/// The merge as it was before it compacted in place: sort, then copy each merged run into a fresh vector.
+fn merge_intervals_by_copying<T: Copy + Ord>(mut intervals: Vec<(T, T)>, after: fn(T) -> T) -> Vec<(T, T)> {
+    intervals.sort_unstable_by_key(|&(lo, _)| lo);
+    let mut merged: Vec<(T, T)> = Vec::with_capacity(intervals.len());
+    for (lo, hi) in intervals {
+        match merged.last_mut() {
+            Some((_, last_hi)) if lo <= after(*last_hi) => {
+                if hi > *last_hi {
+                    *last_hi = hi;
+                }
+            }
+            _ => merged.push((lo, hi)),
+        }
+    }
+    merged
+}
+
+/// Interval lists covering empty, singleton, duplicate, equal-start, nested, overlapping, adjacent, disjoint and
+/// shuffled inputs, built from `points` (which should include the type's extremes) plus deterministic pseudo-random
+/// picks among them.
+fn interval_cases<T: Copy + Ord>(points: &[T]) -> Vec<Vec<(T, T)>> {
+    let ordered = |a: T, b: T| if a <= b { (a, b) } else { (b, a) };
+    let mut cases: Vec<Vec<(T, T)>> = vec![Vec::new()];
+    for &a in points {
+        cases.push(vec![(a, a)]);
+        cases.push(vec![(a, a), (a, a)]);
+        for &b in points {
+            cases.push(vec![ordered(a, b)]);
+            cases.push(vec![ordered(a, b), ordered(a, b)]);
+            cases.push(vec![(a, a), ordered(a, b)]);
+            cases.push(vec![ordered(b, a), (b, b), (a, a)]);
+        }
+    }
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for len in 0..40 {
+        for _ in 0..25 {
+            let case = (0..len)
+                .map(|_| {
+                    let a = points[(next() % points.len() as u64) as usize];
+                    let b = points[(next() % points.len() as u64) as usize];
+                    ordered(a, b)
+                })
+                .collect();
+            cases.push(case);
+        }
+    }
+    cases
+}
+
+#[test]
+fn merging_intervals_in_place_matches_merging_by_copying() {
+    let u64_points = [
+        u64::MIN,
+        1,
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        10,
+        11,
+        100,
+        u64::MAX / 2,
+        u64::MAX - 2,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    for case in interval_cases(&u64_points) {
+        let expected = merge_intervals_by_copying(case.clone(), |hi: u64| hi.saturating_add(1));
+        assert_eq!(merge_intervals(case.clone()), expected, "u64 input {case:?}");
+    }
+
+    let i128_points = [
+        i128::MIN,
+        i128::MIN + 1,
+        i128::MIN + 2,
+        -5,
+        -2,
+        -1,
+        0,
+        1,
+        2,
+        3,
+        5,
+        6,
+        i128::MAX - 2,
+        i128::MAX - 1,
+        i128::MAX,
+    ];
+    for case in interval_cases(&i128_points) {
+        let expected = merge_intervals_by_copying(case.clone(), |hi: i128| hi.saturating_add(1));
+        assert_eq!(merge_intervals_i128(case.clone()), expected, "i128 input {case:?}");
+    }
 }

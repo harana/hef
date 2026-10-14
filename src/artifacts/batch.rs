@@ -105,6 +105,7 @@ fn target_space_code(space: TargetIdSpace) -> u32 {
         TargetIdSpace::EventId => 1,
         TargetIdSpace::ExternalId => 3,
         TargetIdSpace::ProtocolEventId => 2,
+        TargetIdSpace::SubjectSequence => 4,
     }
 }
 
@@ -113,6 +114,7 @@ fn target_space_from_code(code: u32) -> Result<TargetIdSpace, FormatError> {
         1 => Ok(TargetIdSpace::EventId),
         2 => Ok(TargetIdSpace::ProtocolEventId),
         3 => Ok(TargetIdSpace::ExternalId),
+        4 => Ok(TargetIdSpace::SubjectSequence),
         _ => Err(FormatError::Structural {
             rule: "unknown target identifier space code in a relationship record",
         }),
@@ -312,6 +314,13 @@ impl StringTableBuilder {
 
 pub(crate) fn encode_variant_dictionary(dictionary: &KeyDictionary) -> Vec<u8> {
     let mut out = Writer::new();
+    encode_variant_dictionary_into(dictionary, &mut out);
+    out.into_bytes()
+}
+
+/// [`encode_variant_dictionary`] appended to `out` after whatever it already holds, with no buffer of its own. Key
+/// offsets stay relative to the dictionary's own key data.
+pub(crate) fn encode_variant_dictionary_into(dictionary: &KeyDictionary, out: &mut Writer) {
     out.put_u32(dictionary.key_count());
     out.put_u32(1); // flags bit 0 = sorted_keys, mandatory in HEJ v1
     let mut offset = 0u32;
@@ -323,7 +332,6 @@ pub(crate) fn encode_variant_dictionary(dictionary: &KeyDictionary) -> Vec<u8> {
     for key in dictionary.keys() {
         out.put_slice(key.as_bytes());
     }
-    out.into_bytes()
 }
 
 /// Decodes `VariantDictionaryV1` bytes into a `KeyDictionary`.

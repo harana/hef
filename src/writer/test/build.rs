@@ -6,6 +6,7 @@ use crate::events::sim::{SimulatedEventAuthor, signed_event_payload};
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TimestampValue};
 use crate::invariants::io::ThreadPoolEncodeExecutor;
+use crate::layout::graph::RowEdges;
 use crate::layout::reader::{HefFile, HefFooter, PayloadRead, SpeculativeTail, tail_range};
 use crate::typed_id::TypedIdTestExt;
 
@@ -379,6 +380,7 @@ fn benchmark_string_paths_against_stable_field_ids() {
 fn config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 42,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -387,9 +389,11 @@ fn config() -> HefBuildConfig {
         },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan {
             columns: vec![PromotedColumn {
                 name: "kind".to_owned(),
@@ -407,6 +411,7 @@ fn config() -> HefBuildConfig {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(7),
+        time_series_bucket_nanos: None,
     }
 }
 
@@ -4057,4 +4062,156 @@ fn an_encrypted_footer_still_prunes_on_the_entity_hash_filters() {
         "row 70 sits in granule 4 and no other granule's filter admits its hash",
     );
     assert!(file.granules_for_entity_hash(1_000).is_empty());
+}
+
+/// A prev chain over events `0..rows`.
+fn graph_chain(rows: u64) -> GraphInput {
+    GraphInput {
+        chain_cover: None,
+        depth: None,
+        first_sn: 0,
+        inbound: Vec::new(),
+        rows: (0..rows)
+            .map(|sn| RowEdges {
+                auth: Vec::new(),
+                prev: sn.checked_sub(1).into_iter().collect(),
+            })
+            .collect(),
+        state_roots: BTreeMap::new(),
+        subject: b"room".to_vec(),
+        unresolved: Vec::new(),
+    }
+}
+
+#[test]
+fn graph_edges_are_built_only_into_a_whole_graph_profile_file_in_sequence_order() {
+    let rows: Vec<HefRow> = (0..4).map(row).collect();
+    let mut graph = config();
+    graph.profile = Profile::Graph;
+    graph.graph = Some(graph_chain(4));
+    let built = build_hef_file(rows.clone(), &graph).unwrap();
+    assert_eq!(
+        built.footer.required_feature_flags & required_features::GRAPH,
+        required_features::GRAPH_DENSE_IDS
+            | required_features::GRAPH_CSR_FORWARD
+            | required_features::GRAPH_CSR_REVERSE
+    );
+
+    let mut without_edges = graph.clone();
+    without_edges.graph = None;
+    let built = build_hef_file(rows.clone(), &without_edges).unwrap();
+    assert_eq!(built.footer.required_feature_flags & required_features::GRAPH, 0);
+    assert!(built.footer.graph.is_none());
+
+    let mut event_profile = graph.clone();
+    event_profile.profile = Profile::Event;
+    let mut short = graph.clone();
+    short.graph = Some(graph_chain(3));
+    for refused in [event_profile, short] {
+        assert!(matches!(
+            build_hef_file(rows.clone(), &refused),
+            Err(FormatError::Structural { .. })
+        ));
+    }
+    let entity_order = build_hef_file_in_order(
+        HefRow::into_build_rows(rows),
+        &graph,
+        &SerialEncodeExecutor,
+        RowOrder::Entity,
+    );
+    assert!(matches!(entity_order, Err(FormatError::Structural { .. })));
+}
+
+/// Rows of a snapshot file: `row(i)` keyed by `keys[i]`.
+fn snapshot_rows(keys: &[Option<&str>]) -> Vec<HefRow> {
+    keys.iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let mut row = row(i as u64);
+            row.event.envelope.entity_id = key.map(str::to_owned);
+            row
+        })
+        .collect()
+}
+
+/// A snapshot build gives every granule its own stripe and declares its key index; it refuses rows a snapshot cannot
+/// hold: keys out of order or repeated, a row without a key, or more than one epoch.
+#[test]
+fn a_snapshot_build_indexes_its_keys_and_refuses_rows_it_cannot_hold() {
+    let mut cfg = config();
+    cfg.profile = Profile::Snapshot;
+    cfg.targets.stripe_target_bytes = usize::MAX;
+    let keys: Vec<String> = (0..100).map(|i| format!("opp-{i:04}")).collect();
+    let sorted: Vec<Option<&str>> = keys.iter().map(|key| Some(key.as_str())).collect();
+    let built = build_hef_file(snapshot_rows(&sorted), &cfg).unwrap();
+    assert!(built.footer.granules.len() > 1);
+    assert_eq!(built.footer.stripes.len(), built.footer.granules.len());
+    assert_ne!(
+        built.footer.optional_feature_flags & optional_features::SNAPSHOT_KEY_INDEX,
+        0
+    );
+    let index = built.footer.snapshot_keys.as_ref().unwrap();
+    assert_eq!(index.granule_first_keys.first().map(String::as_str), Some("opp-0000"));
+
+    let mut event = cfg.clone();
+    event.profile = Profile::Event;
+    let built = build_hef_file(snapshot_rows(&sorted), &event).unwrap();
+    assert!(built.footer.snapshot_keys.is_none());
+    assert_eq!(
+        built.footer.optional_feature_flags & optional_features::SNAPSHOT_KEY_INDEX,
+        0
+    );
+
+    for keys in [
+        vec![Some("b"), Some("a")],
+        vec![Some("a"), Some("a")],
+        vec![Some("a"), None],
+    ] {
+        assert!(build_hef_file(snapshot_rows(&keys), &cfg).is_err(), "{keys:?}");
+    }
+    let mut two_epochs = snapshot_rows(&[Some("a"), Some("b")]);
+    two_epochs[1].epoch = 2;
+    two_epochs[1].sequence = 1;
+    assert!(build_hef_file(two_epochs, &cfg).is_err());
+}
+
+/// A time-series build takes rows whose occurred_at never goes back, rolls up at the configured width (one minute by
+/// default), and refuses a width that is not positive or that is given to any other profile.
+#[test]
+fn a_time_series_build_refuses_rows_that_go_back_in_time_and_widths_it_cannot_use() {
+    let mut cfg = config();
+    cfg.profile = Profile::TimeSeries;
+    cfg.promotion.columns.push(PromotedColumn {
+        kind: ColumnKind::F64,
+        name: "load".to_owned(),
+        path: "load".to_owned(),
+        since_schema_version: 1,
+        substring_searchable: false,
+    });
+    let built = build_hef_file((0..40).map(row).collect(), &cfg).unwrap();
+    let rollups = built.footer.time_series_rollups.as_ref().unwrap();
+    assert_eq!(rollups.bucket_nanos, DEFAULT_TIME_SERIES_BUCKET_NANOS);
+    assert_eq!(rollups.column_ids, vec![column_ids::PROMOTED_BASE + 1]);
+    assert_eq!(rollups.row_count(), 40);
+
+    let mut late: Vec<HefRow> = (0..40).map(row).collect();
+    late[20].event.envelope.occurred_at = TimestampValue::from_physical_nanos(0);
+    assert_eq!(
+        build_hef_file(late, &cfg).unwrap_err(),
+        FormatError::Structural {
+            rule: "a time-series file's rows never go back in occurred_at"
+        }
+    );
+    for width in [0, -5] {
+        cfg.time_series_bucket_nanos = Some(width);
+        assert!(build_hef_file((0..4).map(row).collect(), &cfg).is_err());
+    }
+    let mut event = config();
+    event.time_series_bucket_nanos = Some(1_000);
+    assert_eq!(
+        build_hef_file((0..4).map(row).collect(), &event).unwrap_err(),
+        FormatError::Structural {
+            rule: "only a time-series file takes a rollup bucket width"
+        }
+    );
 }

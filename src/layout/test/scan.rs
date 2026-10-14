@@ -66,6 +66,7 @@ fn row(i: u64) -> HefRow {
 fn file(rows: u64, rows_per_granule: usize) -> HefFile {
     let config = HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 0,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
@@ -74,9 +75,11 @@ fn file(rows: u64, rows_per_granule: usize) -> HefFile {
         },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets {
             index_granularity: rows_per_granule,
@@ -86,6 +89,7 @@ fn file(rows: u64, rows_per_granule: usize) -> HefFile {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(3),
+        time_series_bucket_nanos: None,
     };
     let built = build_hef_file((0..rows).map(row).collect(), &config).unwrap();
     HefFile::open(built.bytes, Some(&built.file_seal)).unwrap()
@@ -300,4 +304,27 @@ fn projected_scan_of_nothing_is_empty_but_well_formed() {
     })
     .unwrap();
     assert_eq!(delivered, 0);
+}
+
+/// Duplicate granule and column IDs come back as asked, once per mention and in order, whether the scan runs as one
+/// window or as many one-granule windows.
+#[test]
+fn projected_scan_repeats_duplicate_ids_across_many_windows() {
+    let file = file(40, 6);
+    let columns = all_columns(&file);
+    let first = *columns.first().unwrap();
+    let asked_columns = vec![first, first];
+    let granules = all_granules(&file);
+    let asked_granules: Vec<u32> = granules.iter().chain(&granules).copied().collect();
+    for window_bytes in [1, SCAN_WINDOW_BYTES] {
+        let batches = collect(&file, &asked_columns, &asked_granules, false, window_bytes).unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.granule_id).collect::<Vec<_>>(),
+            asked_granules
+        );
+        for batch in &batches {
+            assert_eq!(batch.columns.len(), 2);
+            assert_eq!(flatten(&batch.columns[0]), flatten(&batch.columns[1]));
+        }
+    }
 }

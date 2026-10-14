@@ -46,6 +46,21 @@ Money SHALL use fixed-scale decimal aggregation (decimal128), not float. Floatin
 - **WHEN** ALP/ALP RD encoding of an f64 metric column fails the declared round-trip/aggregate tolerance contract
 - **THEN** that encoding is not selected for the column
 
+### Requirement: Time-series float blocks may store Chimp XOR floats
+A time-series file's float blocks SHALL also be tried as Chimp XOR floats (pipeline transform 14), and the Chimp form SHALL be stored only when it is strictly smaller than the block adaptive selection chooses; no other file's blocks use it. The block layout SHALL be a `u32` value count, a `u32` stream byte length, and the stream, packed most significant bit first with the last byte zero-padded: the first value's 64 bits, then for each later value its XOR with the previous one as a two-bit control code: `00` for a zero XOR; `01` when the XOR has more than six trailing zero bits, followed by a 3-bit leading-zero code, a 6-bit count of centre bits, and the centre bits; `10` when the XOR's rounded leading-zero count equals the one the last `11` set, followed by every bit after the leading zeros; `11` followed by a new 3-bit leading-zero code and every bit after the leading zeros. Leading-zero counts SHALL be rounded down to one of 0, 8, 12, 16, 18, 20, 22, or 24, coded 0 to 7, and a `00` or `01` value clears the count a `10` may reuse. The codec works on bit patterns, so decoding SHALL reproduce every value bit for bit, NaN payloads, both zeros, and both infinities included. A decoder SHALL refuse a value count the stream is too short to hold before allocating for it, a `10` with no count to reuse, centre bits that do not fit a value, a stream that ends mid-value, and bytes or set padding bits after the last value. A block has no per-value offsets, so a row range decodes the whole block and slices it.
+
+#### Scenario: Special values round-trip
+- **WHEN** a block holding NaNs with payloads, `-0.0`, both infinities, and subnormals is stored as Chimp and decoded
+- **THEN** every value's bits equal the original's
+
+#### Scenario: Slowly varying metric
+- **WHEN** a memory-utilization gauge (used over total bytes, holding still about half the time) of 8192 readings is encoded for a time-series file
+- **THEN** the block is stored as Chimp and is smaller than every encoding that predates it (measured: 2.96 bytes per value, against 3.07 for the best earlier encoding and 3.75 for what adaptive selection alone stores)
+
+#### Scenario: Decimal readings keep ALP
+- **WHEN** a block of two-decimal readings is encoded for a time-series file
+- **THEN** it is stored exactly as adaptive selection chooses, because ALP is smaller there
+
 ### Requirement: Strings preserve random-access decode
 String columns SHALL use dictionary encoding for low-cardinality, FSST for high-cardinality short strings, front coding for sorted strings, and a raw byte arena for long/opaque strings. FSST pages SHALL preserve random-access decode through marks or mini-block offsets so a reader can decode selected granules without decoding unrelated string pages. Low-cardinality dimensions SHALL prefer exact bitmap indexes over probabilistic filters.
 

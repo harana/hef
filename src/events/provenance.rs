@@ -15,6 +15,7 @@ use super::constant::{NANOS_PER_SECOND, PROTOCOL_ID_BYTES, SIGNATURE_BYTES};
 use super::envelope::TimestampValue;
 use super::variant::VariantValue;
 use crate::error::ProvenanceError;
+use hex_simd::AsOut;
 use k256::schnorr::signature::hazmat::PrehashVerifier;
 use k256::schnorr::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -98,7 +99,7 @@ impl SignedEventProvenance {
         #[allow(clippy::expect_used)]
         write!(out, "{}", self.protocol_kind).expect("String writes never fail");
         out.push(',');
-        push_tags(&mut out, &tags);
+        push_tags(&mut out, tags);
         out.push(',');
         push_json_string(&mut out, content);
         out.push(']');
@@ -233,11 +234,44 @@ impl SignerSignature {
 
     /// The stored text of several signatures: one entry per line, in the given order.
     pub fn join(signatures: &[SignerSignature]) -> String {
-        signatures
+        let mut out = String::new();
+        Self::join_into(signatures, &mut out);
+        out
+    }
+
+    /// [`join`](Self::join), appended to `out` after whatever it already holds, so a caller writing many rows can
+    /// reuse one buffer instead of allocating a fresh string per row.
+    pub(crate) fn join_into(signatures: &[SignerSignature], out: &mut String) {
+        // One entry is its three text fields, four spaces, and both hex fields; entries are newline-separated.
+        let length = signatures
             .iter()
-            .map(SignerSignature::to_string)
-            .collect::<Vec<_>>()
-            .join("\n")
+            .try_fold(signatures.len().saturating_sub(1), |total, entry| {
+                entry
+                    .scheme
+                    .as_str()
+                    .len()
+                    .checked_add(entry.signer.len())?
+                    .checked_add(entry.key_id.len())?
+                    .checked_add(4 + 2 * (PROTOCOL_ID_BYTES + SIGNATURE_BYTES))?
+                    .checked_add(total)
+            });
+        if let Some(length) = length {
+            out.reserve(length);
+        }
+        for (index, entry) in signatures.iter().enumerate() {
+            if index > 0 {
+                out.push('\n');
+            }
+            out.push_str(entry.scheme.as_str());
+            out.push(' ');
+            out.push_str(&entry.signer);
+            out.push(' ');
+            out.push_str(&entry.key_id);
+            out.push(' ');
+            hex_lower_into(&entry.public_key, out);
+            out.push(' ');
+            hex_lower_into(&entry.signature, out);
+        }
     }
 
     /// Reads [`join`](Self::join)'s text back into its signatures.
@@ -249,14 +283,24 @@ impl SignerSignature {
 impl fmt::Display for SignerSignature {
     /// The stored text form: `<scheme> <signer> <key id> <public key hex> <signature hex>`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut public_key = [0u8; 2 * PROTOCOL_ID_BYTES];
+        let mut signature = [0u8; 2 * SIGNATURE_BYTES];
         write!(
             f,
             "{} {} {} {} {}",
             self.scheme.as_str(),
             self.signer,
             self.key_id,
-            hex_lower(&self.public_key),
-            hex_lower(&self.signature)
+            hex_simd::encode_as_str(
+                &self.public_key,
+                public_key.as_mut_slice().as_out(),
+                hex_simd::AsciiCase::Lower
+            ),
+            hex_simd::encode_as_str(
+                &self.signature,
+                signature.as_mut_slice().as_out(),
+                hex_simd::AsciiCase::Lower
+            )
         )
     }
 }
@@ -293,8 +337,9 @@ pub fn hex_bytes<const N: usize>(text: &str) -> Result<[u8; N], ProvenanceError>
     if text.len() != N * 2 || text.bytes().any(|byte| byte.is_ascii_uppercase()) {
         return Err(ProvenanceError::MalformedHex);
     }
-    let bytes = hex_simd::decode_to_vec(text).map_err(|_| ProvenanceError::MalformedHex)?;
-    bytes.try_into().map_err(|_| ProvenanceError::MalformedHex)
+    let mut bytes = [0u8; N];
+    hex_simd::decode(text.as_bytes(), bytes.as_mut_slice().as_out()).map_err(|_| ProvenanceError::MalformedHex)?;
+    Ok(bytes)
 }
 
 fn payload_content(payload: &VariantValue) -> Result<&str, ProvenanceError> {
@@ -307,42 +352,42 @@ fn payload_content(payload: &VariantValue) -> Result<&str, ProvenanceError> {
     }
 }
 
-fn payload_tags(payload: &VariantValue) -> Result<Vec<Vec<&str>>, ProvenanceError> {
+/// The payload's tags, checked to be an array of string arrays before any canonical bytes are written.
+fn payload_tags(payload: &VariantValue) -> Result<&[VariantValue], ProvenanceError> {
     let VariantValue::Object(fields) = payload else {
         return Err(ProvenanceError::PayloadShape { field: TAGS_FIELD });
     };
     let Some(VariantValue::Array(tags)) = fields.get(TAGS_FIELD) else {
         return Err(ProvenanceError::PayloadShape { field: TAGS_FIELD });
     };
-    let mut out = Vec::with_capacity(tags.len());
-    for tag in tags {
-        let VariantValue::Array(items) = tag else {
-            return Err(ProvenanceError::PayloadShape { field: TAGS_FIELD });
-        };
-        let mut row = Vec::with_capacity(items.len());
-        for item in items {
-            let VariantValue::String(value) = item else {
-                return Err(ProvenanceError::PayloadShape { field: TAGS_FIELD });
-            };
-            row.push(value.as_str());
-        }
-        out.push(row);
+    let well_formed = tags.iter().all(|tag| {
+        matches!(tag, VariantValue::Array(items) if items.iter().all(|item| matches!(item, VariantValue::String(_))))
+    });
+    if !well_formed {
+        return Err(ProvenanceError::PayloadShape { field: TAGS_FIELD });
     }
-    Ok(out)
+    Ok(tags)
 }
 
-fn push_tags(out: &mut String, tags: &[Vec<&str>]) {
+/// Writes tags [`payload_tags`] already checked; anything else is skipped rather than written.
+fn push_tags(out: &mut String, tags: &[VariantValue]) {
     out.push('[');
     for (index, tag) in tags.iter().enumerate() {
         if index > 0 {
             out.push(',');
         }
         out.push('[');
-        for (item_index, item) in tag.iter().enumerate() {
-            if item_index > 0 {
-                out.push(',');
+        if let VariantValue::Array(items) = tag {
+            let strings = items.iter().filter_map(|item| match item {
+                VariantValue::String(value) => Some(value),
+                _ => None,
+            });
+            for (item_index, item) in strings.enumerate() {
+                if item_index > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, item);
             }
-            push_json_string(out, item);
         }
         out.push(']');
     }

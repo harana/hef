@@ -24,8 +24,8 @@ use crate::events::variant::VariantValue;
 use crate::file::bytes::{Reader, Writer, slice};
 use crate::layout::reader::PayloadRead;
 use hashbrown::HashSet;
-use std::collections::BTreeMap;
 use std::sync::OnceLock;
+use std::{borrow::Cow, collections::BTreeMap};
 
 /// Magic the artifact object starts with.
 pub const ARTIFACT_MAGIC: [u8; 4] = *b"HIA1";
@@ -173,21 +173,17 @@ impl DecodedPage {
         Some(match self {
             DecodedPage::BinaryFuse(filter) => {
                 let key = equality_key(clause)?;
-                Statistic::PointMembership {
+                Statistic::SingleMember {
                     column_id: clause.column_id,
-                    members: if filter.contains(key) {
-                        vec![clause.value_lo]
-                    } else {
-                        Vec::new()
-                    },
+                    member: filter.contains(key).then_some(clause.value_lo),
                 }
             }
             DecodedPage::Bitmap(index) => {
                 let key = equality_key(clause)?;
                 let present = index.bitmap(key).is_some_and(|rows| !rows.is_empty());
-                Statistic::PointMembership {
+                Statistic::SingleMember {
                     column_id: clause.column_id,
-                    members: if present { vec![clause.value_lo] } else { Vec::new() },
+                    member: present.then_some(clause.value_lo),
                 }
             }
             DecodedPage::PathPresence(index) => {
@@ -203,24 +199,18 @@ impl DecodedPage {
             DecodedPage::RangeFilter(filter) => {
                 let lo = u64::try_from(clause.value_lo.max(0)).ok()?;
                 let hi = u64::try_from(clause.value_hi.max(0)).ok()?;
-                Statistic::RangeEmptiness {
+                Statistic::SingleSpan {
                     column_id: clause.column_id,
-                    non_empty_spans: if filter.range_nonempty(lo, hi) {
-                        vec![(clause.value_lo, clause.value_hi)]
-                    } else {
-                        Vec::new()
-                    },
+                    span: filter
+                        .range_nonempty(lo, hi)
+                        .then_some((clause.value_lo, clause.value_hi)),
                 }
             }
             DecodedPage::SplitBlockBloom(filter) => {
                 let key = equality_key(clause)?;
-                Statistic::PointMembership {
+                Statistic::SingleMember {
                     column_id: clause.column_id,
-                    members: if filter.contains(key) {
-                        vec![clause.value_lo]
-                    } else {
-                        Vec::new()
-                    },
+                    member: filter.contains(key).then_some(clause.value_lo),
                 }
             }
         })
@@ -518,7 +508,7 @@ pub fn build_membership_artifact(
             continue;
         };
         extend_granule_ranges(&mut granule_ranges, granule.granule_id);
-        granule_keys.push((granule.granule_id, keys));
+        granule_keys.push((granule.granule_id, keys.into_owned()));
     }
     let page = |granule_id: u32, bytes: Vec<u8>| ArtifactPage {
         bytes,
@@ -566,16 +556,18 @@ pub fn build_membership_artifact(
 /// The filter keys one decoded column block contributes to a membership, range, or bitmap artifact, or `None` for a
 /// column type the u64 key space cannot carry: hashed bytes for strings, the value itself for u64, the non-negative
 /// values for i64.
-fn membership_keys(data: &crate::encoding::ColumnData) -> Option<Vec<u64>> {
+fn membership_keys(data: &crate::encoding::ColumnData) -> Option<Cow<'_, [u64]>> {
     Some(match data {
-        crate::encoding::ColumnData::Strings(values) => values
-            .iter()
-            .flatten()
-            .map(|value| super::stable_hash(value.as_bytes()))
-            .collect(),
-        crate::encoding::ColumnData::U64(values) => values.clone(),
+        crate::encoding::ColumnData::Strings(values) => Cow::Owned(
+            values
+                .iter()
+                .flatten()
+                .map(|value| super::stable_hash(value.as_bytes()))
+                .collect(),
+        ),
+        crate::encoding::ColumnData::U64(values) => Cow::Borrowed(values.as_slice()),
         crate::encoding::ColumnData::I64(values) => {
-            values.iter().filter_map(|value| u64::try_from(*value).ok()).collect()
+            Cow::Owned(values.iter().filter_map(|value| u64::try_from(*value).ok()).collect())
         }
         _ => return None,
     })
@@ -637,10 +629,10 @@ pub fn build_path_presence_artifact(
                 collect_payload_paths(&mut path, &value, &mut path_hashes);
             }
         }
-        let hashes: Vec<u64> = path_hashes.into_iter().collect();
+        let hash_count = path_hashes.len();
         extend_granule_ranges(&mut granule_ranges, granule.granule_id);
         pages.push(ArtifactPage {
-            bytes: PathPresenceIndex::build(&hashes).encode(),
+            bytes: PathPresenceIndex::build_from_hashes(path_hashes, hash_count).encode(),
             first_granule: granule.granule_id,
             last_granule: granule.granule_id,
         });
@@ -773,22 +765,24 @@ pub fn build_bitmap_artifact(
         };
         // Map each stored value back to its granule-relative row: stored position i is row i for a dense column, or
         // the i-th set presence bit for a presence-gated one.
-        let rows: Vec<u64> = if read.presence.is_empty() {
-            (0..keys.len() as u64).collect()
-        } else {
-            (0..u64::from(granule.row_count))
-                .filter(|row| {
-                    read.presence
-                        .get((row / 8) as usize)
-                        .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
-                })
-                .collect()
-        };
+        let mut present_rows = (0..u64::from(granule.row_count)).filter(|row| {
+            read.presence
+                .get((row / 8) as usize)
+                .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
+        });
         // Group the granule's rows by value first, then record each value once: inserting row by row would rebuild
         // that value's bitmap on every row, which is quadratic in exactly the dense low-cardinality columns this
         // artifact targets.
         let mut rows_by_value: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-        for (key, row) in keys.iter().zip(rows) {
+        for (position, key) in keys.iter().enumerate() {
+            let row = if read.presence.is_empty() {
+                position as u64
+            } else {
+                let Some(row) = present_rows.next() else {
+                    break;
+                };
+                row
+            };
             rows_by_value.entry(*key).or_default().push(row);
         }
         let mut index = BitmapIndex::new();

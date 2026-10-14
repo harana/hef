@@ -365,3 +365,41 @@ fn prev_and_auth_references_to_external_ids_survive_the_journal() {
         Some(relationships)
     );
 }
+
+#[test]
+fn a_dictionary_encoded_after_a_prefix_matches_its_standalone_bytes() {
+    let dictionaries = [
+        Vec::new(),
+        vec![String::new()],
+        vec!["a".to_owned()],
+        vec![
+            "amount".to_owned(),
+            "kind".to_owned(),
+            "z".repeat(5000),
+            "\u{e9}t\u{e9}".to_owned(),
+        ],
+    ];
+    for keys in dictionaries {
+        let dictionary = KeyDictionary::from_sorted_unique(keys.clone()).unwrap();
+        let standalone = encode_variant_dictionary(&dictionary);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        let mut offset = 0u32;
+        for key in &keys {
+            expected.extend_from_slice(&offset.to_le_bytes());
+            offset += key.len() as u32;
+        }
+        expected.extend_from_slice(&offset.to_le_bytes());
+        for key in &keys {
+            expected.extend_from_slice(key.as_bytes());
+        }
+        assert_eq!(standalone, expected);
+
+        let mut out = Writer::new();
+        out.put_slice(b"prefix");
+        encode_variant_dictionary_into(&dictionary, &mut out);
+        assert_eq!(out.bytes().get(..6), Some(&b"prefix"[..]));
+        assert_eq!(out.bytes().get(6..), Some(standalone.as_slice()));
+    }
+}

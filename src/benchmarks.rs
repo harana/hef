@@ -292,3 +292,315 @@ pub struct WafMeasurement {
 pub fn waf_gate_passes(m: &WafMeasurement) -> bool {
     m.measured_waf <= m.ceiling
 }
+
+/// The gated ceiling on what a write-ahead log object's header and trailer add on top of its records, in bytes. Log
+/// objects are a few KiB, so their fixed framing must stay a few dozen bytes rather than HEF's 4 KiB header block.
+pub const LOG_OBJECT_FRAMING_CEILING_BYTES: u64 = 32;
+
+/// The gated ceiling on the bytes a verified forward read of a log object hashes before returning its first record:
+/// one 1 MiB chunk group, however large the object.
+pub const LOG_STREAM_FIRST_RECORD_CEILING_BYTES: u64 = 1 << 20;
+
+/// One log object's framing cost and verified forward-read cost, needed to evaluate the log-object gate.
+#[derive(Debug, Clone)]
+pub struct LogObjectMeasurement {
+    /// Bytes checked against the pinned root before the first record was returned.
+    pub first_record_verified_bytes: u64,
+    /// Header plus trailer, excluding every record's own length and checksum.
+    pub framing_bytes: u64,
+    pub object_bytes: u64,
+    /// Bytes checked against the pinned root by the time every record had been read.
+    pub verified_bytes: u64,
+}
+
+/// Returns `true` when a log object's framing is within its ceiling and a verified forward read streams it: the first
+/// record arrives within one chunk group of hashing, and a full read hashes no more bytes than the object holds.
+pub fn log_object_gate_passes(m: &LogObjectMeasurement) -> bool {
+    m.framing_bytes <= LOG_OBJECT_FRAMING_CEILING_BYTES
+        && m.first_record_verified_bytes <= LOG_STREAM_FIRST_RECORD_CEILING_BYTES
+        && m.verified_bytes <= m.object_bytes
+}
+
+/// The gated ceiling on stored graph bytes per edge, forward and reverse copies together.
+pub const GRAPH_EDGE_BYTES_TARGET: f64 = 6.0;
+
+/// The edge blocks of a graph measured against the edges they describe, needed to evaluate the graph edge size gate.
+#[derive(Debug, Clone)]
+pub struct GraphEdgeBytesMeasurement {
+    /// Each parent link counted once, though it is stored forward and reverse.
+    pub edges: u64,
+    pub stored_bytes: u64,
+}
+
+/// Returns `true` when a graph's edge blocks stay within `GRAPH_EDGE_BYTES_TARGET` bytes per edge. A graph with no
+/// edges passes only when it stores nothing.
+pub fn graph_edge_bytes_gate_passes(m: &GraphEdgeBytesMeasurement) -> bool {
+    m.stored_bytes as f64 <= m.edges as f64 * GRAPH_EDGE_BYTES_TARGET
+}
+
+/// The gated ceiling on footer bytes a graph file's event-id index costs per indexed event, its filter included.
+pub const GRAPH_EVENT_ID_BYTES_TARGET: f64 = 12.0;
+
+/// The gated ceiling on the share of absent event ids the event-id filter lets through to a file.
+pub const GRAPH_EVENT_ID_FALSE_POSITIVE_TARGET: f64 = 0.02;
+
+/// A graph file's event-id index measured against the events it indexes and a set of ids it does not hold, needed to
+/// evaluate the event-id index gate.
+#[derive(Debug, Clone)]
+pub struct GraphEventIdIndexMeasurement {
+    /// Absent ids the filter admitted.
+    pub absent_admitted: u64,
+    pub absent_probes: u64,
+    pub events: u64,
+    /// The whole footer section, its filter included.
+    pub section_bytes: u64,
+}
+
+/// Returns `true` when the event-id index stays within `GRAPH_EVENT_ID_BYTES_TARGET` bytes per event and its filter
+/// admits at most `GRAPH_EVENT_ID_FALSE_POSITIVE_TARGET` of the absent ids probed.
+pub fn graph_event_id_index_gate_passes(m: &GraphEventIdIndexMeasurement) -> bool {
+    m.section_bytes as f64 <= m.events as f64 * GRAPH_EVENT_ID_BYTES_TARGET
+        && m.absent_admitted as f64 <= m.absent_probes as f64 * GRAPH_EVENT_ID_FALSE_POSITIVE_TARGET
+}
+
+/// The gated ceiling on edge-block bytes one event's chain-cover label adds: half its 8 raw bytes.
+pub const GRAPH_CHAIN_LABEL_BYTES_TARGET: f64 = 4.0;
+
+/// The gated ceiling on chain-cover footer bytes per link, each chain's range included: half a link's 16 raw bytes.
+pub const GRAPH_CHAIN_LINK_BYTES_TARGET: f64 = 8.0;
+
+/// A graph's chain-cover labels and links measured against the bytes they add to the file, needed to evaluate the
+/// chain-cover size gate.
+#[derive(Debug, Clone)]
+pub struct GraphChainCoverMeasurement {
+    /// Edge-block bytes with the labels, less the same blocks without them.
+    pub label_bytes: u64,
+    pub labels: u64,
+    /// The footer's chain-cover section.
+    pub link_bytes: u64,
+    pub links: u64,
+}
+
+/// Returns `true` when labels cost at most `GRAPH_CHAIN_LABEL_BYTES_TARGET` bytes each and the chain-cover section at
+/// most `GRAPH_CHAIN_LINK_BYTES_TARGET` bytes per link.
+pub fn graph_chain_cover_gate_passes(m: &GraphChainCoverMeasurement) -> bool {
+    m.label_bytes as f64 <= m.labels as f64 * GRAPH_CHAIN_LABEL_BYTES_TARGET
+        && m.link_bytes as f64 <= m.links as f64 * GRAPH_CHAIN_LINK_BYTES_TARGET
+}
+
+/// The gated ceiling on new state-chunk bytes one state event writes to a 100,000-member room's state: one 16 KiB
+/// chunk's worth.
+pub const STATE_CHUNK_BYTES_PER_EVENT_TARGET: f64 = 16_384.0;
+
+/// The state chunks a run of state events wrote, needed to evaluate the state-chunk write gate.
+#[derive(Debug, Clone)]
+pub struct StateChunkWriteMeasurement {
+    /// Chunks new to each event's tree, sealed, summed over the events.
+    pub bytes_written: u64,
+    pub events: u64,
+}
+
+/// Returns `true` when state events write at most `STATE_CHUNK_BYTES_PER_EVENT_TARGET` bytes of new chunks each on
+/// average.
+pub fn state_chunk_write_gate_passes(m: &StateChunkWriteMeasurement) -> bool {
+    m.bytes_written as f64 <= m.events as f64 * STATE_CHUNK_BYTES_PER_EVENT_TARGET
+}
+
+/// The gated ceiling on the 99th-percentile time a state lookup spends on the reader's own work: all of a warm lookup,
+/// and what a cold lookup takes beyond its object-store round trips.
+pub const STATE_LOOKUP_LOCAL_P99_MICROS_TARGET: f64 = 1_000.0;
+
+/// Point lookups of one key in the state at an event (state root, then state get), against an empty chunk cache and
+/// repeated against a cache holding their chunks, needed to evaluate the state lookup gate.
+#[derive(Debug, Clone)]
+pub struct StateLookupMeasurement {
+    /// The most chunks one cold lookup fetched; each fetch waits on the one before.
+    pub cold_fetches_max: u64,
+    /// Round trips included, at `round_trip_micros` each.
+    pub cold_p99_micros: f64,
+    pub round_trip_micros: f64,
+    /// Levels of the state tree, so a cold lookup may fetch at most this many chunks.
+    pub tree_levels: u64,
+    pub warm_p99_micros: f64,
+}
+
+/// Returns `true` when a cold lookup fetches at most one chunk per tree level and, beyond those round trips, the cold
+/// and warm 99th percentiles stay within `STATE_LOOKUP_LOCAL_P99_MICROS_TARGET`.
+pub fn state_lookup_gate_passes(m: &StateLookupMeasurement) -> bool {
+    m.cold_fetches_max <= m.tree_levels
+        && m.cold_p99_micros <= m.tree_levels as f64 * m.round_trip_micros + STATE_LOOKUP_LOCAL_P99_MICROS_TARGET
+        && m.warm_p99_micros <= STATE_LOOKUP_LOCAL_P99_MICROS_TARGET
+}
+
+/// Replaying a room's join history into graph files and state chunks, needed to evaluate the room replay gate.
+#[derive(Debug, Clone)]
+pub struct RoomReplayMeasurement {
+    pub events: u64,
+    pub graph_bytes: u64,
+    /// Every chunk new to some event's state tree, sealed, as uploads would store them.
+    pub state_chunk_bytes: u64,
+    pub wall_millis: f64,
+}
+
+/// Returns `true` when a replay writes at most `STATE_CHUNK_BYTES_PER_EVENT_TARGET` bytes of new state chunks per
+/// event. Wall time is recorded, not gated.
+pub fn room_replay_gate_passes(m: &RoomReplayMeasurement) -> bool {
+    m.state_chunk_bytes as f64 <= m.events as f64 * STATE_CHUNK_BYTES_PER_EVENT_TARGET
+}
+
+/// The gated ceiling on Chimp bytes per reading of a slowly varying full-precision gauge, against 8 raw bytes.
+pub const XOR_FLOAT_BYTES_PER_VALUE_TARGET: f64 = 3.5;
+
+/// One float column's readings stored as Chimp XOR floats and in the smallest encoding that predates Chimp, needed to
+/// evaluate the XOR float gate.
+#[derive(Debug, Clone)]
+pub struct XorFloatMeasurement {
+    pub best_existing_bytes: u64,
+    pub chimp_bytes: u64,
+    pub values: u64,
+}
+
+/// Returns `true` when Chimp stores the readings in fewer bytes than every earlier encoding and within
+/// `XOR_FLOAT_BYTES_PER_VALUE_TARGET` bytes per value.
+pub fn xor_float_gate_passes(m: &XorFloatMeasurement) -> bool {
+    m.chimp_bytes < m.best_existing_bytes && m.chimp_bytes as f64 <= m.values as f64 * XOR_FLOAT_BYTES_PER_VALUE_TARGET
+}
+
+/// The gated ceiling on column blocks a rollup aggregate reads for a range that cuts two buckets: each edge bucket's
+/// time and value blocks, in at most two granules.
+pub const TIME_SERIES_ROLLUP_EDGE_BLOCK_READS_TARGET: u64 = 8;
+
+/// Column blocks a time-series aggregate read through rollups and by scanning every row, needed to evaluate the rollup
+/// gate.
+#[derive(Debug, Clone)]
+pub struct TimeSeriesRollupMeasurement {
+    /// A range of whole buckets, answered through rollups.
+    pub aligned_block_reads: u64,
+    /// A range that cuts a bucket at each end, answered through rollups.
+    pub cut_block_reads: u64,
+    /// The same cut range answered by scanning every row.
+    pub scan_block_reads: u64,
+}
+
+/// Returns `true` when a range of whole buckets reads no column block and a cut range reads at most
+/// `TIME_SERIES_ROLLUP_EDGE_BLOCK_READS_TARGET` blocks, fewer than a scan of it.
+pub fn time_series_rollup_gate_passes(m: &TimeSeriesRollupMeasurement) -> bool {
+    m.aligned_block_reads == 0
+        && m.cut_block_reads <= TIME_SERIES_ROLLUP_EDGE_BLOCK_READS_TARGET
+        && m.cut_block_reads < m.scan_block_reads
+}
+
+/// The gated ceiling on the bytes an audit file adds over the same rows built as an event file: its profile and audit
+/// footer sections and their two section directory entries. The hash chain stores nothing per row, so the cost stays
+/// the same however many rows the file holds.
+pub const AUDIT_FILE_OVERHEAD_CEILING_BYTES: u64 = 192;
+
+/// What an audit file adds over an event file of the same rows, measured at two row counts, needed to evaluate the
+/// audit file overhead gate.
+#[derive(Debug, Clone)]
+pub struct AuditFileOverheadMeasurement {
+    pub added_bytes_at_few_rows: u64,
+    pub added_bytes_at_many_rows: u64,
+}
+
+/// Returns `true` when an audit file adds at most `AUDIT_FILE_OVERHEAD_CEILING_BYTES` over an event file of the same
+/// rows and adds exactly as much at many rows as at few, so the hash chain costs no stored bytes per row.
+pub fn audit_file_overhead_gate_passes(m: &AuditFileOverheadMeasurement) -> bool {
+    m.added_bytes_at_few_rows <= AUDIT_FILE_OVERHEAD_CEILING_BYTES
+        && m.added_bytes_at_many_rows == m.added_bytes_at_few_rows
+}
+
+/// The gated ceiling on object-store requests for one cold snapshot lookup: one read of the file's tail to open it,
+/// then one read of the granule holding the key.
+pub const SNAPSHOT_LOOKUP_REQUEST_TARGET: u32 = 2;
+
+/// One cold point lookup in a snapshot file opened remotely, needed to evaluate the snapshot lookup gate.
+#[derive(Debug, Clone)]
+pub struct SnapshotLookupMeasurement {
+    /// Tail and granule bytes together.
+    pub bytes_fetched: u64,
+    /// Requests to open the file and look the key up, the open's tail read included.
+    pub requests: u32,
+    pub stored_bytes: u64,
+}
+
+/// Returns `true` when a cold snapshot lookup issues at most `SNAPSHOT_LOOKUP_REQUEST_TARGET` requests and fetches
+/// less than the whole file, which is what a snapshot file offers over reading a whole per-partition archive.
+pub fn snapshot_lookup_gate_passes(m: &SnapshotLookupMeasurement) -> bool {
+    m.requests <= SNAPSHOT_LOOKUP_REQUEST_TARGET && m.bytes_fetched < m.stored_bytes
+}
+
+/// The gated cost of one recipient's entry in an inbox file's recipient directory, in bytes: its two identity hashes,
+/// its row range, and its newest queue point, eight bytes each.
+pub const INBOX_DIRECTORY_BYTES_PER_RECIPIENT: u64 = 48;
+
+/// The gated ceiling on what the recipient directory adds to a footer beyond its entries, in bytes: its entry count
+/// and its line in the footer's section directory (56 bytes today).
+pub const INBOX_DIRECTORY_FRAMING_CEILING_BYTES: u64 = 64;
+
+/// One recipient's queue read from an inbox file, with the size of the file's recipient directory, needed to evaluate
+/// the inbox read gate.
+#[derive(Debug, Clone)]
+pub struct InboxReadMeasurement {
+    /// Granules holding at least one of the recipient's rows: the fewest any read of its queue can touch.
+    pub covering_granules: u64,
+    /// Bytes the recipient directory adds to the file's footer, framing included.
+    pub directory_bytes: u64,
+    pub granules_read: u64,
+    pub recipients: u64,
+}
+
+/// Returns `true` when the recipient directory costs `INBOX_DIRECTORY_BYTES_PER_RECIPIENT` bytes per recipient plus
+/// at most `INBOX_DIRECTORY_FRAMING_CEILING_BYTES`, and reading one recipient's queue touches no granule beyond those
+/// holding its rows.
+pub fn inbox_read_gate_passes(m: &InboxReadMeasurement) -> bool {
+    m.directory_bytes <= m.recipients * INBOX_DIRECTORY_BYTES_PER_RECIPIENT + INBOX_DIRECTORY_FRAMING_CEILING_BYTES
+        && m.granules_read <= m.covering_granules
+}
+
+/// The gated ceiling on what declaring a profile other than `Event` adds to a file, in bytes: one footer directory
+/// entry (52 B) and its one-byte section, with the 4 KiB header block no larger.
+pub const PROFILE_OVERHEAD_CEILING_BYTES: u64 = 64;
+
+/// The same rows built once as an event file and once under another profile, needed to evaluate the profile overhead
+/// gate.
+#[derive(Debug, Clone)]
+pub struct ProfileOverheadMeasurement {
+    pub event_file_bytes: u64,
+    /// Bytes before the first stripe: the fixed header block.
+    pub event_header_block_bytes: u64,
+    pub profiled_file_bytes: u64,
+    /// Bytes before the first stripe: the fixed header block.
+    pub profiled_header_block_bytes: u64,
+}
+
+/// Returns `true` when declaring a profile leaves the header block the same size and adds at most
+/// `PROFILE_OVERHEAD_CEILING_BYTES` to the file.
+pub fn profile_overhead_gate_passes(m: &ProfileOverheadMeasurement) -> bool {
+    m.profiled_header_block_bytes == m.event_header_block_bytes
+        && m.profiled_file_bytes.saturating_sub(m.event_file_bytes) <= PROFILE_OVERHEAD_CEILING_BYTES
+}
+
+/// The gated number of range requests one level of a graph walk may send to each file it reads: one, every edge block
+/// that level needs from the file joined into a single request.
+pub const GRAPH_WALK_REQUESTS_PER_FILE_PER_LEVEL: u64 = 1;
+
+/// One breadth-first walk over a graph spread across several remote files, needed to evaluate the graph walk request
+/// gate.
+#[derive(Debug, Clone)]
+pub struct GraphWalkMeasurement {
+    pub bytes_fetched: u64,
+    pub files: u64,
+    /// Levels of ancestors the walk returned.
+    pub levels: u64,
+    /// Range requests sent to every file together, after each file was opened.
+    pub requests: u64,
+}
+
+/// Returns `true` when a graph walk sent at most `GRAPH_WALK_REQUESTS_PER_FILE_PER_LEVEL` requests per file per level.
+pub fn graph_walk_gate_passes(m: &GraphWalkMeasurement) -> bool {
+    m.requests
+        <= m.levels
+            .saturating_mul(m.files)
+            .saturating_mul(GRAPH_WALK_REQUESTS_PER_FILE_PER_LEVEL)
+}

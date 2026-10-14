@@ -129,21 +129,26 @@ impl RoaringRangeBitmap {
     /// non-adjacent form first. Empty runs are dropped and overlapping or touching runs are merged, so two inputs that
     /// describe the same set of rows produce byte-identical bitmaps.
     pub fn from_ranges<I: IntoIterator<Item = RowRange>>(ranges: I) -> Self {
-        let mut sorted: Vec<RowRange> = ranges.into_iter().filter(|r| !r.is_empty()).collect();
-        sorted.sort_unstable_by_key(|r| (r.start, r.end));
-        let mut runs: Vec<RowRange> = Vec::with_capacity(sorted.len());
-        for range in sorted {
-            match runs.last_mut() {
-                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
-                _ => runs.push(range),
+        let mut runs: Vec<RowRange> = ranges.into_iter().filter(|r| !r.is_empty()).collect();
+        runs.sort_unstable_by_key(|r| (r.start, r.end));
+        runs.dedup_by(|range, last| {
+            let merges = range.start <= last.end;
+            if merges {
+                last.end = last.end.max(range.end);
             }
-        }
+            merges
+        });
         Self { runs }
     }
 
     /// The set of `[start, end)` runs backing this bitmap, in sorted order.
     pub fn ranges(&self) -> &[RowRange] {
         &self.runs
+    }
+
+    /// Hands over the runs without copying them, for crate code that keeps its own copy of the run list.
+    pub(crate) fn into_ranges(self) -> Vec<RowRange> {
+        self.runs
     }
 
     /// Whether this bitmap holds no rows at all.
@@ -239,16 +244,51 @@ impl RoaringRangeBitmap {
         Self { runs }
     }
 
+    /// Merges two bitmaps into the rows present in either, in one linear walk over both run lists. Both sides are
+    /// already canonical, so taking the run with the lower start from either side at each step visits runs in start
+    /// order, and coalescing each into the last emitted run yields the canonical form with no sort.
+    fn union(&self, other: &Self) -> Self {
+        let mut runs: Vec<RowRange> = Vec::with_capacity(self.runs.len() + other.runs.len());
+        let mut a = 0usize;
+        let mut b = 0usize;
+        loop {
+            let next = match (self.runs.get(a), other.runs.get(b)) {
+                (Some(left), Some(right)) if left.start <= right.start => {
+                    a += 1;
+                    *left
+                }
+                (_, Some(right)) => {
+                    b += 1;
+                    *right
+                }
+                (Some(left), None) => {
+                    a += 1;
+                    *left
+                }
+                (None, None) => break,
+            };
+            match runs.last_mut() {
+                Some(last) if next.start <= last.end => last.end = last.end.max(next.end),
+                _ => runs.push(next),
+            }
+        }
+        Self { runs }
+    }
+
     /// Serializes the bitmap to bytes: a run count followed by each run's `start` and `end`. Round-trips exactly with
     /// [`decode`](Self::decode).
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Writer::with_capacity(RUN_COUNT_PREFIX_BYTES + self.runs.len() * ENCODED_ROW_RANGE_BYTES);
-        out.put_u32(self.runs.len() as u32);
-        for run in &self.runs {
-            out.put_u64(run.start);
-            out.put_u64(run.end);
-        }
+        let mut out = Writer::with_capacity(self.encoded_len());
+        self.encode_into(&mut out);
         out.into_bytes()
+    }
+
+    fn encoded_len(&self) -> usize {
+        encoded_runs_len(self.runs.len())
+    }
+
+    fn encode_into(&self, out: &mut Writer) {
+        put_encoded_runs(out, &self.runs);
     }
 
     /// Reads a bitmap back from [`encode`](Self::encode)'s bytes. Refuses on truncated input or on runs that are
@@ -277,6 +317,21 @@ impl RoaringRangeBitmap {
     }
 }
 
+/// How many bytes [`put_encoded_runs`] writes for `run_count` runs.
+pub(crate) fn encoded_runs_len(run_count: usize) -> usize {
+    RUN_COUNT_PREFIX_BYTES + run_count * ENCODED_ROW_RANGE_BYTES
+}
+
+/// Appends `runs` to `out` in the exact bytes [`RoaringRangeBitmap::encode`] produces, without building a bitmap first.
+/// The caller must pass runs already in canonical sorted, disjoint, non-adjacent form, or the bytes will not decode.
+pub(crate) fn put_encoded_runs(out: &mut Writer, runs: &[RowRange]) {
+    out.put_u32(runs.len() as u32);
+    for run in runs {
+        out.put_u64(run.start);
+        out.put_u64(run.end);
+    }
+}
+
 /// A bitmap index for one low-cardinality column: a mapping from each distinct value (encoded as a `u64` code, e.g. a
 /// dictionary id or a `status` code) to the set of rows that hold it.
 ///
@@ -294,16 +349,18 @@ impl BitmapIndex {
     }
 
     /// Records that `rows` carry `value`. Any rows already mapped to that value are merged in, so calling this
-    /// repeatedly for the same value accumulates its row set.
+    /// repeatedly for the same value accumulates its row set. A value seen for the first time is recorded even when
+    /// `rows` is empty; an empty `rows` for a value already recorded leaves it untouched.
     pub fn insert<I: IntoIterator<Item = u64>>(&mut self, value: u64, rows: I) {
         let added = RoaringRangeBitmap::from_rows(rows);
         match self.entries.binary_search_by_key(&value, |(v, _)| *v) {
             Ok(idx) => {
                 if let Some((_, existing)) = self.entries.get_mut(idx) {
-                    let merged = RoaringRangeBitmap::from_ranges(
-                        existing.ranges().iter().copied().chain(added.ranges().iter().copied()),
-                    );
-                    *existing = merged;
+                    if existing.is_empty() {
+                        *existing = added;
+                    } else if !added.is_empty() {
+                        *existing = existing.union(&added);
+                    }
                 }
             }
             Err(idx) => self.entries.insert(idx, (value, added)),
@@ -356,13 +413,18 @@ impl BitmapIndex {
     /// Serializes the whole index: a value count, then each value followed by its encoded bitmap. Round-trips with
     /// [`decode`](Self::decode).
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Writer::new();
+        let capacity = RUN_COUNT_PREFIX_BYTES
+            + self
+                .entries
+                .iter()
+                .map(|(_, bitmap)| INDEX_ENTRY_HEADER_BYTES + bitmap.encoded_len())
+                .sum::<usize>();
+        let mut out = Writer::with_capacity(capacity);
         out.put_u32(self.entries.len() as u32);
         for (value, bitmap) in &self.entries {
             out.put_u64(*value);
-            let block = bitmap.encode();
-            out.put_u32(block.len() as u32);
-            out.put_slice(&block);
+            out.put_u32(bitmap.encoded_len() as u32);
+            bitmap.encode_into(&mut out);
         }
         out.into_bytes()
     }

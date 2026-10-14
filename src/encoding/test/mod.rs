@@ -1,7 +1,9 @@
 use super::*;
+use crate::benchmarks::{XorFloatMeasurement, xor_float_gate_passes};
 use crate::file::bytes::{Reader, Writer};
 use arrow_array::Array;
 use miniz_oxide::deflate::compress_to_vec;
+use std::collections::BTreeMap;
 
 /// A transform chosen from a sample can encode the full block larger than simply writing the values out — which for
 /// the format's own metadata columns, a handful of values each, was the normal case rather than the unlucky one.
@@ -123,6 +125,149 @@ fn monotonic_block_still_chooses_delta_across_sample_run_boundaries() {
     );
 }
 
+/// Signed selection columns covering the sample threshold on both sides, the extremes of the range and the shapes
+/// selection must tell apart.
+fn signed_selection_columns() -> Vec<Vec<i64>> {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut random = |count: usize| -> Vec<i64> {
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                state as i64
+            })
+            .collect()
+    };
+    let mut columns = Vec::new();
+    for count in [0usize, 1, 1023, 1024, 1025, 4096, 10_007] {
+        columns.push(random(count));
+        columns.push(vec![-7; count]);
+        columns.push((0..count as i64).map(|i| i * 3 - 5_000).collect());
+        columns.push((0..count as i64).map(|i| if i % 2 == 0 { i } else { -i }).collect());
+        columns.push(
+            (0..count)
+                .map(|i| if i % 3 == 0 { i64::MIN } else { i64::MAX })
+                .collect(),
+        );
+    }
+    let mut prefixed = vec![42i64; TRANSFORM_SAMPLE_SIZE];
+    prefixed.extend(random(7 * 1024));
+    columns.push(prefixed);
+    columns
+}
+
+/// Drawing the signed sample straight into zigzag codes must yield exactly the codes of the sample drawn first and
+/// mapped afterwards — same runs, same order, same `None` for a short block — and so the same chosen transform under
+/// every strategy.
+#[test]
+fn signed_sample_drawn_as_zigzag_codes_matches_the_mapped_signed_sample() {
+    for values in signed_selection_columns() {
+        let reference: Option<Vec<u64>> =
+            transform_sample(&values).map(|sample| sample.iter().map(|value| zigzag(*value)).collect());
+        assert_eq!(
+            transform_sample_mapped(&values, zigzag),
+            reference,
+            "sample at {} values",
+            values.len()
+        );
+        let reference_mapped = reference.unwrap_or_else(|| values.iter().map(|value| zigzag(*value)).collect());
+        for strategy in [
+            CascadeStrategy::DecodeOptimized,
+            CascadeStrategy::NoTrailing,
+            CascadeStrategy::SizeOptimized,
+        ] {
+            assert_eq!(
+                choose_i64_transform(&values, strategy),
+                score_u64_candidates(&reference_mapped, values.len(), strategy),
+                "{strategy:?} at {} values",
+                values.len()
+            );
+        }
+    }
+}
+
+/// The float fallback trial as it stood with a separate raw buffer per trial: the reference the shared-buffer trial
+/// must agree with.
+fn reference_float_fallback(values: &[f64]) -> Transform {
+    let sample = transform_sample(values);
+    let sample: &[f64] = sample.as_deref().unwrap_or(values);
+    if sample.is_empty() {
+        return Transform::PlainF64;
+    }
+    let plain_bytes: Vec<u8> = sample.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let mut bss_bytes = vec![0u8; sample.len() * 8];
+    write_byte_stream_split(sample, &mut bss_bytes);
+    let plain_compressed = deflate::compress(&plain_bytes).len();
+    let bss_compressed = deflate::compress(&bss_bytes).len();
+    let (_, _, alp_rd_estimate) = alp_rd_choose_split(sample);
+    if alp_rd_estimate < plain_compressed.min(bss_compressed) {
+        Transform::AlpRd
+    } else if bss_compressed < plain_compressed {
+        Transform::ByteStreamSplit
+    } else {
+        Transform::PlainF64
+    }
+}
+
+/// Float columns for the fallback trial: threshold boundaries, repeated exponents, raw random bits and the special
+/// IEEE values whose bit patterns must survive untouched.
+fn float_fallback_columns() -> Vec<Vec<f64>> {
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    let mut random_bits = |count: usize| -> Vec<f64> {
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                f64::from_bits(state)
+            })
+            .collect()
+    };
+    let specials = [
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7FF8_0000_0000_0001),
+        f64::from_bits(0xFFF0_0000_0000_BEEF),
+        f64::MIN_POSITIVE / 3.0,
+        -f64::MIN_POSITIVE / 7.0,
+    ];
+    let mut columns = Vec::new();
+    for count in [0usize, 1, 1023, 1024, 1025, 4096, 10_007] {
+        columns.push(random_bits(count));
+        columns.push((0..count).map(|i| 1.0 + (i as f64) * f64::EPSILON * 977.0).collect());
+        columns.push((0..count).map(|i| specials[i % specials.len()]).collect());
+        columns.push(
+            (0..count)
+                .map(|i| f64::from_bits((1023u64 << 52) | ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 12)))
+                .collect(),
+        );
+    }
+    columns
+}
+
+/// The float fallback trial reuses one raw buffer for its plain and byte-stream-split compressions. It must choose
+/// exactly what separate buffers chose, and the byte-stream-split planes written over the plain bytes must equal
+/// those written into a fresh buffer.
+#[test]
+fn float_fallback_trial_in_one_buffer_matches_separate_buffers() {
+    for values in float_fallback_columns() {
+        assert_eq!(
+            choose_float_fallback(&values),
+            reference_float_fallback(&values),
+            "fallback at {} values",
+            values.len()
+        );
+        let mut reused: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
+        write_byte_stream_split(&values, &mut reused);
+        let mut fresh = vec![0u8; values.len() * 8];
+        write_byte_stream_split(&values, &mut fresh);
+        assert_eq!(reused, fresh, "planes at {} values", values.len());
+    }
+}
+
 #[test]
 fn metric_f64_uses_alp_with_exact_round_trip() {
     let values: Vec<f64> = (0..2048).map(|i| (i as f64) * 0.25 + 10.5).collect();
@@ -173,6 +318,214 @@ fn byte_stream_split_deflate_page_supports_single_granule_range_decode() {
     let end = 137;
     let decoded = decode_block_range(block.pipeline, &block.bytes, start, end).unwrap();
     assert_eq!(decoded, ColumnData::F64(values[start..end].to_vec()));
+}
+
+/// Float bit patterns a byte-stream-split block must carry through untouched: NaNs with distinct payloads, both
+/// zeros, both infinities, subnormals and the extremes, repeated every 50 rows between pseudo-random raw bits.
+fn byte_stream_split_test_values(count: usize) -> Vec<f64> {
+    let special = [
+        f64::NAN.to_bits(),
+        0x7FF0_0000_0000_0001,
+        0xFFF8_0000_DEAD_BEEF,
+        0.0f64.to_bits(),
+        (-0.0f64).to_bits(),
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+        1,
+        0x800F_FFFF_FFFF_FFFF,
+        f64::MAX.to_bits(),
+        f64::MIN_POSITIVE.to_bits(),
+    ];
+    let mut state = 0x2545_F491_4F6C_DD1D;
+    (0..count)
+        .map(|i| {
+            f64::from_bits(
+                special
+                    .get(i % 50)
+                    .copied()
+                    .unwrap_or_else(|| pseudo_random(&mut state)),
+            )
+        })
+        .collect()
+}
+
+/// A byte-stream-split block body exactly as the encoder writes it: the row count, then the eight byte planes.
+fn byte_stream_split_body(values: &[f64]) -> Vec<u8> {
+    let mut out = Writer::new();
+    encode_byte_stream_split(values, &mut out);
+    out.into_bytes()
+}
+
+/// Floats compared by their bits, so NaN payloads and signed zeros count.
+fn float_bits(values: &[f64]) -> Vec<u64> {
+    values.iter().map(|value| value.to_bits()).collect()
+}
+
+/// How many distinct frames of a seekable stored form the plaintext ranges `(start, len)` fall in: what a decode
+/// reading exactly those ranges inflates when it inflates each frame at most once.
+fn frames_covering(stored: &[u8], ranges: &[(usize, usize)]) -> usize {
+    let table = seekable_zstd::seek_table(stored).unwrap();
+    let mut frames = std::collections::BTreeSet::new();
+    for &(start, len) in ranges.iter().filter(|(_, len)| *len > 0) {
+        frames.extend(table.frame_index_decomp(start as u64)..=table.frame_index_decomp((start + len - 1) as u64));
+    }
+    frames.len()
+}
+
+/// The full byte-stream-split decoder carries every bit pattern through for empty, single-row and larger blocks,
+/// accepts bytes trailing the last plane, and refuses a body cut short in any one of its planes or its header.
+#[test]
+fn byte_stream_split_full_decode_keeps_every_bit_and_refuses_a_truncated_plane() {
+    for count in [0, 1, 300] {
+        let values = byte_stream_split_test_values(count);
+        let body = byte_stream_split_body(&values);
+        let decoded = decode_byte_stream_split(&mut Reader::new(&body)).unwrap();
+        assert_eq!(float_bits(&decoded), float_bits(&values), "{count} rows");
+
+        let mut trailing = body.clone();
+        trailing.extend_from_slice(&[0xAB; 3]);
+        let decoded = decode_byte_stream_split(&mut Reader::new(&trailing)).unwrap();
+        assert_eq!(
+            float_bits(&decoded),
+            float_bits(&values),
+            "{count} rows and trailing bytes"
+        );
+
+        for plane in (0..8).filter(|_| count > 0) {
+            let cut = &body[..4 + plane * count + count - 1];
+            assert_eq!(
+                decode_byte_stream_split(&mut Reader::new(cut)),
+                Err(FormatError::Truncated {
+                    what: "byte-stream-split plane"
+                }),
+                "{count} rows cut short in plane {plane}"
+            );
+        }
+    }
+    assert_eq!(
+        decode_byte_stream_split(&mut Reader::new(&[1, 0])),
+        Err(FormatError::Truncated {
+            what: "byte-stream-split count"
+        })
+    );
+}
+
+/// A framed byte-stream-split range read gives exactly the bits of a whole-block decode, and inflates each frame its
+/// header and its eight plane ranges fall in exactly once: with every plane in one frame, adjacent planes sharing
+/// frames, a frame per plane, and plane ranges crossing frame boundaries. Empty, clipped, reversed and out-of-range
+/// requests behave as they do for every other transform.
+#[test]
+fn byte_stream_split_framed_range_decode_matches_the_full_decode_and_inflates_each_frame_once() {
+    let count = 300;
+    let values = byte_stream_split_test_values(count);
+    let body = byte_stream_split_body(&values);
+    let pipeline = PipelineId::new(Transform::ByteStreamSplit, Compression::SeekableZstd, ValueKind::F64);
+    let shared_frames: Vec<usize> = (1..4).map(|i| i * count * 5 / 2).collect();
+    let frame_per_plane: Vec<usize> = (1..8).map(|plane| 4 + plane * count).collect();
+    let small_frames: Vec<usize> = (1..body.len() / 37).map(|i| i * 37).collect();
+    for breaks in [Vec::new(), shared_frames, frame_per_plane, small_frames] {
+        let bytes = seekable_zstd::compress_with_breaks(&body, &breaks).expect("the body compresses");
+        let ColumnData::F64(full) = decode_block(pipeline, &bytes).unwrap() else {
+            panic!("a float block decodes to floats");
+        };
+        assert_eq!(float_bits(&full), float_bits(&values));
+        for (start, end) in [
+            (0, count),
+            (0, 1),
+            (36, 38),
+            (100, 137),
+            (count - 1, count),
+            (250, count + 50),
+            (count, count + 5),
+            (count + 3, count + 10),
+            (9, 9),
+            (20, 10),
+        ] {
+            let effective_end = end.min(count);
+            let mut ranges = Vec::new();
+            if start < end {
+                ranges.push((0, 4));
+            }
+            if start < effective_end {
+                ranges.extend((0..8).map(|plane| (4 + plane * count + start, effective_end - start)));
+            }
+            seekable_zstd::take_frames_inflated();
+            let ColumnData::F64(range) = decode_block_range(pipeline, &bytes, start, end).unwrap() else {
+                panic!("a float block decodes to floats");
+            };
+            assert_eq!(
+                seekable_zstd::take_frames_inflated(),
+                frames_covering(&bytes, &ranges),
+                "frames inflated for rows {start}..{end} under breaks {breaks:?}"
+            );
+            assert_eq!(
+                float_bits(&range),
+                float_bits(full.get(start..effective_end).unwrap_or(&[])),
+                "rows {start}..{end} under breaks {breaks:?}"
+            );
+        }
+    }
+}
+
+/// A framed byte-stream-split range read refuses a body whose length disagrees with its row-count header, and a
+/// damaged frame holding only the last plane, though the earlier planes were already folded into the output.
+#[test]
+fn byte_stream_split_framed_range_decode_refuses_a_forged_count_and_a_damaged_last_plane() {
+    let count = 300;
+    let mut body = byte_stream_split_body(&byte_stream_split_test_values(count));
+    let pipeline = PipelineId::new(Transform::ByteStreamSplit, Compression::SeekableZstd, ValueKind::F64);
+    let frame_per_plane: Vec<usize> = (1..8).map(|plane| 4 + plane * count).collect();
+    let mut bytes = seekable_zstd::compress_with_breaks(&body, &frame_per_plane).expect("the body compresses");
+    assert!(decode_block_range(pipeline, &bytes, 10, 20).is_ok());
+    let table = seekable_zstd::seek_table(&bytes).unwrap();
+    assert_eq!(table.num_frames(), 8);
+    // Flipping the last frame's first byte breaks its magic number, so that frame no longer decompresses.
+    let last_plane = table.frame_start_comp(7).unwrap() as usize;
+    bytes[last_plane] ^= 0xFF;
+    assert!(decode_block_range(pipeline, &bytes, 10, 20).is_err());
+
+    body[..4].copy_from_slice(&(count as u32 + 1).to_le_bytes());
+    let forged = seekable_zstd::compress(&body).expect("the body compresses");
+    assert!(decode_block_range(pipeline, &forged, 10, 20).is_err());
+}
+
+/// A framed plain range read gives the same rows as slicing a whole-block decode, and inflates each frame its
+/// row-count header and its rows fall in exactly once: rows in the header's frame, in a later frame, or straddling
+/// frames, plus clipped and out-of-range requests.
+#[test]
+fn plain_framed_range_decode_matches_the_full_decode_and_inflates_each_frame_once() {
+    let values: Vec<u64> = (0..300u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+    let mut body = Writer::new();
+    body.put_u32(values.len() as u32);
+    for value in &values {
+        body.put_u64(*value);
+    }
+    let body = body.into_bytes();
+    let pipeline = PipelineId::new(Transform::PlainU64, Compression::SeekableZstd, ValueKind::U64);
+    let small_frames: Vec<usize> = (1..body.len() / 37).map(|i| i * 37).collect();
+    for breaks in [Vec::new(), vec![1_000], small_frames] {
+        let bytes = seekable_zstd::compress_with_breaks(&body, &breaks).expect("the body compresses");
+        assert_eq!(decode_block(pipeline, &bytes).unwrap(), ColumnData::U64(values.clone()));
+        for (start, end) in [(0, 300), (0, 1), (4, 5), (120, 140), (299, 300), (250, 400), (300, 310)] {
+            let effective_end = end.min(values.len());
+            let mut ranges = vec![(0, 4)];
+            if start < effective_end {
+                ranges.push((4 + start * 8, (effective_end - start) * 8));
+            }
+            seekable_zstd::take_frames_inflated();
+            let decoded = decode_block_range(pipeline, &bytes, start, end).unwrap();
+            assert_eq!(
+                seekable_zstd::take_frames_inflated(),
+                frames_covering(&bytes, &ranges),
+                "frames inflated for rows {start}..{end} under breaks {breaks:?}"
+            );
+            assert_eq!(
+                decoded,
+                ColumnData::U64(values[start..effective_end].to_vec()),
+                "rows {start}..{end} under breaks {breaks:?}"
+            );
+        }
+    }
 }
 
 /// A plain block stored as a deflate page reads any row range by inflating only the granules holding it, and the
@@ -598,6 +951,153 @@ fn null_stream_picks_the_smallest_form() {
     );
     // Alternating presence would need 2048 runs, so the raw one-bit-per-row bitmap wins: 5 + 512 bytes.
     assert_eq!(encoded_len(&string_values_with_nulls(4096, |i| i % 2 == 0)), 517);
+}
+
+/// The null-stream derivation as it stood before the counting first pass: build every present-row run, then pick the
+/// form from them. Kept here as the reference the current derivation must match byte for byte.
+fn reference_null_stream(values: &StringColumn) -> NullStream {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        if value.is_some() {
+            let index = index as u32;
+            match runs.last_mut() {
+                Some(run) if run.1 == index => run.1 = index + 1,
+                _ => runs.push((index, index + 1)),
+            }
+        }
+    }
+    let row_count = values.len();
+    let form = if runs.is_empty() {
+        NullStreamForm::AllAbsent
+    } else if runs == [(0, row_count as u32)] {
+        NullStreamForm::AllPresent
+    } else if 4 + runs.len() * 8 < row_count.div_ceil(8) {
+        NullStreamForm::Runs(runs)
+    } else {
+        let mut raw = vec![0u8; row_count.div_ceil(8)];
+        for &(start, end) in &runs {
+            for row in start as usize..end as usize {
+                raw[row / 8] |= 1 << (row % 8);
+            }
+        }
+        NullStreamForm::Raw(raw)
+    };
+    NullStream { form, row_count }
+}
+
+/// A named presence pattern: whether row `i` carries a value.
+type RowShape = (&'static str, Box<dyn Fn(usize) -> bool>);
+
+/// The counting first pass must choose the same form and write the same bytes as the reference derivation for every
+/// null pattern, including the run/raw size tie (which the raw bitmap wins) and patterns ending on byte boundaries.
+#[test]
+fn null_stream_matches_the_reference_derivation() {
+    let mut patterns: Vec<(String, StringColumn)> = vec![
+        ("empty".into(), string_values_with_nulls(0, |_| true)),
+        ("single present".into(), string_values_with_nulls(1, |_| true)),
+        ("single absent".into(), string_values_with_nulls(1, |_| false)),
+    ];
+    for row_count in [7usize, 8, 9, 15, 16, 17, 63, 64, 65, 100, 255, 256, 257, 1000, 4096] {
+        let shapes: [RowShape; 12] = [
+            ("all present", Box::new(|_| true)),
+            ("all absent", Box::new(|_| false)),
+            ("alternating", Box::new(|i| i % 2 == 0)),
+            ("alternating odd", Box::new(|i| i % 2 == 1)),
+            ("sparse present", Box::new(|i| i % 97 == 3)),
+            ("sparse absent", Box::new(|i| i % 89 != 5)),
+            ("clusters", Box::new(|i| (i / 40) % 3 == 0)),
+            ("leading nulls", Box::new(move |i| i >= row_count / 3)),
+            ("trailing nulls", Box::new(move |i| i < row_count - row_count / 3)),
+            ("byte-aligned blocks", Box::new(|i| (i / 8) % 2 == 0)),
+            ("first row only", Box::new(|i| i == 0)),
+            ("last row only", Box::new(move |i| i + 1 == row_count)),
+        ];
+        for (shape, present) in shapes {
+            patterns.push((
+                format!("{shape} x{row_count}"),
+                string_values_with_nulls(row_count, present),
+            ));
+        }
+    }
+    // Run/raw size equality: 4 + 8 * runs == ceil(rows / 8). One run ties at 12 bitmap bytes (89..=96 rows) and two
+    // runs at 20 bytes (153..=160 rows); the rows just outside each range probe both sides of the tie.
+    for (row_count, run_count) in [
+        (88usize, 1usize),
+        (89, 1),
+        (96, 1),
+        (97, 1),
+        (152, 2),
+        (153, 2),
+        (160, 2),
+        (161, 2),
+    ] {
+        patterns.push((
+            format!("tie {run_count} runs x{row_count}"),
+            string_values_with_nulls(row_count, move |i| i < 10 || (run_count == 2 && (20..30).contains(&i))),
+        ));
+    }
+    for (name, values) in patterns {
+        let actual = NullStream::from_values(&values);
+        let expected = reference_null_stream(&values);
+        assert_eq!(actual, expected, "{name}: form");
+        let mut actual_bytes = Writer::new();
+        actual.write(&mut actual_bytes);
+        let mut expected_bytes = Writer::new();
+        expected.write(&mut expected_bytes);
+        assert_eq!(actual_bytes.into_bytes(), expected_bytes.into_bytes(), "{name}: bytes");
+    }
+}
+
+/// The string-transform choice as it stood before the sample was sorted in place: copy the sample into a second
+/// vector to count distinct values. Kept here as the reference the current choice must match.
+fn reference_string_transform(present: &[&str]) -> Transform {
+    if present.is_empty() {
+        return Transform::RawString;
+    }
+    let sample = transform_sample(present);
+    let sample: &[&str] = sample.as_deref().unwrap_or(present);
+    let mut distinct: Vec<&str> = sample.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let average_len = sample.iter().map(|value| value.len()).sum::<usize>() / sample.len().max(1);
+    if distinct.len() * DICTIONARY_MAX_CARDINALITY_DIVISOR <= sample.len() {
+        Transform::DictionaryString
+    } else if average_len <= FSST_MAX_AVERAGE_VALUE_LEN && sample.len() >= FSST_MIN_SAMPLE_COUNT {
+        Transform::FsstString
+    } else {
+        Transform::RawString
+    }
+}
+
+/// Sorting the owned sample in place must pick the same transform as the reference for every block size around the
+/// sample-size boundary, across low and high cardinality and short and long values, and leave the caller's values
+/// untouched.
+#[test]
+fn string_transform_choice_matches_the_reference() {
+    for size in [0usize, 1, 15, 16, 1023, 1024, 1025, 5000, 20_000] {
+        for cardinality in [1usize, 3, 250, 256, 257, usize::MAX] {
+            for pad in [0usize, 40, 60, 64, 65, 200] {
+                let owned: Vec<String> = (0..size)
+                    .map(|i| {
+                        let key = if cardinality == usize::MAX {
+                            i
+                        } else {
+                            (i * 7) % cardinality
+                        };
+                        format!("{key}{}", "x".repeat(pad + (i % 3)))
+                    })
+                    .collect();
+                let present: Vec<&str> = owned.iter().map(String::as_str).collect();
+                let before = present.clone();
+                assert_eq!(
+                    choose_string_transform(&present),
+                    reference_string_transform(&present),
+                    "size {size}, cardinality {cardinality}, pad {pad}"
+                );
+                assert_eq!(present, before, "caller's values must stay in their order");
+            }
+        }
+    }
 }
 
 /// Every string transform must round-trip under every null side-stream form, and the zero-copy view decode must
@@ -1822,6 +2322,70 @@ fn string_arenas_range_decode_from_a_deflate_page() {
     }
 }
 
+/// A framed string range read gives the same values as a whole-block decode, and inflates each frame its header, its
+/// two bounding offsets and its values' bytes fall in exactly once, with frames small enough that the header may span
+/// several, offsets and values share frames, and values straddle frame boundaries. Both string arenas take this path.
+#[test]
+fn string_framed_range_decode_matches_the_full_decode_and_inflates_each_frame_once() {
+    let raw = long_free_text(2_000);
+    let short: Vec<Option<String>> = (0..3_000)
+        .map(|i| (i % 11 != 0).then(|| format!("session-{i:07}@tenant-{:03}.example.com", i % 400)))
+        .collect();
+    for (values, transform) in [(raw, Transform::RawString), (short, Transform::FsstString)] {
+        let block = encode_block(&ColumnData::Strings(values.clone().into()), true);
+        assert_eq!(block.pipeline.transform().unwrap(), transform);
+        assert_eq!(block.pipeline.compression().unwrap(), Compression::SeekableZstd);
+        let body = seekable_zstd::decompress_all(&block.bytes).unwrap();
+        let breaks: Vec<usize> = (1..body.len() / 997).map(|i| i * 997).collect();
+        let bytes = seekable_zstd::compress_with_breaks(&body, &breaks).expect("the body compresses");
+        let table = seekable_zstd::seek_table(&bytes).unwrap();
+        let rows = values.len();
+        for (start, end) in [
+            (0, rows),
+            (0, 1),
+            (11, 12),
+            (rows / 2, rows / 2 + 3),
+            (rows - 5, rows + 20),
+            (rows, rows + 4),
+        ] {
+            // The frames each part of the read falls in, worked out through a window of its own.
+            let mut window = seekable_zstd::Window::open(&bytes).unwrap();
+            seekable_zstd::take_frames_inflated();
+            let header = read_windowed_string_header(transform, &mut window).unwrap();
+            let header_frames = seekable_zstd::take_frames_inflated() as u32;
+            let mut ranges = vec![(0, table.frame_end_decomp(header_frames - 1).unwrap() as usize)];
+            let effective_end = end.min(rows);
+            if start < effective_end {
+                let present_start = header.nulls.present_before(start);
+                let present_end = header.nulls.present_before(effective_end);
+                let offsets_at = header.offsets_start + present_start * 4;
+                let offsets_len = (present_end - present_start + 1) * 4;
+                let offsets = decode_offsets(&window.read(offsets_at, offsets_len).unwrap());
+                let (first, last) = (offsets[0], offsets[offsets.len() - 1]);
+                ranges.push((offsets_at, offsets_len));
+                ranges.push((
+                    header.offsets_start + (header.present_count + 1) * 4 + first,
+                    last - first,
+                ));
+            }
+            drop(window);
+
+            seekable_zstd::take_frames_inflated();
+            let decoded = decode_block_range(block.pipeline, &bytes, start, end).unwrap();
+            assert_eq!(
+                seekable_zstd::take_frames_inflated(),
+                frames_covering(&bytes, &ranges),
+                "{transform:?} frames inflated for rows {start}..{end}"
+            );
+            assert_eq!(
+                decoded,
+                ColumnData::Strings(values[start..effective_end].to_vec().into()),
+                "{transform:?} rows {start}..{end}"
+            );
+        }
+    }
+}
+
 /// The point of the frame window is what it does *not* decompress: a single value's bytes come out of the frames that
 /// hold them, leaving every other frame in the page compressed.
 #[test]
@@ -2852,6 +3416,87 @@ fn alp_rd_split_kernel_matches_a_linear_dictionary_search() {
     }
 }
 
+/// The ALP-RD split search must pick exactly the width, dictionary, and estimate of the original map-based search:
+/// same candidate order, same count-then-key ranking, same strict-improvement rule.
+#[test]
+fn alp_rd_choose_split_matches_the_map_based_reference() {
+    fn reference(sample: &[f64]) -> (u32, Vec<u16>, usize) {
+        let mut best: Option<(u32, Vec<u16>, usize)> = None;
+        for right_width in ALP_RD_MIN_RIGHT_WIDTH..=ALP_RD_MAX_RIGHT_WIDTH {
+            let mut counts: BTreeMap<u16, usize> = BTreeMap::new();
+            for value in sample {
+                *counts.entry((value.to_bits() >> right_width) as u16).or_default() += 1;
+            }
+            let mut ranked: Vec<(u16, usize)> = counts.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            ranked.truncate(ALP_RD_MAX_DICT_LEN);
+            let covered: usize = ranked.iter().map(|(_, count)| count).sum();
+            let dict: Vec<u16> = ranked.into_iter().map(|(left, _)| left).collect();
+            let exceptions = sample.len() - covered;
+            let code_bits = bits_needed(dict.len().saturating_sub(1) as u64) as usize;
+            let estimate = 2
+                + 2 * dict.len()
+                + 4
+                + exceptions * 6
+                + (sample.len() * (code_bits + right_width as usize)).div_ceil(8);
+            if best.as_ref().is_none_or(|(_, _, current)| estimate < *current) {
+                best = Some((right_width, dict, estimate));
+            }
+        }
+        best.unwrap_or((ALP_RD_MAX_RIGHT_WIDTH, Vec::new(), usize::MAX))
+    }
+    // A left part (top 16 bits) over random low bits, so each width sees a different grouping.
+    let with_left = |left: u64, i: u64| f64::from_bits((left << 48) | (mix(i) >> 16));
+    // Keys 0..=6 appear three times per cycle and keys 7..=9 twice, so three keys tie for the last dictionary slot.
+    let boundary_key = |i: u64| {
+        let j = i % 27;
+        if j < 21 { j / 3 } else { 7 + (j - 21) / 2 }
+    };
+    let specials = [
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        f64::from_bits(0x7FF8_0000_0000_0001),
+        f64::from_bits(0x7FF0_0000_0000_0001),
+        f64::from_bits(0xFFFF_FFFF_FFFF_FFFF),
+        f64::from_bits(1),
+        f64::from_bits(0x000F_FFFF_FFFF_FFFF),
+        f64::from_bits(0x8000_0000_0000_0001),
+        f64::MIN_POSITIVE,
+        f64::MAX,
+    ];
+    let shapes: [&dyn Fn(u64) -> f64; 9] = [
+        &|_| 1.5,
+        &|i| with_left(0x4000 + i % 8, i),
+        &|i| with_left(0x4000 + i % 9, i),
+        &|i| with_left(0x4000 + boundary_key(i), i),
+        &|i| with_left(0xFFFF - boundary_key(i), i),
+        &|i| with_left(0x4000 + mix(i ^ 0xABCD) % 12, i),
+        &|i| f64::from_bits(mix(i)),
+        &|i| {
+            if i % 2 == 0 {
+                specials[(mix(i) % specials.len() as u64) as usize]
+            } else {
+                f64::from_bits(0x4000_0000_0000_0000 | (mix(i) >> 12))
+            }
+        },
+        &|i| f64::from_bits(((0x3FF + mix(i) % 4) << 52) | (mix(i + 1) >> 12)),
+    ];
+    for size in [0u64, 1, 7, 8, 9, 16, 128, 1023, 1024, 4096] {
+        for (shape_index, shape) in shapes.iter().enumerate() {
+            let sample: Vec<f64> = (0..size).map(shape).collect();
+            assert_eq!(
+                alp_rd_choose_split(&sample),
+                reference(&sample),
+                "size {size}, shape {shape_index}"
+            );
+        }
+    }
+    assert_eq!(alp_rd_choose_split(&[]), (ALP_RD_MIN_RIGHT_WIDTH, Vec::new(), 6));
+}
+
 #[test]
 fn presence_rank_and_present_position_agree_with_a_prefix_count() {
     // Every third row present, over enough rows to cross several bitmap bytes.
@@ -2868,4 +3513,388 @@ fn presence_rank_and_present_position_agree_with_a_prefix_count() {
     }
     assert_eq!(rank.position(&bitmap, rows), None, "row past the bitmap");
     assert_eq!(present_position(&bitmap, rows), None, "row past the bitmap");
+}
+
+/// A memory-utilization gauge sampled every few seconds: used bytes over a 16 GB total, holding still for runs of
+/// samples and otherwise moving a few pages at a time. The quotient carries full double precision, as a ratio computed
+/// from two counters does.
+fn memory_utilization_series(count: usize) -> Vec<f64> {
+    let total = 16_000_000_000u64;
+    let mut used = 6_000_000_000u64;
+    (0..count as u64)
+        .map(|i| {
+            let draw = mix(i);
+            if draw % 10 >= 5 {
+                used = (used + (draw >> 8) % 513 * 4096).saturating_sub(256 * 4096);
+            }
+            used as f64 / total as f64
+        })
+        .collect()
+}
+
+/// The smallest block any encoding that predates Chimp stores `values` in, under the random access a promoted
+/// column asks for: adaptive selection's choice and every float transform forced in turn.
+fn best_existing_float_block(values: &[f64]) -> usize {
+    let data = ColumnData::F64(values.to_vec());
+    let strategy = CascadeStrategy::DecodeOptimized;
+    [
+        Transform::Alp,
+        Transform::AlpRd,
+        Transform::ByteStreamSplit,
+        Transform::PlainF64,
+    ]
+    .into_iter()
+    .map(|transform| {
+        encode_block_forced_for_conformance(&data, true, strategy, transform)
+            .unwrap()
+            .bytes
+            .len()
+    })
+    .chain([encode_block_with_strategy(&data, true, strategy).bytes.len()])
+    .min()
+    .unwrap()
+}
+
+#[test]
+fn xor_float_blocks_round_trip_bit_for_bit_through_the_pipeline() {
+    let mut values = vec![
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7FF8_0000_DEAD_BEEF),
+        f64::from_bits(0xFFF0_0000_0000_0001),
+        f64::MIN_POSITIVE,
+        f64::MAX,
+    ];
+    values.extend(memory_utilization_series(3000));
+    let block = encode_block_forced_for_conformance(
+        &ColumnData::F64(values.clone()),
+        true,
+        CascadeStrategy::DecodeOptimized,
+        Transform::Chimp,
+    )
+    .unwrap();
+    assert_eq!(block.pipeline.transform().unwrap(), Transform::Chimp);
+    let bits = |data: ColumnData| match data {
+        ColumnData::F64(values) => values.iter().map(|value| value.to_bits()).collect::<Vec<u64>>(),
+        other => panic!("expected floats, got {other:?}"),
+    };
+    let expected: Vec<u64> = values.iter().map(|value| value.to_bits()).collect();
+    assert_eq!(bits(decode_block(block.pipeline, &block.bytes).unwrap()), expected);
+    assert_eq!(
+        bits(decode_block_range(block.pipeline, &block.bytes, 3, 900).unwrap()),
+        expected[3..900]
+    );
+    // A transform id past the ones this reader knows is refused, never decoded as something else.
+    assert!(PipelineId(15).transform().is_err());
+}
+
+#[test]
+fn xor_float_range_reads_equal_the_full_decode_sliced_with_and_without_trailing_compression() {
+    // A random-access block stays uncompressed; a repeating series without random access takes a trailing codec.
+    let periodic: Vec<f64> = (0..4000).map(|i| [1.0, 2.5, 2.5, -7.0][i % 4]).collect();
+    for (values, random_access) in [(memory_utilization_series(3000), true), (periodic, false)] {
+        let block = encode_block_forced_for_conformance(
+            &ColumnData::F64(values.clone()),
+            random_access,
+            CascadeStrategy::DecodeOptimized,
+            Transform::Chimp,
+        )
+        .unwrap();
+        assert_eq!(block.pipeline.transform().unwrap(), Transform::Chimp);
+        assert_eq!(
+            block.pipeline.compression().unwrap() == Compression::None,
+            random_access
+        );
+        let full = decode_block(block.pipeline, &block.bytes).unwrap();
+        let count = values.len();
+        for (start, end) in [
+            (0, 1),
+            (count / 2, count / 2 + 1),
+            (count - 1, count),
+            (10, 250),
+            (0, count),
+            (count - 3, count + 50),
+            (count, count + 1),
+            (count + 10, count + 20),
+            (5, 5),
+            (9, 4),
+        ] {
+            assert_eq!(
+                decode_block_range(block.pipeline, &block.bytes, start, end).unwrap(),
+                slice_column_data(full.clone(), start, end),
+                "rows {start}..{end}"
+            );
+        }
+    }
+}
+
+#[test]
+fn xor_floats_beat_every_existing_float_encoding_on_a_slowly_varying_metric() {
+    let values = memory_utilization_series(8192);
+    let data = ColumnData::F64(values.clone());
+    let best_existing = best_existing_float_block(&values);
+    let block = encode_block_with_xor_floats(&data, true, CascadeStrategy::DecodeOptimized);
+    let adaptive = encode_block_with_strategy(&data, true, CascadeStrategy::DecodeOptimized);
+    eprintln!(
+        "memory utilization, 8192 values: chimp {:.3} bytes/value, best existing {:.3} bytes/value, adaptive \
+         selection {:.3} bytes/value",
+        block.bytes.len() as f64 / values.len() as f64,
+        best_existing as f64 / values.len() as f64,
+        adaptive.bytes.len() as f64 / values.len() as f64
+    );
+    assert_eq!(block.pipeline.transform().unwrap(), Transform::Chimp);
+    assert!(xor_float_gate_passes(&XorFloatMeasurement {
+        best_existing_bytes: best_existing as u64,
+        chimp_bytes: block.bytes.len() as u64,
+        values: values.len() as u64,
+    }));
+    assert_eq!(decode_block(block.pipeline, &block.bytes).unwrap(), data);
+}
+
+#[test]
+fn xor_floats_are_kept_only_where_they_store_fewer_bytes() {
+    // Two-decimal readings are what ALP is built for; the time-series encoder keeps ALP there.
+    let decimal: Vec<f64> = (0..8192u64)
+        .map(|i| (2000 + (mix(i) % 50) as i64) as f64 / 100.0)
+        .collect();
+    let data = ColumnData::F64(decimal.clone());
+    let selected = encode_block_with_strategy(&data, true, CascadeStrategy::DecodeOptimized);
+    let time_series = encode_block_with_xor_floats(&data, true, CascadeStrategy::DecodeOptimized);
+    let forced =
+        encode_block_forced_for_conformance(&data, true, CascadeStrategy::DecodeOptimized, Transform::Chimp).unwrap();
+    eprintln!(
+        "two-decimal readings, 8192 values: chimp {:.3} bytes/value, adaptive selection {:.3} bytes/value",
+        forced.bytes.len() as f64 / decimal.len() as f64,
+        selected.bytes.len() as f64 / decimal.len() as f64
+    );
+    assert_eq!(time_series.pipeline, selected.pipeline);
+    assert_eq!(time_series.bytes, selected.bytes);
+    // Blocks that are not floats encode exactly as they always have.
+    let ints = ColumnData::I64((0..4096).collect());
+    assert_eq!(
+        encode_block_with_xor_floats(&ints, false, CascadeStrategy::DecodeOptimized).bytes,
+        encode_block_with_strategy(&ints, false, CascadeStrategy::DecodeOptimized).bytes
+    );
+}
+
+/// The run list the RLE encoder used to collect, serialized: the reference the two-pass encoder must match byte for
+/// byte.
+fn reference_rle(values: &[u64]) -> Vec<u8> {
+    let mut runs: Vec<(u64, u32)> = Vec::new();
+    for value in values {
+        match runs.last_mut() {
+            Some((current, count)) if current == value => *count += 1,
+            _ => runs.push((*value, 1)),
+        }
+    }
+    let mut out = Writer::new();
+    out.put_u32(runs.len() as u32);
+    for (value, count) in runs {
+        out.put_u64(value);
+        out.put_u32(count);
+    }
+    out.into_bytes()
+}
+
+#[test]
+fn rle_without_a_run_list_matches_the_collected_runs() {
+    let alternating: Vec<u64> = (0..2_000).map(|i| i % 2).collect();
+    let distinct: Vec<u64> = (0..2_000).collect();
+    let cases: [Vec<u64>; 6] = [
+        vec![],
+        vec![7],
+        vec![3; 9_000],
+        vec![1, 1, 2, 2, 2, 1, u64::MAX, u64::MAX, 0],
+        alternating,
+        distinct,
+    ];
+    for values in cases {
+        let mut out = Writer::new();
+        encode_rle(&values, &mut out);
+        assert_eq!(out.into_bytes(), reference_rle(&values));
+    }
+}
+
+#[test]
+fn signed_plain_and_rle_stream_zigzag_codes_identically_to_a_mapped_copy() {
+    let mut mixed: Vec<i64> = (0..2_500).map(|i| if i % 3 == 0 { -i } else { i / 7 }).collect();
+    mixed.extend([i64::MIN, i64::MAX, i64::MIN, 0]);
+    let cases: [Vec<i64>; 5] = [vec![], vec![-1], vec![i64::MIN; 1_024], vec![5; 1_025], mixed];
+    for values in cases {
+        let mapped: Vec<u64> = values.iter().map(|value| zigzag(*value)).collect();
+        let mut plain = Writer::new();
+        encode_i64_with(Transform::PlainU64, &values, &mut plain);
+        let mut expected_plain = Writer::new();
+        encode_plain_u64(&mapped, &mut expected_plain);
+        assert_eq!(plain.into_bytes(), expected_plain.into_bytes());
+        let mut rle = Writer::new();
+        encode_i64_with(Transform::Rle, &values, &mut rle);
+        assert_eq!(rle.into_bytes(), reference_rle(&mapped));
+    }
+}
+
+#[test]
+fn alp_exception_indexes_pack_identically_to_a_collected_index_vector() {
+    let exceptions: Vec<(u32, u64)> = (0..3_000u32).map(|i| (i * 3 + 1_000, u64::from(i))).collect();
+    let indexes: Vec<u64> = exceptions.iter().map(|(index, _)| u64::from(*index)).collect();
+    let mut expected = Writer::new();
+    encode_for_bitpack(&indexes, &mut expected);
+    let base = indexes.iter().copied().min().unwrap_or(0);
+    let max_delta = indexes.iter().map(|index| index - base).max().unwrap_or(0);
+    let mut actual = Writer::new();
+    actual.put_u64(base);
+    bitpack_with(exceptions.len(), bits_needed(max_delta), &mut actual, |i| {
+        u64::from(exceptions[i].0) - base
+    });
+    assert_eq!(actual.into_bytes(), expected.into_bytes());
+}
+
+/// The FSST block layout as it was written before the encoder stopped staging the compressed values in a separate
+/// buffer: every value compressed into a side arena with its length recorded, then the count, the offset table, and
+/// the arena copied in behind them. The encoder's output must match it byte for byte.
+fn reference_fsst_block(values: &StringColumn, replay: Option<&FsstTable>) -> (Vec<u8>, SideStream, Vec<usize>) {
+    let present = present_values(values);
+    let mut out = Writer::new();
+    NullStream::from_values(values).write(&mut out);
+    let corpus: Vec<&[u8]> = present.iter().map(|value| value.as_bytes()).collect();
+    let trained;
+    let compressor = match replay {
+        Some(table) => &table.0,
+        None => {
+            trained = fsst::Compressor::train(&corpus);
+            &trained
+        }
+    };
+    out.put_u16(compressor.symbol_table().len() as u16);
+    for (symbol, length) in compressor.symbol_table().iter().zip(compressor.symbol_lengths().iter()) {
+        out.put_u64(symbol.to_u64());
+        out.put_u8(*length);
+    }
+    let mut scratch = Vec::new();
+    let mut arena = Vec::new();
+    let mut compressed_lens = Vec::new();
+    for value in &corpus {
+        compress_fsst_value(compressor, value, &mut scratch);
+        compressed_lens.push(scratch.len());
+        arena.extend_from_slice(&scratch);
+    }
+    out.put_u32(present.len() as u32);
+    write_offsets(compressed_lens.into_iter(), &mut out).unwrap();
+    out.put_slice(&arena);
+    if !fsst_value_keys_pay(&present) {
+        return (out.into_bytes(), SideStream::None, Vec::new());
+    }
+    let prefixes_start = out.len();
+    for value in &present {
+        out.put_slice(&PrefixKey::of(value).to_stored());
+    }
+    let fingerprints_start = out.len();
+    for value in &present {
+        out.put_u32(StringFingerprint::of(value.as_bytes()).to_bits());
+    }
+    (
+        out.into_bytes(),
+        SideStream::FsstValueKeys,
+        vec![prefixes_start, fingerprints_start],
+    )
+}
+
+/// String columns covering the FSST encoder's edge cases: no rows, only nulls, present empty strings, alternating
+/// nulls, multibyte text, values long enough to earn the per-value keys, and text the table mostly has to escape.
+fn fsst_layout_columns() -> Vec<(&'static str, StringColumn)> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let escape_heavy: StringColumn = (0..300)
+        .map(|_| {
+            let text: String = (0..24)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    char::from_u32(0x20 + (state >> 40) as u32 % 0x2_0000).unwrap_or('?')
+                })
+                .collect();
+            Some(text)
+        })
+        .collect();
+    vec![
+        ("empty", StringColumn::new()),
+        ("all null", (0..50).map(|_| None::<&str>).collect()),
+        (
+            "present empty strings",
+            (0..60).map(|i| Some(if i % 3 == 0 { "" } else { "abc" })).collect(),
+        ),
+        (
+            "alternating nulls",
+            (0..400)
+                .map(|i| (i % 2 == 0).then(|| format!("user-{i:05}@example.com")))
+                .collect(),
+        ),
+        (
+            "multibyte unicode",
+            (0..200)
+                .map(|i| {
+                    Some(format!(
+                        "Gr\u{fc}\u{df}e {i} \u{65e5}\u{672c}\u{8a9e} \u{1f680} {}",
+                        i * 7
+                    ))
+                })
+                .collect(),
+        ),
+        (
+            "long strings",
+            (0..120)
+                .map(|i| (i % 5 != 0).then(|| format!("{i}:").repeat(40) + &"lorem ipsum dolor sit amet ".repeat(8)))
+                .collect(),
+        ),
+        ("escape heavy", escape_heavy),
+    ]
+}
+
+/// A block that trains its own table lays out the same bytes, frame breaks, and side stream the arena-staging
+/// encoder did, and hands back the table it trained.
+#[test]
+fn fsst_trained_block_bytes_match_the_reference_layout() {
+    for (name, values) in fsst_layout_columns() {
+        let (expected, expected_side, expected_breaks) = reference_fsst_block(&values, None);
+        let present = present_values(&values);
+        let mut out = Writer::new();
+        let (side, trained, breaks) = encode_fsst_string(&values, &present, None, &mut out).unwrap();
+        assert_eq!(out.into_bytes(), expected, "{name}: bytes");
+        assert_eq!(side, expected_side, "{name}: side stream");
+        assert_eq!(breaks, expected_breaks, "{name}: frame breaks");
+        if name == "long strings" {
+            assert_eq!(
+                side,
+                SideStream::FsstValueKeys,
+                "long values must exercise the per-value keys"
+            );
+        }
+        let corpus: Vec<&[u8]> = present.iter().map(|value| value.as_bytes()).collect();
+        assert_eq!(
+            fsst_table_entries(&trained.expect("a block without a replay table trains one")),
+            fsst_table_entries(&FsstTable(fsst::Compressor::train(&corpus))),
+            "{name}: trained table"
+        );
+    }
+}
+
+/// A block compressed with a replayed table lays out the same bytes the arena-staging encoder did and trains
+/// nothing, including when the replayed table was trained on unrelated text and has to escape most bytes.
+#[test]
+fn fsst_replayed_block_bytes_match_the_reference_layout() {
+    let training: Vec<String> = (0..300).map(|i| format!("user-{i:05}@example.com")).collect();
+    let corpus: Vec<&[u8]> = training.iter().map(|value| value.as_bytes()).collect();
+    let table = FsstTable(fsst::Compressor::train(&corpus));
+    for (name, values) in fsst_layout_columns() {
+        let (expected, expected_side, expected_breaks) = reference_fsst_block(&values, Some(&table));
+        let present = present_values(&values);
+        let mut out = Writer::new();
+        let (side, trained, breaks) = encode_fsst_string(&values, &present, Some(&table), &mut out).unwrap();
+        assert_eq!(out.into_bytes(), expected, "{name}: bytes");
+        assert_eq!(side, expected_side, "{name}: side stream");
+        assert_eq!(breaks, expected_breaks, "{name}: frame breaks");
+        assert!(trained.is_none(), "{name}: a replayed block trains no table");
+    }
 }

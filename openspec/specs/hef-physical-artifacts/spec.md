@@ -62,11 +62,57 @@ An event SHALL be acknowledged only after the HEJ frame containing it is durable
 - **THEN** acknowledgement waits until the event is included in `visibility_watermark` (or fresh queries block until LiveOverlay replays that sequence), and acknowledged HEJ events not yet HEF-covered are never silently omitted from fresh queries
 
 ### Requirement: HEF is the immutable, self-describing query file
-HEF SHALL be the immutable, footer-indexed, range-readable query file selected by the manifest, columnar for envelope/promoted fields and payload-complete (every event row resolves to its canonical `harana_variant_v1` value). There SHALL be exactly one HEF file format; size, layout kind, and optional index/aggregate/context/acceleration blocks SHALL be declared in the file feature directory rather than creating separate formats. A reader SHALL NOT infer behavior from human lifecycle labels and SHALL inspect the HEF footer and feature directory.
+HEF SHALL be the immutable, footer-indexed, range-readable query file selected by the manifest, columnar for envelope/promoted fields and payload-complete (every event row resolves to its canonical `harana_variant_v1` value). There SHALL be exactly one HEF file format; size, layout kind, file profile (event, graph, snapshot, audit, log, inbox), and optional index/aggregate/context/acceleration blocks SHALL be declared in the file header, footer, and feature directory rather than creating separate formats. A reader SHALL NOT infer behavior from human lifecycle labels and SHALL inspect the HEF footer and feature directory.
 
 #### Scenario: Planner inspects feature directory
 - **WHEN** the planner selects an HEF file for a query
 - **THEN** it inspects the footer and feature directory to determine available blocks rather than inferring behavior from a lifecycle label
+
+### Requirement: Log objects for small write-ahead logs
+A small append-only write-ahead log object (`log/{shard}/{seq}`, a few KiB) SHALL use compact log framing instead of the HEF container's 4 KiB header block and footer index, and SHALL declare the `log` profile code (4) up front. Its bytes, every integer little-endian, SHALL be a 6-byte header (`"HEFL"`, format version 1, profile code 4), then each record as a `u32` payload length, the payload, and a CRC-64/NVME of the length and payload, then a 12-byte trailer (`u32::MAX` in the length position, the `u32` record count, `"HEFL"`). A record payload SHALL be shorter than `u32::MAX` bytes. The magic SHALL differ from HEF's `"HEF1"` at both ends, so a HEF reader refuses a log object and a log reader refuses a HEF file. The object's root SHALL be the BLAKE3 of those bytes; an object larger than one 1 MiB chunk group SHALL carry the same outboard proof tree and `"HEFT"` trailer HEF stripes use under `stripe_verified_streaming`, after its log trailer. A reader SHALL read records forward. Opened with a root the caller pinned when the object was committed, it SHALL check every byte against that root, one chunk group at a time, before yielding it, and SHALL treat any mismatch as corruption. Opened without a root, it SHALL check each record's CRC and SHALL report bytes that stop partway through the header, a record, or the trailer, or at a record boundary with no trailer, as a torn tail carrying the intact record count and byte length; a CRC mismatch, a wrong trailer record count, or bytes after the trailer SHALL be corruption.
+
+#### Scenario: Torn tail after a crash mid-write
+- **WHEN** a log object without a pinned root is any strict prefix of a sealed object
+- **THEN** the reader yields every complete record and then reports a torn tail with their count and byte length, never corruption
+
+#### Scenario: Damage before the end
+- **WHEN** a complete record's CRC does not match, or a byte of an object with a pinned root differs from what the root commits to
+- **THEN** the reader reports corruption rather than a torn tail
+
+#### Scenario: Log object and HEF file are never confused
+- **WHEN** a log object is handed to the HEF header decoder or file opener, or a HEF file to the log reader
+- **THEN** it is refused on its magic
+
+#### Scenario: Log framing overhead
+- **WHEN** a log object is written
+- **THEN** its header and trailer add 18 bytes in total and each record adds 12 bytes to its payload
+
+### Requirement: State chunks hold a subject's state as a content-addressed tree
+A subject's state (for a chat room: which event last set each `(event type, state key)`) SHALL be stored as a prolly tree of immutable state chunks, so successive states share every chunk a change does not touch. A state map SHALL take a key of two interned ids, type id `u32` and state key id `u32`, ordered by type id and then state key id, to the `u64` sequence number of the event that set it. A chunk's plaintext SHALL be, every integer little-endian: the magic `"HSC1"`, a level byte (0 for a leaf), three zero bytes, an entry count `u32`, the entries strictly ascending by key, then a CRC-64/NVME of everything before it. A leaf entry SHALL be the type id, state key id and sequence number (16 bytes); an interior entry SHALL be its child's first type id and state key id, then the child's 32-byte address (40 bytes). The writer SHALL cut each level into chunks of 4 to 16 KiB of entries at content-defined boundaries: a chunk ends after an entry once it holds at least 4 KiB of entries and `stable_hash` of the level byte and the entry's key (type id then state key id, little-endian) is a multiple of 4096 divided by the entry length, and it ends before any entry that would take it past 16 KiB; only the last chunk of a level may hold less than 4 KiB. The boundary hash covers the key and not the value, so a changed value never moves a boundary. Levels SHALL be built until one chunk remains, whose address is the state root; the empty map SHALL be one empty leaf. The same map under the same tenant key SHALL always give the same tree and root. A writer MAY apply changes to a stored tree in place, reading its interior chunks and only the leaves the changes fall in, and cutting a level again only from a changed chunk until a new boundary lands on an old one; the result SHALL be the same root and the same new chunks a full build of the changed map gives. Each chunk SHALL be sealed and addressed as the hef-security-and-isolation requirement "State chunks are sealed convergently per tenant" prescribes, and uploaded under `state/{tenant}/{address in lowercase hex}.hsc` with a create-only put in which an object already at the key counts as stored, children before their parents. A lookup SHALL read one chunk per level. A diff of two roots SHALL return every changed key in key order and SHALL NOT read a subtree whose address both trees share. A reader SHALL refuse a chunk that is missing, fails to open, breaks the framing, the CRC or the key order, or sits at any level but one below its parent. A reader MAY keep the chunks it has opened and decoded, by address, in a cache that holds one tenant's key and opens every chunk it keeps with it, bounded by a byte budget past which it drops the least recently read chunk; a kept chunk SHALL be refused wherever a freshly read one would be, including when it sits at any level but one below its parent. Chunks are read through the `StateChunkStore` interface, which the application backs with durable storage (in production, the object store the uploads write to).
+
+#### Scenario: Identical maps give identical roots
+- **WHEN** the same state map is built twice under one tenant's key
+- **THEN** both builds give the same chunks and the same root, and changing any one value gives a different root
+
+#### Scenario: A one-key change rewrites few chunks
+- **WHEN** one key of a 100,000-member room's state is changed, inserted or removed
+- **THEN** the new tree holds 1 to 3 chunks the old tree lacks
+
+#### Scenario: A change in place matches a full build
+- **WHEN** keys of a stored state are set, inserted and removed in place, growing it from the empty map to three levels and shrinking it back
+- **THEN** every update gives the root a full build of the changed map gives and exactly the chunks that build holds and the old tree lacks, and a one-key change to a 100,000-member room reads every interior chunk and one leaf
+
+#### Scenario: A cache answers repeat lookups without fetching
+- **WHEN** one-member lookups into a 100,000-member room's state go through a state chunk cache with room for every chunk they read
+- **THEN** each answer matches an uncached lookup, a second lookup of the same member fetches no chunk, and a lookup in a later state that changed one key fetches only the chunks that change rewrote
+
+#### Scenario: A diff skips shared subtrees
+- **WHEN** two roots of a 100,000-member room's state that differ in one key are diffed
+- **THEN** the diff returns exactly that key after reading at most 6 chunks, out of about 200 in each tree
+
+#### Scenario: Measured against checkpointed delta chains
+- **WHEN** a 100,000-member room takes 1,024 state events after its initial state (70% changes to existing memberships, 20% new joins, 10% power-level changes), and the same events are also stored as a delta chain that writes the whole map every 64 frames and only the changed keys between
+- **THEN** the prolly tree writes fewer bytes and a cold one-member lookup fetches fewer objects (measured: 13,878 B and 3.00 new chunks per event against 25,076 B per event; 3.00 fetches and 16 KB per lookup against 32.4 fetches and 1.6 MB), while rebuilding the whole state at one frame costs 200 chunk fetches against 32.5 frame fetches on average
 
 ### Requirement: LiveOverlay serves fresh durable ranges and is reconstructable
 LiveOverlay SHALL be the queryable Arrow-native representation of HEJ-durable, validated ranges not yet covered by a manifest-published HEF and not removed by a visible deletion vector. LiveOverlay SHALL NOT be a durability source; on crash its segments SHALL be rebuilt from HEJ replay or replicated fragments. Node-local LiveOverlay SHALL be required — nodes SHALL NOT forward event reads to the tenant's EventManager for LiveOverlay rows, and SHALL serve strict fresh queries only for ranges they have rebuilt, validated, and published locally. A LiveOverlay segment SHALL be evicted only when its complete `(epoch, sequence)` range is covered by a manifest-published HEF file visible to future query snapshots. Any overflow tier SHALL be non-authoritative and reconstructable from HEJ.

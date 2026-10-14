@@ -11,7 +11,7 @@
 use crate::error::FormatError;
 use crate::events::{EventId, SequenceRange};
 use crate::file::bytes::{Reader, Writer};
-use crate::indexes::bitmap::{RoaringRangeBitmap, RowRange};
+use crate::indexes::bitmap::{RoaringRangeBitmap, RowRange, encoded_runs_len, put_encoded_runs};
 use crate::security::{AeadScheme, ContentKey, SealedContentKey};
 use hashbrown::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
@@ -617,11 +617,10 @@ pub fn encode_deletion_vector(vector: &DeletionVector) -> (DeletionVectorWireFor
         }
         (DeletionVectorWireForm::OrdinalArray, out.into_bytes())
     } else {
-        let bitmap = RoaringRangeBitmap::from_ranges(vector.deleted_runs.iter().copied());
-        let encoded = bitmap.encode();
-        let mut out = Writer::with_capacity(1 + encoded.len());
+        // The vector's runs are already canonical, so they are written straight out in the bitmap's wire layout.
+        let mut out = Writer::with_capacity(1 + encoded_runs_len(vector.deleted_runs.len()));
         out.put_u8(DeletionVectorWireForm::PositionalRoaring.tag());
-        out.put_slice(&encoded);
+        put_encoded_runs(&mut out, &vector.deleted_runs);
         (DeletionVectorWireForm::PositionalRoaring, out.into_bytes())
     }
 }

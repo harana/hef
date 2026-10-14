@@ -92,3 +92,63 @@ fn the_scheme_tag_is_registry_controlled() {
     );
     assert_eq!(SignatureScheme::from_str("made-up-scheme"), None);
 }
+
+#[test]
+fn join_writes_display_entries_one_per_line_and_splits_back() {
+    let first = SignerSignature::new(
+        "a.example",
+        "ed25519:1",
+        SignatureScheme::Ed25519,
+        [0x00; PROTOCOL_ID_BYTES],
+        [0xff; SIGNATURE_BYTES],
+    )
+    .unwrap();
+    let second = SignerSignature::new(
+        "b.example",
+        "k",
+        SignatureScheme::Bip340SchnorrSecp256k1,
+        [0x5a; PROTOCOL_ID_BYTES],
+        [0x0f; SIGNATURE_BYTES],
+    )
+    .unwrap();
+    let entries = vec![first.clone(), second.clone()];
+    let joined = SignerSignature::join(&entries);
+    assert_eq!(joined, format!("{first}\n{second}"));
+    assert_eq!(joined.len(), joined.capacity());
+    assert_eq!(SignerSignature::split(&joined).unwrap(), entries);
+    assert_eq!(SignerSignature::join(&[]), "");
+}
+
+/// Appending writes exactly the joined text after whatever the buffer already holds, for empty, single and many
+/// entries, both schemes and long Unicode signers.
+#[test]
+fn joining_into_a_buffer_appends_exactly_the_joined_text() {
+    let long = SignerSignature::new(
+        &format!("\u{e9}{}.example", "s".repeat(300)),
+        "ed25519:\u{1F511}",
+        SignatureScheme::Ed25519,
+        [0x7e; PROTOCOL_ID_BYTES],
+        [0x81; SIGNATURE_BYTES],
+    )
+    .unwrap();
+    let short = SignerSignature::new(
+        "b.example",
+        "k",
+        SignatureScheme::Bip340SchnorrSecp256k1,
+        [0x00; PROTOCOL_ID_BYTES],
+        [0xff; SIGNATURE_BYTES],
+    )
+    .unwrap();
+    let lists = [
+        Vec::new(),
+        vec![short.clone()],
+        vec![long.clone(), short.clone(), long.clone()],
+    ];
+    for prefix in ["", "already here\n"] {
+        for list in &lists {
+            let mut out = prefix.to_owned();
+            SignerSignature::join_into(list, &mut out);
+            assert_eq!(out, format!("{prefix}{}", SignerSignature::join(list)));
+        }
+    }
+}

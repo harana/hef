@@ -53,3 +53,36 @@ The reader SHALL read any stored row back as its event (the full envelope and th
 - **WHEN** one of the entity's events has a replacement correction
 - **THEN** the scan serves the correcting event in the original's place, never the original, and does not serve the correcting event a second time
 
+### Requirement: Graph read API
+The reader SHALL expose an `EventGraph` API over graph-profile files: `parents(subject, sn, kind)` and `children(subject, sn, kind)` for `kind` `prev` or `auth`, their batch forms over many events, and `walk(subject, start, kind, limit)`, a breadth-first stream that yields each next level of ancestors not seen before and stops after `limit` events. Children SHALL be those stored with the parent's file: in-file children and inbound children folded in by its last compaction. The remote implementation SHALL gather every edge block one step needs across the subject's files, prove each against the file's authenticated checksums, join ranges whose gap is at most 1 MiB into requests of at most 8 MiB, send at most the caller's in-flight cap of requests per batch, send a duplicate batch when one runs past the 95th percentile of recent batch latencies (never sooner than the caller's floor, and only when both copies fit under the cap) and take the first successful answer, and hold fetched blocks so a later step needing the same granule sends nothing.
+
+#### Scenario: One request per file per walk level
+- **WHEN** a walk reaches a level whose events span several granules of two files
+- **THEN** that level costs at most one request per file, each covering every edge block it needs
+
+#### Scenario: In-flight cap splits a step
+- **WHEN** one step needs more separate requests than the in-flight cap
+- **THEN** they are sent in successive batches of at most the cap
+
+#### Scenario: Slow batch hedged
+- **WHEN** a batch has not answered within the hedge delay
+- **THEN** an identical batch is sent and the first successful answer is used
+
+### Requirement: Graph event id, chain cover and state read API
+Beside `EventGraph` the reader SHALL expose, over the same graph-profile files: `EventIds` with `resolve_ids(subject, ids)`, turning protocol event ids into sequence numbers (`None` for an id no event of the subject carries); `AuthChains` with `chain_labels(subject, sns)`, each event's chain-cover label (`None` when its file stores no chain cover), and `chain_links(subject, chains)`, the sorted, distinct links that start on the given chains; and `SubjectState` with `state_root(subject, sn)`, the state root recorded after a state event (`None` for any other event), `state_get(root, key)` and `state_diff(before, after)` over the tenant's state chunks. Asking for an event no file of the subject holds SHALL fail. In the remote implementation, `resolve_ids` SHALL look an id up only in files whose event-id index holds its hash and confirm every candidate against the id stored in its row, fetching first the marks pages of the stripes the candidates lie in and then their granules' external-id blocks, each step through the same coalesced, capped and hedged batches as an edge step; `chain_labels` SHALL fetch the edge blocks that carry the labels exactly as an edge step does, so labels and edges of one granule cost one fetch between them; `chain_links` and `state_root` SHALL read only footers; and `state_get` and `state_diff` SHALL read chunks from a store the caller supplies with the tenant's state chunk key.
+
+#### Scenario: Ids resolved in batches
+- **WHEN** ids of events spread over two files are resolved together
+- **THEN** each file costs at most one batch for its marks pages and one for its external-id blocks, and nothing is fetched outside those batches
+
+#### Scenario: Index rules a file out
+- **WHEN** an id's hash is absent from a file's event-id index
+- **THEN** resolving it sends that file no request
+
+#### Scenario: Labels share the edge fetch
+- **WHEN** the chain labels of events in two files are read and then their parents
+- **THEN** the labels cost one request per file and the parents cost none
+
+#### Scenario: State read at a state event
+- **WHEN** a caller reads the state root after a state event, one key of that state, and its diff against an earlier state
+- **THEN** the root costs no request, the key reads one chunk per tree level, and the diff never reads a subtree the two states share

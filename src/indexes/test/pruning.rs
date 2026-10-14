@@ -357,6 +357,172 @@ fn evaluate_uses_the_granule_under_test_not_the_template() {
     assert!(evaluate(&expr, &other_granule).drop);
 }
 
+/// The page-pruning algorithm before it borrowed: build and evaluate one expression per page.
+fn reference_prune_pages(filter: &Filter, page_statistics: &[(u32, GranuleStatistics)], total: u32) -> Vec<u32> {
+    let no_stats = GranuleStatistics::default();
+    (0..total)
+        .filter(|&page_idx| {
+            let stats = page_statistics
+                .iter()
+                .find(|(pi, _)| *pi == page_idx)
+                .map(|(_, s)| s)
+                .unwrap_or(&no_stats);
+            !evaluate(&build_pruning_expression(filter, stats), stats).drop
+        })
+        .collect()
+}
+
+/// A small deterministic xorshift generator, so the differential test needs no extra dependency.
+fn next_random(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+fn random_below(state: &mut u64, bound: u64) -> u64 {
+    next_random(state) % bound
+}
+
+fn random_value(state: &mut u64) -> i128 {
+    random_below(state, 13) as i128 - 6
+}
+
+fn random_values(state: &mut u64) -> Vec<i128> {
+    (0..random_below(state, 4)).map(|_| random_value(state)).collect()
+}
+
+fn random_clause(state: &mut u64) -> FilterClause {
+    let predicate = match random_below(state, 4) {
+        0 => PredicateKind::Equality,
+        1 => PredicateKind::Membership,
+        2 => PredicateKind::Presence,
+        _ => PredicateKind::Range,
+    };
+    let a = random_value(state);
+    let b = random_value(state);
+    let (value_lo, value_hi) = match predicate {
+        PredicateKind::Equality => (a, a),
+        _ => (a.min(b), a.max(b)),
+    };
+    FilterClause {
+        column_id: random_below(state, 3) as u32,
+        predicate,
+        value_hi,
+        value_lo,
+    }
+}
+
+fn random_statistic(state: &mut u64) -> Statistic {
+    let column_id = random_below(state, 3) as u32;
+    let a = random_value(state);
+    let b = random_value(state);
+    let (lo, hi) = (a.min(b), a.max(b));
+    match random_below(state, 8) {
+        0 => Statistic::MinMaxBound {
+            column_id,
+            max: hi,
+            min: lo,
+        },
+        1 => {
+            let row_count = random_below(state, 3);
+            Statistic::NullCount {
+                column_id,
+                null_count: random_below(state, row_count + 2),
+                row_count,
+            }
+        }
+        2 => Statistic::PathPresence {
+            column_id,
+            present: random_below(state, 2) == 0,
+        },
+        3 => Statistic::PointMembership {
+            column_id,
+            members: random_values(state),
+        },
+        4 => Statistic::RangeEmptiness {
+            column_id,
+            non_empty_spans: (0..random_below(state, 3))
+                .map(|_| {
+                    let x = random_value(state);
+                    let y = random_value(state);
+                    (x.min(y), x.max(y))
+                })
+                .collect(),
+        },
+        5 => Statistic::SequenceBounds {
+            column_id,
+            max_sequence: hi,
+            min_sequence: lo,
+        },
+        6 => Statistic::TextToken {
+            column_id,
+            token_hashes: random_values(state),
+        },
+        _ => Statistic::TimeBounds {
+            column_id,
+            max_time: hi,
+            min_time: lo,
+        },
+    }
+}
+
+#[test]
+fn page_pruning_matches_building_and_evaluating_an_expression_per_page() {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    for _ in 0..20_000 {
+        let f = filter(
+            (0..random_below(&mut state, 4))
+                .map(|_| random_clause(&mut state))
+                .collect(),
+        );
+        let total = random_below(&mut state, 6) as u32;
+        // Page ids reach past `total` and repeat, in no particular order.
+        let page_statistics: Vec<(u32, GranuleStatistics)> = (0..random_below(&mut state, 8))
+            .map(|_| {
+                let page_idx = random_below(&mut state, 8) as u32;
+                let page = stats(
+                    (0..random_below(&mut state, 6))
+                        .map(|_| random_statistic(&mut state))
+                        .collect(),
+                );
+                (page_idx, page)
+            })
+            .collect();
+        assert_eq!(
+            prune_pages_in_granule(&f, &page_statistics, total),
+            reference_prune_pages(&f, &page_statistics, total),
+            "filter {f:?}, pages {page_statistics:?}, total {total}"
+        );
+    }
+}
+
+#[test]
+fn page_pruning_judges_contradictory_duplicates_by_the_first_statistic_of_their_kind() {
+    // The second min/max for column 1 would prove 500 absent on its own, but evaluation always reads the first one of
+    // that kind and column, which keeps the page. Reversing the order drops it.
+    let wide = Statistic::MinMaxBound {
+        column_id: 1,
+        max: 1000,
+        min: 0,
+    };
+    let narrow = Statistic::MinMaxBound {
+        column_id: 1,
+        max: 10,
+        min: 0,
+    };
+    let f = filter(vec![eq_clause(1, 500)]);
+    let pages = vec![
+        (0, stats(vec![wide.clone(), narrow.clone()])),
+        (1, stats(vec![narrow, wide])),
+        (1, stats(vec![])),
+        (9, stats(vec![])),
+    ];
+    assert_eq!(prune_pages_in_granule(&f, &pages, 3), vec![0, 2]);
+    assert_eq!(reference_prune_pages(&f, &pages, 3), vec![0, 2]);
+    assert_eq!(prune_pages_in_granule(&filter(vec![]), &pages, 3), vec![0, 1, 2]);
+}
+
 fn indexed_row(i: u64) -> HefRow {
     let mut payload = std::collections::BTreeMap::new();
     payload.insert("amount".to_owned(), VariantValue::Int(1_000 + i as i64));
@@ -401,15 +567,18 @@ fn indexed_row(i: u64) -> HefRow {
 fn indexed_config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 42,
         footer_dek: None,
         footer_encryption: crate::security::FooterEncryption::Plaintext,
         freetext: FreetextDeclaration { fields: Vec::new() },
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 5,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan {
             columns: vec![PromotedColumn {
                 name: "amount_promoted".to_owned(),
@@ -427,6 +596,7 @@ fn indexed_config() -> HefBuildConfig {
             min_bytes_for_wide: 10 * 1024 * 1024,
         },
         tenant_id: TenantId::new_test_id(7),
+        time_series_bucket_nanos: None,
     }
 }
 
@@ -544,4 +714,69 @@ fn hot_column_prunes_pages_cold_column_falls_back_to_granule_granularity() {
         dropped.drop,
         "a range wholly outside the granule's sequence span must still be dropped without any page-level stats"
     );
+}
+
+#[test]
+fn page_pruning_first_duplicate_wins_with_unsorted_and_out_of_range_ids() {
+    let bounds = |min: i128, max: i128| stats(vec![Statistic::MinMaxBound { column_id: 1, max, min }]);
+    let page_statistics = vec![
+        (2, bounds(100, 200)),
+        (0, bounds(0, 10)),
+        (2, bounds(0, 10)),
+        (9, bounds(100, 200)),
+    ];
+    let kept = prune_pages_in_granule(&filter(vec![eq_clause(1, 5)]), &page_statistics, 3);
+    assert_eq!(
+        kept,
+        vec![0, 1],
+        "page 2's first entry rules it out; page 1 has no stats; page 9 is out of range"
+    );
+}
+
+#[test]
+fn inline_statistics_match_their_vector_forms() {
+    let clauses = [
+        eq_clause(1, 5),
+        eq_clause(1, -3),
+        eq_clause(2, 5),
+        range_clause(1, 3, 8),
+        range_clause(1, 8, 3),
+        range_clause(1, i128::MIN, i128::MAX),
+        presence_clause(1),
+        FilterClause {
+            column_id: 1,
+            predicate: PredicateKind::Membership,
+            value_hi: 9,
+            value_lo: 4,
+        },
+    ];
+    for clause in clauses {
+        for member in [None, Some(clause.value_lo), Some(7), Some(-1)] {
+            let inline = Statistic::SingleMember { column_id: 1, member };
+            let vector = Statistic::PointMembership {
+                column_id: 1,
+                members: member.into_iter().collect(),
+            };
+            assert_eq!(inline.relevant_to(&clause), vector.relevant_to(&clause));
+            assert_eq!(inline.judge(&clause), vector.judge(&clause), "{clause:?} {member:?}");
+            assert_eq!(exactness_of(&inline), exactness_of(&vector));
+            assert!(!inline.keep_confirms_match());
+        }
+        for span in [
+            None,
+            Some((clause.value_lo, clause.value_hi)),
+            Some((6, 7)),
+            Some((9, 2)),
+        ] {
+            let inline = Statistic::SingleSpan { column_id: 1, span };
+            let vector = Statistic::RangeEmptiness {
+                column_id: 1,
+                non_empty_spans: span.into_iter().collect(),
+            };
+            assert_eq!(inline.relevant_to(&clause), vector.relevant_to(&clause));
+            assert_eq!(inline.judge(&clause), vector.judge(&clause), "{clause:?} {span:?}");
+            assert_eq!(exactness_of(&inline), exactness_of(&vector));
+            assert!(!inline.keep_confirms_match());
+        }
+    }
 }

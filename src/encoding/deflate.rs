@@ -105,6 +105,16 @@ pub fn granule_byte_range(bytes: &[u8], granule: usize) -> Result<(usize, usize)
 
 /// Inflates every granule and concatenates them back into the original bytes.
 pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
+    let mut plain = Vec::new();
+    decompress_into(bytes, &mut plain)?;
+    Ok(plain)
+}
+
+/// [`decompress`] into `plain`, which is emptied first and whose allocation is kept, so decoding page after page into
+/// one buffer allocates only when a page outgrows it. On error `plain` may hold a partial page; it is never valid data
+/// and the next call empties it before decoding.
+pub(crate) fn decompress_into(bytes: &[u8], plain: &mut Vec<u8>) -> Result<(), FormatError> {
+    plain.clear();
     let directory = mini_block_directory::decode(bytes)?;
     let plain_len = directory.plain_len();
     // Each granule inflates to at most MAX_GRANULE_UNCOMPRESSED_BYTES, so a declared length beyond what the page's
@@ -114,13 +124,13 @@ pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
             rule: "deflate plain length exceeds what its granule count can hold",
         });
     }
-    let mut plain = Vec::with_capacity(directory.plain_capacity_hint());
+    plain.reserve(directory.plain_capacity_hint());
     for (start, len) in directory.ranges() {
         inflate_into(
             slice(bytes, start, len, "deflate granule")?,
             GRANULE_BYTES,
             MAX_GRANULE_UNCOMPRESSED_BYTES,
-            &mut plain,
+            plain,
         )?;
         if plain.len() > plain_len {
             return Err(FormatError::Structural {
@@ -128,7 +138,7 @@ pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
             });
         }
     }
-    Ok(plain)
+    Ok(())
 }
 
 /// Inflates just granule `granule`, reading only that granule's compressed bytes — the mechanism behind

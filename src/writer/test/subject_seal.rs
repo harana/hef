@@ -52,18 +52,22 @@ fn tenant() -> TenantId {
 fn config() -> HefBuildConfig {
     HefBuildConfig {
         analytical_columns: Vec::new(),
+        audit: None,
         created_at_physical: 42,
         footer_dek: None,
         footer_encryption: FooterEncryption::Plaintext,
         freetext: FreetextDeclaration::default(),
         freetext_row_offset_index: false,
         generation_id: 1,
+        graph: None,
         io_alignment_bytes: 0,
         lifecycle: BuildLifecycle::FreshPublication,
         page_size_rows: 0,
+        profile: crate::layout::Profile::Event,
         promotion: PromotionPlan::default(),
         targets: LayoutTargets::default(),
         tenant_id: tenant(),
+        time_series_bucket_nanos: None,
     }
 }
 
@@ -189,4 +193,46 @@ fn sealing_for_an_erased_subject_fails_and_leaves_the_row_untouched() {
         Err(SubjectPayloadError::SubjectErased)
     );
     assert_eq!(rows, before);
+}
+
+fn nested_fields() -> Vec<(FieldName, VariantValue)> {
+    let mut inner = BTreeMap::new();
+    inner.insert("city".to_owned(), VariantValue::String("Oslo".to_owned()));
+    inner.insert("zip".to_owned(), VariantValue::Int(150));
+    vec![
+        (FieldName::from("address"), VariantValue::Object(inner)),
+        (
+            FieldName::from("tags"),
+            VariantValue::Array(vec![VariantValue::Object(BTreeMap::from([(
+                "label".to_owned(),
+                VariantValue::Bool(true),
+            )]))]),
+        ),
+        (FieldName::from("zeta"), VariantValue::Null),
+    ]
+}
+
+fn object_of(fields: &[(FieldName, VariantValue)]) -> VariantValue {
+    VariantValue::Object(
+        fields
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect(),
+    )
+}
+
+#[test]
+fn sorted_object_fields_encode_like_the_equivalent_object_value() {
+    let fields = nested_fields();
+    assert_eq!(encode_object(&fields).unwrap(), encode(&object_of(&fields)).unwrap());
+}
+
+#[test]
+fn unsorted_and_repeated_object_fields_encode_like_a_normalized_object_with_the_last_repeat_winning() {
+    let mut fields = nested_fields();
+    fields.reverse();
+    fields.push((FieldName::from("zeta"), VariantValue::Int(9)));
+    let mut expected = nested_fields();
+    expected[2].1 = VariantValue::Int(9);
+    assert_eq!(encode_object(&fields).unwrap(), encode(&object_of(&expected)).unwrap());
 }

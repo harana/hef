@@ -12,16 +12,25 @@ use constant::HEF_MAGIC;
 use std::borrow::Cow;
 use uuid::Uuid;
 
+pub use remote::{RemoteGraph, RemoteGraphOptions, RemoteState};
+
+pub mod api;
+pub mod audit;
 pub mod cache;
 pub mod clustering;
 pub mod constant;
 pub mod entity_scan;
 pub mod event;
 pub mod footer;
+pub mod graph;
+pub mod inbox;
+pub mod log;
 pub mod mirror;
 pub mod reader;
 mod remote;
+pub mod snapshot;
 pub mod source_form;
+pub mod time_series;
 
 /// The fixed file header occupies the first 4 KiB block.
 pub const HEADER_BLOCK_LEN: usize = 4096;
@@ -64,42 +73,50 @@ pub fn encode_presence(presence: &[u8], row_count: u32, out: &mut Writer) {
         return;
     }
     let rows = row_count as usize;
-    let set: Vec<usize> = (0..rows)
-        .filter(|row| presence.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0))
-        .collect();
-    if set.len() == rows {
+    let is_set = |row: usize| presence.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0);
+    let (mut set_count, mut run_count) = (0usize, 0usize);
+    for row in 0..rows {
+        if is_set(row) {
+            set_count += 1;
+            if row == 0 || !is_set(row - 1) {
+                run_count += 1;
+            }
+        }
+    }
+    if set_count == rows {
         out.put_u8(presence_forms::ALL_PRESENT);
         return;
     }
-    if set.is_empty() {
+    if set_count == 0 {
         out.put_u8(presence_forms::ALL_ABSENT);
         return;
     }
-    let mut runs: Vec<(u32, u32)> = Vec::new();
-    for &row in &set {
-        match runs.last_mut() {
-            Some((start, len)) if *start as usize + *len as usize == row => *len += 1,
-            _ => runs.push((row as u32, 1)),
-        }
-    }
     let raw_size = 4 + presence.len();
-    let runs_size = 4 + runs.len() * 8;
-    let positions_size = 4 + set.len() * 4;
+    let runs_size = 4 + run_count * 8;
+    let positions_size = 4 + set_count * 4;
     if raw_size <= runs_size && raw_size <= positions_size {
         out.put_u8(presence_forms::RAW);
         out.put_u32(presence.len() as u32);
         out.put_slice(presence);
     } else if runs_size <= positions_size {
         out.put_u8(presence_forms::SET_RUNS);
-        out.put_u32(runs.len() as u32);
-        for (start, len) in runs {
-            out.put_u32(start);
-            out.put_u32(len);
+        out.put_u32(run_count as u32);
+        let mut start = None;
+        for row in 0..=rows {
+            match (start, row < rows && is_set(row)) {
+                (None, true) => start = Some(row),
+                (Some(first), false) => {
+                    out.put_u32(first as u32);
+                    out.put_u32((row - first) as u32);
+                    start = None;
+                }
+                _ => {}
+            }
         }
     } else {
         out.put_u8(presence_forms::SET_POSITIONS);
-        out.put_u32(set.len() as u32);
-        for row in set {
+        out.put_u32(set_count as u32);
+        for row in (0..rows).filter(|&row| is_set(row)) {
             out.put_u32(row as u32);
         }
     }
@@ -373,6 +390,64 @@ impl LayoutClass {
     }
 }
 
+/// What kind of data a file holds, which decides the extra blocks it may carry and the rules a writer and reader apply
+/// to it. Ordinary event files are [`Profile::Event`]; the others are purpose-built shapes that reuse the same container.
+///
+/// Stored as an explicit one-byte code in the header, the footer, and the manifest entry. The code never follows the
+/// variant order, so the variants stay alphabetical. An unknown code is a structural error.
+///
+/// See: hef-file-layout/spec.md
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum Profile {
+    /// Append-only audit trail: rows chained by hash, never rewritten.
+    Audit,
+    /// Ordinary event file. The default, and what every file written before profiles existed reads as.
+    #[default]
+    Event,
+    /// A subject's event graph (prev / auth edges) and state.
+    Graph,
+    /// Per-recipient message queues retired by acknowledgement watermarks.
+    Inbox,
+    /// Small append-only write-ahead log object.
+    Log,
+    /// Whole-epoch keyed state, read by point lookup.
+    Snapshot,
+    /// Metric readings in time order, with float blocks that may store only the bits that changed and per-interval
+    /// rollups that answer range aggregates without reading every row.
+    TimeSeries,
+}
+
+impl Profile {
+    /// The byte this profile is stored as.
+    pub fn code(self) -> u8 {
+        match self {
+            Profile::Event => 0,
+            Profile::Graph => 1,
+            Profile::Snapshot => 2,
+            Profile::Audit => 3,
+            Profile::Log => 4,
+            Profile::Inbox => 5,
+            Profile::TimeSeries => 6,
+        }
+    }
+
+    /// Reads a profile from its stored byte, or a structural error for a code this reader does not know.
+    pub fn from_u8(value: u8) -> Result<Self, FormatError> {
+        match value {
+            0 => Ok(Profile::Event),
+            1 => Ok(Profile::Graph),
+            2 => Ok(Profile::Snapshot),
+            3 => Ok(Profile::Audit),
+            4 => Ok(Profile::Log),
+            5 => Ok(Profile::Inbox),
+            6 => Ok(Profile::TimeSeries),
+            _ => Err(FormatError::Structural {
+                rule: "unknown profile",
+            }),
+        }
+    }
+}
+
 /// Required feature flags: every HEF file must declare all of these, and a reader that does not understand a declared
 /// required feature refuses.
 pub mod required_features {
@@ -447,13 +522,58 @@ pub mod required_features {
     /// reads rather than silently treating unverified bytes as trusted.
     pub const STRIPE_VERIFIED_STREAMING: u64 = 1 << 22;
 
+    /// Rows carry a dense per-subject event sequence number, and graph edges reference it instead of protocol ids.
+    pub const GRAPH_DENSE_IDS: u64 = 1 << 23;
+
+    /// The file carries forward edge blocks (each event's prev / auth parents) in compressed sparse row form.
+    pub const GRAPH_CSR_FORWARD: u64 = 1 << 24;
+
+    /// The file carries reverse edge blocks (each event's children), including inbound edges from later files.
+    pub const GRAPH_CSR_REVERSE: u64 = 1 << 25;
+
+    /// The file carries an event-id to sequence-number lookup index.
+    pub const GRAPH_EVENT_ID_INDEX: u64 = 1 << 26;
+
+    /// The file carries auth chain-cover labels and link tables.
+    pub const GRAPH_CHAIN_COVER: u64 = 1 << 27;
+
+    /// The file carries state-root columns pointing at content-addressed state chunks.
+    pub const GRAPH_STATE_ROOTS: u64 = 1 << 28;
+
+    /// Every graph-profile bit. A graph file declares the ones whose blocks it carries; an event file declares none.
+    /// Required and refusing on purpose: a reader that predates them would read a graph file as plain events and
+    /// silently drop its edges, so it must reject the file instead.
+    pub const GRAPH: u64 = GRAPH_DENSE_IDS
+        | GRAPH_CSR_FORWARD
+        | GRAPH_CSR_REVERSE
+        | GRAPH_EVENT_ID_INDEX
+        | GRAPH_CHAIN_COVER
+        | GRAPH_STATE_ROOTS;
+
+    /// The file is an audit file: every row is chained to the one before it by hash, the footer carries the chain's
+    /// ends and the file's retention, and the file must never be rewritten. Required and refusing on purpose: a
+    /// reader or compactor that predates it would treat the file as plain events, and a rewrite by one would drop the
+    /// chain and the retention without noticing. Remote readers never see the header's profile byte, so this bit is
+    /// what stops them.
+    pub const AUDIT_HASH_CHAIN: u64 = 1 << 29;
+
+    /// At least one float block stores Chimp XOR floats (pipeline transform 14), which only time-series files write.
+    /// Required and refusing on purpose: a reader that predates the transform would refuse each such block only when
+    /// it came to decode it, after it had already answered from the file's other columns, and a rewriter that
+    /// predates it would copy the blocks into a file that no longer declares them. Remote readers never see the
+    /// header's profile byte and readers from before profiles ignore the footer's profile section, so this bit is
+    /// what stops them at open.
+    pub const XOR_FLOAT_BLOCKS: u64 = 1 << 30;
+
     /// Every required feature this reader implements.
-    pub const KNOWN: u64 = (1 << 23) - 1;
+    pub const KNOWN: u64 = (1 << 31) - 1;
 
     /// The full required set every v1 file declares, `COLUMNAR_MARKS` included — the writer emits the columnar,
-    /// per-stripe marks form. Excludes only `FOOTER_ENCRYPTED` (opt-in per build, set only when the caller requests
-    /// footer encryption); declaring that bit before it applies would misrepresent the file.
-    pub const ALL: u64 = KNOWN & !FOOTER_ENCRYPTED;
+    /// per-stripe marks form. Excludes `FOOTER_ENCRYPTED` (opt-in per build, set only when the caller requests footer
+    /// encryption), the graph bits (set only on a graph file that carries their blocks), `AUDIT_HASH_CHAIN` (set
+    /// only on an audit file) and `XOR_FLOAT_BLOCKS` (set only on a file that stores a Chimp block); declaring a bit
+    /// before it applies would misrepresent the file.
+    pub const ALL: u64 = KNOWN & !FOOTER_ENCRYPTED & !GRAPH & !AUDIT_HASH_CHAIN & !XOR_FLOAT_BLOCKS;
 }
 
 /// Optional feature flags: unknown optional features are ignored; known ones are validated and used.
@@ -492,8 +612,26 @@ pub mod optional_features {
     /// never rules out a granule that holds the id, so a confirmed match is never lost.
     pub const ENTITY_HASH_POINT_FILTERS: u64 = 1 << 10;
 
+    /// A snapshot file's key index in the footer: a learned model of where each key sits plus each granule's first
+    /// key, so a lookup by key fetches the one granule that can hold it. Droppable acceleration state: a reader that
+    /// does not declare the feature searches the granules in turn and returns the identical answer.
+    pub const SNAPSHOT_KEY_INDEX: u64 = 1 << 11;
+
+    /// An inbox file's footer carries a recipient directory: each recipient's row range and newest queue position, so
+    /// a reader fetches one recipient's rows directly and the lifecycle tells from the footer alone whether every
+    /// recipient has acknowledged the whole file. Droppable acceleration state: a reader that does not declare it finds
+    /// a recipient's rows through the entity hash bounds and returns the identical rows; only acknowledgement
+    /// retirement needs the directory, and a file without one is simply never retired by it.
+    pub const INBOX_RECIPIENT_DIRECTORY: u64 = 1 << 12;
+
+    /// A time-series file's footer carries rollups: per fixed-width time bucket, its row range and the count, sum,
+    /// minimum and maximum of every rolled-up float column, so a range aggregate reads rows only for the buckets the
+    /// range cuts through. Droppable acceleration state: a reader that does not declare it reads every row in the
+    /// range and returns the identical answer.
+    pub const TIME_SERIES_ROLLUPS: u64 = 1 << 13;
+
     /// Optional features this reader knows how to validate and use.
-    pub const KNOWN: u64 = (1 << 11) - 1;
+    pub const KNOWN: u64 = (1 << 14) - 1;
 }
 
 /// The decoded fixed file header. A coarse rejection accelerator, not the authoritative aggregate source.
@@ -513,6 +651,8 @@ pub struct HefHeader {
     pub min_ingested_at_physical: i64,
     pub min_occurred_at_physical: i64,
     pub min_sequence: u64,
+    /// Stored only for a non-event profile; an event file keeps the original header layout byte for byte.
+    pub profile: Profile,
     pub projection_count: u32,
     pub row_count: u64,
     /// Internal only; never public output.
@@ -523,8 +663,12 @@ pub struct HefHeader {
 
 // magic + version pair + header_len + file_id + tenant_id + generation + layout_class + projection_count + (created_at,
 // 2× occurred, 2× ingested, 2× epoch, 2× sequence, row_count, feature_flags, footer_pointer_hint = 12 u64s) + crc64 +
-// blake3.
+// blake3. The event-profile layout, unchanged since before profiles existed.
 const HEADER_FIXED_LEN: usize = 4 + 2 + 2 + 4 + 16 + 16 + 8 + 1 + 4 + 8 * 12 + 8 + 32;
+
+// The non-event layout: the event layout plus one profile byte after `footer_pointer_hint`. Its different `header_len`
+// makes a reader that predates profiles refuse the file instead of reading it as events.
+const PROFILED_HEADER_FIXED_LEN: usize = HEADER_FIXED_LEN + 1;
 
 impl HefHeader {
     /// Coarse header-level rejection: true when the file's sequence coverage in `epoch` may intersect the queried
@@ -549,13 +693,20 @@ impl HefHeader {
     }
 }
 
-/// Encodes the header into its fixed aligned 4 KiB block with CRC-64/NVME and BLAKE3 over the header bytes.
+/// Encodes the header into its fixed aligned 4 KiB block with CRC-64/NVME and BLAKE3 over the header bytes. An event
+/// file gets the original layout; any other profile adds its profile byte.
 pub fn encode_header(header: &HefHeader) -> Vec<u8> {
+    let profiled = header.profile != Profile::Event;
+    let fixed_len = if profiled {
+        PROFILED_HEADER_FIXED_LEN
+    } else {
+        HEADER_FIXED_LEN
+    };
     let mut out = Writer::with_capacity(HEADER_BLOCK_LEN);
     out.put_slice(&HEF_MAGIC);
     out.put_u16(header.version_major);
     out.put_u16(header.version_minor);
-    out.put_u32(HEADER_FIXED_LEN as u32);
+    out.put_u32(fixed_len as u32);
     out.put_u128(header.file_id);
     out.put_u128(header.tenant_id.uuid().as_u128());
     out.put_u64(header.generation_id);
@@ -573,6 +724,9 @@ pub fn encode_header(header: &HefHeader) -> Vec<u8> {
     out.put_u64(header.row_count);
     out.put_u64(header.feature_flags);
     out.put_u64(header.footer_pointer_hint);
+    if profiled {
+        out.put_u8(header.profile.code());
+    }
     let crc = crate::file::integrity::crc64_nvme(out.bytes());
     out.put_u64(crc);
     let digest = blake3::hash(out.bytes());
@@ -582,28 +736,34 @@ pub fn encode_header(header: &HefHeader) -> Vec<u8> {
     block
 }
 
-/// Decodes and validates the fixed header block.
+/// Decodes and validates the fixed header block. Reads both layouts: the original one (an event file) and the one that
+/// carries a profile byte.
 pub fn decode_header(block: &[u8]) -> Result<HefHeader, FormatError> {
-    let fixed = slice(block, 0, HEADER_FIXED_LEN, "hef header")?;
-    let mut reader = Reader::new(fixed);
-    let magic = reader.take(HEF_MAGIC.len(), "hef magic")?;
+    let mut preamble = Reader::new(slice(block, 0, HEADER_FIXED_LEN, "hef header")?);
+    let magic = preamble.take(HEF_MAGIC.len(), "hef magic")?;
     if magic != HEF_MAGIC {
         return Err(FormatError::BadMagic { expected: "HEF1" });
     }
-    let version_major = reader.u16("version_major")?;
-    let version_minor = reader.u16("version_minor")?;
+    let version_major = preamble.u16("version_major")?;
+    let version_minor = preamble.u16("version_minor")?;
     if version_major != 1 {
         return Err(FormatError::UnsupportedVersion {
             field: "HEFHeader.version_major",
             found: u32::from(version_major),
         });
     }
-    let header_len = reader.u32("header_len")?;
-    if header_len as usize != HEADER_FIXED_LEN {
-        return Err(FormatError::Structural {
-            rule: "hef header_len mismatch",
-        });
-    }
+    let fixed_len = match preamble.u32("header_len")? as usize {
+        HEADER_FIXED_LEN => HEADER_FIXED_LEN,
+        PROFILED_HEADER_FIXED_LEN => PROFILED_HEADER_FIXED_LEN,
+        _ => {
+            return Err(FormatError::Structural {
+                rule: "hef header_len mismatch",
+            });
+        }
+    };
+    let fixed = slice(block, 0, fixed_len, "hef header")?;
+    let mut reader = Reader::new(fixed);
+    reader.take(HEF_MAGIC.len() + 2 + 2 + 4, "hef header preamble")?;
     let file_id = reader.u128("file_id")?;
     let tenant_id = TenantId::from_uuid(Uuid::from_u128(reader.u128("tenant_id")?));
     let generation_id = reader.u64("generation_id")?;
@@ -621,22 +781,27 @@ pub fn decode_header(block: &[u8]) -> Result<HefHeader, FormatError> {
     let row_count = reader.u64("row_count")?;
     let feature_flags = reader.u64("feature_flags")?;
     let footer_pointer_hint = reader.u64("footer_pointer_hint")?;
+    let profile = if fixed_len == PROFILED_HEADER_FIXED_LEN {
+        Profile::from_u8(reader.u8("profile")?)?
+    } else {
+        Profile::Event
+    };
     let stored_crc = reader.u64("header_crc64")?;
     let stored_blake3 = reader.take(32, "header_blake3")?;
 
-    let crc_scope = slice(block, 0, HEADER_FIXED_LEN - 8 - 32, "hef header crc scope")?;
+    let crc_scope = slice(block, 0, fixed_len - 8 - 32, "hef header crc scope")?;
     if crate::file::integrity::crc64_nvme(crc_scope) != stored_crc {
         return Err(FormatError::HeaderCrcMismatch);
     }
-    let blake3_scope = slice(block, 0, HEADER_FIXED_LEN - 32, "hef header blake3 scope")?;
+    let blake3_scope = slice(block, 0, fixed_len - 32, "hef header blake3 scope")?;
     if blake3::hash(blake3_scope).as_bytes() != stored_blake3 {
         return Err(FormatError::Blake3Mismatch { scope: "hef header" });
     }
     // Padding to the aligned block must be zero.
     let padding = slice(
         block,
-        HEADER_FIXED_LEN,
-        HEADER_BLOCK_LEN.saturating_sub(HEADER_FIXED_LEN),
+        fixed_len,
+        HEADER_BLOCK_LEN.saturating_sub(fixed_len),
         "hef header padding",
     )?;
     if padding.iter().any(|byte| *byte != 0) {
@@ -664,6 +829,7 @@ pub fn decode_header(block: &[u8]) -> Result<HefHeader, FormatError> {
         row_count,
         feature_flags,
         footer_pointer_hint,
+        profile,
     })
 }
 

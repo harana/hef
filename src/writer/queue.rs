@@ -559,21 +559,23 @@ impl CommitQueue {
         Ok((QueueRegion { start, end }, records))
     }
 
-    /// Copies the longest prefix of the stealable region whose records all belong to `tenant_id` and `epoch`. The
-    /// returned region ends exactly at the first non-matching record, so a flush over a mixed queue can claim just the
-    /// flushable prefix and leave the rest pending — a claimed record is never dropped for belonging to another
-    /// tenant or epoch. An empty prefix (the queue is empty, or its first record does not match) returns an empty
-    /// region and no records.
+    /// Copies the longest prefix of the stealable region whose records all belong to `tenant_id` and `epoch`, ending
+    /// with the record that brings the prefix to `limit_bytes` of queue space (`u64::MAX` for no limit). The returned
+    /// region ends exactly at the first record left out, so a flush over a mixed queue can claim just the flushable
+    /// prefix and leave the rest pending — a claimed record is never dropped for belonging to another tenant or epoch.
+    /// An empty prefix (the queue is empty, or its first record does not match) returns an empty region and no
+    /// records.
     pub fn copy_matching_prefix(
         &self,
         tenant_id: TenantId,
         epoch: u64,
+        limit_bytes: u64,
     ) -> Result<(QueueRegion, Vec<PendingRecord>), QueueError> {
         let start = self.clean_cursor;
         let end = self.dirty_cursor;
         let mut records = Vec::new();
         let mut cursor = start;
-        while cursor < end {
+        while cursor < end && cursor - start < limit_bytes {
             let len = self.read_u64_at(cursor);
             if len == SKIP_MARKER {
                 cursor += self.capacity - (cursor % self.capacity);

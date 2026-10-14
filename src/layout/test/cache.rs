@@ -100,3 +100,83 @@ fn remove_drops_a_piece_from_both_tiers() {
     assert!(disk.entries.lock().unwrap().is_empty());
     assert!(cache.get(&key(1, 0, 4)).is_none());
 }
+
+/// The obvious timestamp-and-scan cache the linked recency list replaces, kept as the reference it must agree with.
+#[derive(Default)]
+struct ReferenceTier {
+    budget_bytes: u64,
+    entries: StdHashMap<BlockKey, (Arc<[u8]>, u64)>,
+    held_bytes: u64,
+    tick: u64,
+}
+
+impl ReferenceTier {
+    fn get(&mut self, key: &BlockKey) -> Option<Arc<[u8]>> {
+        self.tick += 1;
+        let entry = self.entries.get_mut(key)?;
+        entry.1 = self.tick;
+        Some(Arc::clone(&entry.0))
+    }
+
+    fn insert(&mut self, key: BlockKey, bytes: Arc<[u8]>) {
+        if bytes.len() as u64 > self.budget_bytes {
+            return;
+        }
+        self.tick += 1;
+        self.held_bytes += bytes.len() as u64;
+        if let Some((replaced, _)) = self.entries.insert(key, (bytes, self.tick)) {
+            self.held_bytes -= replaced.len() as u64;
+        }
+        while self.held_bytes > self.budget_bytes {
+            let oldest = *self
+                .entries
+                .iter()
+                .filter(|(candidate, _)| **candidate != key)
+                .min_by_key(|(_, (_, used))| *used)
+                .unwrap()
+                .0;
+            let (evicted, _) = self.entries.remove(&oldest).unwrap();
+            self.held_bytes -= evicted.len() as u64;
+        }
+    }
+
+    fn remove(&mut self, key: &BlockKey) {
+        if let Some((removed, _)) = self.entries.remove(key) {
+            self.held_bytes -= removed.len() as u64;
+        }
+    }
+}
+
+#[test]
+fn the_memory_tier_evicts_exactly_as_a_full_recency_scan_would() {
+    for budget in [0u64, 7, 40, 200] {
+        let cache = BlockCache::new(budget, None);
+        let mut reference = ReferenceTier {
+            budget_bytes: budget,
+            ..ReferenceTier::default()
+        };
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for step in 0..5_000u32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let piece = key(1, state % 16, 0);
+            match (state >> 8) % 4 {
+                0 | 1 => assert_eq!(cache.get(&piece), reference.get(&piece), "step {step}"),
+                2 => {
+                    let value = bytes(step as u8, ((state >> 16) % 30) as usize);
+                    cache.insert(piece, Arc::clone(&value));
+                    reference.insert(piece, value);
+                }
+                _ => {
+                    cache.remove(&piece);
+                    reference.remove(&piece);
+                }
+            }
+            assert_eq!(cache.memory_bytes(), reference.held_bytes, "step {step}");
+        }
+        let memory = cache.memory.lock().unwrap();
+        assert!(memory.slots.len() <= 16, "freed slots are reused");
+        assert_eq!(memory.entries.len(), reference.entries.len());
+    }
+}
