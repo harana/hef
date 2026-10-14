@@ -340,9 +340,12 @@ pub fn encode_graph_blocks(
         .checked_add(row_count)
         .ok_or(refuse("graph sequence numbers overflow"))?;
     let mut reverse: Vec<[Vec<u64>; GRAPH_EDGE_KINDS]> = vec![Default::default(); graph.rows.len()];
+    // One duplicate-check set for every parent list, cleared between lists, so a list allocates only when it needs
+    // more room than every list before it.
+    let mut seen = HashSet::new();
     for (sn, row) in (graph.first_sn..).zip(&graph.rows) {
         for (kind, targets) in [(EdgeKind::Prev, &row.prev), (EdgeKind::Auth, &row.auth)] {
-            let mut seen = HashSet::with_capacity(targets.len());
+            seen.clear();
             for &target in targets {
                 if target >= sn {
                     return Err(refuse("a graph parent must be strictly earlier than its event"));

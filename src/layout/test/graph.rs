@@ -169,6 +169,338 @@ fn a_graph_that_breaks_a_rule_is_refused() {
     }
 }
 
+/// [`encode_graph_blocks`] as first written, with a fresh duplicate-check set per parent list and a child vector per
+/// reverse slot: the reference the current builder must match byte for byte and refusal for refusal.
+fn encode_graph_blocks_as_first_written(
+    graph: &GraphInput,
+    row_count: u64,
+    granules: &[GranuleEntry],
+) -> Result<BTreeMap<u32, Vec<u8>>, FormatError> {
+    let refuse = |rule: &'static str| FormatError::Structural { rule };
+    if graph.subject.is_empty() || graph.subject.len() > MAX_GRAPH_SUBJECT_BYTES {
+        return Err(refuse("a graph subject is 1 to 255 bytes"));
+    }
+    if graph.rows.len() as u64 != row_count {
+        return Err(refuse("a graph carries one edge entry per row"));
+    }
+    let end_sn = graph
+        .first_sn
+        .checked_add(row_count)
+        .ok_or(refuse("graph sequence numbers overflow"))?;
+    let mut reverse: Vec<[Vec<u64>; GRAPH_EDGE_KINDS]> = vec![Default::default(); graph.rows.len()];
+    for (sn, row) in (graph.first_sn..).zip(&graph.rows) {
+        for (kind, targets) in [(EdgeKind::Prev, &row.prev), (EdgeKind::Auth, &row.auth)] {
+            let mut seen = HashSet::with_capacity(targets.len());
+            for &target in targets {
+                if target >= sn {
+                    return Err(refuse("a graph parent must be strictly earlier than its event"));
+                }
+                if !seen.insert(target) {
+                    return Err(refuse("a graph event names the same parent twice"));
+                }
+                if let Some(children) = target
+                    .checked_sub(graph.first_sn)
+                    .and_then(|row| reverse.get_mut(row as usize))
+                    .and_then(|slots| slots.get_mut(kind.slot()))
+                {
+                    children.push(sn);
+                }
+            }
+        }
+    }
+    for edge in &graph.unresolved {
+        if !(graph.first_sn..end_sn).contains(&edge.child) {
+            return Err(refuse("an unresolved graph edge's child lives in the file"));
+        }
+        if EdgeKind::of(edge.parent.kind).is_none() || edge.parent.space == TargetIdSpace::SubjectSequence {
+            return Err(refuse(
+                "an unresolved graph edge names a prev or auth parent by protocol id",
+            ));
+        }
+    }
+    if graph.depth.is_some_and(|depth| depth.min > depth.max) {
+        return Err(refuse("a graph depth range's minimum does not pass its maximum"));
+    }
+    if let Some(cover) = &graph.chain_cover {
+        if cover.labels.len() != graph.rows.len() {
+            return Err(refuse("a graph chain cover carries one label per row"));
+        }
+        let mut last_seq: BTreeMap<u32, u32> = BTreeMap::new();
+        for label in &cover.labels {
+            if last_seq
+                .insert(label.chain_id, label.seq)
+                .is_some_and(|last| last >= label.seq)
+            {
+                return Err(refuse("a chain's seq must strictly increase in row order"));
+            }
+        }
+    }
+    let mut inbound: Vec<[Vec<u64>; GRAPH_EDGE_KINDS]> = vec![Default::default(); graph.rows.len()];
+    for edge in &graph.inbound {
+        if edge.child < end_sn {
+            return Err(refuse("an inbound graph edge's child lives past the file's last event"));
+        }
+        let children = edge
+            .parent
+            .checked_sub(graph.first_sn)
+            .and_then(|row| inbound.get_mut(row as usize))
+            .and_then(|slots| slots.get_mut(edge.kind.slot()))
+            .ok_or(refuse("an inbound graph edge's parent lives in the file"))?;
+        children.push(edge.child);
+    }
+    for children in inbound.iter_mut().flatten() {
+        children.sort_unstable();
+        if children.windows(2).any(|pair| pair.first() == pair.last()) {
+            return Err(refuse("a graph inbound edge is repeated"));
+        }
+    }
+
+    let mut blocks = BTreeMap::new();
+    for granule in granules {
+        let start = granule.first_row_ordinal as usize;
+        let range = start..start.saturating_add(granule.row_count as usize);
+        let rows = graph
+            .rows
+            .get(range.clone())
+            .ok_or(refuse("granule rows beyond the graph"))?;
+        let first_sn = graph.first_sn + granule.first_row_ordinal;
+        let forward: Vec<[&[u64]; GRAPH_EDGE_KINDS]> = rows.iter().map(|row| [&row.prev[..], &row.auth[..]]).collect();
+        let mut out = Writer::new();
+        encode_csr(&mut out, first_sn, &forward)?;
+        for lists in [&reverse, &inbound] {
+            let lists: Vec<[&[u64]; GRAPH_EDGE_KINDS]> = lists
+                .get(range.clone())
+                .unwrap_or_default()
+                .iter()
+                .map(|[prev, auth]| [&prev[..], &auth[..]])
+                .collect();
+            encode_csr(&mut out, first_sn, &lists)?;
+        }
+        if let Some(cover) = &graph.chain_cover {
+            let labels = cover.labels.get(range).unwrap_or_default();
+            put_block(
+                &mut out,
+                &ColumnData::U64(labels.iter().map(|label| u64::from(label.chain_id)).collect()),
+            );
+            put_block(
+                &mut out,
+                &ColumnData::U64(labels.iter().map(|label| u64::from(label.seq)).collect()),
+            );
+        }
+        blocks.insert(granule.granule_id, out.into_bytes());
+    }
+    Ok(blocks)
+}
+
+/// A seeded pseudo-random source: each call returns a value below `bound`.
+fn seeded(seed: u64) -> impl FnMut(u64) -> u64 {
+    let mut state = seed;
+    move |bound: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) % bound
+    }
+}
+
+/// A pseudo-random graph, its row count, and granules over it: unsorted parent lists from empty to high fan-out,
+/// parents before the file, sequence numbers near zero, `2^40` and `u64::MAX`, inbound edges, chain labels, and
+/// sometimes an extra granule that repeats or overlaps another. About half the cases also break a rule or two.
+fn random_graph(next: &mut impl FnMut(u64) -> u64) -> (GraphInput, u64, Vec<GranuleEntry>) {
+    let rows = next(40) + 1;
+    let first_sn = [0, 7, 1 << 40, u64::MAX - 64][next(4) as usize];
+    let end_sn = first_sn + rows;
+    let mut parents = |sn: u64| {
+        let count = if next(10) == 0 { next(30) } else { next(4) };
+        let mut list = Vec::new();
+        for _ in 0..count {
+            let back = 1 + if next(4) == 0 { next(1 << 20) } else { next(rows + 4) };
+            if let Some(target) = sn.checked_sub(back)
+                && !list.contains(&target)
+            {
+                list.push(target);
+            }
+        }
+        // A parent at zero spans more sequence numbers than a delta stores when the event sits near `u64::MAX`.
+        if sn > 0 && next(30) == 0 && !list.contains(&0) {
+            list.push(0);
+        }
+        list
+    };
+    let mut graph = GraphInput {
+        chain_cover: None,
+        depth: None,
+        first_sn,
+        inbound: Vec::new(),
+        rows: (first_sn..end_sn)
+            .map(|sn| RowEdges {
+                auth: parents(sn),
+                prev: parents(sn),
+            })
+            .collect(),
+        state_roots: BTreeMap::new(),
+        subject: b"!room:example.org".to_vec(),
+        unresolved: Vec::new(),
+    };
+    for _ in 0..next(5) {
+        let edge = GraphEdge {
+            child: end_sn + next(6),
+            kind: if next(2) == 0 { EdgeKind::Prev } else { EdgeKind::Auth },
+            parent: first_sn + next(rows),
+        };
+        if !graph.inbound.contains(&edge) {
+            graph.inbound.push(edge);
+        }
+    }
+    if next(3) == 0 {
+        graph.chain_cover = Some(ChainCoverInput {
+            labels: (0..rows as u32)
+                .map(|row| ChainLabel {
+                    chain_id: next(3) as u32,
+                    seq: row,
+                })
+                .collect(),
+            links: Vec::new(),
+        });
+    }
+    if next(3) == 0 {
+        graph.depth = Some(DepthRange { max: 9, min: 2 });
+    }
+    if next(3) == 0 {
+        graph.unresolved.push(UnresolvedEdge {
+            child: first_sn + next(rows),
+            parent: RelationshipRef::to_external(RelationshipKind::Prev, b"$late:example.org").unwrap(),
+        });
+    }
+    let mut granules = Vec::new();
+    let mut start = 0;
+    while start < rows {
+        let len = 1 + next((rows - start).min(8));
+        granules.push(granule(granules.len() as u32, start, len as u32));
+        start += len;
+    }
+    if next(5) == 0 {
+        let id = next(granules.len() as u64 + 1) as u32;
+        granules.push(granule(id, next(rows + 1), 1 + next(4) as u32));
+    }
+    for _ in 0..next(3) {
+        break_rule(&mut graph, &mut *next);
+    }
+    (graph, rows, granules)
+}
+
+/// Breaks one rule of `graph` at random, sometimes in a way a later check would also catch.
+fn break_rule(graph: &mut GraphInput, next: &mut impl FnMut(u64) -> u64) {
+    if graph.rows.is_empty() {
+        return;
+    }
+    let rows = graph.rows.len() as u64;
+    let row = next(rows) as usize;
+    let sn = graph.first_sn + row as u64;
+    let list = if next(2) == 0 {
+        &mut graph.rows[row].prev
+    } else {
+        &mut graph.rows[row].auth
+    };
+    match next(10) {
+        0 if !list.is_empty() => {
+            let repeated = list[next(list.len() as u64) as usize];
+            list.insert(next(list.len() as u64 + 1) as usize, repeated);
+        }
+        1 => list.insert(next(list.len() as u64 + 1) as usize, sn.saturating_add(next(3))),
+        2 => graph.unresolved.push(UnresolvedEdge {
+            child: graph.first_sn + rows,
+            parent: RelationshipRef::to_external(RelationshipKind::Auth, b"$gone:example.org").unwrap(),
+        }),
+        3 => graph.depth = Some(DepthRange { max: 1, min: 2 }),
+        4 => graph.chain_cover = Some(ChainCoverInput::default()),
+        5 => graph.inbound.push(GraphEdge {
+            child: graph.first_sn,
+            kind: EdgeKind::Prev,
+            parent: graph.first_sn,
+        }),
+        6 => graph.inbound.push(GraphEdge {
+            child: u64::MAX,
+            kind: EdgeKind::Auth,
+            parent: graph.first_sn.wrapping_sub(1),
+        }),
+        7 => drop(graph.rows.pop()),
+        8 => graph.subject.clear(),
+        _ => {
+            if let Some(&edge) = graph.inbound.first() {
+                graph.inbound.push(edge);
+            }
+        }
+    }
+}
+
+#[test]
+fn graph_blocks_match_the_builder_as_first_written() {
+    let mut next = seeded(0x2545_F491_4F6C_DD1D);
+    let (mut built, mut refused) = (0, 0);
+    for case in 0..3000 {
+        let (graph, row_count, granules) = random_graph(&mut next);
+        let expected = encode_graph_blocks_as_first_written(&graph, row_count, &granules);
+        assert_eq!(
+            encode_graph_blocks(&graph, row_count, &granules),
+            expected,
+            "case {case}"
+        );
+        if expected.is_ok() {
+            built += 1;
+        } else {
+            refused += 1;
+        }
+    }
+    assert!(built >= 200 && refused >= 200, "built {built}, refused {refused}");
+
+    for graph in [graph(), room_graph(20_000)] {
+        let rows = graph.rows.len() as u64;
+        for granules in [
+            room_granules(rows),
+            vec![granule(0, 0, 3), granule(1, 3, 3)],
+            vec![granule(4, 2, 1), granule(4, 0, 4), granule(9, 1, 2)],
+        ] {
+            assert_eq!(
+                encode_graph_blocks(&graph, rows, &granules),
+                encode_graph_blocks_as_first_written(&graph, rows, &granules)
+            );
+        }
+    }
+}
+
+/// A repeated parent at the start, middle or end of a list, or competing with a parent that is not earlier in the
+/// same list, is refused with the same rule as before, whichever comes first.
+#[test]
+fn a_repeated_or_later_parent_is_refused_as_first_written() {
+    let granules = [granule(0, 0, 3), granule(1, 3, 3)];
+    let lists: [&[u64]; 8] = [
+        &[101, 101, 100],
+        &[100, 99, 101, 99],
+        &[99, 98, 97, 99],
+        &[90, 90],
+        &[105, 101, 101],
+        &[101, 101, 105],
+        &[103, 104],
+        &[103, 102, 101, 100, 99, 90],
+    ];
+    for list in lists {
+        for auth in [false, true] {
+            let mut graph = graph();
+            if auth {
+                graph.rows[4].auth = list.to_vec();
+            } else {
+                graph.rows[4].prev = list.to_vec();
+            }
+            assert_eq!(
+                encode_graph_blocks(&graph, 6, &granules),
+                encode_graph_blocks_as_first_written(&graph, 6, &granules),
+                "{list:?} auth {auth}"
+            );
+        }
+    }
+}
+
 /// A block of three CSR tables over `rows` rows, each from raw offsets and deltas, so a test can write what no
 /// writer would.
 fn raw_block(tables: [(&[u64], &[i64]); 3]) -> Vec<u8> {
