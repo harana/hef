@@ -3662,19 +3662,21 @@ impl HefFile {
         Ok((low < end && values.get(low).flatten() == Some(key)).then_some(low))
     }
 
-    /// The text granule row `row` holds in string block `(column_id, granule_id)`, a block of `row_count` rows, or
-    /// `None` when the row has no value. Decodes the block once into the decoded-block cache, so later reads into the
-    /// same granule cost a lookup instead of a decode.
-    pub(super) fn cached_string_at(
+    /// Runs `visit` on the text granule row `row` holds in string block `(column_id, granule_id)`, a block of
+    /// `row_count` rows, or on `None` when the row has no value. The text is borrowed from the decoded-block cache, so
+    /// later reads into the same granule cost a lookup instead of a decode, and the block stays alive for the call
+    /// even if the cache evicts it meanwhile.
+    pub(super) fn with_cached_string_at<T>(
         &self,
         column_id: u32,
         granule_id: u32,
         row_count: u32,
         row: u64,
-    ) -> Result<Option<String>, FormatError> {
+        visit: impl FnOnce(Option<&str>) -> T,
+    ) -> Result<T, FormatError> {
         let column = self.cached_column(column_id, granule_id)?;
         let ColumnData::Strings(values) = &column.data else {
-            return Ok(None);
+            return Ok(visit(None));
         };
         // A dense block stores one slot per row; a presence-gated one stores only the present rows' values.
         let position = if values.len() == row_count as usize {
@@ -3683,9 +3685,9 @@ impl HefFile {
             let (before, present) = column.rank.rank_and_contains(row);
             present.then_some(before)
         };
-        Ok(position
-            .and_then(|position| values.get(position as usize).flatten())
-            .map(str::to_owned))
+        Ok(visit(
+            position.and_then(|position| values.get(position as usize).flatten()),
+        ))
     }
 
     /// Sizes the decoded-block cache budget, replacing [`DECODED_CACHE_BUDGET_BYTES`]. A caller-supplied working-set

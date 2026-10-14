@@ -265,8 +265,9 @@ pub fn plan_compaction_cycle(
     generation: &ManifestGeneration,
     tenant_id: TenantId,
 ) -> Vec<CompactionJob> {
-    // A merge needs at least two inputs; a narrower width would degenerate into empty or single-file jobs.
-    if policy.max_merge_width < 2 {
+    // A merge needs at least two inputs; a narrower width would degenerate into empty or single-file jobs. A zero job
+    // budget plans nothing, so it skips collecting and sorting candidates.
+    if policy.max_merge_width < 2 || policy.max_jobs_per_cycle == 0 {
         return Vec::new();
     }
     let mut candidates: Vec<&HefFileEntry> = generation
@@ -287,21 +288,28 @@ pub fn plan_compaction_cycle(
     };
 
     let mut jobs = Vec::new();
-    let mut run: Vec<&HefFileEntry> = Vec::new();
-    // One trailing sentinel flushes the final run through the same path as an interior break.
-    for entry in candidates.iter().copied().map(Some).chain([None]) {
-        let small = entry.filter(|entry| entry.size_bytes < policy.roll_target_bytes);
+    // The current run is `candidates[run_start..boundary]`. One boundary past the last candidate flushes the final run
+    // through the same path as an interior break.
+    let mut run_start = 0usize;
+    for boundary in 0..=candidates.len() {
+        let small = candidates
+            .get(boundary)
+            .copied()
+            .filter(|entry| entry.size_bytes < policy.roll_target_bytes);
+        let previous = boundary.checked_sub(1).filter(|&previous| previous >= run_start);
         if let Some(next) = small
-            && run.last().is_none_or(|last| follows_on(last, next))
+            && previous
+                .and_then(|previous| candidates.get(previous))
+                .is_none_or(|last| follows_on(last, next))
         {
-            run.push(next);
             continue;
         }
+        let run = candidates.get(run_start..boundary).unwrap_or_default();
         // A finished file, a small file that does not follow on from the run, or the end of the candidates closes the
         // current run; schedule what qualifies. The window slides so one larger-but-unfinished file at the head of a
         // run does not block its small tail from merging.
         let mut start = 0usize;
-        while jobs.len() < policy.max_jobs_per_cycle && start + 2 <= run.len() {
+        while start + 2 <= run.len() {
             let window = &run[start..run.len().min(start + policy.max_merge_width)];
             let total: u64 = window.iter().map(|entry| entry.size_bytes).sum();
             let largest = window.iter().map(|entry| entry.size_bytes).max().unwrap_or(0);
@@ -312,15 +320,17 @@ pub fn plan_compaction_cycle(
                     expected_output_bytes: total,
                     file_ids: window.iter().map(|entry| entry.file_id).collect(),
                 });
+                if jobs.len() == policy.max_jobs_per_cycle {
+                    return jobs;
+                }
                 start += window.len();
             } else {
                 // The doubling bound defers this window — the run's newest files are not rewritten just for existing.
                 start += 1;
             }
         }
-        run.clear();
         // A small file that closed the run starts the next one.
-        run.extend(small);
+        run_start = if small.is_some() { boundary } else { boundary + 1 };
     }
     jobs
 }
