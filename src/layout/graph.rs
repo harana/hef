@@ -1006,14 +1006,25 @@ impl HefFile {
         else {
             return Vec::new();
         };
+        // Each chain is looked up once, in ascending order. A reader's cover always comes through
+        // `ChainCover::decode`, which refuses links that are not sorted and distinct, so each chain's links are one
+        // sorted run and the runs of ascending chains join already sorted.
+        let normalized: Vec<u32>;
+        let chains = if chains.is_sorted_by(|a, b| a < b) {
+            chains
+        } else {
+            let mut owned = chains.to_vec();
+            owned.sort_unstable();
+            owned.dedup();
+            normalized = owned;
+            &normalized
+        };
         let mut links: Vec<ChainLink> = Vec::new();
         for &chain in chains {
             let start = cover.links.partition_point(|link| link.from_chain < chain);
             let end = cover.links.partition_point(|link| link.from_chain <= chain);
             links.extend_from_slice(cover.links.get(start..end).unwrap_or_default());
         }
-        links.sort_unstable();
-        links.dedup();
         links
     }
 

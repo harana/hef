@@ -1347,6 +1347,79 @@ fn chain_labels_and_links_round_trip_through_a_built_file() {
     assert!(uncovered.graph_chain_links(&[1, 2]).is_empty());
 }
 
+/// [`HefFile::graph_chain_links`] as first written: every requested chain's links copied, repeats and all, then sorted
+/// and deduplicated. The reference the current lookup must match.
+fn chain_links_as_first_written(file: &HefFile, chains: &[u32]) -> Vec<ChainLink> {
+    let Some(cover) = file
+        .footer()
+        .graph
+        .as_ref()
+        .and_then(|graph| graph.chain_cover.as_ref())
+    else {
+        return Vec::new();
+    };
+    let mut links: Vec<ChainLink> = Vec::new();
+    for &chain in chains {
+        let start = cover.links.partition_point(|link| link.from_chain < chain);
+        let end = cover.links.partition_point(|link| link.from_chain <= chain);
+        links.extend_from_slice(cover.links.get(start..end).unwrap_or_default());
+    }
+    links.sort_unstable();
+    links.dedup();
+    links
+}
+
+/// Looking each requested chain up once, in ascending order, gives exactly the sorted union the lookup as first
+/// written gives: for requests in any order, with repeats, unknown chains and chains at the ends of `u32`, against a
+/// cover with many links per chain (several sharing `from_chain` and `from_seq`), a cover with no links, and a file
+/// with no cover.
+#[test]
+fn chain_links_match_the_lookup_as_first_written() {
+    let mut next = seeded(0x5DEE_CE66_D1CE_4E5B);
+    let known = [0, 1, 2, 5, u32::MAX];
+    let mut cover = chain_cover(20);
+    cover.links = (0..80)
+        .map(|_| ChainLink {
+            from_chain: known[next(known.len() as u64) as usize],
+            from_seq: next(4) as u32,
+            to_chain: next(3) as u32,
+            to_seq: next(5) as u32,
+        })
+        .collect();
+    let mut linkless = chain_cover(20);
+    linkless.links.clear();
+    let built = build_hef_file(
+        (0..20).map(plain_row).collect::<Vec<_>>(),
+        &graph_config(4, Some(chain(50, 20))),
+    )
+    .unwrap();
+    let files = [
+        covered_file(cover).unwrap(),
+        covered_file(linkless).unwrap(),
+        HefFile::open(built.bytes, Some(&built.file_seal)).unwrap(),
+    ];
+    let asked = [0, 1, 2, 3, 5, 7, u32::MAX - 1, u32::MAX];
+    let mut requests: Vec<Vec<u32>> = vec![
+        Vec::new(),
+        vec![1; 50],
+        asked.to_vec(),
+        asked.iter().rev().copied().collect(),
+        vec![u32::MAX, 0, u32::MAX, 0],
+        vec![3, 7, 3],
+    ];
+    for _ in 0..300 {
+        let len = next(12);
+        requests.push((0..len).map(|_| asked[next(asked.len() as u64) as usize]).collect());
+    }
+    for file in &files {
+        for request in &requests {
+            let links = file.graph_chain_links(request);
+            assert_eq!(links, chain_links_as_first_written(file, request), "{request:?}");
+        }
+    }
+    assert!(!files[0].graph_chain_links(&[5, 0]).is_empty());
+}
+
 #[test]
 fn a_file_is_pruned_by_chain_range() {
     // Chain 1 holds seqs 10 to 19 in this file, chain 2 the same.
