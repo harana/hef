@@ -2341,25 +2341,36 @@ fn encode_raw_string(values: &StringColumn, present: &[&str], out: &mut Writer) 
     Ok(())
 }
 
-/// Threads a block's densely stored present values back through its null stream, landing them in one arena-backed
-/// column rather than a string per row.
-fn merge_nulls<T: AsRef<str>>(nulls: &NullStream, present: &[T]) -> Result<StringColumn, FormatError> {
-    let text_bytes = present.iter().map(|value| value.as_ref().len()).sum();
+/// Threads a block's `count` densely stored present values back through its null stream, landing them in one
+/// arena-backed column rather than a string per row. `value(i)` borrows present value `i` on demand: every value is
+/// checked and sized first, so a malformed value is refused before the null stream is walked, then each is fetched
+/// again straight into the output instead of through a collected list of views.
+fn merge_nulls<'a>(
+    nulls: &NullStream<'_>,
+    count: usize,
+    value: impl Fn(usize) -> Result<&'a str, FormatError>,
+) -> Result<StringColumn, FormatError> {
+    let mut text_bytes = 0usize;
+    for index in 0..count {
+        text_bytes += value(index)?.len();
+    }
     let mut values = StringColumn::with_capacity(nulls.row_count(), text_bytes);
     let mut next = 0usize;
     nulls.each_row(|set| {
         if set {
-            let value = present.get(next).ok_or(FormatError::Structural {
-                rule: "null bitmap disagrees with present count",
-            })?;
-            values.push(Some(value.as_ref()));
+            if next >= count {
+                return Err(FormatError::Structural {
+                    rule: "null bitmap disagrees with present count",
+                });
+            }
+            values.push(Some(value(next)?));
             next += 1;
         } else {
             values.push(None);
         }
         Ok(())
     })?;
-    if next != present.len() {
+    if next != count {
         return Err(FormatError::Structural {
             rule: "null bitmap disagrees with present count",
         });
@@ -2437,13 +2448,21 @@ fn decode_dictionary_string(
         })?;
         let codes = bitunpack(reader)?;
         let present = resolve_dictionary_codes(&codes, alphabet)?;
-        return merge_nulls(&nulls, &present);
+        return merge_nulls(&nulls, present.len(), |index| {
+            present.get(index).copied().ok_or(FormatError::RefOutOfRange {
+                what: "dictionary code",
+            })
+        });
     }
     let dict_count = reader.u32("dictionary count")? as usize;
     let dictionary = read_dictionary_values(reader, dict_count, side)?;
     let codes = bitunpack(reader)?;
     let present = resolve_dictionary_codes(&codes, &dictionary)?;
-    merge_nulls(&nulls, &present)
+    merge_nulls(&nulls, present.len(), |index| {
+        present.get(index).copied().ok_or(FormatError::RefOutOfRange {
+            what: "dictionary code",
+        })
+    })
 }
 
 /// Resolves each stored code to the dictionary entry it names, borrowed rather than copied — the codes outnumber the
@@ -2894,15 +2913,7 @@ fn decode_fsst_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatErr
         "fsst value",
         "fsst offsets must be non-decreasing",
     )?;
-    let mut present: Vec<&str> = Vec::with_capacity(arena.len());
-    for index in 0..arena.len() {
-        present.push(
-            arena
-                .value(index)
-                .ok_or(FormatError::InvalidUtf8 { what: "fsst value" })?,
-        );
-    }
-    merge_nulls(&nulls, &present)
+    merge_nulls(&nulls, arena.len(), |index| fsst_arena_value(&arena, index))
 }
 
 fn decode_raw_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatError> {
@@ -2911,21 +2922,9 @@ fn decode_raw_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatErro
     let offsets = read_offsets(reader, present_count)?;
     let data_len = offsets.last().copied().unwrap_or(0);
     let data = reader.take(data_len, "raw string data")?;
-    let mut present = Vec::with_capacity(present_count);
-    for pair in offsets.windows(2) {
-        let (start, end) = match pair {
-            [start, end] => (*start, *end),
-            _ => continue,
-        };
-        if end < start {
-            return Err(FormatError::Structural {
-                rule: "raw string offsets must be non-decreasing",
-            });
-        }
-        let bytes = slice(data, start, end - start, "raw string")?;
-        present.push(simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "raw string" })?);
-    }
-    merge_nulls(&nulls, &present)
+    merge_nulls(&nulls, offsets.len().saturating_sub(1), |index| {
+        raw_string_value(data, &offsets, index)
+    })
 }
 
 /// Decodes a string block straight into an Arrow `StringView` array: the same values and nulls `decode_block` returns

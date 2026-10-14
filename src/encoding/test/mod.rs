@@ -2420,6 +2420,69 @@ fn a_raw_string_block_holding_invalid_utf8_is_rejected() {
     assert!(decode_block_range(pipeline, &forged, 0, 1).is_err());
 }
 
+/// A hand-built raw string block: the null stream of `values`, then `offsets.len() - 1` stored values whose offset
+/// table is `offsets` over the byte arena `data`.
+fn forged_raw_string_block(values: &StringColumn, offsets: &[u32], data: &[u8]) -> Vec<u8> {
+    let mut out = Writer::new();
+    NullStream::from_values(values).write(&mut out);
+    out.put_u32(offsets.len().saturating_sub(1) as u32);
+    for &offset in offsets {
+        out.put_u32(offset);
+    }
+    out.put_slice(data);
+    out.into_bytes()
+}
+
+/// The whole-block raw string decode checks every stored value, surplus ones included, before it walks the null
+/// stream, so a malformed value wins over a count disagreement; a count disagreement alone is refused either way.
+#[test]
+fn raw_string_whole_block_decode_validates_every_value_before_weaving_nulls() {
+    let pipeline = PipelineId::new(Transform::RawString, Compression::None, ValueKind::String);
+    let values: StringColumn = (0..4).map(|i| (i != 1).then_some("x")).collect();
+    let decode =
+        |offsets: &[u32], data: &[u8]| decode_block(pipeline, &forged_raw_string_block(&values, offsets, data));
+    let disagree = FormatError::Structural {
+        rule: "null bitmap disagrees with present count",
+    };
+    let utf8 = FormatError::InvalidUtf8 { what: "raw string" };
+
+    assert_eq!(
+        decode(&[0, 1, 1, 3], "a\u{e9}".as_bytes()).unwrap(),
+        ColumnData::Strings(vec![Some("a"), None, Some(""), Some("\u{e9}")].into())
+    );
+    assert_eq!(decode(&[0, 1, 2], b"ab").unwrap_err(), disagree, "too few values");
+    assert_eq!(
+        decode(&[0, 1, 2, 3, 4], b"abcd").unwrap_err(),
+        disagree,
+        "too many values"
+    );
+    assert_eq!(
+        decode(&[0, 1, 2, 3, 4], b"abc\xFF").unwrap_err(),
+        utf8,
+        "invalid surplus value"
+    );
+    assert_eq!(
+        decode(&[0, 1, 2], b"\xFFb").unwrap_err(),
+        utf8,
+        "invalid value with too few"
+    );
+    assert_eq!(
+        decode(&[0, 2, 1, 3], b"abc").unwrap_err(),
+        FormatError::Structural {
+            rule: "raw string offsets must be non-decreasing",
+        }
+    );
+    assert!(matches!(
+        decode(&[0, 1, 2, 9], b"abc"),
+        Err(FormatError::Truncated { .. })
+    ));
+    assert_eq!(
+        decode(&[2, 3, 4, 5], b"zzabc").unwrap(),
+        ColumnData::Strings(vec![Some("a"), None, Some("b"), Some("c")].into()),
+        "a leading offset other than zero"
+    );
+}
+
 /// A raw-string block stores a byte arena behind an offset table, so one row's bytes are reachable without decoding
 /// the block — the same guarantee FSST blocks already carried. Long free text is exactly the shape that lands here.
 #[test]
