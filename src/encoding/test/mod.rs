@@ -410,6 +410,50 @@ fn byte_stream_split_full_decode_keeps_every_bit_and_refuses_a_truncated_plane()
     );
 }
 
+/// Byte-stream-split planes built the obvious way, one byte at a time: plane `p` holds byte `p` of every value. The
+/// reference the tiled writer must match byte for byte.
+fn byte_stream_split_reference(values: &[f64]) -> Vec<u8> {
+    let mut planes = vec![0u8; values.len() * 8];
+    for (row, value) in values.iter().enumerate() {
+        for (plane, byte) in value.to_le_bytes().into_iter().enumerate() {
+            planes[plane * values.len() + row] = byte;
+        }
+    }
+    planes
+}
+
+/// The tiled byte-stream-split writer lays out exactly the bytes of a byte-at-a-time transpose, and the tiled reader
+/// gets every bit back (NaN payloads, signed zeros, subnormals), for empty blocks, lengths around the tile size, and
+/// pseudo-random lengths up to several tiles of vectors.
+#[test]
+fn byte_stream_split_tiles_match_a_byte_at_a_time_transpose() {
+    let tile = BYTE_STREAM_SPLIT_TILE;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let random_lengths: Vec<usize> = (0..24).map(|_| (pseudo_random(&mut state) % 5000) as usize).collect();
+    let lengths = [
+        0,
+        1,
+        2,
+        tile - 1,
+        tile,
+        tile + 1,
+        2 * tile - 1,
+        2 * tile + 1,
+        3 * tile + 7,
+        65_537,
+    ];
+    for count in lengths.into_iter().chain(random_lengths) {
+        let values = byte_stream_split_test_values(count);
+        let mut planes = vec![0u8; count * 8];
+        write_byte_stream_split(&values, &mut planes);
+        assert_eq!(planes, byte_stream_split_reference(&values), "{count} rows");
+        let body = byte_stream_split_body(&values);
+        assert_eq!(&body[4..], &planes[..], "{count} rows in a block body");
+        let decoded = decode_byte_stream_split(&mut Reader::new(&body)).unwrap();
+        assert_eq!(float_bits(&decoded), float_bits(&values), "{count} rows decoded");
+    }
+}
+
 /// A framed byte-stream-split range read gives exactly the bits of a whole-block decode, and inflates each frame its
 /// header and its eight plane ranges fall in exactly once: with every plane in one frame, adjacent planes sharing
 /// frames, a frame per plane, and plane ranges crossing frame boundaries. Empty, clipped, reversed and out-of-range

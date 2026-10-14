@@ -26,11 +26,11 @@ use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use constant::{
     ALP_CONVERT_MAGIC, ALP_EXACT_CONVERT_MAX_WIDTH, ALP_MAX_EXCEPTION_SAMPLE_DIVISOR, ALP_MAX_SCALED_MAGNITUDE,
     ALP_RD_CODE_MISS, ALP_RD_MAX_DICT_LEN, ALP_RD_MAX_RIGHT_WIDTH, ALP_RD_MIN_RIGHT_WIDTH, ALP_VECTOR_ESCAPE_SENTINEL,
-    DECODE_OPTIMIZED_THRESHOLD_DEN, DECODE_OPTIMIZED_THRESHOLD_NUM, DICTIONARY_FSST_MAX_VALUE_LEN,
-    DICTIONARY_MAX_CARDINALITY_DIVISOR, FASTLANES_SPARSE_MAX_VALUES, FSST_LOSSY_PHT_HASH_MULTIPLIER,
-    FSST_LOSSY_PHT_HASH_SHIFT, FSST_MAX_AVERAGE_VALUE_LEN, FSST_MAX_SYMBOL_COUNT, FSST_MIN_SAMPLE_COUNT,
-    FSST_VALUE_KEYS_MAX_PLAINTEXT_DIVISOR, MAX_RLE_EXPANSION_VALUES, PREFIX_KEY_BYTES, REPLAY_TRIP_DEN,
-    REPLAY_TRIP_NUM, SIZE_OPTIMIZED_SAVINGS_DIVISOR, TRANSFORM_SAMPLE_RUNS, TRANSFORM_SAMPLE_SIZE,
+    BYTE_STREAM_SPLIT_TILE, DECODE_OPTIMIZED_THRESHOLD_DEN, DECODE_OPTIMIZED_THRESHOLD_NUM,
+    DICTIONARY_FSST_MAX_VALUE_LEN, DICTIONARY_MAX_CARDINALITY_DIVISOR, FASTLANES_SPARSE_MAX_VALUES,
+    FSST_LOSSY_PHT_HASH_MULTIPLIER, FSST_LOSSY_PHT_HASH_SHIFT, FSST_MAX_AVERAGE_VALUE_LEN, FSST_MAX_SYMBOL_COUNT,
+    FSST_MIN_SAMPLE_COUNT, FSST_VALUE_KEYS_MAX_PLAINTEXT_DIVISOR, MAX_RLE_EXPANSION_VALUES, PREFIX_KEY_BYTES,
+    REPLAY_TRIP_DEN, REPLAY_TRIP_NUM, SIZE_OPTIMIZED_SAVINGS_DIVISOR, TRANSFORM_SAMPLE_RUNS, TRANSFORM_SAMPLE_SIZE,
     ZSTD_LENGTH_PREFIX_BYTES,
 };
 use multiversion::multiversion;
@@ -1493,18 +1493,46 @@ fn encode_plain_f64(values: &[f64], out: &mut Writer) {
 }
 
 /// Writes `values` regrouped into 8 same-significance planes straight into `out` (exactly `values.len() * 8` bytes):
-/// plane 0 holds every value's byte 0, plane 1 every value's byte 1, and so on — eight linear, streaming passes (one
-/// per plane) rather than one scattered store per byte, mirroring the eight linear passes [`decode_byte_stream_split`]
-/// already reassembles a value from.
+/// plane 0 holds every value's byte 0, plane 1 every value's byte 1, and so on.
+///
+/// The values are read once, a tile of [`BYTE_STREAM_SPLIT_TILE`] at a time: each tile's bytes are scattered to the
+/// eight planes (an 8 x tile byte transpose) before the next tile is loaded, so the input is not re-read once per
+/// plane. Compiled once per instruction set and dispatched on the CPU features detected at runtime; every clone moves
+/// the same bytes, so the planes are identical whichever clone runs.
+#[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2", "aarch64+neon"))]
 fn write_byte_stream_split(values: &[f64], out: &mut [u8]) {
     if values.is_empty() {
         return;
     }
-    let plane_len = values.len();
     let bits: &[u64] = bytemuck::cast_slice(values);
-    for (plane_index, plane) in out.chunks_exact_mut(plane_len).enumerate() {
+    let mut planes = out.chunks_exact_mut(values.len());
+    let mut plane_tiles: [_; 8] = std::array::from_fn(|_| {
+        planes
+            .next()
+            .unwrap_or_default()
+            .chunks_exact_mut(BYTE_STREAM_SPLIT_TILE)
+    });
+    let mut tiles = bits.chunks_exact(BYTE_STREAM_SPLIT_TILE);
+    for tile in tiles.by_ref() {
+        let Ok(tile): Result<&[u64; BYTE_STREAM_SPLIT_TILE], _> = tile.try_into() else {
+            continue;
+        };
+        for (plane_index, plane_tile) in plane_tiles.iter_mut().enumerate() {
+            let Some(Ok(dest)): Option<Result<&mut [u8; BYTE_STREAM_SPLIT_TILE], _>> =
+                plane_tile.next().map(TryInto::try_into)
+            else {
+                continue;
+            };
+            let shift = (8 * plane_index) as u32;
+            for (slot, value) in dest.iter_mut().zip(tile) {
+                *slot = (value >> shift) as u8;
+            }
+        }
+    }
+    let tail = tiles.remainder();
+    for (plane_index, plane_tile) in plane_tiles.into_iter().enumerate() {
         let shift = (8 * plane_index) as u32;
-        for (slot, value) in plane.iter_mut().zip(bits) {
+        for (slot, value) in plane_tile.into_remainder().iter_mut().zip(tail) {
             *slot = (value >> shift) as u8;
         }
     }
@@ -1553,17 +1581,44 @@ fn decode_byte_stream_split(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatE
     for plane in planes.iter_mut() {
         *plane = reader.take(count, "byte-stream-split plane")?;
     }
-    // Each plane is exactly `count` bytes, so eight linear passes reassemble every value without a per-value bounds
-    // check: pass `p` ORs each row's plane-`p` byte into bit position `8 * p`.
-    let mut bits = vec![0u64; count];
-    for (plane_index, plane) in planes.iter().enumerate() {
+    // A pure bit reinterpret, not a value mapping: cast the buffer in place instead of collecting a second one.
+    Ok(bytemuck::cast_vec(join_byte_stream_split(&planes, count)))
+}
+
+/// Reassembles `count` values from the eight byte planes of a byte-stream-split block, each exactly `count` bytes.
+///
+/// A tile of [`BYTE_STREAM_SPLIT_TILE`] values is gathered from all eight planes in registers and then written out
+/// once, instead of updating the whole output once per plane. Compiled once per instruction set and dispatched on the
+/// CPU features detected at runtime; every clone computes the same shifts and ORs, so the values are identical
+/// whichever clone runs.
+#[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2", "aarch64+neon"))]
+fn join_byte_stream_split(planes: &[&[u8]; 8], count: usize) -> Vec<u64> {
+    let mut bits = Vec::with_capacity(count);
+    let mut plane_tiles = planes.map(|plane| plane.chunks_exact(BYTE_STREAM_SPLIT_TILE));
+    for _ in 0..count / BYTE_STREAM_SPLIT_TILE {
+        let mut tile = [0u64; BYTE_STREAM_SPLIT_TILE];
+        for (plane_index, plane_tile) in plane_tiles.iter_mut().enumerate() {
+            let Some(Ok(source)): Option<Result<&[u8; BYTE_STREAM_SPLIT_TILE], _>> =
+                plane_tile.next().map(TryInto::try_into)
+            else {
+                continue;
+            };
+            let shift = (8 * plane_index) as u32;
+            for (slot, byte) in tile.iter_mut().zip(source) {
+                *slot |= u64::from(*byte) << shift;
+            }
+        }
+        bits.extend_from_slice(&tile);
+    }
+    let mut tail = [0u64; BYTE_STREAM_SPLIT_TILE];
+    for (plane_index, plane_tile) in plane_tiles.iter().enumerate() {
         let shift = (8 * plane_index) as u32;
-        for (slot, byte) in bits.iter_mut().zip(plane.iter()) {
+        for (slot, byte) in tail.iter_mut().zip(plane_tile.remainder()) {
             *slot |= u64::from(*byte) << shift;
         }
     }
-    // A pure bit reinterpret, not a value mapping: cast the buffer in place instead of collecting a second one.
-    Ok(bytemuck::cast_vec(bits))
+    bits.extend_from_slice(tail.get(..count % BYTE_STREAM_SPLIT_TILE).unwrap_or(&[]));
+    bits
 }
 
 /// Picks the ALP-RD split for a sample: the right-part bit width and the left-part dictionary that minimize the

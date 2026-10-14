@@ -41,6 +41,10 @@ pub const ALP_RD_MIN_RIGHT_WIDTH: u32 = 48;
 /// with a real exponent index, which is bounded by the ALP power table's length.
 pub const ALP_VECTOR_ESCAPE_SENTINEL: u8 = 255;
 
+/// How many values the byte-stream-split writer and reader move between the eight byte planes at once: a tile of 32
+/// doubles is 256 bytes, small enough to stay in registers while its bytes are transposed into (or out of) the planes.
+pub const BYTE_STREAM_SPLIT_TILE: usize = 32;
+
 /// The leading-zero counts a Chimp block ([`super::chimp`]) can record, indexed by their 3-bit code. A value's real
 /// count of leading zero bits in its XOR with the previous value is rounded down to the nearest entry, so the code
 /// fits three bits while the common counts of a slowly changing series (12 to 24) lose almost nothing.
