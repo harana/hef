@@ -2554,6 +2554,73 @@ fn integer_transforms_round_trip_signed_and_unsigned_blocks() {
     }
 }
 
+/// The plain one-value-at-a-time running sum [`prefix_sum`] must reproduce: each slot becomes the carried total plus
+/// its own difference, mapped back from the stored code.
+fn running_sum_reference<T: IntValue>(differences: &[u64], carry: u64) -> (Vec<T>, u64) {
+    let mut total = carry;
+    let values = differences
+        .iter()
+        .map(|difference| {
+            total = total.wrapping_add(*difference);
+            T::from_code(total)
+        })
+        .collect();
+    (values, total)
+}
+
+/// The chunked prefix sum must match the plain running sum bit for bit, for u64 and i64 slots, at lengths that are
+/// not a multiple of the chunk or of a vector, and with differences and carries large enough to wrap.
+#[test]
+fn prefix_sum_matches_a_running_sum() {
+    let mut state = 0x2545_F491_4F6C_DD1D;
+    for len in [0usize, 1, 2, 15, 16, 17, 31, 1023, 1024, 1025, 3001] {
+        for carry in [0u64, 1, u64::MAX - 5, i64::MAX as u64] {
+            for range_mask in [u64::MAX, 0xFFFF, 0] {
+                let differences: Vec<u64> = (0..len).map(|_| pseudo_random(&mut state) & range_mask).collect();
+
+                let (expected, expected_total) = running_sum_reference::<u64>(&differences, carry);
+                let mut values = differences.clone();
+                assert_eq!(prefix_sum(&mut values, carry), expected_total, "u64 total, len {len}");
+                assert_eq!(values, expected, "u64 values, len {len}, carry {carry}");
+
+                let (expected, expected_total) = running_sum_reference::<i64>(&differences, carry);
+                let mut values: Vec<i64> = differences.iter().map(|bits| i64::from_bits(*bits)).collect();
+                assert_eq!(prefix_sum(&mut values, carry), expected_total, "i64 total, len {len}");
+                assert_eq!(values, expected, "i64 values, len {len}, carry {carry}");
+            }
+        }
+    }
+}
+
+/// A delta block decodes to the plain running sum over its zigzag deltas, starting from the stored first value, for a
+/// single value, a zero-width stream, counts that end mid-vector, and sums that wrap past the top of the range.
+#[test]
+fn delta_decode_matches_a_running_sum() {
+    let mut state = 0x9E37_79B9_7F4A_7C15;
+    for width in [0u32, 1, 17, 64] {
+        for count in [0usize, 1, 5, 1023, 1024, 1025, 2500] {
+            for first in [0u64, 42, u64::MAX - 2] {
+                let codes: Vec<u64> = (0..count).map(|_| pseudo_random(&mut state) & mask(width)).collect();
+                let mut writer = Writer::new();
+                writer.put_u64(first);
+                bitpack(&codes, width, &mut writer);
+                let body = writer.into_bytes();
+                let differences: Vec<u64> = codes.iter().map(|code| unzigzag(*code) as u64).collect();
+
+                let (tail, _) = running_sum_reference::<u64>(&differences, first);
+                let expected: Vec<u64> = std::iter::once(first).chain(tail).collect();
+                let decoded = decode_delta_bitpack::<u64>(&mut Reader::new(&body)).unwrap();
+                assert_eq!(decoded, expected, "u64, width {width}, count {count}, first {first}");
+
+                let (tail, _) = running_sum_reference::<i64>(&differences, first);
+                let expected: Vec<i64> = std::iter::once(unzigzag(first)).chain(tail).collect();
+                let decoded = decode_delta_bitpack::<i64>(&mut Reader::new(&body)).unwrap();
+                assert_eq!(decoded, expected, "i64, width {width}, count {count}, first {first}");
+            }
+        }
+    }
+}
+
 /// The fused i64 encoders ([`encode_for_bitpack_i64`], [`encode_delta_bitpack_i64`]) fold the zigzag mapping and the
 /// frame-of-reference/delta step into the bitpack gather instead of materialising a zigzag-mapped copy first. They
 /// must still write exactly the bytes the unfused, mapped-then-bitpacked path would.

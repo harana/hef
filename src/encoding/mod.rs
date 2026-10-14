@@ -30,8 +30,8 @@ use constant::{
     DICTIONARY_FSST_MAX_VALUE_LEN, DICTIONARY_MAX_CARDINALITY_DIVISOR, FASTLANES_SPARSE_MAX_VALUES,
     FSST_LOSSY_PHT_HASH_MULTIPLIER, FSST_LOSSY_PHT_HASH_SHIFT, FSST_MAX_AVERAGE_VALUE_LEN, FSST_MAX_SYMBOL_COUNT,
     FSST_MIN_SAMPLE_COUNT, FSST_VALUE_KEYS_MAX_PLAINTEXT_DIVISOR, MAX_RLE_EXPANSION_VALUES, PREFIX_KEY_BYTES,
-    REPLAY_TRIP_DEN, REPLAY_TRIP_NUM, SIZE_OPTIMIZED_SAVINGS_DIVISOR, TRANSFORM_SAMPLE_RUNS, TRANSFORM_SAMPLE_SIZE,
-    ZSTD_LENGTH_PREFIX_BYTES,
+    PREFIX_SUM_CHUNK, REPLAY_TRIP_DEN, REPLAY_TRIP_NUM, SIZE_OPTIMIZED_SAVINGS_DIVISOR, TRANSFORM_SAMPLE_RUNS,
+    TRANSFORM_SAMPLE_SIZE, ZSTD_LENGTH_PREFIX_BYTES,
 };
 use multiversion::multiversion;
 use std::borrow::Cow;
@@ -911,12 +911,43 @@ fn decode_delta_bitpack<T: IntValue>(reader: &mut Reader<'_>) -> Result<Vec<T>, 
         stream.unpack_into(deltas, |packed| T::from_bits(unzigzag(packed) as u64));
     }
     values.truncate(stream.count + 1);
-    let mut previous = first;
-    for slot in values.iter_mut().skip(1) {
-        previous = previous.wrapping_add(slot.to_bits());
-        *slot = T::from_code(previous);
+    if let Some(deltas) = values.get_mut(1..) {
+        prefix_sum(deltas, first);
     }
     Ok(values)
+}
+
+/// Turns a run of differences into the values they describe, in place: each slot becomes `carry` plus every
+/// difference up to and including its own, mapped back from the stored code with [`IntValue::from_code`]. Returns the
+/// last running total (still a stored code), so the next run can carry on from it. All sums wrap.
+///
+/// The slots are taken [`PREFIX_SUM_CHUNK`] at a time: a chunk's local running totals are built in a fixed-size array
+/// without waiting on any earlier chunk, then the carried total is added to the whole chunk at once, so the carried
+/// sum advances once per chunk rather than once per value. (A log-step shift-and-add scan within the chunk measured
+/// slower: the compiler turns its shifts back into scalar adds.) Compiled once per instruction set and dispatched on
+/// the CPU features detected at runtime; every clone performs the same wrapping integer additions, so the totals are
+/// identical whichever clone runs.
+#[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2", "aarch64+neon"))]
+fn prefix_sum<T: IntValue>(values: &mut [T], carry: u64) -> u64 {
+    let mut carry = carry;
+    let mut chunks = values.chunks_exact_mut(PREFIX_SUM_CHUNK);
+    for chunk in &mut chunks {
+        let mut sums = [0u64; PREFIX_SUM_CHUNK];
+        let mut chunk_total = 0u64;
+        for (sum, slot) in sums.iter_mut().zip(chunk.iter()) {
+            chunk_total = chunk_total.wrapping_add(slot.to_bits());
+            *sum = chunk_total;
+        }
+        for (slot, sum) in chunk.iter_mut().zip(sums) {
+            *slot = T::from_code(carry.wrapping_add(sum));
+        }
+        carry = carry.wrapping_add(chunk_total);
+    }
+    for slot in chunks.into_remainder() {
+        carry = carry.wrapping_add(slot.to_bits());
+        *slot = T::from_code(carry);
+    }
+    carry
 }
 
 fn encode_rle(values: &[u64], out: &mut Writer) {

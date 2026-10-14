@@ -122,6 +122,11 @@ pub const PREFIX_KEY_BYTES: usize = PREFIX_KEY_PREFIX_LEN + 1;
 /// values except those agreeing on their first seven bytes.
 pub const PREFIX_KEY_PREFIX_LEN: usize = 7;
 
+/// How many values [`super::prefix_sum`] totals at once: each chunk's local running totals are worked out without
+/// waiting on the previous chunk, and only the chunk's last total is carried forward, so the carried sum advances once
+/// per chunk instead of once per value.
+pub const PREFIX_SUM_CHUNK: usize = 16;
+
 /// Decode-bomb guard on an RLE block's total decoded value count (not its declared run count), so a run of forged runs
 /// cannot make [`super::decode_rle`] amplify a small input into an unbounded allocation.
 pub const MAX_RLE_EXPANSION_VALUES: usize = 64 * 1024 * 1024;
