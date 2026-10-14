@@ -1840,8 +1840,80 @@ enum NullStreamForm<'a> {
     Raw(Cow<'a, [u8]>),
     /// Sorted, disjoint, non-adjacent `[start, end)` runs of present rows — the roaring-style run form, smallest when
     /// nulls cluster (the usual case for event data).
-    Runs(Vec<(u32, u32)>),
+    Runs(NullRuns<'a>),
 }
+
+/// The present-row runs of a string block's null stream: either a list the encoder just built, or the run table still
+/// sitting in the block bytes it was read from, so a transient decode never copies it into a list of its own.
+///
+/// Both kinds answer the same questions (how many runs, the run at a position, every run in order) and compare
+/// equal when they hold the same runs.
+///
+/// See: hef-encodings-and-compression/spec.md
+#[derive(Debug, Clone)]
+enum NullRuns<'a> {
+    /// The stored table: each run's start then end as little-endian `u32`s, already validated by [`NullStream::read`].
+    Encoded(&'a [u8]),
+    Pairs(Vec<(u32, u32)>),
+}
+
+impl NullRuns<'_> {
+    fn len(&self) -> usize {
+        match self {
+            NullRuns::Encoded(bytes) => bytes.len() / 8,
+            NullRuns::Pairs(pairs) => pairs.len(),
+        }
+    }
+
+    /// The `[start, end)` run at `index`, or `None` past the last run.
+    fn get(&self, index: usize) -> Option<(u32, u32)> {
+        match self {
+            NullRuns::Encoded(bytes) => {
+                let offset = index.checked_mul(8)?;
+                let start = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+                let end = bytes
+                    .get(offset.checked_add(4)?..offset.checked_add(8)?)?
+                    .try_into()
+                    .ok()?;
+                Some((u32::from_le_bytes(start), u32::from_le_bytes(end)))
+            }
+            NullRuns::Pairs(pairs) => pairs.get(index).copied(),
+        }
+    }
+
+    /// Every run, in row order.
+    fn iter(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.iter_from(0)
+    }
+
+    /// The runs from index `first` on, in row order, without visiting the ones before it.
+    fn iter_from(&self, first: usize) -> impl Iterator<Item = (u32, u32)> + '_ {
+        (first..self.len()).filter_map(|index| self.get(index))
+    }
+
+    /// The index of the first run for which `keep_going` is false, given that it holds for a prefix of the runs:
+    /// the run-list counterpart of a slice's `partition_point`.
+    fn partition_point(&self, mut keep_going: impl FnMut((u32, u32)) -> bool) -> usize {
+        let (mut low, mut high) = (0usize, self.len());
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.get(middle).is_some_and(&mut keep_going) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low
+    }
+}
+
+impl PartialEq for NullRuns<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for NullRuns<'_> {}
 
 /// One string block's presence-of-value stream, shared by every string transform (dictionary, FSST, raw) instead of
 /// each writing its own unconditional raw bitmap. An all-present block stores zero null bytes; clustered nulls store
@@ -1895,7 +1967,7 @@ impl<'a> NullStream<'a> {
         } else if 4 + run_count * 8 < row_count.div_ceil(8) {
             let mut runs: Vec<(u32, u32)> = Vec::with_capacity(run_count);
             each_present_run(presence, |start, end| runs.push((start as u32, end as u32)));
-            NullStreamForm::Runs(runs)
+            NullStreamForm::Runs(NullRuns::Pairs(runs))
         } else {
             // LSB-0: row `8 * byte + bit` is bit `bit` of byte `byte`.
             let mut raw = vec![0u8; row_count.div_ceil(8)];
@@ -1919,7 +1991,7 @@ impl<'a> NullStream<'a> {
             NullStreamForm::Runs(runs) => {
                 out.put_u8(2);
                 out.put_u32(runs.len() as u32);
-                for &(start, end) in runs {
+                for (start, end) in runs.iter() {
                     out.put_u32(start);
                     out.put_u32(end);
                 }
@@ -1948,7 +2020,10 @@ impl<'a> NullStream<'a> {
             1 => NullStreamForm::AllAbsent,
             2 => {
                 let run_count = reader.u32("null stream run count")? as usize;
-                let mut runs = Vec::with_capacity(reader.capacity_hint(run_count, 8));
+                // Validate run by run through `reader`, so a bad early run is reported before a later truncation,
+                // then borrow exactly the bytes those runs occupied.
+                let mut table = *reader;
+                let mut previous_end: Option<u32> = None;
                 for _ in 0..run_count {
                     let start = reader.u32("null stream run start")?;
                     let end = reader.u32("null stream run end")?;
@@ -1957,14 +2032,15 @@ impl<'a> NullStream<'a> {
                             rule: "null stream run must be non-empty and within the row count",
                         });
                     }
-                    if runs.last().is_some_and(|&(_, previous_end)| start <= previous_end) {
+                    if previous_end.is_some_and(|previous_end| start <= previous_end) {
                         return Err(FormatError::Structural {
                             rule: "null stream runs must be sorted and non-adjacent",
                         });
                     }
-                    runs.push((start, end));
+                    previous_end = Some(end);
                 }
-                NullStreamForm::Runs(runs)
+                let consumed = reader.position() - table.position();
+                NullStreamForm::Runs(NullRuns::Encoded(table.take(consumed, "null stream runs")?))
             }
             3 => NullStreamForm::Raw(Cow::Borrowed(reader.take(row_count.div_ceil(8), "null bitmap")?)),
             _ => {
@@ -1976,13 +2052,15 @@ impl<'a> NullStream<'a> {
         Ok(Self { form, row_count })
     }
 
-    /// The same stream, copying a borrowed raw bitmap so it no longer depends on the bytes it was read from.
+    /// The same stream, copying a borrowed raw bitmap or run table so it no longer depends on the bytes it was read
+    /// from.
     fn into_owned(self) -> NullStream<'static> {
         let form = match self.form {
             NullStreamForm::AllAbsent => NullStreamForm::AllAbsent,
             NullStreamForm::AllPresent => NullStreamForm::AllPresent,
             NullStreamForm::Raw(bits) => NullStreamForm::Raw(Cow::Owned(bits.into_owned())),
-            NullStreamForm::Runs(runs) => NullStreamForm::Runs(runs),
+            NullStreamForm::Runs(NullRuns::Pairs(pairs)) => NullStreamForm::Runs(NullRuns::Pairs(pairs)),
+            NullStreamForm::Runs(runs) => NullStreamForm::Runs(NullRuns::Pairs(runs.iter().collect())),
         };
         NullStream {
             form,
@@ -2000,7 +2078,7 @@ impl<'a> NullStream<'a> {
             NullStreamForm::AllAbsent => 0,
             NullStreamForm::AllPresent => self.row_count,
             NullStreamForm::Raw(bits) => count_set_bits(bits, self.row_count),
-            NullStreamForm::Runs(runs) => runs.iter().map(|&(start, end)| (end - start) as usize).sum(),
+            NullStreamForm::Runs(runs) => runs.iter().map(|(start, end)| (end - start) as usize).sum(),
         }
     }
 
@@ -2014,10 +2092,10 @@ impl<'a> NullStream<'a> {
             NullStreamForm::AllPresent => true,
             NullStreamForm::Raw(bits) => bits.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0),
             NullStreamForm::Runs(runs) => {
-                let idx = runs.partition_point(|&(start, _)| start as usize <= row);
+                let idx = runs.partition_point(|(start, _)| start as usize <= row);
                 idx.checked_sub(1)
                     .and_then(|i| runs.get(i))
-                    .is_some_and(|&(_, end)| row < end as usize)
+                    .is_some_and(|(_, end)| row < end as usize)
             }
         }
     }
@@ -2032,8 +2110,8 @@ impl<'a> NullStream<'a> {
             NullStreamForm::Raw(bits) => count_present_before(bits, row),
             NullStreamForm::Runs(runs) => runs
                 .iter()
-                .take_while(|&&(start, _)| (start as usize) < row)
-                .map(|&(start, end)| (end as usize).min(row) - start as usize)
+                .take_while(|&(start, _)| (start as usize) < row)
+                .map(|(start, end)| (end as usize).min(row) - start as usize)
                 .sum(),
         }
     }
@@ -2064,7 +2142,7 @@ impl<'a> NullStream<'a> {
             }
             NullStreamForm::Runs(runs) => {
                 let mut cursor = 0usize;
-                for &(start, end) in runs {
+                for (start, end) in runs.iter() {
                     for _ in cursor..start as usize {
                         row(false)?;
                     }
@@ -2112,8 +2190,8 @@ impl<'a> NullStream<'a> {
             }
             NullStreamForm::Runs(runs) => {
                 let mut cursor = start;
-                let first = runs.partition_point(|&(_, run_end)| (run_end as usize) <= start);
-                for &(run_start, run_end) in &runs[first..] {
+                let first = runs.partition_point(|(_, run_end)| (run_end as usize) <= start);
+                for (run_start, run_end) in runs.iter_from(first) {
                     let run_start = (run_start as usize).max(start);
                     let run_end = (run_end as usize).min(end);
                     if run_start >= end {
@@ -3417,7 +3495,7 @@ fn views_by_row(nulls: &NullStream, mut values: impl ExactSizeIterator<Item = u1
         }
         NullStreamForm::Runs(runs) => {
             let mut views = vec![0u128; rows];
-            for &(start, end) in runs {
+            for (start, end) in runs.iter() {
                 // `NullStream::read` and `from_values` keep every run inside the row count.
                 for slot in views.get_mut(start as usize..end as usize).into_iter().flatten() {
                     *slot = values.next().unwrap_or(0);
@@ -3443,7 +3521,7 @@ fn null_buffer(nulls: &NullStream) -> Option<NullBuffer> {
         ))),
         NullStreamForm::Runs(runs) => {
             let mut builder = BooleanBufferBuilder::new(nulls.row_count());
-            for &(start, end) in runs {
+            for (start, end) in runs.iter() {
                 let (start, end) = (start as usize, end as usize);
                 if builder.len() < start {
                     builder.append_n(start - builder.len(), false);
