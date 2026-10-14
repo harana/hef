@@ -102,6 +102,20 @@ fn clear_empties_the_buffer_without_dropping_its_capacity() {
 }
 
 #[test]
+fn truncate_rolls_back_to_a_checkpoint_and_keeps_the_prefix() {
+    let mut writer = Writer::new();
+    writer.put_slice(b"keep");
+    let checkpoint = writer.len();
+    writer.put_u64(u64::MAX);
+    writer.truncate(checkpoint);
+    assert_eq!(writer.bytes(), b"keep");
+    writer.truncate(100);
+    assert_eq!(writer.bytes(), b"keep");
+    writer.put_u8(b'!');
+    assert_eq!(writer.into_bytes(), b"keep!");
+}
+
+#[test]
 fn patch_u32_overwrites_only_its_own_four_written_bytes() {
     let mut writer = Writer::new();
     writer.put_slice(b"ab");

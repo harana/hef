@@ -4048,3 +4048,225 @@ fn fsst_replayed_block_bytes_match_the_reference_layout() {
         assert!(trained.is_none(), "{name}: a replayed block trains no table");
     }
 }
+
+/// The dictionary string encoder as it stood before it stopped collecting one code per row, kept so the
+/// differential test below can hold the current encoder to the exact same bytes.
+fn reference_encode_dictionary_string(
+    values: &StringColumn,
+    present: &[&str],
+    strategy: CascadeStrategy,
+    shared: Option<&[String]>,
+    out: &mut Writer,
+) -> Result<SideStream, FormatError> {
+    NullStream::from_values(values).write(out);
+    let mut dictionary: Vec<&str> = AHashSet::from_iter(present.iter().copied()).into_iter().collect();
+    dictionary.sort_unstable();
+    let code_of: AHashMap<&str, u64> = dictionary
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (*value, index as u64))
+        .collect();
+    let codes: Vec<u64> = present
+        .iter()
+        .map(|value| code_of.get(value).copied().unwrap_or(0))
+        .collect();
+    if let Some(alphabet) = shared
+        && dictionary
+            .iter()
+            .all(|value| alphabet.binary_search_by(|entry| entry.as_str().cmp(value)).is_ok())
+    {
+        let shared_codes: Vec<u64> = codes
+            .iter()
+            .map(|&code| {
+                dictionary
+                    .get(code as usize)
+                    .and_then(|value| alphabet.binary_search_by(|entry| entry.as_str().cmp(value)).ok())
+                    .unwrap_or(0) as u64
+            })
+            .collect();
+        let max = shared_codes.iter().copied().max().unwrap_or(0);
+        let mut shared_out = Writer::new();
+        bitpack(&shared_codes, bits_needed(max), &mut shared_out);
+        let mut local_out = Writer::new();
+        let local_side = reference_encode_local_dictionary(&dictionary, &codes, strategy, &mut local_out)?;
+        if shared_out.len() < local_out.len() {
+            out.put_slice(shared_out.bytes());
+            return Ok(SideStream::FileScopeDictionary);
+        }
+        out.put_slice(local_out.bytes());
+        return Ok(local_side);
+    }
+    reference_encode_local_dictionary(&dictionary, &codes, strategy, out)
+}
+
+fn reference_encode_local_dictionary(
+    dictionary: &[&str],
+    codes: &[u64],
+    strategy: CascadeStrategy,
+    out: &mut Writer,
+) -> Result<SideStream, FormatError> {
+    out.put_u32(dictionary.len() as u32);
+    let fsst = (cascade_level_fits(1)
+        && dictionary.len() >= FSST_MIN_SAMPLE_COUNT
+        && dictionary
+            .iter()
+            .all(|value| value.len() <= DICTIONARY_FSST_MAX_VALUE_LEN))
+    .then(|| {
+        let corpus: Vec<&[u8]> = dictionary.iter().map(|value| value.as_bytes()).collect();
+        let compressor = fsst::Compressor::train(&corpus);
+        let mut scratch = Vec::new();
+        let mut arena = Vec::new();
+        let mut compressed_lens = Vec::new();
+        for value in &corpus {
+            compress_fsst_value(&compressor, value, &mut scratch);
+            compressed_lens.push(scratch.len());
+            arena.extend_from_slice(&scratch);
+        }
+        let plain = (dictionary.len() + 1) * 4 + corpus.iter().map(|value| value.len()).sum::<usize>();
+        let compressed = 2 + 9 * compressor.symbol_table().len() + (dictionary.len() + 1) * 4 + arena.len();
+        let threshold = match strategy {
+            CascadeStrategy::DecodeOptimized | CascadeStrategy::NoTrailing => {
+                plain * DECODE_OPTIMIZED_THRESHOLD_NUM / DECODE_OPTIMIZED_THRESHOLD_DEN
+            }
+            CascadeStrategy::SizeOptimized => plain - plain / SIZE_OPTIMIZED_SAVINGS_DIVISOR,
+        };
+        (compressed < threshold).then_some((compressor, compressed_lens, arena))
+    })
+    .flatten();
+    let side = match fsst {
+        Some((compressor, compressed_lens, arena)) => {
+            out.put_u16(compressor.symbol_table().len() as u16);
+            for (symbol, length) in compressor.symbol_table().iter().zip(compressor.symbol_lengths()) {
+                out.put_u64(symbol.to_u64());
+                out.put_u8(*length);
+            }
+            write_offsets(compressed_lens.into_iter(), out)?;
+            out.put_slice(&arena);
+            SideStream::FsstDictionaryValues
+        }
+        None => {
+            write_offsets(dictionary.iter().map(|value| value.len()), out)?;
+            for value in dictionary {
+                out.put_slice(value.as_bytes());
+            }
+            SideStream::None
+        }
+    };
+    let max = codes.iter().copied().max().unwrap_or(0);
+    bitpack(codes, bits_needed(max), out);
+    Ok(side)
+}
+
+/// The dictionary string encoder writes exactly the bytes and side stream of the reference encoder, behind a
+/// nonempty prefix, across plain and FSST value streams, every cascade strategy, shared alphabets that win, lose
+/// and do not cover the block, empty, all-null, singleton and zero-width blocks, and row counts on either side of
+/// a 1024-value vector.
+#[test]
+fn dictionary_string_encoding_matches_the_reference_encoder_byte_for_byte() {
+    let urls: Vec<String> = (0..200)
+        .map(|i| format!("https://events.example.com/api/v1/tenants/tenant-{i:04}/streams/manifest-{i:04}.json"))
+        .collect();
+    let unicode: Vec<String> = (0..40).map(|i| format!("caf\u{e9}-\u{65e5}\u{672c}-{i}")).collect();
+    let wide_alphabet: Vec<String> = (0..1024).map(|i| format!("v{i:04}")).collect();
+    let mut url_alphabet = urls.clone();
+    url_alphabet.sort();
+    let mut unicode_alphabet = unicode.clone();
+    unicode_alphabet.sort();
+    let pick = |pool: &[String], rows: usize, null_every: usize| -> Vec<Option<String>> {
+        (0..rows)
+            .map(|i| (null_every == 0 || i % null_every != 0).then(|| pool[i % pool.len()].clone()))
+            .collect()
+    };
+    let columns: Vec<Vec<Option<String>>> = vec![
+        Vec::new(),
+        vec![None; 50],
+        vec![Some("only".to_owned())],
+        vec![Some(String::new()); 1025],
+        pick(&["a".to_owned(), String::new(), "b".to_owned()], 1023, 5),
+        pick(&urls, 1024, 0),
+        pick(&urls, 2049, 13),
+        pick(&unicode, 1025, 3),
+        pick(&wide_alphabet[..2], 4096, 0),
+        pick(&wide_alphabet[..64], 2048, 7),
+        (0..3000)
+            .map(|i| Some(if i % 2 == 0 { "v0000" } else { "v1023" }.to_owned()))
+            .collect(),
+    ];
+    let alphabets: [Option<&[String]>; 4] = [None, Some(&wide_alphabet), Some(&url_alphabet), Some(&unicode_alphabet)];
+    let strategies = [
+        CascadeStrategy::DecodeOptimized,
+        CascadeStrategy::NoTrailing,
+        CascadeStrategy::SizeOptimized,
+    ];
+    let mut sides = Vec::new();
+    for (index, column) in columns.iter().enumerate() {
+        let values: StringColumn = column.clone().into();
+        let present = present_values(&values);
+        for shared in alphabets {
+            for strategy in strategies {
+                let mut expected = Writer::new();
+                expected.put_slice(b"prefix");
+                let expected_side =
+                    reference_encode_dictionary_string(&values, &present, strategy, shared, &mut expected).unwrap();
+                let mut actual = Writer::new();
+                actual.put_slice(b"prefix");
+                let actual_side = encode_dictionary_string(&values, &present, strategy, shared, &mut actual).unwrap();
+                let case = format!(
+                    "column {index}, shared {}, {strategy:?}",
+                    shared.map_or(0, <[String]>::len)
+                );
+                assert_eq!(actual_side, expected_side, "{case}");
+                assert_eq!(actual.bytes(), expected.bytes(), "{case}");
+                sides.push(actual_side);
+            }
+        }
+    }
+    for side in [
+        SideStream::FileScopeDictionary,
+        SideStream::FsstDictionaryValues,
+        SideStream::None,
+    ] {
+        assert!(sides.contains(&side), "the cases must exercise {side:?}");
+    }
+}
+
+/// FSST dictionary values written in place keep the reference bytes on both sides of the acceptance threshold: a
+/// sweep of shared-prefix lengths flips the trial between kept and rolled back under every strategy, and every
+/// trial lands in one writer after the ones before it, so a rollback must leave earlier bytes untouched and a kept
+/// stream must patch its offsets where they belong.
+#[test]
+fn fsst_dictionary_values_written_in_place_match_the_reference_across_the_threshold() {
+    let strategies = [
+        CascadeStrategy::DecodeOptimized,
+        CascadeStrategy::NoTrailing,
+        CascadeStrategy::SizeOptimized,
+    ];
+    let mut expected = Writer::new();
+    expected.put_slice(b"prefix");
+    let mut actual = Writer::new();
+    actual.put_slice(b"prefix");
+    let mut sides = Vec::new();
+    for prefix_len in 0..48 {
+        let prefix = "\u{e9}x".repeat(prefix_len / 2) + &"p".repeat(prefix_len % 2);
+        let owned: Vec<String> = (0..FSST_MIN_SAMPLE_COUNT + prefix_len)
+            .map(|i| format!("{prefix}{i:03}"))
+            .collect();
+        let mut dictionary: Vec<&str> = owned.iter().map(String::as_str).collect();
+        dictionary.sort_unstable();
+        let codes: Vec<u64> = (0..2000).map(|row| (row % dictionary.len()) as u64).collect();
+        for strategy in strategies {
+            let expected_side =
+                reference_encode_local_dictionary(&dictionary, &codes, strategy, &mut expected).unwrap();
+            let actual_side =
+                encode_local_dictionary(&dictionary, codes.len(), |row| codes[row], strategy, &mut actual).unwrap();
+            assert_eq!(actual_side, expected_side, "prefix {prefix_len}, {strategy:?}");
+            assert_eq!(actual.bytes(), expected.bytes(), "prefix {prefix_len}, {strategy:?}");
+            sides.push(actual_side);
+        }
+    }
+    assert!(
+        sides.contains(&SideStream::FsstDictionaryValues),
+        "the sweep must keep FSST"
+    );
+    assert!(sides.contains(&SideStream::None), "the sweep must roll FSST back");
+}
