@@ -150,6 +150,12 @@ impl Writer {
         self.bytes.clear();
     }
 
+    /// Drops everything written after the first `len` bytes, keeping the allocation, so a caller that wrote a trial in
+    /// place can abandon it and write something else from the same point. Does nothing when fewer bytes are written.
+    pub fn truncate(&mut self, len: usize) {
+        self.bytes.truncate(len);
+    }
+
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }

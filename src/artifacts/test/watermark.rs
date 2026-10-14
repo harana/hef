@@ -130,3 +130,114 @@ fn seal_epoch_does_not_publish_a_durable_event_frame_not_yet_republished() {
         "visibility must stall before a durable-but-unpublished range"
     );
 }
+
+/// The merge `RangeSet::insert` used before it merged in place: rebuilds the whole list into a fresh vector. Kept here
+/// as the reference the in-place merge must match range for range.
+fn reference_insert(ranges: &mut Vec<(u64, u64)>, first: u64, last: u64) {
+    if last < first {
+        return;
+    }
+    let mut merged = Vec::with_capacity(ranges.len() + 1);
+    let mut new_first = first;
+    let mut new_last = last;
+    let mut placed = false;
+    for (start, end) in ranges.iter() {
+        if end.saturating_add(1) < new_first && !placed {
+            merged.push((*start, *end));
+        } else if new_last.saturating_add(1) < *start {
+            if !placed {
+                merged.push((new_first, new_last));
+                placed = true;
+            }
+            merged.push((*start, *end));
+        } else {
+            new_first = new_first.min(*start);
+            new_last = new_last.max(*end);
+        }
+    }
+    if !placed {
+        merged.push((new_first, new_last));
+    }
+    *ranges = merged;
+}
+
+fn assert_inserts_match_reference(inserts: &[(u64, u64)]) {
+    let mut set = RangeSet::default();
+    let mut reference = Vec::new();
+    for &(first, last) in inserts {
+        set.insert(first, last);
+        reference_insert(&mut reference, first, last);
+        assert_eq!(
+            set.ranges, reference,
+            "after inserting {first}..={last} from {inserts:?}"
+        );
+    }
+    let expected_max = reference.last().map(|(_, end)| *end);
+    assert_eq!(set.max_covered(), expected_max);
+    let expected_prefix = reference
+        .first()
+        .filter(|(start, _)| *start <= FIRST_SEQUENCE)
+        .map(|(_, end)| *end);
+    assert_eq!(set.contiguous_prefix_end(FIRST_SEQUENCE), expected_prefix);
+    for &(start, end) in &reference {
+        assert!(set.covers(start, end));
+    }
+    let to = expected_max.unwrap_or(0);
+    assert_eq!(set.gaps(0, to), RangeSet { ranges: reference }.gaps(0, to));
+}
+
+#[test]
+fn range_set_in_place_merge_matches_the_rebuilding_merge() {
+    let edge_cases: &[&[(u64, u64)]] = &[
+        &[],
+        &[(5, 5)],
+        &[(5, 3)],
+        &[(10, 20), (5, 3)],
+        &[(10, 20), (10, 20)],
+        &[(1, 5), (10, 20), (2, 3)],
+        &[(1, 5), (10, 20), (12, 15)],
+        &[(1, 2), (10, 20), (5, 6)],
+        &[(1, 2), (10, 20), (30, 40), (3, 9)],
+        &[(1, 2), (10, 20), (30, 40), (3, 29)],
+        &[(1, 2), (10, 20), (30, 40), (0, 100)],
+        &[(1, 2), (10, 20), (30, 40), (15, 35)],
+        &[(1, 2), (10, 20), (30, 40), (21, 29)],
+        &[(1, 2), (10, 20), (30, 40), (22, 28)],
+        &[(0, 0), (u64::MAX, u64::MAX), (1, 1)],
+        &[(u64::MAX - 5, u64::MAX), (0, 3), (4, u64::MAX - 6)],
+        &[(u64::MAX, u64::MAX), (0, u64::MAX)],
+        &[(10, u64::MAX), (0, 8), (9, 9)],
+    ];
+    for inserts in edge_cases {
+        assert_inserts_match_reference(inserts);
+    }
+
+    let ascending: Vec<(u64, u64)> = (0..64).map(|i| (i * 3, i * 3 + 1)).collect();
+    assert_inserts_match_reference(&ascending);
+    let descending: Vec<(u64, u64)> = ascending.iter().rev().copied().collect();
+    assert_inserts_match_reference(&descending);
+
+    // Deterministic xorshift so the shuffled and random sequences are reproducible.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut shuffled = ascending.clone();
+    for i in (1..shuffled.len()).rev() {
+        shuffled.swap(i, (next() % (i as u64 + 1)) as usize);
+    }
+    assert_inserts_match_reference(&shuffled);
+    for _ in 0..200 {
+        let inserts: Vec<(u64, u64)> = (0..40)
+            .map(|_| {
+                let first = next() % 200;
+                let last = first.wrapping_add(next() % 12).wrapping_sub(2);
+                (first, last)
+            })
+            .collect();
+        assert_inserts_match_reference(&inserts);
+    }
+}

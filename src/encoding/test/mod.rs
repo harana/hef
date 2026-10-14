@@ -876,6 +876,69 @@ fn fastlanes_layout_packs_whole_1024_value_vectors() {
     }
 }
 
+/// The packer as it was before it wrote straight into the writer: a full zeroed `Vec<u64>` for the whole stream,
+/// filled vector by vector and then copied in. Kept only as the byte-for-byte reference for the packers.
+fn reference_bitpack(values: &[u64], width: u32, out: &mut Writer) {
+    out.put_u32(values.len() as u32);
+    out.put_u8(width as u8);
+    if width == 0 {
+        return;
+    }
+    let words_per_vector = 16 * width as usize;
+    let mut packed = vec![0u64; values.len().div_ceil(1024) * words_per_vector];
+    for (packed_vector, in_vector) in packed.chunks_exact_mut(words_per_vector).zip(values.chunks(1024)) {
+        let mut padded = [0u64; 1024];
+        padded[..in_vector.len()].copy_from_slice(in_vector);
+        bitpack_vector(&padded, packed_vector, width, mask(width));
+    }
+    out.put_u64_slice(&packed);
+}
+
+/// Packing straight into the writer must produce exactly the bytes the old staged packer did, for the slice and the
+/// callback packer alike, at every width, across vector boundaries, at every starting offset modulo 8 and with several
+/// streams appended to one writer. The callback must run once per logical row, and never for a zero-width stream.
+#[test]
+fn bitpack_writes_the_same_bytes_as_the_staged_reference() {
+    let mut state: u64 = 0x5851_F42D_4C95_7F2D;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state
+    };
+    let counts = [0usize, 1, 1023, 1024, 1025, 3 * 1024 + 7];
+    for width in 0u32..=64 {
+        let limit = mask(width);
+        for &count in &counts {
+            let random: Vec<u64> = (0..count).map(|_| next() & limit).collect();
+            for values in [random, vec![0; count], vec![limit; count]] {
+                for prefix in 0..8 {
+                    let mut expected = Writer::new();
+                    let mut sliced = Writer::new();
+                    let mut called = Writer::new();
+                    for writer in [&mut expected, &mut sliced, &mut called] {
+                        writer.put_slice(&vec![0xAB; prefix]);
+                    }
+                    let calls = std::cell::Cell::new(0usize);
+                    for _ in 0..2 {
+                        reference_bitpack(&values, width, &mut expected);
+                        bitpack(&values, width, &mut sliced);
+                        bitpack_with(values.len(), width, &mut called, |i| {
+                            calls.set(calls.get() + 1);
+                            values[i]
+                        });
+                    }
+                    let context = format!("width {width}, count {count}, prefix {prefix}");
+                    assert_eq!(sliced.bytes(), expected.bytes(), "slice packer: {context}");
+                    assert_eq!(called.bytes(), expected.bytes(), "callback packer: {context}");
+                    let expected_calls = if width == 0 { 0 } else { 2 * count };
+                    assert_eq!(calls.get(), expected_calls, "callback count: {context}");
+                }
+            }
+        }
+    }
+}
+
 /// String values whose null pattern drives the encoder to a specific side-stream form.
 fn string_values_with_nulls(row_count: usize, present: impl Fn(usize) -> bool) -> StringColumn {
     (0..row_count)
@@ -955,7 +1018,7 @@ fn null_stream_picks_the_smallest_form() {
 
 /// The null-stream derivation as it stood before the counting first pass: build every present-row run, then pick the
 /// form from them. Kept here as the reference the current derivation must match byte for byte.
-fn reference_null_stream(values: &StringColumn) -> NullStream {
+fn reference_null_stream(values: &StringColumn) -> NullStream<'static> {
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for (index, value) in values.iter().enumerate() {
         if value.is_some() {
@@ -980,7 +1043,7 @@ fn reference_null_stream(values: &StringColumn) -> NullStream {
                 raw[row / 8] |= 1 << (row % 8);
             }
         }
-        NullStreamForm::Raw(raw)
+        NullStreamForm::Raw(Cow::Owned(raw))
     };
     NullStream { form, row_count }
 }
@@ -1149,7 +1212,7 @@ fn string_transforms_round_trip_under_every_null_stream_form() {
 fn null_stream_refuses_malformed_input() {
     let read = |bytes: &[u8]| {
         let mut reader = Reader::new(bytes);
-        NullStream::read(&mut reader)
+        NullStream::read(&mut reader).map(NullStream::into_owned)
     };
     let stream = |row_count: u32, form: u8, rest: &[u8]| {
         let mut out = Writer::new();
@@ -1171,6 +1234,53 @@ fn null_stream_refuses_malformed_input() {
     let unsorted = [2u32.to_le_bytes().as_slice(), &run(4, 6), &run(0, 2)].concat();
     assert!(read(&stream(8, 2, &unsorted)).is_err(), "unsorted runs");
     assert!(read(&stream(64, 3, &[0xFF; 4])).is_err(), "truncated raw bitmap");
+}
+
+/// A raw-form null stream read from a block borrows its bitmap straight out of the input instead of copying it, the
+/// encoder's derived stream owns its bitmap, and both write the same bytes. Decodes of a raw-form block still return
+/// output that outlives the block bytes.
+#[test]
+fn raw_null_stream_borrows_the_input_bitmap_and_decodes_into_owned_output() {
+    let derived = NullStream::from_values(&string_values_with_nulls(300, |i| i % 2 == 0));
+    assert!(matches!(derived.form, NullStreamForm::Raw(Cow::Owned(_))));
+    let mut out = Writer::new();
+    derived.write(&mut out);
+    let bytes = out.into_bytes();
+    let read = NullStream::read(&mut Reader::new(&bytes)).unwrap();
+    match &read.form {
+        NullStreamForm::Raw(Cow::Borrowed(bits)) => {
+            assert_eq!(bits.as_ptr(), bytes[5..].as_ptr());
+            assert_eq!(bits.len(), 300usize.div_ceil(8));
+        }
+        other => panic!("expected a borrowed raw bitmap, got {other:?}"),
+    }
+    assert_eq!(read, derived);
+    let mut rewritten = Writer::new();
+    read.write(&mut rewritten);
+    assert_eq!(rewritten.into_bytes(), bytes);
+
+    let values: Vec<Option<String>> = (0..300).map(|i| (i % 2 == 0).then(|| format!("v{i}-\u{e9}"))).collect();
+    let data = ColumnData::Strings(values.clone().into());
+    for transform in [Transform::DictionaryString, Transform::FsstString, Transform::RawString] {
+        let block =
+            encode_block_forced_for_conformance(&data, false, CascadeStrategy::DecodeOptimized, transform).unwrap();
+        let mut bytes = block.bytes.clone();
+        let full = decode_block(block.pipeline, &bytes).unwrap();
+        let range = decode_block_range(block.pipeline, &bytes, 3, 10).unwrap();
+        let views = decode_string_block_views(block.pipeline, &bytes).unwrap().unwrap();
+        bytes.fill(0);
+        drop(bytes);
+        assert_eq!(full, data, "{transform:?}: full decode");
+        assert_eq!(
+            range,
+            ColumnData::Strings(values[3..10].to_vec().into()),
+            "{transform:?}: range decode"
+        );
+        let viewed: Vec<Option<String>> = (0..views.len())
+            .map(|row| views.is_valid(row).then(|| views.value(row).to_string()))
+            .collect();
+        assert_eq!(viewed, values, "{transform:?}: views");
+    }
 }
 
 /// A hand-built FSST string block: one present row whose compressed bytes are `data`, under a symbol table with the
@@ -2224,6 +2334,243 @@ fn dictionary_range_decode_matches_whole_block_across_vector_boundaries() {
     }
 }
 
+/// A hand-built dictionary block whose codes are zero bits wide: the null stream of `values`, then `entries` as the
+/// value stream (plain, FSST with an empty symbol table and every byte escaped, or nothing at file scope), then a
+/// zero-width code stream of `codes` values.
+fn zero_width_dictionary_block(
+    values: &StringColumn,
+    entries: &[&str],
+    side: SideStream,
+    codes: usize,
+) -> (PipelineId, Vec<u8>) {
+    let mut out = Writer::new();
+    NullStream::from_values(values).write(&mut out);
+    match side {
+        SideStream::FileScopeDictionary => {}
+        SideStream::FsstDictionaryValues => {
+            out.put_u32(entries.len() as u32);
+            out.put_u16(0);
+            write_offsets(entries.iter().map(|entry| entry.len() * 2), &mut out).unwrap();
+            for byte in entries.iter().flat_map(|entry| entry.bytes()) {
+                out.put_u8(255);
+                out.put_u8(byte);
+            }
+        }
+        _ => {
+            out.put_u32(entries.len() as u32);
+            write_offsets(entries.iter().map(|entry| entry.len()), &mut out).unwrap();
+            for entry in entries {
+                out.put_slice(entry.as_bytes());
+            }
+        }
+    }
+    out.put_u32(codes as u32);
+    out.put_u8(0);
+    let pipeline =
+        PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String).with_side_stream(side);
+    (pipeline, out.into_bytes())
+}
+
+/// A zero-width dictionary block names entry 0 for every present row. Its range decode must match the whole-block
+/// decode for local, FSST-value and file-scope dictionaries under every null form, and must look entry 0 up only when
+/// the range selects a present row, so an empty dictionary fails exactly when a present row is requested.
+#[test]
+fn zero_width_dictionary_range_decode_matches_the_whole_block() {
+    let alphabet = vec!["only \u{e9}".to_owned(), "other".to_owned()];
+    let rows = 2000usize;
+    let patterns: [(&str, fn(usize) -> bool); 4] = [
+        ("all present", |_| true),
+        ("all absent", |_| false),
+        ("leading and trailing nulls", |i| (5..1500).contains(&i)),
+        ("scattered bitmap", |i| i % 3 != 1),
+    ];
+    let shared = Some(alphabet.as_slice());
+    for (name, present) in patterns {
+        let values: StringColumn = (0..rows).map(|i| present(i).then_some(alphabet[0].as_str())).collect();
+        let count = values.iter().flatten().count();
+        for side in [
+            SideStream::None,
+            SideStream::FsstDictionaryValues,
+            SideStream::FileScopeDictionary,
+        ] {
+            let (pipeline, bytes) = zero_width_dictionary_block(&values, &[alphabet[0].as_str()], side, count);
+            assert_eq!(
+                decode_block_shared(pipeline, &bytes, shared).unwrap(),
+                ColumnData::Strings(values.clone()),
+                "{name} {side:?}: full decode"
+            );
+            for (start, end) in [
+                (0, rows),
+                (0, 1),
+                (3, 9),
+                (1023, 1025),
+                (1990, rows + 50),
+                (rows, rows + 5),
+            ] {
+                let expected: StringColumn = values
+                    .iter()
+                    .skip(start)
+                    .take(end.min(rows).saturating_sub(start))
+                    .collect();
+                assert_eq!(
+                    decode_block_range_shared(pipeline, &bytes, shared, start, end).unwrap(),
+                    ColumnData::Strings(expected),
+                    "{name} {side:?}: range {start}..{end}"
+                );
+            }
+        }
+    }
+
+    let half: StringColumn = (0..10).map(|i| (i >= 5).then_some("x")).collect();
+    let (pipeline, bytes) = zero_width_dictionary_block(&half, &[], SideStream::None, 5);
+    assert_eq!(
+        decode_block_range(pipeline, &bytes, 0, 5).unwrap(),
+        ColumnData::Strings((0..5).map(|_| None::<&str>).collect()),
+        "no present row selected, so the empty dictionary is never consulted"
+    );
+    for result in [
+        decode_block_range(pipeline, &bytes, 3, 8),
+        decode_block(pipeline, &bytes),
+    ] {
+        assert!(
+            matches!(
+                result,
+                Err(FormatError::RefOutOfRange {
+                    what: "dictionary code"
+                })
+            ),
+            "{result:?}"
+        );
+    }
+}
+
+/// A hand-built dictionary block: the null stream of `values`, then `entries` as a plain local value stream (or no
+/// value stream at all when `entries` is `None`, the file scope), then `codes` bitpacked.
+fn forged_dictionary_block(values: &StringColumn, entries: Option<&[&str]>, codes: &[u64]) -> (PipelineId, Vec<u8>) {
+    let mut out = Writer::new();
+    NullStream::from_values(values).write(&mut out);
+    let side = match entries {
+        Some(entries) => {
+            out.put_u32(entries.len() as u32);
+            write_offsets(entries.iter().map(|entry| entry.len()), &mut out).unwrap();
+            for entry in entries {
+                out.put_slice(entry.as_bytes());
+            }
+            SideStream::None
+        }
+        None => SideStream::FileScopeDictionary,
+    };
+    bitpack(codes, bits_needed(codes.iter().copied().max().unwrap_or(0)), &mut out);
+    let pipeline =
+        PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String).with_side_stream(side);
+    (pipeline, out.into_bytes())
+}
+
+/// The whole-block dictionary decode checks every stored code, surplus ones included, before it walks the null
+/// stream, so a code past the dictionary wins over a count disagreement, for local and file-scope dictionaries alike.
+#[test]
+fn dictionary_whole_block_decode_checks_every_code_before_weaving_nulls() {
+    let alphabet = vec!["a".to_owned(), "\u{e9}t\u{e9}".to_owned()];
+    let entries = ["a", "\u{e9}t\u{e9}"];
+    let values: StringColumn = (0..4).map(|i| (i != 1).then_some("x")).collect();
+    let disagree = FormatError::Structural {
+        rule: "null bitmap disagrees with present count",
+    };
+    let out_of_range = FormatError::RefOutOfRange {
+        what: "dictionary code",
+    };
+    for local in [Some(entries.as_slice()), None] {
+        let decode = |codes: &[u64]| {
+            let (pipeline, bytes) = forged_dictionary_block(&values, local, codes);
+            decode_block_shared(pipeline, &bytes, Some(&alphabet))
+        };
+        assert_eq!(
+            decode(&[1, 0, 1]).unwrap(),
+            ColumnData::Strings(vec![Some("\u{e9}t\u{e9}"), None, Some("a"), Some("\u{e9}t\u{e9}")].into())
+        );
+        assert_eq!(decode(&[0, 1]).unwrap_err(), disagree, "too few codes");
+        assert_eq!(decode(&[0, 1, 0, 1]).unwrap_err(), disagree, "too many codes");
+        assert_eq!(decode(&[0, 1, 0, 2]).unwrap_err(), out_of_range, "invalid surplus code");
+        assert_eq!(decode(&[2, 1]).unwrap_err(), out_of_range, "invalid code with too few");
+    }
+
+    let absent: StringColumn = (0..3).map(|_| None::<&str>).collect();
+    let (pipeline, bytes) = forged_dictionary_block(&absent, Some(&[]), &[]);
+    assert_eq!(decode_block(pipeline, &bytes).unwrap(), ColumnData::Strings(absent));
+    let (pipeline, bytes) = forged_dictionary_block(&values, Some(&[]), &[0, 0, 0]);
+    assert_eq!(
+        decode_block(pipeline, &bytes).unwrap_err(),
+        out_of_range,
+        "empty dictionary"
+    );
+}
+
+/// The whole-block dictionary decode checks every local entry, unused ones included, before it reads the codes, so a
+/// malformed entry wins over a bad code or a count disagreement, for plain and FSST value streams alike.
+#[test]
+fn dictionary_whole_block_decode_checks_every_entry_before_the_codes() {
+    let values: StringColumn = (0..3).map(|_| Some("x")).collect();
+    let plain = |offsets: &[u32], data: &[u8], codes: &[u64]| {
+        let mut out = Writer::new();
+        NullStream::from_values(&values).write(&mut out);
+        out.put_u32(offsets.len() as u32 - 1);
+        for &offset in offsets {
+            out.put_u32(offset);
+        }
+        out.put_slice(data);
+        bitpack(codes, bits_needed(codes.iter().copied().max().unwrap_or(0)), &mut out);
+        let pipeline = PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String);
+        decode_block(pipeline, &out.into_bytes())
+    };
+    let utf8 = FormatError::InvalidUtf8 {
+        what: "dictionary entry",
+    };
+    assert_eq!(
+        plain(&[0, 1, 3], "a\u{e9}".as_bytes(), &[1, 0, 1]).unwrap(),
+        ColumnData::Strings(vec![Some("\u{e9}"), Some("a"), Some("\u{e9}")].into())
+    );
+    assert_eq!(
+        plain(&[1, 2, 4], "za\u{e9}".as_bytes(), &[0, 0, 1]).unwrap(),
+        ColumnData::Strings(vec![Some("a"), Some("a"), Some("\u{e9}")].into()),
+        "a leading offset other than zero"
+    );
+    assert_eq!(
+        plain(&[0, 1, 2], b"a\xFF", &[0, 0, 0]).unwrap_err(),
+        utf8,
+        "unused invalid entry"
+    );
+    assert_eq!(
+        plain(&[0, 1, 2], b"a\xFF", &[0, 9]).unwrap_err(),
+        utf8,
+        "beats a bad code and count"
+    );
+    assert_eq!(
+        plain(&[0, 1, 3], "\u{e9}b".as_bytes(), &[0, 0, 0]).unwrap_err(),
+        utf8,
+        "split character"
+    );
+    assert_eq!(
+        plain(&[0, 2, 1, 3], b"abc", &[0, 0, 0]).unwrap_err(),
+        FormatError::Structural {
+            rule: "dictionary offsets must be non-decreasing",
+        }
+    );
+    assert!(matches!(
+        plain(&[0, 1, 9], b"ab", &[0, 0, 0]),
+        Err(FormatError::Truncated { .. })
+    ));
+
+    let long = "y".repeat(DICTIONARY_FSST_MAX_VALUE_LEN + 1);
+    let (pipeline, bytes) = zero_width_dictionary_block(&values, &[long.as_str()], SideStream::FsstDictionaryValues, 1);
+    assert_eq!(
+        decode_block(pipeline, &bytes).unwrap_err(),
+        FormatError::Structural {
+            rule: "dictionary entry exceeds the FSST value cap",
+        },
+        "the cap beats a count disagreement"
+    );
+}
+
 /// Long free-text bodies, the shape `choose_string_transform` sends to the raw arena: high cardinality, average
 /// length past `FSST_MAX_AVERAGE_VALUE_LEN`, one row in nine absent.
 fn long_free_text(rows: usize) -> Vec<Option<String>> {
@@ -2261,6 +2608,69 @@ fn a_raw_string_block_holding_invalid_utf8_is_rejected() {
     assert!(decode_block(pipeline, &forged).is_err());
     assert!(decode_string_block_views(pipeline, &forged).is_err());
     assert!(decode_block_range(pipeline, &forged, 0, 1).is_err());
+}
+
+/// A hand-built raw string block: the null stream of `values`, then `offsets.len() - 1` stored values whose offset
+/// table is `offsets` over the byte arena `data`.
+fn forged_raw_string_block(values: &StringColumn, offsets: &[u32], data: &[u8]) -> Vec<u8> {
+    let mut out = Writer::new();
+    NullStream::from_values(values).write(&mut out);
+    out.put_u32(offsets.len().saturating_sub(1) as u32);
+    for &offset in offsets {
+        out.put_u32(offset);
+    }
+    out.put_slice(data);
+    out.into_bytes()
+}
+
+/// The whole-block raw string decode checks every stored value, surplus ones included, before it walks the null
+/// stream, so a malformed value wins over a count disagreement; a count disagreement alone is refused either way.
+#[test]
+fn raw_string_whole_block_decode_validates_every_value_before_weaving_nulls() {
+    let pipeline = PipelineId::new(Transform::RawString, Compression::None, ValueKind::String);
+    let values: StringColumn = (0..4).map(|i| (i != 1).then_some("x")).collect();
+    let decode =
+        |offsets: &[u32], data: &[u8]| decode_block(pipeline, &forged_raw_string_block(&values, offsets, data));
+    let disagree = FormatError::Structural {
+        rule: "null bitmap disagrees with present count",
+    };
+    let utf8 = FormatError::InvalidUtf8 { what: "raw string" };
+
+    assert_eq!(
+        decode(&[0, 1, 1, 3], "a\u{e9}".as_bytes()).unwrap(),
+        ColumnData::Strings(vec![Some("a"), None, Some(""), Some("\u{e9}")].into())
+    );
+    assert_eq!(decode(&[0, 1, 2], b"ab").unwrap_err(), disagree, "too few values");
+    assert_eq!(
+        decode(&[0, 1, 2, 3, 4], b"abcd").unwrap_err(),
+        disagree,
+        "too many values"
+    );
+    assert_eq!(
+        decode(&[0, 1, 2, 3, 4], b"abc\xFF").unwrap_err(),
+        utf8,
+        "invalid surplus value"
+    );
+    assert_eq!(
+        decode(&[0, 1, 2], b"\xFFb").unwrap_err(),
+        utf8,
+        "invalid value with too few"
+    );
+    assert_eq!(
+        decode(&[0, 2, 1, 3], b"abc").unwrap_err(),
+        FormatError::Structural {
+            rule: "raw string offsets must be non-decreasing",
+        }
+    );
+    assert!(matches!(
+        decode(&[0, 1, 2, 9], b"abc"),
+        Err(FormatError::Truncated { .. })
+    ));
+    assert_eq!(
+        decode(&[2, 3, 4, 5], b"zzabc").unwrap(),
+        ColumnData::Strings(vec![Some("a"), None, Some("b"), Some("c")].into()),
+        "a leading offset other than zero"
+    );
 }
 
 /// A raw-string block stores a byte arena behind an offset table, so one row's bytes are reachable without decoding
@@ -3131,6 +3541,93 @@ fn shared_scope_dictionary_blocks_store_codes_only_and_translate_once() {
     assert!(forged.side_stream().is_err(), "the external scope is reserved");
 }
 
+/// Preparing a file-scope alphabet builds its arena and views straight from the alphabet, byte for byte the same as
+/// concatenating it and taking views over the boundaries: empty, single and many entries, duplicates, empty text,
+/// Unicode, and lengths either side of Arrow's twelve-byte inline limit.
+#[test]
+fn prepared_shared_dictionary_matches_concatenated_views() {
+    let mut many: Vec<String> = [0usize, 1, 11, 12, 13, 300]
+        .iter()
+        .map(|&len| "x".repeat(len))
+        .collect();
+    many.extend(
+        [
+            "",
+            "dup",
+            "dup",
+            "naive cafe \u{e9}\u{1f600}",
+            "\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30ad}",
+        ]
+        .map(str::to_owned),
+    );
+    many.extend((0..500).map(|i| format!("value number {i}")));
+    for alphabet in [Vec::new(), vec!["only one long entry here".to_owned()], many] {
+        let entries: Vec<&str> = alphabet.iter().map(String::as_str).collect();
+        let (arena, bounds) = concatenate(&entries);
+        let expected = views_over(&arena, &bounds).unwrap();
+        let prepared = prepare_shared_string_view_dictionary(&alphabet).unwrap();
+        assert_eq!(
+            prepared.arena.as_slice(),
+            arena.as_slice(),
+            "{} entries",
+            alphabet.len()
+        );
+        assert_eq!(prepared.entry_views, expected, "{} entries", alphabet.len());
+    }
+}
+
+/// The prepared dictionary owns its text: it keeps decoding repeated shared-scope blocks after the alphabet it was
+/// built from is dropped.
+#[test]
+fn prepared_shared_dictionary_outlives_its_alphabet() {
+    let alphabet: Vec<String> = ["a value long enough to sit in the arena", "blue", "red", "yellow"]
+        .map(str::to_owned)
+        .to_vec();
+    let values: Vec<Option<String>> = (0..600)
+        .map(|i| (i % 7 != 0).then(|| alphabet[i % 4].clone()))
+        .collect();
+    let block = encode_block_with_shared_dictionary(
+        &ColumnData::Strings(values.clone().into()),
+        false,
+        CascadeStrategy::DecodeOptimized,
+        Some(&alphabet),
+    );
+    assert_eq!(block.pipeline.side_stream().unwrap(), SideStream::FileScopeDictionary);
+    let prepared = prepare_shared_string_view_dictionary(&alphabet).unwrap();
+    drop(alphabet);
+    for _ in 0..2 {
+        let bytes = block.bytes.clone();
+        let views = decode_string_block_views_shared_prepared(block.pipeline, &bytes, None, Some(&prepared))
+            .unwrap()
+            .expect("dictionary blocks decode to views");
+        drop(bytes);
+        for (row, expected) in values.iter().enumerate() {
+            assert_eq!(
+                views.is_valid(row).then(|| views.value(row)),
+                expected.as_deref(),
+                "row {row}"
+            );
+        }
+    }
+}
+
+/// The arena length check accepts exactly what a `u32` view offset can address and refuses one byte more, or a sum
+/// that overflows, with the same structural error the boundary walk reports.
+#[test]
+fn view_arena_len_is_checked_at_the_u32_limit() {
+    let max = u32::MAX as usize;
+    assert_eq!(view_arena_len([]).unwrap(), 0);
+    assert_eq!(view_arena_len([max - 12, 12]).unwrap(), max);
+    for lens in [vec![max - 12, 13], vec![max, 1], vec![usize::MAX, 1]] {
+        assert!(matches!(
+            view_arena_len(lens),
+            Err(FormatError::Structural {
+                rule: "string arena larger than a view offset can address"
+            })
+        ));
+    }
+}
+
 /// The scope decision is a per-block size trial, not a coverage rule: a block whose two distinct values sit at the
 /// far ends of a 1024-entry alphabet would pay ten-bit codes at file scope, so its one-bit local dictionary wins —
 /// while a block spanning the whole alphabet drops the value stream and takes the file scope.
@@ -3495,6 +3992,294 @@ fn alp_rd_choose_split_matches_the_map_based_reference() {
         }
     }
     assert_eq!(alp_rd_choose_split(&[]), (ALP_RD_MIN_RIGHT_WIDTH, Vec::new(), 6));
+}
+
+/// The ALP-RD decoder as it stood before it reused the codes buffer for its output: the reference the in-place decode
+/// must match bit for bit, error for error.
+fn decode_alp_rd_reference(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
+    let right_width = u32::from(reader.u8("alp-rd right width")?);
+    if !(ALP_RD_MIN_RIGHT_WIDTH..=ALP_RD_MAX_RIGHT_WIDTH).contains(&right_width) {
+        return Err(FormatError::Structural {
+            rule: "alp-rd right width out of range",
+        });
+    }
+    let dict_len = reader.u8("alp-rd dictionary length")? as usize;
+    if dict_len > ALP_RD_MAX_DICT_LEN {
+        return Err(FormatError::Structural {
+            rule: "alp-rd dictionary too long",
+        });
+    }
+    let left_limit = 1u64 << (64 - right_width);
+    let mut dict = Vec::with_capacity(dict_len);
+    for _ in 0..dict_len {
+        let left = reader.u16("alp-rd dictionary entry")?;
+        if u64::from(left) >= left_limit {
+            return Err(FormatError::Structural {
+                rule: "alp-rd left part exceeds its width",
+            });
+        }
+        dict.push(left);
+    }
+    let exception_count = reader.u32("alp-rd exception count")? as usize;
+    if exception_count > MAX_BLOCK_VALUES {
+        return Err(FormatError::Structural {
+            rule: "alp-rd exception count beyond the block bound",
+        });
+    }
+    let mut exceptions = Vec::new();
+    for _ in 0..exception_count {
+        let index = reader.u32("alp-rd exception index")?;
+        let left = reader.u16("alp-rd exception left part")?;
+        if u64::from(left) >= left_limit {
+            return Err(FormatError::Structural {
+                rule: "alp-rd left part exceeds its width",
+            });
+        }
+        exceptions.push((index, left));
+    }
+    let codes = bitunpack(reader)?;
+    let rights = bitunpack(reader)?;
+    if codes.len() != rights.len() {
+        return Err(FormatError::Structural {
+            rule: "alp-rd code and right-part streams disagree",
+        });
+    }
+    let mut values = Vec::with_capacity(codes.len());
+    for (code, right) in codes.iter().zip(rights.iter()) {
+        if *right >> right_width != 0 {
+            return Err(FormatError::Structural {
+                rule: "alp-rd right part exceeds its width",
+            });
+        }
+        let left = dict
+            .get(*code as usize)
+            .copied()
+            .ok_or(FormatError::RefOutOfRange { what: "alp-rd code" })?;
+        values.push(f64::from_bits((u64::from(left) << right_width) | *right));
+    }
+    for (index, left) in exceptions {
+        let right = rights.get(index as usize).ok_or(FormatError::RefOutOfRange {
+            what: "alp-rd exception index",
+        })?;
+        let slot = values.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
+            what: "alp-rd exception index",
+        })?;
+        *slot = f64::from_bits((u64::from(left) << right_width) | *right);
+    }
+    Ok(values)
+}
+
+/// Writes a hand-built ALP-RD body, so a test can forge streams the encoder would never produce.
+fn alp_rd_body(right_width: u8, dict: &[u16], exceptions: &[(u32, u16)], codes: &[u64], rights: &[u64]) -> Vec<u8> {
+    let mut out = Writer::new();
+    out.put_u8(right_width);
+    out.put_u8(dict.len() as u8);
+    for left in dict {
+        out.put_u16(*left);
+    }
+    out.put_u32(exceptions.len() as u32);
+    for (index, left) in exceptions {
+        out.put_u32(*index);
+        out.put_u16(*left);
+    }
+    bitpack(codes, bits_needed(codes.iter().copied().max().unwrap_or(0)), &mut out);
+    bitpack(rights, bits_needed(rights.iter().copied().max().unwrap_or(0)), &mut out);
+    out.into_bytes()
+}
+
+/// Decodes `body` with both the in-place decoder and the reference, asserting identical bits or identical errors and
+/// the same bytes consumed.
+fn assert_alp_rd_decode_matches_reference(body: &[u8]) {
+    let mut reader = Reader::new(body);
+    let mut reference_reader = Reader::new(body);
+    let decoded = decode_alp_rd(&mut reader);
+    let expected = decode_alp_rd_reference(&mut reference_reader);
+    match (decoded, expected) {
+        (Ok(decoded), Ok(expected)) => {
+            let decoded: Vec<u64> = decoded.iter().map(|value| value.to_bits()).collect();
+            let expected: Vec<u64> = expected.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(decoded, expected);
+            assert_eq!(reader.remaining(), reference_reader.remaining());
+        }
+        (decoded, expected) => assert_eq!(decoded.err(), expected.err()),
+    }
+}
+
+/// Reusing the decoded codes buffer as the output must leave every float's bits unchanged: arbitrary bit patterns,
+/// special values, every dictionary length, sparse and dense exceptions, and lengths around the 1024-value vector.
+#[test]
+fn alp_rd_in_place_decode_matches_the_reference_bit_for_bit() {
+    let specials = [
+        0.0f64.to_bits(),
+        (-0.0f64).to_bits(),
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+        0x7FF8_0000_0000_0001,
+        0xFFF4_0000_DEAD_BEEF,
+        1,
+        0x800F_FFFF_FFFF_FFFF,
+    ];
+    for len in [0usize, 1, 7, 1023, 1024, 1025, 2049] {
+        for spread in [1u64, 3, 9, 64] {
+            let values: Vec<f64> = (0..len as u64)
+                .map(|i| match i % 11 {
+                    0 => f64::from_bits(specials[(i / 11) as usize % specials.len()]),
+                    _ => f64::from_bits(0x4030_0000_0000_0000 ^ ((mix(i) % spread) << 52) ^ (mix(i + 7) >> 12)),
+                })
+                .collect();
+            let mut out = Writer::new();
+            encode_alp_rd(&values, &mut out);
+            let body = out.into_bytes();
+            assert_alp_rd_decode_matches_reference(&body);
+            let decoded = decode_alp_rd(&mut Reader::new(&body)).unwrap();
+            let decoded: Vec<u64> = decoded.iter().map(|value| value.to_bits()).collect();
+            let original: Vec<u64> = values.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(decoded, original, "len {len}, spread {spread}");
+        }
+    }
+    for right_width in [ALP_RD_MIN_RIGHT_WIDTH, 52, ALP_RD_MAX_RIGHT_WIDTH] {
+        let left_mask = mask(64 - right_width);
+        for dict_len in 0..=ALP_RD_MAX_DICT_LEN {
+            let dict: Vec<u16> = (0..dict_len as u64).map(|i| (mix(i) & left_mask) as u16).collect();
+            let len = 1500usize;
+            let codes: Vec<u64> = (0..len as u64).map(|i| mix(i) % dict_len.max(1) as u64).collect();
+            let rights: Vec<u64> = (0..len as u64).map(|i| mix(i + 99) & mask(right_width)).collect();
+            // Dense, sparse, and duplicate exception indices; the last entry for an index wins.
+            let exceptions: Vec<(u32, u16)> = (0..len as u32)
+                .step_by(if dict_len == 0 { 1 } else { 37 })
+                .chain([5, 5, 1499])
+                .map(|index| (index, (mix(u64::from(index) + 3) & left_mask) as u16))
+                .collect();
+            let body = alp_rd_body(right_width as u8, &dict, &exceptions, &codes, &rights);
+            assert_alp_rd_decode_matches_reference(&body);
+        }
+    }
+}
+
+/// Corrupt ALP-RD bodies must fail with the same error the reference decoder reports, in the same order of checks.
+#[test]
+fn alp_rd_in_place_decode_rejects_corrupt_bodies_like_the_reference() {
+    let right_width = 52u8;
+    let dict = [0x403u16, 0x404];
+    let codes = vec![0u64, 1, 0, 1];
+    let rights = vec![1u64, 2, 3, 4];
+    let wide_right = 1u64 << right_width;
+    let corrupt = [
+        // Mismatched code and right-part counts.
+        alp_rd_body(right_width, &dict, &[], &codes, &rights[..3]),
+        // A code past the dictionary, including on a row an exception later replaces.
+        alp_rd_body(right_width, &dict, &[], &[0, 2, 0, 1], &rights),
+        alp_rd_body(right_width, &dict, &[(1, 0x405)], &[0, 2, 0, 1], &rights),
+        // A right part past its width, ahead of a bad code on the same row.
+        alp_rd_body(right_width, &dict, &[], &[0, 9, 0, 1], &[1, wide_right, 3, 4]),
+        // Dictionary and exception left parts past their width.
+        alp_rd_body(right_width, &[0x1000], &[], &[0, 0, 0, 0], &rights),
+        alp_rd_body(right_width, &dict, &[(0, 0x1000)], &codes, &rights),
+        // An exception index past the end.
+        alp_rd_body(right_width, &dict, &[(4, 0x405)], &codes, &rights),
+        // A right width out of range and an over-long dictionary.
+        alp_rd_body(ALP_RD_MIN_RIGHT_WIDTH as u8 - 1, &dict, &[], &codes, &rights),
+        alp_rd_body(right_width, &[0x403; ALP_RD_MAX_DICT_LEN + 1], &[], &codes, &rights),
+    ];
+    for body in &corrupt {
+        assert!(decode_alp_rd(&mut Reader::new(body)).is_err());
+        assert_alp_rd_decode_matches_reference(body);
+    }
+    // An exception count past the block bound.
+    let mut out = Writer::new();
+    out.put_u8(right_width);
+    out.put_u8(0);
+    out.put_u32(MAX_BLOCK_VALUES as u32 + 1);
+    assert_alp_rd_decode_matches_reference(&out.into_bytes());
+    // Truncation at every byte of a valid body, plus trailing bytes past it.
+    let mut body = alp_rd_body(right_width, &dict, &[(2, 0x405)], &codes, &rights);
+    for end in 0..body.len() {
+        assert_alp_rd_decode_matches_reference(&body[..end]);
+    }
+    body.extend_from_slice(&[0xAB; 5]);
+    assert_alp_rd_decode_matches_reference(&body);
+}
+
+/// The ALP-RD encoder as it stood before it dropped its full-length right-part and exception buffers: the reference
+/// the leaner encoder must match byte for byte.
+fn encode_alp_rd_reference(values: &[f64], out: &mut Writer) {
+    let sample = transform_sample(values);
+    let sample: &[f64] = sample.as_deref().unwrap_or(values);
+    let (right_width, dict, _) = alp_rd_choose_split(sample);
+    let mut padded_dict = [0u16; ALP_RD_MAX_DICT_LEN];
+    for (slot, entry) in padded_dict.iter_mut().zip(&dict) {
+        *slot = *entry;
+    }
+    let mut codes = vec![0u64; values.len()];
+    let mut rights = vec![0u64; values.len()];
+    alp_rd_split_chunk(values, right_width, &padded_dict, dict.len(), &mut codes, &mut rights);
+    let mut exceptions: Vec<(u32, u16)> = Vec::new();
+    for (index, (code, value)) in codes.iter_mut().zip(values).enumerate() {
+        if *code == ALP_RD_CODE_MISS {
+            *code = 0;
+            exceptions.push((index as u32, (value.to_bits() >> right_width) as u16));
+        }
+    }
+    out.put_u8(right_width as u8);
+    out.put_u8(dict.len() as u8);
+    for left in &dict {
+        out.put_u16(*left);
+    }
+    out.put_u32(exceptions.len() as u32);
+    for (index, left) in &exceptions {
+        out.put_u32(*index);
+        out.put_u16(*left);
+    }
+    let max_code = codes.iter().copied().max().unwrap_or(0);
+    bitpack(&codes, bits_needed(max_code), out);
+    let max_right = rights.iter().copied().max().unwrap_or(0);
+    bitpack(&rights, bits_needed(max_right), out);
+}
+
+/// Splitting a vector at a time and packing right parts straight from the input must write exactly the bytes the
+/// full-buffer encoder wrote: empty and singleton blocks, lengths around the 1024-value vector, no, mixed, and all
+/// exceptions, zero-width and maximal right parts, and special values.
+#[test]
+fn alp_rd_encode_matches_the_full_buffer_reference_byte_for_byte() {
+    let specials = [
+        0.0f64,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7FF8_0000_0000_0001),
+        f64::from_bits(0xFFF4_0000_DEAD_BEEF),
+        f64::from_bits(1),
+        f64::from_bits(0x800F_FFFF_FFFF_FFFF),
+    ];
+    let generators: [fn(u64) -> f64; 5] = [
+        // One shared left part: no exceptions.
+        |i| f64::from_bits(0x43F0_0000_0000_0000 | (mix(i) >> 12)),
+        // A few left parts plus specials: mixed exceptions.
+        |i| f64::from_bits(0x4030_0000_0000_0000 ^ ((mix(i) % 12) << 52) ^ (mix(i + 7) >> 12)),
+        // Raw bit patterns: nearly every left part misses.
+        |i| f64::from_bits(mix(i)),
+        // Right parts all zero: a zero-width right stream.
+        |i| f64::from_bits((mix(i) % 3) << 52),
+        // Right parts all ones: a maximal-width right stream.
+        |i| f64::from_bits(0x4010_0000_0000_0000 | ((mix(i) % 2) << 63) | 0x000F_FFFF_FFFF_FFFF),
+    ];
+    for len in [0usize, 1, 2, 1023, 1024, 1025, 2048, 3001] {
+        for generate in generators {
+            let mut values: Vec<f64> = (0..len as u64).map(generate).collect();
+            for (slot, special) in values.iter_mut().step_by(97).zip(specials.iter().cycle()) {
+                *slot = *special;
+            }
+            let mut out = Writer::new();
+            encode_alp_rd(&values, &mut out);
+            let mut reference = Writer::new();
+            encode_alp_rd_reference(&values, &mut reference);
+            assert_eq!(out.bytes(), reference.bytes(), "len {len}");
+            let decoded = decode_alp_rd(&mut Reader::new(out.bytes())).unwrap();
+            let decoded: Vec<u64> = decoded.iter().map(|value| value.to_bits()).collect();
+            let original: Vec<u64> = values.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(decoded, original, "len {len}");
+        }
+    }
 }
 
 #[test]
@@ -3897,4 +4682,226 @@ fn fsst_replayed_block_bytes_match_the_reference_layout() {
         assert_eq!(breaks, expected_breaks, "{name}: frame breaks");
         assert!(trained.is_none(), "{name}: a replayed block trains no table");
     }
+}
+
+/// The dictionary string encoder as it stood before it stopped collecting one code per row, kept so the
+/// differential test below can hold the current encoder to the exact same bytes.
+fn reference_encode_dictionary_string(
+    values: &StringColumn,
+    present: &[&str],
+    strategy: CascadeStrategy,
+    shared: Option<&[String]>,
+    out: &mut Writer,
+) -> Result<SideStream, FormatError> {
+    NullStream::from_values(values).write(out);
+    let mut dictionary: Vec<&str> = AHashSet::from_iter(present.iter().copied()).into_iter().collect();
+    dictionary.sort_unstable();
+    let code_of: AHashMap<&str, u64> = dictionary
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (*value, index as u64))
+        .collect();
+    let codes: Vec<u64> = present
+        .iter()
+        .map(|value| code_of.get(value).copied().unwrap_or(0))
+        .collect();
+    if let Some(alphabet) = shared
+        && dictionary
+            .iter()
+            .all(|value| alphabet.binary_search_by(|entry| entry.as_str().cmp(value)).is_ok())
+    {
+        let shared_codes: Vec<u64> = codes
+            .iter()
+            .map(|&code| {
+                dictionary
+                    .get(code as usize)
+                    .and_then(|value| alphabet.binary_search_by(|entry| entry.as_str().cmp(value)).ok())
+                    .unwrap_or(0) as u64
+            })
+            .collect();
+        let max = shared_codes.iter().copied().max().unwrap_or(0);
+        let mut shared_out = Writer::new();
+        bitpack(&shared_codes, bits_needed(max), &mut shared_out);
+        let mut local_out = Writer::new();
+        let local_side = reference_encode_local_dictionary(&dictionary, &codes, strategy, &mut local_out)?;
+        if shared_out.len() < local_out.len() {
+            out.put_slice(shared_out.bytes());
+            return Ok(SideStream::FileScopeDictionary);
+        }
+        out.put_slice(local_out.bytes());
+        return Ok(local_side);
+    }
+    reference_encode_local_dictionary(&dictionary, &codes, strategy, out)
+}
+
+fn reference_encode_local_dictionary(
+    dictionary: &[&str],
+    codes: &[u64],
+    strategy: CascadeStrategy,
+    out: &mut Writer,
+) -> Result<SideStream, FormatError> {
+    out.put_u32(dictionary.len() as u32);
+    let fsst = (cascade_level_fits(1)
+        && dictionary.len() >= FSST_MIN_SAMPLE_COUNT
+        && dictionary
+            .iter()
+            .all(|value| value.len() <= DICTIONARY_FSST_MAX_VALUE_LEN))
+    .then(|| {
+        let corpus: Vec<&[u8]> = dictionary.iter().map(|value| value.as_bytes()).collect();
+        let compressor = fsst::Compressor::train(&corpus);
+        let mut scratch = Vec::new();
+        let mut arena = Vec::new();
+        let mut compressed_lens = Vec::new();
+        for value in &corpus {
+            compress_fsst_value(&compressor, value, &mut scratch);
+            compressed_lens.push(scratch.len());
+            arena.extend_from_slice(&scratch);
+        }
+        let plain = (dictionary.len() + 1) * 4 + corpus.iter().map(|value| value.len()).sum::<usize>();
+        let compressed = 2 + 9 * compressor.symbol_table().len() + (dictionary.len() + 1) * 4 + arena.len();
+        let threshold = match strategy {
+            CascadeStrategy::DecodeOptimized | CascadeStrategy::NoTrailing => {
+                plain * DECODE_OPTIMIZED_THRESHOLD_NUM / DECODE_OPTIMIZED_THRESHOLD_DEN
+            }
+            CascadeStrategy::SizeOptimized => plain - plain / SIZE_OPTIMIZED_SAVINGS_DIVISOR,
+        };
+        (compressed < threshold).then_some((compressor, compressed_lens, arena))
+    })
+    .flatten();
+    let side = match fsst {
+        Some((compressor, compressed_lens, arena)) => {
+            out.put_u16(compressor.symbol_table().len() as u16);
+            for (symbol, length) in compressor.symbol_table().iter().zip(compressor.symbol_lengths()) {
+                out.put_u64(symbol.to_u64());
+                out.put_u8(*length);
+            }
+            write_offsets(compressed_lens.into_iter(), out)?;
+            out.put_slice(&arena);
+            SideStream::FsstDictionaryValues
+        }
+        None => {
+            write_offsets(dictionary.iter().map(|value| value.len()), out)?;
+            for value in dictionary {
+                out.put_slice(value.as_bytes());
+            }
+            SideStream::None
+        }
+    };
+    let max = codes.iter().copied().max().unwrap_or(0);
+    bitpack(codes, bits_needed(max), out);
+    Ok(side)
+}
+
+/// The dictionary string encoder writes exactly the bytes and side stream of the reference encoder, behind a
+/// nonempty prefix, across plain and FSST value streams, every cascade strategy, shared alphabets that win, lose
+/// and do not cover the block, empty, all-null, singleton and zero-width blocks, and row counts on either side of
+/// a 1024-value vector.
+#[test]
+fn dictionary_string_encoding_matches_the_reference_encoder_byte_for_byte() {
+    let urls: Vec<String> = (0..200)
+        .map(|i| format!("https://events.example.com/api/v1/tenants/tenant-{i:04}/streams/manifest-{i:04}.json"))
+        .collect();
+    let unicode: Vec<String> = (0..40).map(|i| format!("caf\u{e9}-\u{65e5}\u{672c}-{i}")).collect();
+    let wide_alphabet: Vec<String> = (0..1024).map(|i| format!("v{i:04}")).collect();
+    let mut url_alphabet = urls.clone();
+    url_alphabet.sort();
+    let mut unicode_alphabet = unicode.clone();
+    unicode_alphabet.sort();
+    let pick = |pool: &[String], rows: usize, null_every: usize| -> Vec<Option<String>> {
+        (0..rows)
+            .map(|i| (null_every == 0 || i % null_every != 0).then(|| pool[i % pool.len()].clone()))
+            .collect()
+    };
+    let columns: Vec<Vec<Option<String>>> = vec![
+        Vec::new(),
+        vec![None; 50],
+        vec![Some("only".to_owned())],
+        vec![Some(String::new()); 1025],
+        pick(&["a".to_owned(), String::new(), "b".to_owned()], 1023, 5),
+        pick(&urls, 1024, 0),
+        pick(&urls, 2049, 13),
+        pick(&unicode, 1025, 3),
+        pick(&wide_alphabet[..2], 4096, 0),
+        pick(&wide_alphabet[..64], 2048, 7),
+        (0..3000)
+            .map(|i| Some(if i % 2 == 0 { "v0000" } else { "v1023" }.to_owned()))
+            .collect(),
+    ];
+    let alphabets: [Option<&[String]>; 4] = [None, Some(&wide_alphabet), Some(&url_alphabet), Some(&unicode_alphabet)];
+    let strategies = [
+        CascadeStrategy::DecodeOptimized,
+        CascadeStrategy::NoTrailing,
+        CascadeStrategy::SizeOptimized,
+    ];
+    let mut sides = Vec::new();
+    for (index, column) in columns.iter().enumerate() {
+        let values: StringColumn = column.clone().into();
+        let present = present_values(&values);
+        for shared in alphabets {
+            for strategy in strategies {
+                let mut expected = Writer::new();
+                expected.put_slice(b"prefix");
+                let expected_side =
+                    reference_encode_dictionary_string(&values, &present, strategy, shared, &mut expected).unwrap();
+                let mut actual = Writer::new();
+                actual.put_slice(b"prefix");
+                let actual_side = encode_dictionary_string(&values, &present, strategy, shared, &mut actual).unwrap();
+                let case = format!(
+                    "column {index}, shared {}, {strategy:?}",
+                    shared.map_or(0, <[String]>::len)
+                );
+                assert_eq!(actual_side, expected_side, "{case}");
+                assert_eq!(actual.bytes(), expected.bytes(), "{case}");
+                sides.push(actual_side);
+            }
+        }
+    }
+    for side in [
+        SideStream::FileScopeDictionary,
+        SideStream::FsstDictionaryValues,
+        SideStream::None,
+    ] {
+        assert!(sides.contains(&side), "the cases must exercise {side:?}");
+    }
+}
+
+/// FSST dictionary values written in place keep the reference bytes on both sides of the acceptance threshold: a
+/// sweep of shared-prefix lengths flips the trial between kept and rolled back under every strategy, and every
+/// trial lands in one writer after the ones before it, so a rollback must leave earlier bytes untouched and a kept
+/// stream must patch its offsets where they belong.
+#[test]
+fn fsst_dictionary_values_written_in_place_match_the_reference_across_the_threshold() {
+    let strategies = [
+        CascadeStrategy::DecodeOptimized,
+        CascadeStrategy::NoTrailing,
+        CascadeStrategy::SizeOptimized,
+    ];
+    let mut expected = Writer::new();
+    expected.put_slice(b"prefix");
+    let mut actual = Writer::new();
+    actual.put_slice(b"prefix");
+    let mut sides = Vec::new();
+    for prefix_len in 0..48 {
+        let prefix = "\u{e9}x".repeat(prefix_len / 2) + &"p".repeat(prefix_len % 2);
+        let owned: Vec<String> = (0..FSST_MIN_SAMPLE_COUNT + prefix_len)
+            .map(|i| format!("{prefix}{i:03}"))
+            .collect();
+        let mut dictionary: Vec<&str> = owned.iter().map(String::as_str).collect();
+        dictionary.sort_unstable();
+        let codes: Vec<u64> = (0..2000).map(|row| (row % dictionary.len()) as u64).collect();
+        for strategy in strategies {
+            let expected_side =
+                reference_encode_local_dictionary(&dictionary, &codes, strategy, &mut expected).unwrap();
+            let actual_side =
+                encode_local_dictionary(&dictionary, codes.len(), |row| codes[row], strategy, &mut actual).unwrap();
+            assert_eq!(actual_side, expected_side, "prefix {prefix_len}, {strategy:?}");
+            assert_eq!(actual.bytes(), expected.bytes(), "prefix {prefix_len}, {strategy:?}");
+            sides.push(actual_side);
+        }
+    }
+    assert!(
+        sides.contains(&SideStream::FsstDictionaryValues),
+        "the sweep must keep FSST"
+    );
+    assert!(sides.contains(&SideStream::None), "the sweep must roll FSST back");
 }

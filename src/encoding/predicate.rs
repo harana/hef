@@ -1600,15 +1600,19 @@ fn filter_for_block(body: &[u8], predicate: &NumericPredicate, kind: ValueKind) 
 fn filter_delta_block(body: &[u8], predicate: &NumericPredicate, kind: ValueKind) -> Result<Vec<bool>, FormatError> {
     let mut reader = Reader::new(body);
     let first = reader.u64("delta first")?;
-    let deltas = super::bitunpack(&mut reader)?;
+    let deltas = read_packed_stream(&mut reader)?;
     let test = PackedLaneTest::translate(predicate, kind, 0);
-    let mut result = Vec::with_capacity(deltas.len() + 1);
+    let mut result = Vec::with_capacity(deltas.count + 1);
     let mut current = first;
     result.push(test.matches(0, current));
-    for delta in deltas {
-        current = current.wrapping_add(unzigzag(delta) as u64);
-        result.push(test.matches(0, current));
-    }
+    // One vector of deltas at a time: the running sum is a sequential walk over each restored vector, never the
+    // whole stream materialized first.
+    deltas.for_each_vector(|vector| {
+        for &delta in vector {
+            current = current.wrapping_add(unzigzag(delta) as u64);
+            result.push(test.matches(0, current));
+        }
+    });
     Ok(result)
 }
 

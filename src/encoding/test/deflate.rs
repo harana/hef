@@ -147,3 +147,63 @@ fn decompressing_into_a_reused_buffer_matches_the_allocating_decode() {
     decompress_into(&pages[1], &mut plain).unwrap();
     assert_eq!(plain, b"tiny");
 }
+
+/// A small xorshift stream, so the incompressible inputs below are the same on every run.
+fn noise_bytes(len: usize) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn compressed_len_matches_the_length_of_compress() {
+    let inputs: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        vec![7],
+        vec![0; GRANULE_BYTES - 1],
+        vec![0; GRANULE_BYTES],
+        vec![0; GRANULE_BYTES + 1],
+        multi_granule_bytes(),
+        noise_bytes(GRANULE_BYTES),
+        noise_bytes(3 * GRANULE_BYTES + 17),
+    ];
+    // Twice over, so sizes alternate on the reused per-thread compressor.
+    for raw in inputs.iter().chain(inputs.iter()) {
+        assert_eq!(compressed_len(raw), compress(raw).len(), "input of {} bytes", raw.len());
+    }
+}
+
+/// The float fallback picks a layout from these two trial lengths, so they must equal the real compressed sizes for
+/// every kind of float bit pattern.
+#[test]
+fn compressed_len_matches_compress_on_float_fallback_trials() {
+    let mut values = vec![
+        0.0,
+        -0.0,
+        f64::NAN,
+        f64::from_bits(0x7FF0_0000_0000_0001),
+        f64::from_bits(0xFFF8_0000_DEAD_BEEF),
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::MIN_POSITIVE / 2.0,
+        f64::from_bits(1),
+    ];
+    values.extend(
+        noise_bytes(1200 * 8)
+            .chunks_exact(8)
+            .map(|bits| f64::from_le_bytes(bits.try_into().unwrap())),
+    );
+    let plain: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let mut split = vec![0u8; values.len() * 8];
+    super::super::write_byte_stream_split(&values, &mut split);
+    for raw in [plain, split] {
+        assert_eq!(compressed_len(&raw), compress(&raw).len());
+    }
+}

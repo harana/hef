@@ -20,7 +20,6 @@ use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TimestampValue
 use crate::file::bytes::{Reader, Writer, slice};
 use hashbrown::HashMap;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use uuid::Uuid;
 
 /// Variable-record payload flag bit 0: the payload bytes are a UTF-8 internal immutable payload reference, not an
@@ -267,27 +266,25 @@ pub struct DecodedBatch<'a> {
 
 /// String interner preserving first-insertion refs.
 ///
-/// The lookup table and the ordered value list share one allocation per distinct value — an `Arc<str>` cloned into
-/// both — rather than each holding its own copy of the text.
+/// It borrows every string from the events being packed, which outlive the build, so interning copies no text.
 #[derive(Default)]
-struct StringTableBuilder {
-    refs: HashMap<Arc<str>, u32>,
-    strings: Vec<Arc<str>>,
+struct StringTableBuilder<'a> {
+    refs: HashMap<&'a str, u32>,
+    strings: Vec<&'a str>,
 }
 
-impl StringTableBuilder {
-    fn intern(&mut self, value: &str) -> u32 {
+impl<'a> StringTableBuilder<'a> {
+    fn intern(&mut self, value: &'a str) -> u32 {
         if let Some(existing) = self.refs.get(value) {
             return *existing;
         }
         let next = self.strings.len() as u32;
-        let value: Arc<str> = Arc::from(value);
-        self.strings.push(Arc::clone(&value));
+        self.strings.push(value);
         self.refs.insert(value, next);
         next
     }
 
-    fn intern_optional(&mut self, value: Option<&str>) -> u32 {
+    fn intern_optional(&mut self, value: Option<&'a str>) -> u32 {
         match value {
             Some(value) => self.intern(value),
             None => REF_ABSENT,
@@ -483,48 +480,14 @@ pub fn build_batch(
     }
     let arena_bytes = arena.into_bytes();
 
-    // Provenance table: one record per signed event, in event order, referenced from the variable records.
+    // Provenance table: one record per signed event, in event order, referenced by record index from the variable
+    // records. Relationship table: one variable-length entry per event that declares references, in event order,
+    // addressed by byte offset from the variable records. References are stored exactly as declared, with no target
+    // looked up. Both are written inside the record loop below.
     let mut provenance = Writer::new();
-    let mut provenance_refs: Vec<u32> = Vec::with_capacity(events.len());
-    for event in events {
-        match &event.provenance {
-            None => provenance_refs.push(REF_ABSENT),
-            Some(signed) => {
-                provenance_refs.push((provenance.len() as u32) / PROVENANCE_RECORD_LEN);
-                provenance.put_slice(&signed.author_pubkey);
-                provenance.put_slice(&signed.protocol_event_id);
-                provenance.put_slice(&signed.signature);
-                provenance.put_i64(signed.claimed_at.physical_nanos());
-                provenance.put_u32(signed.protocol_kind);
-                provenance.put_u32(scheme_code(signed.scheme));
-            }
-        }
-    }
-    let provenance_bytes = provenance.into_bytes();
-
-    // Relationship table: one variable-length entry per event that declares references, in event order, addressed by
-    // byte offset from the variable records. References are stored exactly as declared — no target is looked up.
     let mut relationship_table = Writer::new();
-    let mut relationship_refs: Vec<u32> = Vec::with_capacity(events.len());
-    for event in events {
-        match &event.relationships {
-            None => relationship_refs.push(REF_ABSENT),
-            Some(relationships) => {
-                relationship_refs.push(relationship_table.len() as u32);
-                relationship_table.put_u32(relationships.refs().len() as u32);
-                for reference in relationships.refs() {
-                    relationship_table.put_u32(relationship_kind_code(reference.kind));
-                    relationship_table.put_u32(target_space_code(reference.space));
-                    // A variable-length space records its target's length ahead of the bytes.
-                    if reference.space.fixed_len().is_none() {
-                        relationship_table.put_u32(reference.target_ref.len() as u32);
-                    }
-                    relationship_table.put_slice(&reference.target_ref);
-                }
-            }
-        }
-    }
-    let relationship_bytes = relationship_table.into_bytes();
+    // A batch without a relationship table writes zero in every relationships_ref so the field stays reserved-zero.
+    let has_relationships = events.iter().any(|event| event.relationships.is_some());
 
     // Fixed and variable tables.
     let mut fixed = Writer::with_capacity(events.len() * FIXED_RECORD_LEN as usize);
@@ -570,16 +533,39 @@ pub fn build_batch(
         variable.put_u32(strings.intern_optional(event.source_delivery.as_deref()));
         variable.put_u64(event.connector_delivery_hash_low);
         variable.put_u64(event.connector_delivery_hash_high);
-        variable.put_u32(provenance_refs.get(index).copied().unwrap_or(REF_ABSENT));
-        // A batch without a relationship table writes zero here so the field stays reserved-zero on the wire.
-        variable.put_u32(if relationship_bytes.is_empty() {
-            0
-        } else {
-            relationship_refs.get(index).copied().unwrap_or(REF_ABSENT)
-        });
+        match &event.provenance {
+            None => variable.put_u32(REF_ABSENT),
+            Some(signed) => {
+                variable.put_u32((provenance.len() as u32) / PROVENANCE_RECORD_LEN);
+                provenance.put_slice(&signed.author_pubkey);
+                provenance.put_slice(&signed.protocol_event_id);
+                provenance.put_slice(&signed.signature);
+                provenance.put_i64(signed.claimed_at.physical_nanos());
+                provenance.put_u32(signed.protocol_kind);
+                provenance.put_u32(scheme_code(signed.scheme));
+            }
+        }
+        match &event.relationships {
+            None => variable.put_u32(if has_relationships { REF_ABSENT } else { 0 }),
+            Some(relationships) => {
+                variable.put_u32(relationship_table.len() as u32);
+                relationship_table.put_u32(relationships.refs().len() as u32);
+                for reference in relationships.refs() {
+                    relationship_table.put_u32(relationship_kind_code(reference.kind));
+                    relationship_table.put_u32(target_space_code(reference.space));
+                    // A variable-length space records its target's length ahead of the bytes.
+                    if reference.space.fixed_len().is_none() {
+                        relationship_table.put_u32(reference.target_ref.len() as u32);
+                    }
+                    relationship_table.put_slice(&reference.target_ref);
+                }
+            }
+        }
         variable.put_u64(0); // reserved_zero_1
     }
 
+    let provenance_bytes = provenance.into_bytes();
+    let relationship_bytes = relationship_table.into_bytes();
     let string_table = strings.encode();
     let dictionary_bytes = encode_variant_dictionary(&dictionary);
 

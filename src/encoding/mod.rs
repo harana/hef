@@ -455,25 +455,25 @@ fn bitpack(values: &[u64], width: u32, out: &mut Writer) {
     let words_per_vector = FASTLANES_LANES * fastlanes_words_per_lane(bits);
     let vectors = values.len().div_ceil(FASTLANES_VECTOR);
     let value_mask = mask(width);
-    let mut packed = vec![0u64; vectors * words_per_vector];
-    // Whole vectors are gathered straight out of `values` — nothing is copied to reach them.
-    let mut whole = values.chunks_exact(FASTLANES_VECTOR);
-    for (packed_vector, in_vector) in packed.chunks_exact_mut(words_per_vector).zip(whole.by_ref()) {
-        bitpack_vector(in_vector, packed_vector, width, value_mask);
-    }
-    // A trailing partial vector is the one that needs a buffer of its own: its values go into a zero-filled vector,
-    // exactly matching the tail fill the transposed layout defines, and are then gathered like any other.
-    let tail = whole.remainder();
-    if !tail.is_empty()
-        && let Some(packed_vector) = packed.chunks_exact_mut(words_per_vector).nth(vectors - 1)
+    let packed = out.reserve_bytes(vectors * words_per_vector * 8);
+    let mut scratch = [0u64; FASTLANES_VECTOR];
+    let mut padded = [0u64; FASTLANES_VECTOR];
+    for (packed_vector, in_vector) in packed
+        .chunks_exact_mut(words_per_vector * 8)
+        .zip(values.chunks(FASTLANES_VECTOR))
     {
-        let mut padded = [0u64; FASTLANES_VECTOR];
-        for (slot, value) in padded.iter_mut().zip(tail) {
-            *slot = *value;
-        }
-        bitpack_vector(&padded, packed_vector, width, value_mask);
+        // Whole vectors are gathered straight out of `values`. A trailing partial vector goes into a zero-filled
+        // vector first, exactly matching the tail fill the transposed layout defines.
+        let in_vector = if in_vector.len() == FASTLANES_VECTOR {
+            in_vector
+        } else {
+            for (slot, value) in padded.iter_mut().zip(in_vector) {
+                *slot = *value;
+            }
+            &padded
+        };
+        pack_vector_into(in_vector, &mut scratch, packed_vector, width, value_mask);
     }
-    out.put_u64_slice(&packed);
 }
 
 /// [`bitpack`] for a caller whose values are not already a `&[u64]` slice: `lane(i)` produces value `i` on demand
@@ -491,17 +491,44 @@ fn bitpack_with(len: usize, width: u32, out: &mut Writer, lane: impl Fn(usize) -
     let words_per_vector = FASTLANES_LANES * fastlanes_words_per_lane(bits);
     let vectors = len.div_ceil(FASTLANES_VECTOR);
     let value_mask = mask(width);
-    let mut packed = vec![0u64; vectors * words_per_vector];
+    let packed = out.reserve_bytes(vectors * words_per_vector * 8);
     let mut buffer = [0u64; FASTLANES_VECTOR];
-    for (vector_index, packed_vector) in packed.chunks_exact_mut(words_per_vector).enumerate() {
+    let mut scratch = [0u64; FASTLANES_VECTOR];
+    for (vector_index, packed_vector) in packed.chunks_exact_mut(words_per_vector * 8).enumerate() {
         let base = vector_index * FASTLANES_VECTOR;
         let this_len = FASTLANES_VECTOR.min(len.saturating_sub(base));
         for (offset, slot) in buffer.iter_mut().enumerate() {
             *slot = if offset < this_len { lane(base + offset) } else { 0 };
         }
-        bitpack_vector(&buffer, packed_vector, width, value_mask);
+        pack_vector_into(&buffer, &mut scratch, packed_vector, width, value_mask);
     }
-    out.put_u64_slice(&packed);
+}
+
+/// Packs one whole 1024-value vector and writes its words little-endian into `packed_vector`, that vector's slot in the
+/// output.
+///
+/// The kernel works on aligned `u64` words, so it packs into `scratch` (8 KiB, enough for one vector at width 64) and
+/// only that vector's words are copied out; the output bytes sit at an arbitrary offset in the writer and are never
+/// reinterpreted as words. Staging memory stays at one vector however long the stream is: a caller holding this
+/// scratch plus a 1024-value input buffer uses about 16 KiB of stack.
+fn pack_vector_into(
+    in_vector: &[u64],
+    scratch: &mut [u64; FASTLANES_VECTOR],
+    packed_vector: &mut [u8],
+    width: u32,
+    value_mask: u64,
+) {
+    let words = scratch.get_mut(..packed_vector.len() / 8).unwrap_or(&mut []);
+    // The kernel ORs bits into its destination, so every vector starts from zeroed words.
+    words.fill(0);
+    bitpack_vector(in_vector, words, width, value_mask);
+    if cfg!(target_endian = "little") {
+        packed_vector.copy_from_slice(bytemuck::cast_slice(words));
+    } else {
+        for (bytes, word) in packed_vector.chunks_exact_mut(8).zip(words.iter()) {
+            bytes.copy_from_slice(&word.to_le_bytes());
+        }
+    }
 }
 
 /// Gathers one whole 1024-value vector into the packed words of its own vector slot, in the FastLanes transposed order.
@@ -604,6 +631,28 @@ impl PackedStream<'_> {
             return;
         }
         unpack_vectors(self.packed, self.width, out, lane);
+    }
+
+    /// Hands `consume` the stream's values in their original order, one 1024-value vector at a time, never including
+    /// the padding after the last value. Each vector is unpacked into one reused 8 KiB buffer, so a caller that walks
+    /// the values once never holds the whole stream. A zero-width stream yields its count of zeros.
+    fn for_each_vector(&self, mut consume: impl FnMut(&[u64])) {
+        let mut buffer = [0u64; FASTLANES_VECTOR];
+        let bytes_per_vector = FASTLANES_LANES * fastlanes_words_per_lane(self.width as usize) * 8;
+        // A zero-width stream has no packed bytes; `max(1)` only keeps the chunk size legal for it.
+        let mut packed_vectors = self.packed.chunks(bytes_per_vector.max(1));
+        let mut remaining = self.count;
+        while remaining > 0 {
+            let rows = remaining.min(FASTLANES_VECTOR);
+            if self.width != 0 {
+                let Some(packed_vector) = packed_vectors.next() else {
+                    return;
+                };
+                unpack_vectors(packed_vector, self.width, &mut buffer, |packed| packed);
+            }
+            consume(buffer.get(..rows).unwrap_or(&[]));
+            remaining -= rows;
+        }
     }
 }
 
@@ -1478,9 +1527,9 @@ fn choose_float_fallback(values: &[f64]) -> Transform {
     for (bytes, value) in trial.chunks_exact_mut(8).zip(sample) {
         bytes.copy_from_slice(&value.to_le_bytes());
     }
-    let plain_compressed = deflate::compress(&trial).len();
+    let plain_compressed = deflate::compressed_len(&trial);
     write_byte_stream_split(sample, &mut trial);
-    let bss_compressed = deflate::compress(&trial).len();
+    let bss_compressed = deflate::compressed_len(&trial);
     let (_, _, alp_rd_estimate) = alp_rd_choose_split(sample);
     if alp_rd_estimate < plain_compressed.min(bss_compressed) {
         Transform::AlpRd
@@ -1610,6 +1659,10 @@ fn alp_rd_split_chunk(
 /// ALP-RD block: right-part width, left-part dictionary, exact left-part exceptions, then bitpacked codes and right
 /// parts. The split and dictionary come from the block's sample; a value whose left part missed the dictionary stores
 /// code 0 and patches its real left part through the exception list.
+///
+/// The block is split one 1024-value vector at a time into fixed scratch, never into full-length code or right-part
+/// vectors: a first pass writes the exceptions and finds both streams' widths, a second re-splits each vector to pack
+/// its codes, and the right parts are packed straight from the input's bits.
 fn encode_alp_rd(values: &[f64], out: &mut Writer) {
     let sample = transform_sample(values);
     let sample: &[f64] = sample.as_deref().unwrap_or(values);
@@ -1618,30 +1671,82 @@ fn encode_alp_rd(values: &[f64], out: &mut Writer) {
     for (slot, entry) in padded_dict.iter_mut().zip(&dict) {
         *slot = *entry;
     }
-    let mut codes = vec![0u64; values.len()];
-    let mut rights = vec![0u64; values.len()];
-    alp_rd_split_chunk(values, right_width, &padded_dict, dict.len(), &mut codes, &mut rights);
-    let mut exceptions: Vec<(u32, u16)> = Vec::new();
-    for (index, (code, value)) in codes.iter_mut().zip(values).enumerate() {
-        if *code == ALP_RD_CODE_MISS {
-            *code = 0;
-            exceptions.push((index as u32, (value.to_bits() >> right_width) as u16));
-        }
-    }
     out.put_u8(right_width as u8);
     out.put_u8(dict.len() as u8);
     for left in &dict {
         out.put_u16(*left);
     }
-    out.put_u32(exceptions.len() as u32);
-    for (index, left) in &exceptions {
-        out.put_u32(*index);
-        out.put_u16(*left);
+    let exception_count_at = out.len();
+    out.put_u32(0);
+    let mut exception_count = 0u32;
+    let mut codes = [0u64; FASTLANES_VECTOR];
+    let mut rights = [0u64; FASTLANES_VECTOR];
+    let mut max_code = 0u64;
+    let mut max_right = 0u64;
+    for (vector_index, value_chunk) in values.chunks(FASTLANES_VECTOR).enumerate() {
+        alp_rd_split_chunk(
+            value_chunk,
+            right_width,
+            &padded_dict,
+            dict.len(),
+            &mut codes,
+            &mut rights,
+        );
+        for (offset, ((code, right), value)) in codes.iter().zip(&rights).zip(value_chunk).enumerate() {
+            if *code == ALP_RD_CODE_MISS {
+                exception_count += 1;
+                out.put_u32((vector_index * FASTLANES_VECTOR + offset) as u32);
+                out.put_u16((value.to_bits() >> right_width) as u16);
+            } else {
+                max_code = max_code.max(*code);
+            }
+            max_right = max_right.max(*right);
+        }
     }
-    let max_code = codes.iter().copied().max().unwrap_or(0);
-    bitpack(&codes, bits_needed(max_code), out);
-    let max_right = rights.iter().copied().max().unwrap_or(0);
-    bitpack(&rights, bits_needed(max_right), out);
+    out.patch_u32(exception_count_at, exception_count);
+    alp_rd_bitpack_vectors(values.len(), bits_needed(max_code), out, |vector_index, buffer| {
+        let start = vector_index * FASTLANES_VECTOR;
+        let value_chunk = values
+            .get(start..values.len().min(start + FASTLANES_VECTOR))
+            .unwrap_or(&[]);
+        buffer.fill(0);
+        alp_rd_split_chunk(value_chunk, right_width, &padded_dict, dict.len(), buffer, &mut rights);
+        for code in buffer.iter_mut() {
+            if *code == ALP_RD_CODE_MISS {
+                *code = 0;
+            }
+        }
+    });
+    let right_mask = mask(right_width);
+    bitpack_with(values.len(), bits_needed(max_right), out, |i| {
+        values.get(i).map_or(0, |value| value.to_bits() & right_mask)
+    });
+}
+
+/// Byte-identical to [`bitpack`] over `len` values, but `fill(vector_index, buffer)` writes one whole 1024-value vector
+/// at a time into `buffer` (zeroing slots past `len`), so a caller can produce values with a vector-wide kernel instead
+/// of keeping a full-length `Vec<u64>` of them.
+fn alp_rd_bitpack_vectors(
+    len: usize,
+    width: u32,
+    out: &mut Writer,
+    mut fill: impl FnMut(usize, &mut [u64; FASTLANES_VECTOR]),
+) {
+    out.put_u32(len as u32);
+    out.put_u8(width as u8);
+    if width == 0 {
+        return;
+    }
+    let words_per_vector = FASTLANES_LANES * fastlanes_words_per_lane(width as usize);
+    let vectors = len.div_ceil(FASTLANES_VECTOR);
+    let value_mask = mask(width);
+    let packed = out.reserve_bytes(vectors * words_per_vector * 8);
+    let mut buffer = [0u64; FASTLANES_VECTOR];
+    let mut scratch = [0u64; FASTLANES_VECTOR];
+    for (vector_index, packed_vector) in packed.chunks_exact_mut(words_per_vector * 8).enumerate() {
+        fill(vector_index, &mut buffer);
+        pack_vector_into(&buffer, &mut scratch, packed_vector, width, value_mask);
+    }
 }
 
 fn decode_alp_rd(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
@@ -1686,36 +1791,37 @@ fn decode_alp_rd(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
         }
         exceptions.push((index, left));
     }
-    let codes = bitunpack(reader)?;
+    let mut codes = bitunpack(reader)?;
     let rights = bitunpack(reader)?;
     if codes.len() != rights.len() {
         return Err(FormatError::Structural {
             rule: "alp-rd code and right-part streams disagree",
         });
     }
-    let mut values = Vec::with_capacity(codes.len());
-    for (code, right) in codes.iter().zip(rights.iter()) {
+    // Each code slot is overwritten in place with its reassembled float bits, so the decoded codes buffer becomes the
+    // output and no separate float vector is allocated.
+    for (slot, right) in codes.iter_mut().zip(rights.iter()) {
         if *right >> right_width != 0 {
             return Err(FormatError::Structural {
                 rule: "alp-rd right part exceeds its width",
             });
         }
         let left = dict
-            .get(*code as usize)
+            .get(*slot as usize)
             .copied()
             .ok_or(FormatError::RefOutOfRange { what: "alp-rd code" })?;
-        values.push(f64::from_bits((u64::from(left) << right_width) | *right));
+        *slot = (u64::from(left) << right_width) | *right;
     }
     for (index, left) in exceptions {
         let right = rights.get(index as usize).ok_or(FormatError::RefOutOfRange {
             what: "alp-rd exception index",
         })?;
-        let slot = values.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
+        let slot = codes.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
             what: "alp-rd exception index",
         })?;
-        *slot = f64::from_bits((u64::from(left) << right_width) | *right);
+        *slot = (u64::from(left) << right_width) | *right;
     }
-    Ok(values)
+    Ok(bytemuck::cast_vec(codes))
 }
 
 /// The stored form of one string block's null side stream. The encoder picks the smallest deterministic form for the
@@ -1724,13 +1830,14 @@ fn decode_alp_rd(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
 /// Variants are in strict alphabetical order; the wire tags (`all_present` 0, `all_absent` 1, runs 2, raw 3) are
 /// written and read in [`NullStream::write`] / [`NullStream::read`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum NullStreamForm {
+enum NullStreamForm<'a> {
     /// No row carries a value — zero stored bytes beyond the header.
     AllAbsent,
     /// Every row carries a value — zero stored bytes beyond the header.
     AllPresent,
     /// The raw one-bit-per-row LSB-0 bitmap: the fallback and the equivalence reference for the compressed forms.
-    Raw(Vec<u8>),
+    /// Borrowed straight from the block body when read, owned when derived by the encoder.
+    Raw(Cow<'a, [u8]>),
     /// Sorted, disjoint, non-adjacent `[start, end)` runs of present rows — the roaring-style run form, smallest when
     /// nulls cluster (the usual case for event data).
     Runs(Vec<(u32, u32)>),
@@ -1742,8 +1849,8 @@ enum NullStreamForm {
 /// how many present rows precede it — are answered directly on the stored form, never by first materializing the raw
 /// bitmap. Requirement: "Presence and null bitmaps are encoded side streams".
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct NullStream {
-    form: NullStreamForm,
+struct NullStream<'a> {
+    form: NullStreamForm<'a>,
     row_count: usize,
 }
 
@@ -1765,7 +1872,7 @@ fn each_present_run(presence: &[bool], mut emit: impl FnMut(usize, usize)) {
     }
 }
 
-impl NullStream {
+impl<'a> NullStream<'a> {
     /// Derives the stream from a block's values, choosing the smallest form: `all_present` / `all_absent` at zero
     /// bytes, the run form when it undercuts the raw bitmap, the raw bitmap otherwise. Deterministic, so
     /// byte-identical encodes across nodes hold unchanged.
@@ -1798,7 +1905,7 @@ impl NullStream {
                     .enumerate()
                     .fold(0u8, |bits, (bit, &present)| bits | (u8::from(present) << bit));
             }
-            NullStreamForm::Raw(raw)
+            NullStreamForm::Raw(Cow::Owned(raw))
         };
         Self { form, row_count }
     }
@@ -1827,7 +1934,7 @@ impl NullStream {
     /// Reads a stream written by [`write`](Self::write), refusing malformed input: an unknown form tag, a zero-byte
     /// form whose row count is pure output amplification, or runs that are empty, out of bounds, or not sorted and
     /// non-adjacent.
-    fn read(reader: &mut Reader<'_>) -> Result<Self, FormatError> {
+    fn read(reader: &mut Reader<'a>) -> Result<Self, FormatError> {
         let row_count = reader.u32("string row count")? as usize;
         let form = match reader.u8("null stream form")? {
             0 | 1 if row_count > MAX_BLOCK_VALUES => {
@@ -1859,7 +1966,7 @@ impl NullStream {
                 }
                 NullStreamForm::Runs(runs)
             }
-            3 => NullStreamForm::Raw(reader.take(row_count.div_ceil(8), "null bitmap")?.to_vec()),
+            3 => NullStreamForm::Raw(Cow::Borrowed(reader.take(row_count.div_ceil(8), "null bitmap")?)),
             _ => {
                 return Err(FormatError::Structural {
                     rule: "unknown null stream form",
@@ -1867,6 +1974,20 @@ impl NullStream {
             }
         };
         Ok(Self { form, row_count })
+    }
+
+    /// The same stream, copying a borrowed raw bitmap so it no longer depends on the bytes it was read from.
+    fn into_owned(self) -> NullStream<'static> {
+        let form = match self.form {
+            NullStreamForm::AllAbsent => NullStreamForm::AllAbsent,
+            NullStreamForm::AllPresent => NullStreamForm::AllPresent,
+            NullStreamForm::Raw(bits) => NullStreamForm::Raw(Cow::Owned(bits.into_owned())),
+            NullStreamForm::Runs(runs) => NullStreamForm::Runs(runs),
+        };
+        NullStream {
+            form,
+            row_count: self.row_count,
+        }
     }
 
     fn row_count(&self) -> usize {
@@ -2067,43 +2188,69 @@ fn offset_window(table: &[u8], first: usize, count: usize) -> Result<Vec<usize>,
     )?))
 }
 
-/// Tries the FSST inner cascade level on a dictionary's distinct-value stream: trains a symbol table, compresses every
-/// entry (the scratch buffer budgets the FSST worst case of two output bytes per input byte), and keeps the level only
-/// when the compressed value stream — symbol table included — clears the strategy's size bar against the plain stream.
-/// Entries longer than [`DICTIONARY_FSST_MAX_VALUE_LEN`] keep the stream plain. Returns what the level emits, or
-/// `None` to keep the plain value stream.
-fn fsst_dictionary_values(
+/// Tries the FSST inner cascade level on a dictionary's distinct-value stream: trains a symbol table, then writes the
+/// table, the offset table and every compressed entry straight into `out` (the scratch buffer budgets the FSST worst
+/// case of two output bytes per input byte), and keeps the level only when that stream clears the strategy's size bar
+/// against the plain stream. Entries longer than [`DICTIONARY_FSST_MAX_VALUE_LEN`] keep the stream plain. Returns
+/// whether the level was kept; when it was not, `out` is rolled back to where it started, ready for the plain value
+/// stream.
+fn write_fsst_dictionary_values(
     dictionary: &[&str],
     strategy: CascadeStrategy,
-) -> Option<(fsst::Compressor, Vec<usize>, Vec<u8>)> {
+    out: &mut Writer,
+) -> Result<bool, FormatError> {
     if !cascade_level_fits(1) || dictionary.len() < FSST_MIN_SAMPLE_COUNT {
-        return None;
+        return Ok(false);
     }
     if dictionary
         .iter()
         .any(|value| value.len() > DICTIONARY_FSST_MAX_VALUE_LEN)
     {
-        return None;
+        return Ok(false);
     }
     let corpus: Vec<&[u8]> = dictionary.iter().map(|value| value.as_bytes()).collect();
     let compressor = fsst::Compressor::train(&corpus);
+    let start = out.len();
+    let symbols = compressor.symbol_table();
+    let lengths = compressor.symbol_lengths();
+    out.put_u16(symbols.len() as u16);
+    for (symbol, length) in symbols.iter().zip(lengths.iter()) {
+        out.put_u64(symbol.to_u64());
+        out.put_u8(*length);
+    }
+    // The offset table opens with a zero and is filled in entry by entry as each compressed entry lands after it.
+    let offsets_start = out.len();
+    out.reserve_bytes((dictionary.len() + 1) * 4);
+    let arena_start = out.len();
+    let mut offsets_overflow = false;
     let mut scratch = Vec::new();
-    let mut arena = Vec::new();
-    let mut compressed_lens = Vec::with_capacity(corpus.len());
-    for value in &corpus {
+    for (index, value) in corpus.iter().enumerate() {
         compress_fsst_value(&compressor, value, &mut scratch);
-        compressed_lens.push(scratch.len());
-        arena.extend_from_slice(&scratch);
+        out.put_slice(&scratch);
+        match u32::try_from(out.len() - arena_start) {
+            Ok(offset) => out.patch_u32(offsets_start + (index + 1) * 4, offset),
+            Err(_) => offsets_overflow = true,
+        }
     }
     let plain = (dictionary.len() + 1) * 4 + corpus.iter().map(|value| value.len()).sum::<usize>();
-    let compressed = 2 + 9 * compressor.symbol_table().len() + (dictionary.len() + 1) * 4 + arena.len();
+    let compressed = out.len() - start;
     let threshold = match strategy {
         CascadeStrategy::DecodeOptimized | CascadeStrategy::NoTrailing => {
             plain * DECODE_OPTIMIZED_THRESHOLD_NUM / DECODE_OPTIMIZED_THRESHOLD_DEN
         }
         CascadeStrategy::SizeOptimized => plain - plain / SIZE_OPTIMIZED_SAVINGS_DIVISOR,
     };
-    (compressed < threshold).then_some((compressor, compressed_lens, arena))
+    if compressed >= threshold {
+        out.truncate(start);
+        return Ok(false);
+    }
+    // Only a kept stream reports offsets past the u32 range, matching [`write_offsets`] on the stream it would write.
+    if offsets_overflow {
+        return Err(FormatError::Structural {
+            rule: "string arena offsets exceed the u32 range the format stores",
+        });
+    }
+    Ok(true)
 }
 
 /// Dictionary string block: null bitmap, sorted distinct values, then each present row's code bitpacked. When every
@@ -2111,7 +2258,7 @@ fn fsst_dictionary_values(
 /// alphabet (its sorted-order assignment) competes with the local dictionary form in an exact size trial, and the
 /// smaller stored form wins — a block covering only a corner of a wide alphabet pays wider codes at file scope than
 /// its own narrow dictionary would, so coverage alone cannot decide. The local dictionary's distinct-value stream
-/// may ride the FSST inner cascade level (see [`fsst_dictionary_values`]). Codes keep their ascending sorted-order
+/// may ride the FSST inner cascade level (see [`write_fsst_dictionary_values`]). Codes keep their ascending sorted-order
 /// assignment in every scope, so compressed-form predicates on codes never notice. Returns the side stream the block
 /// records.
 fn encode_dictionary_string(
@@ -2134,17 +2281,20 @@ fn encode_dictionary_string(
         .enumerate()
         .map(|(index, value)| (*value, index as u64))
         .collect();
-    let codes: Vec<u64> = present
-        .iter()
-        .map(|value| code_of.get(value).copied().unwrap_or(0))
-        .collect();
+    // Each present row's local code, looked up on demand rather than kept as one `u64` per row.
+    let local_code = |row: usize| {
+        present
+            .get(row)
+            .and_then(|value| code_of.get(value).copied())
+            .unwrap_or(0)
+    };
     if let Some(alphabet) = shared
         && dictionary
             .iter()
             .all(|value| alphabet.binary_search_by(|entry| entry.as_str().cmp(value)).is_ok())
     {
-        // Each distinct value's alphabet index is resolved once here, then every present row's already-computed
-        // local code is translated to it in O(1) instead of every row paying its own alphabet binary search.
+        // Each distinct value's alphabet index is resolved once here, then every present row's local code is
+        // translated to it in O(1) instead of every row paying its own alphabet binary search.
         let alphabet_index_of: Vec<u64> = dictionary
             .iter()
             .map(|value| {
@@ -2154,15 +2304,16 @@ fn encode_dictionary_string(
                     .unwrap_or(0)
             })
             .collect();
-        let shared_code = |code: u64| alphabet_index_of.get(code as usize).copied().unwrap_or(0);
-        let max = codes.iter().map(|&code| shared_code(code)).max().unwrap_or(0);
+        // Every dictionary entry is some present row's value, so the largest index any row uses is the largest
+        // index of any entry.
+        let max = alphabet_index_of.iter().copied().max().unwrap_or(0);
         let mut shared_out = Writer::new();
-        bitpack_with(codes.len(), bits_needed(max), &mut shared_out, |i| {
-            codes.get(i).map_or(0, |&code| shared_code(code))
+        bitpack_with(present.len(), bits_needed(max), &mut shared_out, |row| {
+            alphabet_index_of.get(local_code(row) as usize).copied().unwrap_or(0)
         });
         let shared_bytes = shared_out.into_bytes();
         let mut local_out = Writer::new();
-        let local_side = encode_local_dictionary(&dictionary, &codes, strategy, &mut local_out)?;
+        let local_side = encode_local_dictionary(&dictionary, present.len(), local_code, strategy, &mut local_out)?;
         let local_bytes = local_out.into_bytes();
         if shared_bytes.len() < local_bytes.len() {
             out.put_slice(&shared_bytes);
@@ -2171,43 +2322,33 @@ fn encode_dictionary_string(
         out.put_slice(&local_bytes);
         return Ok(local_side);
     }
-    encode_local_dictionary(&dictionary, &codes, strategy, out)
+    encode_local_dictionary(&dictionary, present.len(), local_code, strategy, out)
 }
 
-/// The block-local dictionary form: distinct values (plain or through the FSST inner cascade level), then each
-/// present row's already-resolved code ([`encode_dictionary_string`]'s `codes`, sorted-order assignment against
-/// `dictionary`) bitpacked. One candidate in [`encode_dictionary_string`]'s scope trial, and the only form for a
-/// block the column's shared alphabet does not cover.
+/// The block-local dictionary form: distinct values (plain or through the FSST inner cascade level), then the `count`
+/// present rows' codes bitpacked, row `i`'s code read from `code(i)` ([`encode_dictionary_string`]'s sorted-order
+/// assignment against `dictionary`). Every entry of `dictionary` must be some row's value, which fixes the largest
+/// code at `dictionary.len() - 1`. One candidate in [`encode_dictionary_string`]'s scope trial, and the only form for
+/// a block the column's shared alphabet does not cover.
 fn encode_local_dictionary(
     dictionary: &[&str],
-    codes: &[u64],
+    count: usize,
+    code: impl Fn(usize) -> u64,
     strategy: CascadeStrategy,
     out: &mut Writer,
 ) -> Result<SideStream, FormatError> {
     out.put_u32(dictionary.len() as u32);
-    let side = match fsst_dictionary_values(dictionary, strategy) {
-        Some((compressor, compressed_lens, arena)) => {
-            let symbols = compressor.symbol_table();
-            let lengths = compressor.symbol_lengths();
-            out.put_u16(symbols.len() as u16);
-            for (symbol, length) in symbols.iter().zip(lengths.iter()) {
-                out.put_u64(symbol.to_u64());
-                out.put_u8(*length);
-            }
-            write_offsets(compressed_lens.into_iter(), out)?;
-            out.put_slice(&arena);
-            SideStream::FsstDictionaryValues
+    let side = if write_fsst_dictionary_values(dictionary, strategy, out)? {
+        SideStream::FsstDictionaryValues
+    } else {
+        write_offsets(dictionary.iter().map(|value| value.len()), out)?;
+        for value in dictionary {
+            out.put_slice(value.as_bytes());
         }
-        None => {
-            write_offsets(dictionary.iter().map(|value| value.len()), out)?;
-            for value in dictionary {
-                out.put_slice(value.as_bytes());
-            }
-            SideStream::None
-        }
+        SideStream::None
     };
-    let max = codes.iter().copied().max().unwrap_or(0);
-    bitpack(codes, bits_needed(max), out);
+    let max = dictionary.len().saturating_sub(1) as u64;
+    bitpack_with(count, bits_needed(max), out, code);
     Ok(side)
 }
 
@@ -2326,30 +2467,110 @@ fn encode_raw_string(values: &StringColumn, present: &[&str], out: &mut Writer) 
     Ok(())
 }
 
-/// Threads a block's densely stored present values back through its null stream, landing them in one arena-backed
-/// column rather than a string per row.
-fn merge_nulls<T: AsRef<str>>(nulls: &NullStream, present: &[T]) -> Result<StringColumn, FormatError> {
-    let text_bytes = present.iter().map(|value| value.as_ref().len()).sum();
+/// Threads a block's `count` densely stored present values back through its null stream, landing them in one
+/// arena-backed column rather than a string per row. `value(i)` borrows present value `i` on demand: every value is
+/// checked and sized first, so a malformed value is refused before the null stream is walked, then each is fetched
+/// again straight into the output instead of through a collected list of views.
+fn merge_nulls<'a>(
+    nulls: &NullStream<'_>,
+    count: usize,
+    value: impl Fn(usize) -> Result<&'a str, FormatError>,
+) -> Result<StringColumn, FormatError> {
+    let mut text_bytes = 0usize;
+    for index in 0..count {
+        text_bytes += value(index)?.len();
+    }
     let mut values = StringColumn::with_capacity(nulls.row_count(), text_bytes);
     let mut next = 0usize;
     nulls.each_row(|set| {
         if set {
-            let value = present.get(next).ok_or(FormatError::Structural {
-                rule: "null bitmap disagrees with present count",
-            })?;
-            values.push(Some(value.as_ref()));
+            if next >= count {
+                return Err(FormatError::Structural {
+                    rule: "null bitmap disagrees with present count",
+                });
+            }
+            values.push(Some(value(next)?));
             next += 1;
         } else {
             values.push(None);
         }
         Ok(())
     })?;
-    if next != present.len() {
+    if next != count {
         return Err(FormatError::Structural {
             rule: "null bitmap disagrees with present count",
         });
     }
     Ok(values)
+}
+
+/// The distinct values a dictionary block stores, left where they already are: borrowed from the block body for a
+/// plain value stream, or held in the decompressed arena when the block records the FSST inner level. No entry is
+/// copied into a string of its own.
+///
+/// See: hef-encodings-and-compression/spec.md
+enum DictionaryValues<'a> {
+    Fsst(FsstArena),
+    Plain { data: &'a [u8], offsets: Vec<usize> },
+}
+
+impl<'a> DictionaryValues<'a> {
+    /// Reads a dictionary block's distinct-value stream: plain, or FSST-compressed when the block records the
+    /// [`SideStream::FsstDictionaryValues`] inner level.
+    fn read(reader: &mut Reader<'a>, dict_count: usize, side: SideStream) -> Result<Self, FormatError> {
+        let fsst = match side {
+            SideStream::FsstDictionaryValues => Some(FsstDecodeTable::read(reader)?),
+            _ => None,
+        };
+        let offsets = read_offsets(reader, dict_count)?;
+        let data_len = offsets.last().copied().unwrap_or(0);
+        let data = reader.take(data_len, "dictionary data")?;
+        Ok(match &fsst {
+            Some(table) => Self::Fsst(fsst_decompress_arena(
+                table,
+                data,
+                &offsets,
+                "dictionary entry",
+                "dictionary offsets must be non-decreasing",
+            )?),
+            None => Self::Plain { data, offsets },
+        })
+    }
+
+    /// Every entry, in code order, each checked before any is lent out: plain entries for ordered, in-bounds offsets
+    /// and UTF-8, FSST entries for character boundaries and the FSST value cap.
+    fn entries(&self) -> Result<Vec<&str>, FormatError> {
+        match self {
+            Self::Fsst(arena) => (0..arena.len())
+                .map(|index| {
+                    let entry = arena.value(index).ok_or(FormatError::InvalidUtf8 {
+                        what: "dictionary entry",
+                    })?;
+                    if entry.len() > DICTIONARY_FSST_MAX_VALUE_LEN {
+                        return Err(FormatError::Structural {
+                            rule: "dictionary entry exceeds the FSST value cap",
+                        });
+                    }
+                    Ok(entry)
+                })
+                .collect(),
+            Self::Plain { data, offsets } => offsets
+                .iter()
+                .zip(offsets.iter().skip(1))
+                .map(|(&start, &end)| {
+                    if end < start {
+                        return Err(FormatError::Structural {
+                            rule: "dictionary offsets must be non-decreasing",
+                        });
+                    }
+                    let bytes = slice(data, start, end - start, "dictionary entry")?;
+                    simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
+                        what: "dictionary entry",
+                    })
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Reads a dictionary block's distinct-value stream — plain, or FSST-compressed when the block records the
@@ -2359,55 +2580,8 @@ fn read_dictionary_values(
     dict_count: usize,
     side: SideStream,
 ) -> Result<Vec<String>, FormatError> {
-    let fsst = match side {
-        SideStream::FsstDictionaryValues => Some(FsstDecodeTable::read(reader)?),
-        _ => None,
-    };
-    let offsets = read_offsets(reader, dict_count)?;
-    let data_len = offsets.last().copied().unwrap_or(0);
-    let data = reader.take(data_len, "dictionary data")?;
-    let mut dictionary = Vec::with_capacity(reader.capacity_hint(dict_count, 1));
-    if let Some(table) = &fsst {
-        let arena = fsst_decompress_arena(
-            table,
-            data,
-            &offsets,
-            "dictionary entry",
-            "dictionary offsets must be non-decreasing",
-        )?;
-        for index in 0..arena.len() {
-            let entry = arena.value(index).ok_or(FormatError::InvalidUtf8 {
-                what: "dictionary entry",
-            })?;
-            if entry.len() > DICTIONARY_FSST_MAX_VALUE_LEN {
-                return Err(FormatError::Structural {
-                    rule: "dictionary entry exceeds the FSST value cap",
-                });
-            }
-            dictionary.push(entry.to_owned());
-        }
-        return Ok(dictionary);
-    }
-    for pair in offsets.windows(2) {
-        let (start, end) = match pair {
-            [start, end] => (*start, *end),
-            _ => continue,
-        };
-        if end < start {
-            return Err(FormatError::Structural {
-                rule: "dictionary offsets must be non-decreasing",
-            });
-        }
-        let bytes = slice(data, start, end - start, "dictionary entry")?;
-        dictionary.push(
-            simdutf8::basic::from_utf8(bytes)
-                .map_err(|_| FormatError::InvalidUtf8 {
-                    what: "dictionary entry",
-                })?
-                .to_owned(),
-        );
-    }
-    Ok(dictionary)
+    let dictionary = DictionaryValues::read(reader, dict_count, side)?;
+    Ok(dictionary.entries()?.into_iter().map(str::to_owned).collect())
 }
 
 fn decode_dictionary_string(
@@ -2421,30 +2595,29 @@ fn decode_dictionary_string(
             rule: "shared-scope dictionary block without its file alphabet",
         })?;
         let codes = bitunpack(reader)?;
-        let present = resolve_dictionary_codes(&codes, alphabet)?;
-        return merge_nulls(&nulls, &present);
+        return merge_nulls(&nulls, codes.len(), |index| dictionary_entry(&codes, alphabet, index));
     }
     let dict_count = reader.u32("dictionary count")? as usize;
-    let dictionary = read_dictionary_values(reader, dict_count, side)?;
+    let dictionary = DictionaryValues::read(reader, dict_count, side)?;
+    let entries = dictionary.entries()?;
     let codes = bitunpack(reader)?;
-    let present = resolve_dictionary_codes(&codes, &dictionary)?;
-    merge_nulls(&nulls, &present)
+    merge_nulls(&nulls, codes.len(), |index| dictionary_entry(&codes, &entries, index))
 }
 
-/// Resolves each stored code to the dictionary entry it names, borrowed rather than copied — the codes outnumber the
-/// entries, so a dense column would otherwise copy the same handful of values once per row.
-fn resolve_dictionary_codes<'a>(codes: &[u64], dictionary: &'a [String]) -> Result<Vec<&'a str>, FormatError> {
+/// The dictionary entry that stored code `index` names, borrowed rather than copied: the codes outnumber the entries,
+/// so a dense column would otherwise copy the same handful of values once per row.
+fn dictionary_entry<'a, T: AsRef<str>>(
+    codes: &[u64],
+    dictionary: &'a [T],
+    index: usize,
+) -> Result<&'a str, FormatError> {
     codes
-        .iter()
-        .map(|code| {
-            dictionary
-                .get(*code as usize)
-                .map(String::as_str)
-                .ok_or(FormatError::RefOutOfRange {
-                    what: "dictionary code",
-                })
+        .get(index)
+        .and_then(|&code| dictionary.get(code as usize))
+        .map(AsRef::as_ref)
+        .ok_or(FormatError::RefOutOfRange {
+            what: "dictionary code",
         })
-        .collect()
 }
 
 /// fsst-rs's lossy perfect-hash-table size (`fsst::lossy_pht::HASH_TABLE_SIZE`), pinned with fsst-rs 0.5.11. A slot
@@ -2879,15 +3052,7 @@ fn decode_fsst_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatErr
         "fsst value",
         "fsst offsets must be non-decreasing",
     )?;
-    let mut present: Vec<&str> = Vec::with_capacity(arena.len());
-    for index in 0..arena.len() {
-        present.push(
-            arena
-                .value(index)
-                .ok_or(FormatError::InvalidUtf8 { what: "fsst value" })?,
-        );
-    }
-    merge_nulls(&nulls, &present)
+    merge_nulls(&nulls, arena.len(), |index| fsst_arena_value(&arena, index))
 }
 
 fn decode_raw_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatError> {
@@ -2896,21 +3061,9 @@ fn decode_raw_string(reader: &mut Reader<'_>) -> Result<StringColumn, FormatErro
     let offsets = read_offsets(reader, present_count)?;
     let data_len = offsets.last().copied().unwrap_or(0);
     let data = reader.take(data_len, "raw string data")?;
-    let mut present = Vec::with_capacity(present_count);
-    for pair in offsets.windows(2) {
-        let (start, end) = match pair {
-            [start, end] => (*start, *end),
-            _ => continue,
-        };
-        if end < start {
-            return Err(FormatError::Structural {
-                rule: "raw string offsets must be non-decreasing",
-            });
-        }
-        let bytes = slice(data, start, end - start, "raw string")?;
-        present.push(simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 { what: "raw string" })?);
-    }
-    merge_nulls(&nulls, &present)
+    merge_nulls(&nulls, offsets.len().saturating_sub(1), |index| {
+        raw_string_value(data, &offsets, index)
+    })
 }
 
 /// Decodes a string block straight into an Arrow `StringView` array: the same values and nulls `decode_block` returns
@@ -2947,13 +3100,30 @@ pub(crate) struct SharedStringViewDictionary {
 pub(crate) fn prepare_shared_string_view_dictionary(
     shared: &[String],
 ) -> Result<SharedStringViewDictionary, FormatError> {
-    let entries: Vec<&str> = shared.iter().map(String::as_str).collect();
-    let (arena, bounds) = concatenate(&entries);
-    let entry_views = views_over(&arena, &bounds)?;
+    // Sized and checked up front, so an alphabet too large for a view to address is refused before its arena is
+    // allocated rather than after. Every entry is already a `String`, so each view spans valid UTF-8 by construction.
+    let mut arena = Vec::with_capacity(view_arena_len(shared.iter().map(String::len))?);
+    let mut entry_views = Vec::with_capacity(shared.len());
+    for value in shared {
+        // The whole arena fits a `u32`, checked above, so every start within it does too.
+        entry_views.push(make_view(value.as_bytes(), 0, arena.len() as u32));
+        arena.extend_from_slice(value.as_bytes());
+    }
     Ok(SharedStringViewDictionary {
         arena: Buffer::from(arena),
         entry_views,
     })
+}
+
+/// The byte length of values of lengths `lens` laid end to end, refused when it overflows or a view's `u32` offset
+/// could not address its end.
+fn view_arena_len(lens: impl IntoIterator<Item = usize>) -> Result<usize, FormatError> {
+    lens.into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .filter(|&total| u32::try_from(total).is_ok())
+        .ok_or(FormatError::Structural {
+            rule: "string arena larger than a view offset can address",
+        })
 }
 
 /// [`decode_string_block_views_shared`] with a prepared representation of the same file-scope alphabet. The prepared
@@ -4341,8 +4511,18 @@ fn decode_dictionary_string_range(
         )
     };
     if width == 0 {
-        let zero_codes = vec![0u64; present_end - present_start];
-        return materialize(&zero_codes);
+        // Every code is 0, so each present row names entry 0, looked up only when a present row is selected.
+        return merge_nulls_range(
+            &nulls,
+            present_end - present_start,
+            |_| {
+                entries.first().copied().ok_or(FormatError::RefOutOfRange {
+                    what: "dictionary code",
+                })
+            },
+            start,
+            effective_end,
+        );
     }
     let bits = width as usize;
     let words_per_lane = fastlanes_words_per_lane(bits);
@@ -4368,14 +4548,14 @@ fn decode_dictionary_string_range(
 
 /// What every string block writes before its values: the presence stream, the FSST symbol table when the block
 /// carries one, how many present values follow, and where the offset table over them begins.
-struct StringHeader {
+struct StringHeader<'a> {
     fsst: Option<FsstDecodeTable>,
-    nulls: NullStream,
+    nulls: NullStream<'a>,
     offsets_start: usize,
     present_count: usize,
 }
 
-impl StringHeader {
+impl StringHeader<'_> {
     /// The block's FSST symbol table, which every FSST block carries and no other string block does.
     fn fsst(&self) -> Result<&FsstDecodeTable, FormatError> {
         self.fsst.as_ref().ok_or(FormatError::Structural {
@@ -4391,7 +4571,7 @@ impl StringHeader {
 }
 
 /// Reads the header of a string block stored under `transform`, leaving `reader` positioned at its offset table.
-fn read_string_header(transform: Transform, reader: &mut Reader<'_>) -> Result<StringHeader, FormatError> {
+fn read_string_header<'a>(transform: Transform, reader: &mut Reader<'a>) -> Result<StringHeader<'a>, FormatError> {
     let nulls = NullStream::read(reader)?;
     let fsst = match transform {
         Transform::FsstString => Some(FsstDecodeTable::read(reader)?),
@@ -4447,7 +4627,7 @@ fn merge_nulls_range<'a>(
 /// slice — read from a block body through the two offset entries that bound the run, never through the whole table.
 fn value_bytes_for_range<'a>(
     body: &'a [u8],
-    header: &StringHeader,
+    header: &StringHeader<'_>,
     present_start: usize,
     present_end: usize,
     what: &'static str,
@@ -4550,15 +4730,23 @@ fn raw_string_value<'a>(data: &'a [u8], offsets: &[usize], index: usize) -> Resu
 fn read_windowed_string_header(
     transform: Transform,
     window: &mut seekable_zstd::Window<'_>,
-) -> Result<StringHeader, FormatError> {
-    let mut probe = window.first_frame_len().min(window.plain_len());
+) -> Result<StringHeader<'static>, FormatError> {
+    let plain_len = window.plain_len();
+    let mut probe = window.first_frame_len().min(plain_len);
     loop {
         let head = window.read_forward(0, probe)?;
         match read_string_header(transform, &mut Reader::new(&head)) {
-            Err(FormatError::Truncated { .. }) if probe < window.plain_len() => {
-                probe = probe.saturating_mul(2).min(window.plain_len());
+            Err(FormatError::Truncated { .. }) if probe < plain_len => {
+                probe = probe.saturating_mul(2).min(plain_len);
             }
-            header => return header,
+            header => {
+                return header.map(|header| StringHeader {
+                    fsst: header.fsst,
+                    nulls: header.nulls.into_owned(),
+                    offsets_start: header.offsets_start,
+                    present_count: header.present_count,
+                });
+            }
         }
     }
 }

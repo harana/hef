@@ -204,7 +204,9 @@ pub fn decompress_all_into(stored: &[u8], plain: &mut Vec<u8>) -> Result<(), For
 /// one at most once, so reaching a single value leaves the rest of the arena compressed. A caller walking the form
 /// front to back through [`Window::read_forward`] keeps only one frame inflated at a time.
 pub struct Window<'a> {
-    frames: Vec<Option<Vec<u8>>>,
+    /// Only the frames inflated so far, as (frame index, plaintext) sorted by index, so a form of many frames costs
+    /// nothing here until a read reaches one.
+    frames: Vec<(u32, Vec<u8>)>,
     /// Frames below this index were passed by a forward walk and let go.
     released: u32,
     /// A frame buffer let go of and kept for the next frame inflated, so a walk reuses one allocation.
@@ -217,10 +219,9 @@ impl<'a> Window<'a> {
     /// Opens the stored form, reading its seek table but decompressing nothing.
     pub fn open(stored: &'a [u8]) -> Result<Self, FormatError> {
         let table = seek_table(stored)?;
-        let frames = vec![None; table.num_frames() as usize];
         let spare = SPARE_FRAME.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
         Ok(Self {
-            frames,
+            frames: Vec::new(),
             released: 0,
             spare,
             stored,
@@ -243,7 +244,13 @@ impl<'a> Window<'a> {
     /// what a forward walk let go.
     #[cfg(test)]
     pub(crate) fn decompressed_frames(&self) -> usize {
-        self.frames.iter().filter(|frame| frame.is_some()).count()
+        self.frames.len()
+    }
+
+    /// The indexes of the frames inflated right now, lowest first.
+    #[cfg(test)]
+    pub(crate) fn decompressed_frame_indexes(&self) -> Vec<u32> {
+        self.frames.iter().map(|(index, _)| *index).collect()
     }
 
     /// Plaintext bytes `[start, start + len)`, decompressing only the frames they fall in.
@@ -279,9 +286,9 @@ impl<'a> Window<'a> {
             return Ok(Cow::Borrowed(&[]));
         }
         let (first, last, end) = self.span(start, len)?;
-        while self.released < first {
-            self.release(self.released);
-            self.released += 1;
+        if self.released < first {
+            self.release(self.released, first);
+            self.released = first;
         }
         if first != last {
             return self.read(start, len).map(Cow::Owned);
@@ -317,23 +324,30 @@ impl<'a> Window<'a> {
 
     /// Frame `index`'s plaintext, inflated into the spare buffer on first use and kept until let go.
     fn frame(&mut self, index: u32) -> Result<&[u8], FormatError> {
-        let outside = || failed("seekable zstd frame index is outside the seek table");
-        let slot = usize::try_from(index).unwrap_or(usize::MAX);
-        if self.frames.get(slot).is_none_or(Option::is_none) {
-            let mut buffer = std::mem::take(&mut self.spare);
-            decompress_frame(self.stored, &self.table, index, &mut buffer)?;
-            *self.frames.get_mut(slot).ok_or_else(outside)? = Some(buffer);
-        }
-        self.frames.get(slot).and_then(Option::as_deref).ok_or_else(outside)
+        let position = match self.frames.binary_search_by_key(&index, |(cached, _)| *cached) {
+            Ok(position) => position,
+            Err(position) => {
+                let mut buffer = std::mem::take(&mut self.spare);
+                decompress_frame(self.stored, &self.table, index, &mut buffer)?;
+                self.frames.insert(position, (index, buffer));
+                position
+            }
+        };
+        self.frames
+            .get(position)
+            .map(|(_, buffer)| buffer.as_slice())
+            .ok_or_else(|| failed("seekable zstd frame index is outside the seek table"))
     }
 
-    /// Lets frame `index`'s plaintext go, keeping its buffer as the spare when there is none.
-    fn release(&mut self, index: u32) {
-        let slot = usize::try_from(index).unwrap_or(usize::MAX);
-        if let Some(buffer) = self.frames.get_mut(slot).and_then(Option::take)
-            && self.spare.capacity() == 0
-        {
-            self.spare = buffer;
+    /// Lets the plaintext of every inflated frame in `[from, to)` go, lowest first, keeping a buffer as the spare
+    /// when there is none.
+    fn release(&mut self, from: u32, to: u32) {
+        let low = self.frames.partition_point(|(index, _)| *index < from);
+        let high = self.frames.partition_point(|(index, _)| *index < to);
+        for (_, buffer) in self.frames.drain(low..high) {
+            if self.spare.capacity() == 0 {
+                self.spare = buffer;
+            }
         }
     }
 }
@@ -345,7 +359,11 @@ impl Drop for Window<'_> {
         let buffer = if spare.capacity() > 0 {
             spare
         } else {
-            self.frames.iter_mut().find_map(Option::take).unwrap_or_default()
+            self.frames
+                .drain(..)
+                .next()
+                .map(|(_, buffer)| buffer)
+                .unwrap_or_default()
         };
         if buffer.capacity() <= FRAME_BYTES as usize {
             SPARE_FRAME.with(|slot| *slot.borrow_mut() = buffer);

@@ -247,6 +247,77 @@ fn a_forward_walk_keeps_one_frame_inflated_and_agrees_with_the_plaintext() {
     assert!(window.read_forward(plain.len() - 4, 5).is_err());
 }
 
+/// A window caches only the frames a read inflated: a first read near the end inflates one frame, a read behind the
+/// walk adds its frame without releasing anything, a forward read releases only the cached frames between the old and
+/// new walk position, and a failed inflation caches nothing.
+#[test]
+fn a_window_caches_only_inflated_frames_and_releases_those_the_walk_passes() {
+    let plain = arena(8192);
+    let stored = compress(&plain).unwrap();
+    let table = seek_table(&stored).unwrap();
+    let last = table.num_frames() - 1;
+    assert!(last >= 5, "the arena spans enough frames to skip over");
+    let start_of = |index: u32| table.frame_start_decomp(index).unwrap() as usize;
+    take_frames_inflated();
+
+    let mut window = Window::open(&stored).unwrap();
+    assert!(window.decompressed_frame_indexes().is_empty());
+    let late = window.read_forward(start_of(last) + 3, 7).unwrap();
+    assert!(matches!(late, Cow::Borrowed(_)));
+    assert_eq!(&*late, &plain[start_of(last) + 3..start_of(last) + 10]);
+    assert_eq!(take_frames_inflated(), 1);
+    assert_eq!(window.decompressed_frame_indexes(), [last]);
+
+    assert_eq!(window.read(5, 10).unwrap(), &plain[5..15]);
+    let below = window.read_forward(start_of(1) + 1, 4).unwrap();
+    assert_eq!(&*below, &plain[start_of(1) + 1..start_of(1) + 5]);
+    assert_eq!(take_frames_inflated(), 2);
+    assert_eq!(
+        window.decompressed_frame_indexes(),
+        [0, 1, last],
+        "a forward read below the walk's high-water mark releases nothing"
+    );
+    let again = window.read_forward(start_of(last), 4).unwrap();
+    assert_eq!(&*again, &plain[start_of(last)..start_of(last) + 4]);
+    assert_eq!(take_frames_inflated(), 0, "a cached frame is not inflated again");
+    assert_eq!(window.decompressed_frame_indexes(), [0, 1, last]);
+    let lowest = window.frames[0].1.clone();
+    drop(window);
+    assert_eq!(
+        SPARE_FRAME.with(|slot| slot.borrow().clone()),
+        lowest,
+        "a window without a spare hands its lowest cached frame back to the thread"
+    );
+
+    let mut window = Window::open(&stored).unwrap();
+    window.read(0, 4).unwrap();
+    window.read(start_of(2), 4).unwrap();
+    let reused = window.frames[0].1.as_ptr();
+    let gathered = window.read_forward(start_of(4) - 3, 6).unwrap();
+    assert!(matches!(gathered, Cow::Owned(_)));
+    assert_eq!(&*gathered, &plain[start_of(4) - 3..start_of(4) + 3]);
+    assert_eq!(window.decompressed_frame_indexes(), [3, 4]);
+    assert_eq!(
+        window.frames[0].1.as_ptr(),
+        reused,
+        "the lowest released frame's buffer is the spare the next frame inflates into"
+    );
+    take_frames_inflated();
+    let inside = window.read_forward(start_of(4) + 3, 4).unwrap();
+    assert_eq!(&*inside, &plain[start_of(4) + 3..start_of(4) + 7]);
+    assert_eq!(take_frames_inflated(), 0);
+    assert_eq!(window.decompressed_frame_indexes(), [4]);
+    assert_eq!(window.read(0, plain.len()).unwrap(), plain);
+    assert_eq!(window.decompressed_frames() as u32, last + 1);
+
+    let mut zeroed = stored.clone();
+    zeroed[..table.size_comp() as usize].fill(0);
+    let mut window = Window::open(&zeroed).unwrap();
+    assert!(window.read_forward(start_of(last), 4).is_err());
+    assert!(window.read(0, 4).is_err());
+    assert!(window.decompressed_frame_indexes().is_empty());
+}
+
 /// Frames that disagree with their seek table — a table promising more plaintext than a frame holds, frames
 /// overwritten under an honest table, or frames cut short — are refused by the whole-arena, range, and window reads
 /// alike, never served short or padded.
