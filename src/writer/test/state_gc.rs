@@ -177,13 +177,9 @@ fn an_orphan_is_deleted_once_the_grace_period_passes() {
     deleted.sort_unstable();
     assert_eq!(deleted, orphans(&world));
     assert!(deleted.iter().all(|address| !stored(&world, address)));
-    let recorded: Vec<[u8; 32]> = world
-        .ledger
-        .records()
-        .unwrap()
-        .iter()
-        .map(|record| record.address)
-        .collect();
+    let mut records = Vec::new();
+    world.ledger.records_after(None, usize::MAX, &mut records).unwrap();
+    let recorded: Vec<[u8; 32]> = records.iter().map(|record| record.address).collect();
     assert!(deleted.iter().all(|address| !recorded.contains(address)));
     assert!(matches!(
         read(&world, &world.old.root),
@@ -229,4 +225,131 @@ fn a_missing_referenced_chunk_fails_the_sweep_before_anything_is_deleted() {
         .unwrap();
     assert!(matches!(sweep(&world), Err(StateChunkError::Missing { .. })));
     assert!(orphans(&world).iter().all(|address| stored(&world, address)));
+}
+
+/// A ledger whose records are only addresses `0..count` (big-endian in the last eight bytes) with no stored objects;
+/// those below `recent_from` were last used long before `now`, the rest at `now`.
+fn bare_ledger(count: u64, recent_from: u64, now: i64) -> SimStateChunkLedger {
+    let ledger = SimStateChunkLedger::default();
+    for i in 0..count {
+        let used = if i < recent_from {
+            now - 2 * STATE_CHUNK_GRACE_NANOS
+        } else {
+            now
+        };
+        ledger.touch(&bare_address(i), used).unwrap();
+    }
+    ledger
+}
+
+fn bare_address(i: u64) -> [u8; 32] {
+    let mut address = [0; 32];
+    address[24..].copy_from_slice(&i.to_be_bytes());
+    address
+}
+
+fn bare_sweep(ledger: &dyn StateChunkLedger, clock: &FixedClock) -> StateChunkSweep {
+    let objects = SimObjectStore::new();
+    let head = ManifestGeneration::default();
+    sweep_state_chunks(
+        &head,
+        tenant(),
+        &RootsByFile::default(),
+        &key(),
+        ledger,
+        &objects,
+        clock,
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_sweep_over_several_pages_deletes_every_due_chunk_once_and_keeps_the_rest() {
+    let now = 1_760_000_000 * 1_000_000_000;
+    let clock = FixedClock::at(now);
+    // Exact page multiples and one past, with every page's last record (the next page's cursor) deleted.
+    for count in [
+        STATE_CHUNK_SWEEP_PAGE_RECORDS as u64,
+        2 * STATE_CHUNK_SWEEP_PAGE_RECORDS as u64,
+        2 * STATE_CHUNK_SWEEP_PAGE_RECORDS as u64 + 1,
+    ] {
+        let due = count - 3;
+        let ledger = bare_ledger(count, due, now);
+
+        let sweep = bare_sweep(&ledger, &clock);
+
+        let expected: Vec<[u8; 32]> = (0..due).map(bare_address).collect();
+        assert_eq!(sweep.deleted, expected, "count {count}");
+        let mut left = Vec::new();
+        ledger.records_after(None, usize::MAX, &mut left).unwrap();
+        let left: Vec<[u8; 32]> = left.iter().map(|record| record.address).collect();
+        assert_eq!(left, (due..count).map(bare_address).collect::<Vec<_>>());
+    }
+}
+
+/// A ledger that lets an upload reuse `reused` and add `added` just after the sweep reads its first page.
+struct UploadDuringSweep {
+    added: [u8; 32],
+    ledger: SimStateChunkLedger,
+    now: i64,
+    reused: [u8; 32],
+}
+
+impl StateChunkLedger for UploadDuringSweep {
+    fn touch(&self, address: &[u8; 32], now_nanos: i64) -> Result<bool, StorageError> {
+        self.ledger.touch(address, now_nanos)
+    }
+
+    fn clear_marks(&self) -> Result<(), StorageError> {
+        self.ledger.clear_marks()
+    }
+
+    fn mark(&self, address: &[u8; 32]) -> Result<bool, StorageError> {
+        self.ledger.mark(address)
+    }
+
+    fn records_after(
+        &self,
+        after: Option<&[u8; 32]>,
+        limit: usize,
+        page: &mut Vec<StateChunkRecord>,
+    ) -> Result<(), StorageError> {
+        self.ledger.records_after(after, limit, page)?;
+        if after.is_none() {
+            assert!(self.ledger.touch(&self.reused, self.now)?);
+            assert!(self.ledger.touch(&self.added, self.now)?);
+        }
+        Ok(())
+    }
+
+    fn claim(&self, address: &[u8; 32], unused_since_nanos: i64) -> Result<bool, StorageError> {
+        self.ledger.claim(address, unused_since_nanos)
+    }
+
+    fn forget(&self, address: &[u8; 32]) -> Result<(), StorageError> {
+        self.ledger.forget(address)
+    }
+}
+
+#[test]
+fn a_chunk_an_upload_uses_mid_sweep_is_kept() {
+    let now = 1_760_000_000 * 1_000_000_000;
+    let clock = FixedClock::at(now);
+    let count = 2 * STATE_CHUNK_SWEEP_PAGE_RECORDS as u64;
+    let reused = bare_address(1);
+    let ledger = UploadDuringSweep {
+        added: bare_address(count + 5),
+        ledger: bare_ledger(count, count, now),
+        now,
+        reused,
+    };
+
+    let sweep = bare_sweep(&ledger, &clock);
+
+    let expected: Vec<[u8; 32]> = (0..count).filter(|&i| i != 1).map(bare_address).collect();
+    assert_eq!(sweep.deleted, expected);
+    let mut left = Vec::new();
+    ledger.records_after(None, usize::MAX, &mut left).unwrap();
+    let left: Vec<[u8; 32]> = left.iter().map(|record| record.address).collect();
+    assert_eq!(left, vec![reused, bare_address(count + 5)]);
 }

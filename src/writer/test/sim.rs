@@ -82,3 +82,33 @@ fn a_refreshed_receipt_outlives_its_stale_queue_entry() {
     assert_eq!(retry.len(), 1, "the refreshed row survives the stale queue entry");
     assert!(retry.duplicate_within_guard(tenant, (100, 0), 2_000));
 }
+
+#[test]
+fn ledger_pages_resume_strictly_after_the_cursor_even_once_it_is_forgotten() {
+    let ledger = SimStateChunkLedger::default();
+    for first_byte in [0, 3, 7, 9, u8::MAX] {
+        ledger.touch(&[first_byte; 32], 1).unwrap();
+    }
+    let mut page = Vec::new();
+    ledger.records_after(None, 2, &mut page).unwrap();
+    assert_eq!(
+        page.iter().map(|record| record.address[0]).collect::<Vec<_>>(),
+        vec![0, 3]
+    );
+
+    ledger.forget(&[3; 32]).unwrap();
+    ledger.records_after(Some(&[3; 32]), 2, &mut page).unwrap();
+    assert_eq!(
+        page.iter().map(|record| record.address[0]).collect::<Vec<_>>(),
+        vec![7, 9]
+    );
+
+    ledger.records_after(Some(&[9; 32]), 2, &mut page).unwrap();
+    assert_eq!(
+        page.iter().map(|record| record.address[0]).collect::<Vec<_>>(),
+        vec![u8::MAX]
+    );
+
+    ledger.records_after(Some(&[u8::MAX; 32]), 2, &mut page).unwrap();
+    assert!(page.is_empty());
+}
