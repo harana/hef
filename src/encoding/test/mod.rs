@@ -3703,6 +3703,88 @@ fn alp_rd_in_place_decode_rejects_corrupt_bodies_like_the_reference() {
     assert_alp_rd_decode_matches_reference(&body);
 }
 
+/// The ALP-RD encoder as it stood before it dropped its full-length right-part and exception buffers: the reference
+/// the leaner encoder must match byte for byte.
+fn encode_alp_rd_reference(values: &[f64], out: &mut Writer) {
+    let sample = transform_sample(values);
+    let sample: &[f64] = sample.as_deref().unwrap_or(values);
+    let (right_width, dict, _) = alp_rd_choose_split(sample);
+    let mut padded_dict = [0u16; ALP_RD_MAX_DICT_LEN];
+    for (slot, entry) in padded_dict.iter_mut().zip(&dict) {
+        *slot = *entry;
+    }
+    let mut codes = vec![0u64; values.len()];
+    let mut rights = vec![0u64; values.len()];
+    alp_rd_split_chunk(values, right_width, &padded_dict, dict.len(), &mut codes, &mut rights);
+    let mut exceptions: Vec<(u32, u16)> = Vec::new();
+    for (index, (code, value)) in codes.iter_mut().zip(values).enumerate() {
+        if *code == ALP_RD_CODE_MISS {
+            *code = 0;
+            exceptions.push((index as u32, (value.to_bits() >> right_width) as u16));
+        }
+    }
+    out.put_u8(right_width as u8);
+    out.put_u8(dict.len() as u8);
+    for left in &dict {
+        out.put_u16(*left);
+    }
+    out.put_u32(exceptions.len() as u32);
+    for (index, left) in &exceptions {
+        out.put_u32(*index);
+        out.put_u16(*left);
+    }
+    let max_code = codes.iter().copied().max().unwrap_or(0);
+    bitpack(&codes, bits_needed(max_code), out);
+    let max_right = rights.iter().copied().max().unwrap_or(0);
+    bitpack(&rights, bits_needed(max_right), out);
+}
+
+/// Splitting a vector at a time and packing right parts straight from the input must write exactly the bytes the
+/// full-buffer encoder wrote: empty and singleton blocks, lengths around the 1024-value vector, no, mixed, and all
+/// exceptions, zero-width and maximal right parts, and special values.
+#[test]
+fn alp_rd_encode_matches_the_full_buffer_reference_byte_for_byte() {
+    let specials = [
+        0.0f64,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7FF8_0000_0000_0001),
+        f64::from_bits(0xFFF4_0000_DEAD_BEEF),
+        f64::from_bits(1),
+        f64::from_bits(0x800F_FFFF_FFFF_FFFF),
+    ];
+    let generators: [fn(u64) -> f64; 5] = [
+        // One shared left part: no exceptions.
+        |i| f64::from_bits(0x43F0_0000_0000_0000 | (mix(i) >> 12)),
+        // A few left parts plus specials: mixed exceptions.
+        |i| f64::from_bits(0x4030_0000_0000_0000 ^ ((mix(i) % 12) << 52) ^ (mix(i + 7) >> 12)),
+        // Raw bit patterns: nearly every left part misses.
+        |i| f64::from_bits(mix(i)),
+        // Right parts all zero: a zero-width right stream.
+        |i| f64::from_bits((mix(i) % 3) << 52),
+        // Right parts all ones: a maximal-width right stream.
+        |i| f64::from_bits(0x4010_0000_0000_0000 | ((mix(i) % 2) << 63) | 0x000F_FFFF_FFFF_FFFF),
+    ];
+    for len in [0usize, 1, 2, 1023, 1024, 1025, 2048, 3001] {
+        for generate in generators {
+            let mut values: Vec<f64> = (0..len as u64).map(generate).collect();
+            for (slot, special) in values.iter_mut().step_by(97).zip(specials.iter().cycle()) {
+                *slot = *special;
+            }
+            let mut out = Writer::new();
+            encode_alp_rd(&values, &mut out);
+            let mut reference = Writer::new();
+            encode_alp_rd_reference(&values, &mut reference);
+            assert_eq!(out.bytes(), reference.bytes(), "len {len}");
+            let decoded = decode_alp_rd(&mut Reader::new(out.bytes())).unwrap();
+            let decoded: Vec<u64> = decoded.iter().map(|value| value.to_bits()).collect();
+            let original: Vec<u64> = values.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(decoded, original, "len {len}");
+        }
+    }
+}
+
 #[test]
 fn presence_rank_and_present_position_agree_with_a_prefix_count() {
     // Every third row present, over enough rows to cross several bitmap bytes.
