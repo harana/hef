@@ -2442,6 +2442,72 @@ fn dictionary_whole_block_decode_checks_every_code_before_weaving_nulls() {
     );
 }
 
+/// The whole-block dictionary decode checks every local entry, unused ones included, before it reads the codes, so a
+/// malformed entry wins over a bad code or a count disagreement, for plain and FSST value streams alike.
+#[test]
+fn dictionary_whole_block_decode_checks_every_entry_before_the_codes() {
+    let values: StringColumn = (0..3).map(|_| Some("x")).collect();
+    let plain = |offsets: &[u32], data: &[u8], codes: &[u64]| {
+        let mut out = Writer::new();
+        NullStream::from_values(&values).write(&mut out);
+        out.put_u32(offsets.len() as u32 - 1);
+        for &offset in offsets {
+            out.put_u32(offset);
+        }
+        out.put_slice(data);
+        bitpack(codes, bits_needed(codes.iter().copied().max().unwrap_or(0)), &mut out);
+        let pipeline = PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String);
+        decode_block(pipeline, &out.into_bytes())
+    };
+    let utf8 = FormatError::InvalidUtf8 {
+        what: "dictionary entry",
+    };
+    assert_eq!(
+        plain(&[0, 1, 3], "a\u{e9}".as_bytes(), &[1, 0, 1]).unwrap(),
+        ColumnData::Strings(vec![Some("\u{e9}"), Some("a"), Some("\u{e9}")].into())
+    );
+    assert_eq!(
+        plain(&[1, 2, 4], "za\u{e9}".as_bytes(), &[0, 0, 1]).unwrap(),
+        ColumnData::Strings(vec![Some("a"), Some("a"), Some("\u{e9}")].into()),
+        "a leading offset other than zero"
+    );
+    assert_eq!(
+        plain(&[0, 1, 2], b"a\xFF", &[0, 0, 0]).unwrap_err(),
+        utf8,
+        "unused invalid entry"
+    );
+    assert_eq!(
+        plain(&[0, 1, 2], b"a\xFF", &[0, 9]).unwrap_err(),
+        utf8,
+        "beats a bad code and count"
+    );
+    assert_eq!(
+        plain(&[0, 1, 3], "\u{e9}b".as_bytes(), &[0, 0, 0]).unwrap_err(),
+        utf8,
+        "split character"
+    );
+    assert_eq!(
+        plain(&[0, 2, 1, 3], b"abc", &[0, 0, 0]).unwrap_err(),
+        FormatError::Structural {
+            rule: "dictionary offsets must be non-decreasing",
+        }
+    );
+    assert!(matches!(
+        plain(&[0, 1, 9], b"ab", &[0, 0, 0]),
+        Err(FormatError::Truncated { .. })
+    ));
+
+    let long = "y".repeat(DICTIONARY_FSST_MAX_VALUE_LEN + 1);
+    let (pipeline, bytes) = zero_width_dictionary_block(&values, &[long.as_str()], SideStream::FsstDictionaryValues, 1);
+    assert_eq!(
+        decode_block(pipeline, &bytes).unwrap_err(),
+        FormatError::Structural {
+            rule: "dictionary entry exceeds the FSST value cap",
+        },
+        "the cap beats a count disagreement"
+    );
+}
+
 /// Long free-text bodies, the shape `choose_string_transform` sends to the raw arena: high cardinality, average
 /// length past `FSST_MAX_AVERAGE_VALUE_LEN`, one row in nine absent.
 fn long_free_text(rows: usize) -> Vec<Option<String>> {

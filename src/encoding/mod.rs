@@ -2378,6 +2378,75 @@ fn merge_nulls<'a>(
     Ok(values)
 }
 
+/// The distinct values a dictionary block stores, left where they already are: borrowed from the block body for a
+/// plain value stream, or held in the decompressed arena when the block records the FSST inner level. No entry is
+/// copied into a string of its own.
+///
+/// See: hef-encodings-and-compression/spec.md
+enum DictionaryValues<'a> {
+    Fsst(FsstArena),
+    Plain { data: &'a [u8], offsets: Vec<usize> },
+}
+
+impl<'a> DictionaryValues<'a> {
+    /// Reads a dictionary block's distinct-value stream: plain, or FSST-compressed when the block records the
+    /// [`SideStream::FsstDictionaryValues`] inner level.
+    fn read(reader: &mut Reader<'a>, dict_count: usize, side: SideStream) -> Result<Self, FormatError> {
+        let fsst = match side {
+            SideStream::FsstDictionaryValues => Some(FsstDecodeTable::read(reader)?),
+            _ => None,
+        };
+        let offsets = read_offsets(reader, dict_count)?;
+        let data_len = offsets.last().copied().unwrap_or(0);
+        let data = reader.take(data_len, "dictionary data")?;
+        Ok(match &fsst {
+            Some(table) => Self::Fsst(fsst_decompress_arena(
+                table,
+                data,
+                &offsets,
+                "dictionary entry",
+                "dictionary offsets must be non-decreasing",
+            )?),
+            None => Self::Plain { data, offsets },
+        })
+    }
+
+    /// Every entry, in code order, each checked before any is lent out: plain entries for ordered, in-bounds offsets
+    /// and UTF-8, FSST entries for character boundaries and the FSST value cap.
+    fn entries(&self) -> Result<Vec<&str>, FormatError> {
+        match self {
+            Self::Fsst(arena) => (0..arena.len())
+                .map(|index| {
+                    let entry = arena.value(index).ok_or(FormatError::InvalidUtf8 {
+                        what: "dictionary entry",
+                    })?;
+                    if entry.len() > DICTIONARY_FSST_MAX_VALUE_LEN {
+                        return Err(FormatError::Structural {
+                            rule: "dictionary entry exceeds the FSST value cap",
+                        });
+                    }
+                    Ok(entry)
+                })
+                .collect(),
+            Self::Plain { data, offsets } => offsets
+                .iter()
+                .zip(offsets.iter().skip(1))
+                .map(|(&start, &end)| {
+                    if end < start {
+                        return Err(FormatError::Structural {
+                            rule: "dictionary offsets must be non-decreasing",
+                        });
+                    }
+                    let bytes = slice(data, start, end - start, "dictionary entry")?;
+                    simdutf8::basic::from_utf8(bytes).map_err(|_| FormatError::InvalidUtf8 {
+                        what: "dictionary entry",
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Reads a dictionary block's distinct-value stream — plain, or FSST-compressed when the block records the
 /// [`SideStream::FsstDictionaryValues`] inner level — into owned entries, in code order.
 fn read_dictionary_values(
@@ -2385,55 +2454,8 @@ fn read_dictionary_values(
     dict_count: usize,
     side: SideStream,
 ) -> Result<Vec<String>, FormatError> {
-    let fsst = match side {
-        SideStream::FsstDictionaryValues => Some(FsstDecodeTable::read(reader)?),
-        _ => None,
-    };
-    let offsets = read_offsets(reader, dict_count)?;
-    let data_len = offsets.last().copied().unwrap_or(0);
-    let data = reader.take(data_len, "dictionary data")?;
-    let mut dictionary = Vec::with_capacity(reader.capacity_hint(dict_count, 1));
-    if let Some(table) = &fsst {
-        let arena = fsst_decompress_arena(
-            table,
-            data,
-            &offsets,
-            "dictionary entry",
-            "dictionary offsets must be non-decreasing",
-        )?;
-        for index in 0..arena.len() {
-            let entry = arena.value(index).ok_or(FormatError::InvalidUtf8 {
-                what: "dictionary entry",
-            })?;
-            if entry.len() > DICTIONARY_FSST_MAX_VALUE_LEN {
-                return Err(FormatError::Structural {
-                    rule: "dictionary entry exceeds the FSST value cap",
-                });
-            }
-            dictionary.push(entry.to_owned());
-        }
-        return Ok(dictionary);
-    }
-    for pair in offsets.windows(2) {
-        let (start, end) = match pair {
-            [start, end] => (*start, *end),
-            _ => continue,
-        };
-        if end < start {
-            return Err(FormatError::Structural {
-                rule: "dictionary offsets must be non-decreasing",
-            });
-        }
-        let bytes = slice(data, start, end - start, "dictionary entry")?;
-        dictionary.push(
-            simdutf8::basic::from_utf8(bytes)
-                .map_err(|_| FormatError::InvalidUtf8 {
-                    what: "dictionary entry",
-                })?
-                .to_owned(),
-        );
-    }
-    Ok(dictionary)
+    let dictionary = DictionaryValues::read(reader, dict_count, side)?;
+    Ok(dictionary.entries()?.into_iter().map(str::to_owned).collect())
 }
 
 fn decode_dictionary_string(
@@ -2450,11 +2472,10 @@ fn decode_dictionary_string(
         return merge_nulls(&nulls, codes.len(), |index| dictionary_entry(&codes, alphabet, index));
     }
     let dict_count = reader.u32("dictionary count")? as usize;
-    let dictionary = read_dictionary_values(reader, dict_count, side)?;
+    let dictionary = DictionaryValues::read(reader, dict_count, side)?;
+    let entries = dictionary.entries()?;
     let codes = bitunpack(reader)?;
-    merge_nulls(&nulls, codes.len(), |index| {
-        dictionary_entry(&codes, &dictionary, index)
-    })
+    merge_nulls(&nulls, codes.len(), |index| dictionary_entry(&codes, &entries, index))
 }
 
 /// The dictionary entry that stored code `index` names, borrowed rather than copied: the codes outnumber the entries,
