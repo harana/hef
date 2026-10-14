@@ -4282,6 +4282,207 @@ fn alp_rd_encode_matches_the_full_buffer_reference_byte_for_byte() {
     }
 }
 
+/// The ALP encoder as it stood before it dropped its full-length code vector: every vector's codes appended to one
+/// `Vec<u64>`, then scanned for the maximum and packed in one go. The reference the vector-at-a-time encoder must match
+/// byte for byte.
+fn encode_alp_reference(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Option<SideStream> {
+    let sample = transform_sample(values);
+    let sample: &[f64] = sample.as_deref().unwrap_or(values);
+    let mut zigzags = vec![0u64; sample.len()];
+    let mut encodable = vec![false; sample.len()];
+    let mut best: Option<(usize, usize)> = None;
+    for (index, power) in ALP_POWERS.iter().enumerate() {
+        alp_probe_chunk(sample, *power, &mut zigzags, &mut encodable);
+        let exceptions = encodable.iter().filter(|ok| !**ok).count();
+        if best.is_none_or(|(_, current)| exceptions < current) {
+            best = Some((index, exceptions));
+        }
+        if exceptions == 0 {
+            break;
+        }
+    }
+    let (exponent_index, _) = best?;
+    let power = ALP_POWERS.get(exponent_index).copied().unwrap_or(1.0);
+    alp_probe_chunk(sample, power, &mut zigzags, &mut encodable);
+    if !alp_viable(&encodable) {
+        return None;
+    }
+    let vector_scratch = values.len().min(FASTLANES_VECTOR);
+    zigzags.resize(vector_scratch, 0);
+    encodable.resize(vector_scratch, false);
+    let mut ints = Vec::with_capacity(values.len());
+    let mut exceptions: Vec<(u32, u64)> = Vec::new();
+    let mut escaped: Vec<u32> = Vec::new();
+    for (vector_index, vector) in values.chunks(FASTLANES_VECTOR).enumerate() {
+        let (Some(vector_zigzags), Some(vector_encodable)) =
+            (zigzags.get_mut(..vector.len()), encodable.get_mut(..vector.len()))
+        else {
+            continue;
+        };
+        alp_probe_chunk(vector, power, vector_zigzags, vector_encodable);
+        let vector_exceptions = vector_encodable.iter().filter(|ok| !**ok).count();
+        if vector_exceptions * ALP_MAX_EXCEPTION_SAMPLE_DIVISOR > vector.len() {
+            escaped.push(vector_index as u32);
+            ints.extend(std::iter::repeat_n(0u64, vector.len()));
+            continue;
+        }
+        let base = vector_index * FASTLANES_VECTOR;
+        ints.extend_from_slice(vector_zigzags);
+        for (offset, (ok, value)) in vector_encodable.iter().zip(vector).enumerate() {
+            if !*ok {
+                exceptions.push(((base + offset) as u32, value.to_bits()));
+            }
+        }
+    }
+    let index_base = exceptions.iter().map(|(index, _)| u64::from(*index)).min().unwrap_or(0);
+    let index_max_delta = exceptions
+        .iter()
+        .map(|(index, _)| u64::from(*index).wrapping_sub(index_base))
+        .max()
+        .unwrap_or(0);
+    let side = choose_exception_side_stream(exceptions.len(), index_max_delta, strategy);
+    if escaped.is_empty() {
+        out.put_u8(exponent_index as u8);
+    } else {
+        out.put_u8(ALP_VECTOR_ESCAPE_SENTINEL);
+        out.put_u8(exponent_index as u8);
+        out.put_u32(escaped.len() as u32);
+        for vector_index in &escaped {
+            out.put_u32(*vector_index);
+        }
+    }
+    out.put_u32(exceptions.len() as u32);
+    match side {
+        SideStream::None => {
+            for (index, bits) in &exceptions {
+                out.put_u32(*index);
+                out.put_u64(*bits);
+            }
+        }
+        SideStream::ForBitpack => {
+            out.put_u64(index_base);
+            bitpack_with(exceptions.len(), bits_needed(index_max_delta), out, |i| {
+                exceptions
+                    .get(i)
+                    .map_or(0, |(index, _)| u64::from(*index).wrapping_sub(index_base))
+            });
+            for (_, bits) in &exceptions {
+                out.put_u64(*bits);
+            }
+        }
+        SideStream::FileScopeDictionary | SideStream::FsstDictionaryValues | SideStream::FsstValueKeys => {
+            unreachable!("the exception side-stream chooser never picks a string block's side stream")
+        }
+    }
+    let max = ints.iter().copied().max().unwrap_or(0);
+    bitpack(&ints, bits_needed(max), out);
+    for vector_index in &escaped {
+        let start = *vector_index as usize * FASTLANES_VECTOR;
+        for value in &values[start..(start + FASTLANES_VECTOR).min(values.len())] {
+            out.put_u64(value.to_bits());
+        }
+    }
+    Some(side)
+}
+
+/// Float columns covering the ALP encoder's edge cases, each named for the failure message.
+fn alp_encode_columns() -> Vec<(String, Vec<f64>)> {
+    let specials = [
+        -0.0f64,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7FF8_0000_0000_0001),
+        f64::from_bits(0xFFF4_0000_DEAD_BEEF),
+        f64::from_bits(1),
+        1.0e300,
+    ];
+    let noise = |i: usize| f64::from_bits(0x3FF0_0000_0000_0000 | (mix(i as u64) & 0x000F_FFFF_FFFF_FFFF));
+    let mut columns: Vec<(String, Vec<f64>)> = vec![
+        ("empty".to_owned(), Vec::new()),
+        ("singleton".to_owned(), vec![0.25]),
+        ("singleton nan".to_owned(), vec![f64::NAN]),
+    ];
+    for len in [1usize, 2, 1023, 1024, 1025, 2048, 3001, 5000] {
+        // Quarter steps: no exceptions.
+        columns.push((format!("quarters {len}"), (0..len).map(|i| (i as f64) * 0.25).collect()));
+        // Every value zero: a zero-width code stream.
+        columns.push((format!("zeros {len}"), vec![0.0; len]));
+        // Large integers: codes near the scaled-magnitude bound, so a high width.
+        columns.push((
+            format!("wide {len}"),
+            (0..len).map(|i| (mix(i as u64) >> 12) as f64 - 2.0e15).collect(),
+        ));
+        // Negative hundredths with sparse specials: a handful of exceptions per vector.
+        let mut sparse: Vec<f64> = (0..len).map(|i| -(i as f64) / 100.0).collect();
+        for (slot, special) in sparse.iter_mut().step_by(97).zip(specials.iter().cycle()) {
+            *slot = *special;
+        }
+        columns.push((format!("sparse specials {len}"), sparse));
+        // Every tenth value noise: many exceptions, none of them enough to escape a vector.
+        columns.push((
+            format!("dense {len}"),
+            (0..len)
+                .map(|i| if i % 10 == 3 { noise(i) } else { (i as f64) * 0.5 })
+                .collect(),
+        ));
+    }
+    // Vector 0 sits exactly at the escape bound (kept), vector 1 one past it (escaped), vector 2 is clean, vector 3 is
+    // entirely noise (escaped), and the partial tail is noise (escaped).
+    let per_vector_noise = [128usize, 129, 0, 1024, 1024];
+    let mut mixed: Vec<f64> = Vec::new();
+    for (vector_index, noisy) in per_vector_noise.iter().enumerate() {
+        let len = if vector_index == 4 { 500 } else { FASTLANES_VECTOR };
+        for offset in 0..len {
+            let i = vector_index * FASTLANES_VECTOR + offset;
+            mixed.push(if offset < *noisy { noise(i) } else { (i as f64) * 0.125 });
+        }
+    }
+    columns.push(("mixed escapes".to_owned(), mixed.clone()));
+    // The same block, but its escaped vectors carry specials rather than mantissa noise.
+    let escaped_specials: Vec<f64> = mixed
+        .iter()
+        .enumerate()
+        .map(|(i, value)| {
+            if value.to_bits() & 0x3FF0_0000_0000_0000 == 0x3FF0_0000_0000_0000 && i % 2 == 0 {
+                specials.get(i % specials.len()).copied().unwrap_or(0.0)
+            } else {
+                *value
+            }
+        })
+        .collect();
+    columns.push(("mixed escaped specials".to_owned(), escaped_specials));
+    columns.push(("one noisy vector".to_owned(), one_noisy_vector()));
+    columns
+}
+
+/// Probing again per vector and packing straight into the writer must write exactly the bytes, and choose exactly the
+/// exception side stream, the full-code-vector encoder did, under every cascade strategy.
+#[test]
+fn alp_encode_matches_the_full_code_vector_reference_byte_for_byte() {
+    let mut sides_seen = Vec::new();
+    for (name, values) in alp_encode_columns() {
+        for strategy in [
+            CascadeStrategy::DecodeOptimized,
+            CascadeStrategy::NoTrailing,
+            CascadeStrategy::SizeOptimized,
+        ] {
+            let mut out = Writer::new();
+            let side = encode_alp(&values, strategy, &mut out);
+            let mut reference = Writer::new();
+            let reference_side = encode_alp_reference(&values, strategy, &mut reference);
+            assert_eq!(side, reference_side, "{name} {strategy:?}");
+            assert_eq!(out.bytes(), reference.bytes(), "{name} {strategy:?}");
+            if let Some(side) = side {
+                sides_seen.push(side);
+                let decoded = decode_alp(&mut Reader::new(out.bytes()), side).unwrap();
+                assert_eq!(decoded.len(), values.len(), "{name} {strategy:?}");
+            }
+        }
+    }
+    assert!(sides_seen.contains(&SideStream::None));
+    assert!(sides_seen.contains(&SideStream::ForBitpack));
+}
+
 #[test]
 fn presence_rank_and_present_position_agree_with_a_prefix_count() {
     // Every third row present, over enough rows to cross several bitmap bytes.

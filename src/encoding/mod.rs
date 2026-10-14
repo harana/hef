@@ -445,6 +445,7 @@ const fn fastlanes_words_per_lane(bits: usize) -> usize {
 /// elsewhere — recovers sixteen lanes' worth at a time with only shifts and masks. `width` must be the true bit width
 /// of the data (every value fits in `width` bits); a zero width writes nothing but the count, since every value is then
 /// zero.
+#[cfg(test)]
 fn bitpack(values: &[u64], width: u32, out: &mut Writer) {
     out.put_u32(values.len() as u32);
     out.put_u8(width as u8);
@@ -1270,6 +1271,10 @@ fn alp_viable(encodable: &[bool]) -> bool {
 /// position — so one pathological 1024-value stretch costs its own bytes, never the whole block's eligibility. A block
 /// with no escaped vector keeps the original layout byte for byte. Returns the inner encoding chosen for the exception
 /// index stream (the recorded second cascade level), or `None` when ALP is not viable for this data.
+///
+/// The scaled integers are never held as a full-length vector: a first pass probes one 1024-value vector at a time to
+/// collect the exceptions, the escaped vectors and the widest code, and a second pass probes each kept vector again to
+/// pack its codes straight into `out`.
 fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Option<SideStream> {
     let sample = transform_sample(values);
     let sample: &[f64] = sample.as_deref().unwrap_or(values);
@@ -1297,7 +1302,7 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
     let vector_scratch = values.len().min(FASTLANES_VECTOR);
     zigzags.resize(vector_scratch, 0);
     encodable.resize(vector_scratch, false);
-    let mut ints = Vec::with_capacity(values.len());
+    let mut max_code = 0u64;
     let mut exceptions: Vec<(u32, u64)> = Vec::new();
     let mut escaped: Vec<u32> = Vec::new();
     for (vector_index, vector) in values.chunks(FASTLANES_VECTOR).enumerate() {
@@ -1310,13 +1315,12 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
         let vector_exceptions = vector_encodable.iter().filter(|ok| !**ok).count();
         if vector_exceptions * ALP_MAX_EXCEPTION_SAMPLE_DIVISOR > vector.len() {
             escaped.push(vector_index as u32);
-            ints.extend(std::iter::repeat_n(0u64, vector.len()));
             continue;
         }
         let base = vector_index * FASTLANES_VECTOR;
-        // The kernel already wrote zigzag codes with 0 in every exception slot, so the codes append wholesale and only
-        // the exceptions walk per value.
-        ints.extend_from_slice(vector_zigzags);
+        // The kernel already wrote zigzag codes with 0 in every exception slot, so the codes only feed the maximum and
+        // only the exceptions walk per value.
+        max_code = max_code.max(vector_zigzags.iter().copied().max().unwrap_or(0));
         for (offset, (ok, value)) in vector_encodable.iter().zip(vector).enumerate() {
             if !*ok {
                 exceptions.push(((base + offset) as u32, value.to_bits()));
@@ -1364,8 +1368,27 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
             unreachable!("the exception side-stream chooser never picks a string block's side stream")
         }
     }
-    let max = ints.iter().copied().max().unwrap_or(0);
-    bitpack(&ints, bits_needed(max), out);
+    // Escaped vectors pack as zero codes without a probe; every other vector is probed again under the chosen power,
+    // which writes the same codes the first pass saw. The escaped indexes ascend, so one cursor walks them in step.
+    let mut next_escaped = escaped.iter().peekable();
+    alp_rd_bitpack_vectors(values.len(), bits_needed(max_code), out, |vector_index, buffer| {
+        buffer.fill(0);
+        if next_escaped
+            .next_if(|escaped_index| **escaped_index as usize == vector_index)
+            .is_some()
+        {
+            return;
+        }
+        let start = vector_index * FASTLANES_VECTOR;
+        let vector = values
+            .get(start..values.len().min(start + FASTLANES_VECTOR))
+            .unwrap_or(&[]);
+        if let (Some(vector_codes), Some(vector_encodable)) =
+            (buffer.get_mut(..vector.len()), encodable.get_mut(..vector.len()))
+        {
+            alp_probe_chunk(vector, power, vector_codes, vector_encodable);
+        }
+    });
     // Raw payloads ride after the packed words, where a sequential decoder already knows the value count needed to
     // size each escaped vector.
     for vector_index in &escaped {
