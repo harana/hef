@@ -1490,3 +1490,126 @@ fn merging_intervals_in_place_matches_merging_by_copying() {
         assert_eq!(merge_intervals_i128(case.clone()), expected, "i128 input {case:?}");
     }
 }
+
+/// A deterministic stream of pseudo-random u64s, so the randomized kernel tests are reproducible.
+fn lcg(seed: u64) -> impl FnMut() -> u64 {
+    let mut state = seed;
+    move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state >> 11
+    }
+}
+
+/// The FOR answer for every predicate must equal `matches_i128` on each decoded value, row for row.
+fn assert_for_block_matches_i128(pipeline: PipelineId, bytes: &[u8], values: &[i128], predicates: &[NumericPredicate]) {
+    for predicate in predicates {
+        let mask = filter_numeric_block(pipeline, bytes, predicate)
+            .unwrap()
+            .expect("FOR blocks answer from packed lanes");
+        let reference: Vec<bool> = values.iter().map(|v| predicate.matches_i128(*v)).collect();
+        assert_eq!(mask, reference, "packed lane kernel diverged for {predicate:?}");
+    }
+}
+
+/// Each specialised packed lane kernel (point, negated point, one interval, small sets of both padded sizes, the
+/// parity-split zigzag range) and the binary-search fallback agree with the reference over a block whose length is
+/// not a multiple of 1024, so the padded tail of the last vector is unpacked and then dropped.
+#[test]
+fn specialised_packed_lane_kernels_agree_with_the_reference() {
+    let mut next = lcg(0x5851_F42D_4C95_7F2D);
+    let base = 1_000_000u64;
+    let values: Vec<u64> = (0..3077).map(|_| base + next() % 5_000).collect();
+    let wide: Vec<i128> = values.iter().map(|v| i128::from(*v)).collect();
+    let hit = wide[2900];
+    let set = |len: i128| NumericPredicate::InSet((0..len).map(|i| wide[0] + i * 37 - 200).collect());
+    let predicates = vec![
+        NumericPredicate::Equals(hit),
+        NumericPredicate::Equals(i128::from(base) - 1),
+        NumericPredicate::Equals(i128::from(u64::MAX)),
+        NumericPredicate::NotEquals(hit),
+        NumericPredicate::NotEquals(i128::from(u64::MAX) + 1),
+        range(Some((hit - 300, true)), Some((hit + 300, false))),
+        range(Some((hit, true)), Some((hit, true))),
+        range(Some((0, true)), Some((i128::from(u64::MAX), true))),
+        range(Some((i128::from(u64::MAX), false)), None),
+        range(Some((i128::MIN, false)), Some((i128::from(base) + 2, false))),
+        range(Some((hit, true)), Some((hit - 1, true))),
+        set(2),
+        set(4),
+        set(5),
+        set(16),
+        set(17),
+        set(40),
+        // Adjacent members merge into wider intervals before the set is padded.
+        NumericPredicate::InSet(vec![
+            hit,
+            hit + 1,
+            hit + 2,
+            wide[7],
+            wide[7] + 1,
+            -5,
+            i128::from(u64::MAX) + 3,
+        ]),
+        NumericPredicate::InSet(Vec::new()),
+    ];
+    let (pipeline, bytes) = for_u64_block(&values);
+    assert_for_block_matches_i128(pipeline, &bytes, &wide, &predicates);
+
+    let signed: Vec<i64> = (0..3077).map(|_| (next() % 6_000) as i64 - 3_000).collect();
+    let wide: Vec<i128> = signed.iter().map(|v| i128::from(*v)).collect();
+    let hit = wide[3070];
+    let set = |len: i128| NumericPredicate::InSet((0..len).map(|i| i * 41 - 400).collect());
+    let predicates = vec![
+        NumericPredicate::Equals(hit),
+        NumericPredicate::Equals(-hit - 1),
+        NumericPredicate::NotEquals(hit),
+        NumericPredicate::NotEquals(i128::from(i64::MIN) - 1),
+        range(Some((-700, true)), Some((900, false))),
+        range(Some((-700, false)), Some((-2, true))),
+        range(Some((0, true)), Some((1_500, true))),
+        range(Some((i128::from(i64::MIN), true)), None),
+        range(None, Some((i128::from(i64::MAX), false))),
+        range(Some((i128::MIN, true)), Some((i128::MIN, false))),
+        range(Some((i128::MAX, false)), None),
+        range(Some((5, true)), Some((5, true))),
+        set(3),
+        set(4),
+        set(9),
+        set(16),
+        set(25),
+    ];
+    let (pipeline, bytes) = for_i64_block(&signed);
+    assert_for_block_matches_i128(pipeline, &bytes, &wide, &predicates);
+}
+
+/// A set of ranges that mixes plain delta points with a parity-split zigzag pair has no specialised kernel; it falls
+/// back to the binary search, which still matches the scalar per-lane test in either polarity.
+#[test]
+fn mixed_delta_points_and_zigzag_ranges_fall_back_to_the_search() {
+    let mut next = lcg(0x2127_599B_F432_5C37);
+    let deltas: Vec<u64> = (0..1500).map(|_| next() % 512).collect();
+    let mut body = Writer::new();
+    bitpack(&deltas, 9, &mut body);
+    let bytes = body.into_bytes();
+    let stream = read_packed_stream(&mut Reader::new(&bytes)).unwrap();
+    let base = 40;
+    for negate in [false, true] {
+        let test = PackedLaneTest {
+            negate,
+            ranges: MergedLaneRanges::from_ranges(vec![
+                PackedLaneRange::Delta { hi: 7, lo: 7 },
+                PackedLaneRange::Zigzag {
+                    even: (100, 300),
+                    odd: (151, 401),
+                },
+            ]),
+        };
+        let mut out = vec![false; stream.padded_count()];
+        test.apply(&stream, base, &mut out);
+        out.truncate(deltas.len());
+        let expected: Vec<bool> = deltas.iter().map(|delta| test.matches(base, *delta)).collect();
+        assert_eq!(out, expected);
+    }
+}

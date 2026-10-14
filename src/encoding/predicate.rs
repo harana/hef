@@ -18,7 +18,10 @@
 //! and the caller falls back to `decode_block` + plain filter. The fast answer is exact and equals the slow path row
 //! for row. Requirements: "Compressed-data string predicates" and "Compressed-data numeric predicates".
 
-use super::constant::{PARALLEL_SCAN_MIN_GRANULE_BYTES, PARALLEL_SCAN_MIN_GRANULES, PREFIX_KEY_BYTES};
+use super::constant::{
+    BRANCH_FREE_SET_NARROW, BRANCH_FREE_SET_WIDE, PARALLEL_SCAN_MIN_GRANULE_BYTES, PARALLEL_SCAN_MIN_GRANULES,
+    PREFIX_KEY_BYTES,
+};
 use super::seekable_zstd::Window;
 use super::sidecar::{PrefixKey, StringFingerprint};
 use super::{
@@ -1395,12 +1398,46 @@ impl PackedLaneTest {
 
     /// Fills `out` (the stream's padded length) with one verdict per lane: whether the lane satisfies the translated
     /// predicate, in one pass over the stream regardless of how many ranges (e.g. `IN` values) translated it.
+    ///
+    /// The shape of the merged ranges picks one compare for the whole block: a single point, a single interval
+    /// (`lo <= d <= hi` as the one unsigned compare `d - lo <= hi - lo`), a parity-split zigzag pair, or a small
+    /// set OR-ed without branches. Each is its own closure, so the multiversioned unpack kernel is compiled and
+    /// vectorized once per shape, with the compare and the negation fused into the same pass that unpacks the lanes.
+    /// Any other shape (a large set, or points mixed with zigzag intervals) keeps the binary search.
     fn apply(&self, stream: &PackedStream<'_>, base: u64, out: &mut [bool]) {
-        stream.unpack_into(out, |delta| self.ranges.contains(base, delta));
-        if self.negate {
-            for slot in out.iter_mut() {
-                *slot = !*slot;
+        let negate = self.negate;
+        match (
+            self.ranges.delta.as_slice(),
+            self.ranges.even.as_slice(),
+            self.ranges.odd.as_slice(),
+        ) {
+            ([], [], []) => out.fill(negate),
+            (&[(lo, hi)], [], []) if lo == hi => stream.unpack_into(out, move |delta| (delta == lo) != negate),
+            (&[(lo, hi)], [], []) => {
+                let span = hi - lo;
+                stream.unpack_into(out, move |delta| (delta.wrapping_sub(lo) <= span) != negate);
             }
+            (delta, [], []) if delta.len() <= BRANCH_FREE_SET_NARROW => {
+                apply_lane_set::<BRANCH_FREE_SET_NARROW>(stream, delta, negate, out);
+            }
+            (delta, [], []) if delta.len() <= BRANCH_FREE_SET_WIDE => {
+                apply_lane_set::<BRANCH_FREE_SET_WIDE>(stream, delta, negate, out);
+            }
+            ([], even, odd) if even.len() <= 1 && odd.len() <= 1 => {
+                // An empty half becomes a one-code interval of the other parity, which no code of its own parity
+                // can ever hit.
+                let (even_lo, even_span) = even.first().map_or((1, 0), |&(lo, hi)| (lo, hi - lo));
+                let (odd_lo, odd_span) = odd.first().map_or((0, 0), |&(lo, hi)| (lo, hi - lo));
+                stream.unpack_into(out, move |delta| {
+                    let code = base.wrapping_add(delta);
+                    // All ones for an odd code, all zeros for an even one: picks the half without a branch.
+                    let odd_mask = 0u64.wrapping_sub(code & 1);
+                    let lo = (even_lo & !odd_mask) | (odd_lo & odd_mask);
+                    let span = (even_span & !odd_mask) | (odd_span & odd_mask);
+                    (code.wrapping_sub(lo) <= span) != negate
+                });
+            }
+            _ => stream.unpack_into(out, |delta| self.ranges.contains(base, delta) != negate),
         }
     }
 
@@ -1410,6 +1447,22 @@ impl PackedLaneTest {
     fn matches(&self, base: u64, value: u64) -> bool {
         self.ranges.contains(base, value) != self.negate
     }
+}
+
+/// Unpacks `stream` into `out` testing each lane delta against `intervals` (at most `N`, merged and non-empty) with
+/// a fixed-length, branch-free OR of `N` unsigned compares, so the lane loop stays vectorizable. The set is padded to
+/// `N` by repeating its first interval, which cannot change an OR.
+fn apply_lane_set<const N: usize>(stream: &PackedStream<'_>, intervals: &[(u64, u64)], negate: bool, out: &mut [bool]) {
+    let first = intervals.first().map_or((0, 0), |&(lo, hi)| (lo, hi - lo));
+    let mut set = [first; N];
+    for (slot, &(lo, hi)) in set.iter_mut().zip(intervals) {
+        *slot = (lo, hi - lo);
+    }
+    stream.unpack_into(out, move |delta| {
+        set.iter()
+            .fold(false, |hit, &(lo, span)| hit | (delta.wrapping_sub(lo) <= span))
+            != negate
+    });
 }
 
 /// Inclusive u64 value intervals satisfying `predicate` — the value domain of a u64 FOR block — plus whether the
