@@ -1478,9 +1478,9 @@ fn choose_float_fallback(values: &[f64]) -> Transform {
     for (bytes, value) in trial.chunks_exact_mut(8).zip(sample) {
         bytes.copy_from_slice(&value.to_le_bytes());
     }
-    let plain_compressed = deflate::compress(&trial).len();
+    let plain_compressed = deflate::compressed_len(&trial);
     write_byte_stream_split(sample, &mut trial);
-    let bss_compressed = deflate::compress(&trial).len();
+    let bss_compressed = deflate::compressed_len(&trial);
     let (_, _, alp_rd_estimate) = alp_rd_choose_split(sample);
     if alp_rd_estimate < plain_compressed.min(bss_compressed) {
         Transform::AlpRd

@@ -64,7 +64,7 @@ pub fn compress(bytes: &[u8]) -> Vec<u8> {
         for granule in bytes.chunks(GRANULE_BYTES) {
             compressor.reset();
             let before = body.len();
-            deflate_granule(&mut compressor, granule, &mut body);
+            deflate_granule(&mut compressor, granule, |chunk| body.extend_from_slice(chunk));
             granule_lens.push(body.len() - before);
         }
     });
@@ -74,13 +74,28 @@ pub fn compress(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Deflates one granule through `compressor` (already [`CompressorOxide::reset`]), appending its compressed bytes
-/// straight onto `out`.
-fn deflate_granule(compressor: &mut CompressorOxide, granule: &[u8], out: &mut Vec<u8>) {
+/// The exact length [`compress`] would return for `bytes`, without keeping any compressed output. Use it when only
+/// the size matters, such as when comparing candidate layouts; the compression work itself is the same.
+pub(crate) fn compressed_len(bytes: &[u8]) -> usize {
+    // The directory header `compress` writes: block count and plain length, then one u32 length per granule.
+    let mut len = 8 + 4 * bytes.len().div_ceil(GRANULE_BYTES);
+    COMPRESSOR.with(|cell| {
+        let mut compressor = cell.borrow_mut();
+        for granule in bytes.chunks(GRANULE_BYTES) {
+            compressor.reset();
+            deflate_granule(&mut compressor, granule, |chunk| len += chunk.len());
+        }
+    });
+    len
+}
+
+/// Deflates one granule through `compressor` (already [`CompressorOxide::reset`]), handing each chunk of compressed
+/// bytes to `sink` as it is produced.
+fn deflate_granule(compressor: &mut CompressorOxide, granule: &[u8], mut sink: impl FnMut(&[u8])) {
     let mut remaining = granule;
     loop {
         let (status, bytes_in) = compress_to_output(compressor, remaining, TDEFLFlush::Finish, |chunk| {
-            out.extend_from_slice(chunk);
+            sink(chunk);
             true
         });
         remaining = remaining.get(bytes_in..).unwrap_or(&[]);
