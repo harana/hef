@@ -876,6 +876,69 @@ fn fastlanes_layout_packs_whole_1024_value_vectors() {
     }
 }
 
+/// The packer as it was before it wrote straight into the writer: a full zeroed `Vec<u64>` for the whole stream,
+/// filled vector by vector and then copied in. Kept only as the byte-for-byte reference for the packers.
+fn reference_bitpack(values: &[u64], width: u32, out: &mut Writer) {
+    out.put_u32(values.len() as u32);
+    out.put_u8(width as u8);
+    if width == 0 {
+        return;
+    }
+    let words_per_vector = 16 * width as usize;
+    let mut packed = vec![0u64; values.len().div_ceil(1024) * words_per_vector];
+    for (packed_vector, in_vector) in packed.chunks_exact_mut(words_per_vector).zip(values.chunks(1024)) {
+        let mut padded = [0u64; 1024];
+        padded[..in_vector.len()].copy_from_slice(in_vector);
+        bitpack_vector(&padded, packed_vector, width, mask(width));
+    }
+    out.put_u64_slice(&packed);
+}
+
+/// Packing straight into the writer must produce exactly the bytes the old staged packer did, for the slice and the
+/// callback packer alike, at every width, across vector boundaries, at every starting offset modulo 8 and with several
+/// streams appended to one writer. The callback must run once per logical row, and never for a zero-width stream.
+#[test]
+fn bitpack_writes_the_same_bytes_as_the_staged_reference() {
+    let mut state: u64 = 0x5851_F42D_4C95_7F2D;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state
+    };
+    let counts = [0usize, 1, 1023, 1024, 1025, 3 * 1024 + 7];
+    for width in 0u32..=64 {
+        let limit = mask(width);
+        for &count in &counts {
+            let random: Vec<u64> = (0..count).map(|_| next() & limit).collect();
+            for values in [random, vec![0; count], vec![limit; count]] {
+                for prefix in 0..8 {
+                    let mut expected = Writer::new();
+                    let mut sliced = Writer::new();
+                    let mut called = Writer::new();
+                    for writer in [&mut expected, &mut sliced, &mut called] {
+                        writer.put_slice(&vec![0xAB; prefix]);
+                    }
+                    let calls = std::cell::Cell::new(0usize);
+                    for _ in 0..2 {
+                        reference_bitpack(&values, width, &mut expected);
+                        bitpack(&values, width, &mut sliced);
+                        bitpack_with(values.len(), width, &mut called, |i| {
+                            calls.set(calls.get() + 1);
+                            values[i]
+                        });
+                    }
+                    let context = format!("width {width}, count {count}, prefix {prefix}");
+                    assert_eq!(sliced.bytes(), expected.bytes(), "slice packer: {context}");
+                    assert_eq!(called.bytes(), expected.bytes(), "callback packer: {context}");
+                    let expected_calls = if width == 0 { 0 } else { 2 * count };
+                    assert_eq!(calls.get(), expected_calls, "callback count: {context}");
+                }
+            }
+        }
+    }
+}
+
 /// String values whose null pattern drives the encoder to a specific side-stream form.
 fn string_values_with_nulls(row_count: usize, present: impl Fn(usize) -> bool) -> StringColumn {
     (0..row_count)
