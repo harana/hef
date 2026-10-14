@@ -1613,3 +1613,146 @@ fn mixed_delta_points_and_zigzag_ranges_fall_back_to_the_search() {
         assert_eq!(out, expected);
     }
 }
+
+/// The decoded integer filters (constant, point, negated point, one range, both padded small-set sizes and the
+/// binary-search fallback) agree with `matches_i128` row for row, including bounds outside each type's domain,
+/// exclusive bounds at the `i128` extremes, empty ranges, and `IN` members no value of the type can equal.
+#[test]
+fn decoded_integer_filters_agree_with_the_reference() {
+    let mut next = lcg(0x9FB2_1C65_1E98_DF25);
+    let mut unsigned: Vec<u64> = (0..3001).map(|_| next() % 4_000).collect();
+    unsigned.extend_from_slice(&[0, 1, u64::MAX, u64::MAX - 1, 1 << 63]);
+    let mut signed: Vec<i64> = (0..3001).map(|_| (next() % 4_000) as i64 - 2_000).collect();
+    signed.extend_from_slice(&[i64::MIN, i64::MIN + 1, i64::MAX, i64::MAX - 1, -1, 0, 1]);
+    let set = |len: i128, start: i128| NumericPredicate::InSet((0..len).map(|i| start + i * 53).collect());
+    let extremes = [
+        i128::MIN,
+        i128::from(i64::MIN) - 1,
+        i128::from(i64::MIN),
+        -1,
+        0,
+        i128::from(i64::MAX),
+        i128::from(u64::MAX),
+        i128::from(u64::MAX) + 1,
+        i128::MAX,
+    ];
+    let mut predicates = vec![
+        NumericPredicate::InSet(Vec::new()),
+        NumericPredicate::InSet(vec![-1, i128::from(u64::MAX) + 1, i128::MIN]),
+        NumericPredicate::InSet(vec![
+            5,
+            6,
+            7,
+            8,
+            -3,
+            -2,
+            100,
+            i128::from(i64::MIN),
+            i128::from(u64::MAX),
+        ]),
+        range(None, None),
+        range(Some((10, true)), Some((9, true))),
+        range(Some((-300, true)), Some((900, false))),
+        range(Some((-300, false)), Some((-300, true))),
+    ];
+    for len in [2, 4, 5, 16, 17, 40] {
+        predicates.push(set(len, -900));
+        predicates.push(set(len, 100));
+    }
+    for &n in &extremes {
+        predicates.push(NumericPredicate::Equals(n));
+        predicates.push(NumericPredicate::NotEquals(n));
+        for inclusive in [false, true] {
+            predicates.push(range(Some((n, inclusive)), None));
+            predicates.push(range(None, Some((n, inclusive))));
+            predicates.push(range(Some((n, inclusive)), Some((1_000, true))));
+            predicates.push(range(Some((-1_000, true)), Some((n, inclusive))));
+        }
+    }
+    for value in [unsigned[17], unsigned[2999]] {
+        predicates.push(NumericPredicate::Equals(i128::from(value)));
+        predicates.push(NumericPredicate::NotEquals(i128::from(value)));
+    }
+    for value in [signed[17], signed[2999]] {
+        predicates.push(NumericPredicate::Equals(i128::from(value)));
+        predicates.push(NumericPredicate::NotEquals(i128::from(value)));
+    }
+    let unsigned_data = ColumnData::U64(unsigned.clone());
+    let signed_data = ColumnData::I64(signed.clone());
+    for predicate in &predicates {
+        let expected: Vec<bool> = unsigned
+            .iter()
+            .map(|v| predicate.matches_i128(i128::from(*v)))
+            .collect();
+        assert_eq!(
+            predicate.filter_decoded(&unsigned_data),
+            expected,
+            "u64 diverged for {predicate:?}"
+        );
+        let expected: Vec<bool> = signed.iter().map(|v| predicate.matches_i128(i128::from(*v))).collect();
+        assert_eq!(
+            predicate.filter_decoded(&signed_data),
+            expected,
+            "i64 diverged for {predicate:?}"
+        );
+    }
+}
+
+/// The decoded float filters agree with `matches_f64` row for row, with NaN, signed zeros, infinities, subnormals
+/// and the largest finite values both in the data and as bounds or set members.
+#[test]
+fn decoded_float_filters_agree_with_the_reference() {
+    let mut next = lcg(0x1405_7B7E_F767_814F);
+    let specials = [
+        f64::NAN,
+        -f64::NAN,
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::MIN_POSITIVE,
+        -f64::MIN_POSITIVE,
+        f64::from_bits(1),
+        -f64::from_bits(1),
+        f64::MAX,
+        f64::MIN,
+        1.5,
+        -2.25,
+    ];
+    let mut values: Vec<f64> = (0..3001).map(|_| (next() % 2_000) as f64 / 4.0 - 250.0).collect();
+    values.extend((0..500).map(|_| f64::from_bits(next() << 11 ^ next())));
+    values.extend_from_slice(&specials);
+    let float_range = |lower: Option<(f64, bool)>, upper: Option<(f64, bool)>| FloatPredicate::Range {
+        lower: lower.map(|(value, inclusive)| FloatBound { inclusive, value }),
+        upper: upper.map(|(value, inclusive)| FloatBound { inclusive, value }),
+    };
+    let mut predicates = vec![
+        FloatPredicate::InSet(Vec::new()),
+        FloatPredicate::InSet(vec![f64::NAN]),
+        FloatPredicate::InSet(vec![-0.0, 1.5, f64::NAN, values[9]]),
+        FloatPredicate::InSet(vec![0.0, -2.25, f64::NAN, values[9], values[10]]),
+        FloatPredicate::InSet(values.iter().step_by(150).copied().collect()),
+        FloatPredicate::InSet(values.iter().step_by(40).copied().chain(specials).collect()),
+        float_range(None, None),
+        float_range(Some((-10.0, true)), Some((10.0, false))),
+        float_range(Some((10.0, true)), Some((-10.0, true))),
+    ];
+    for &n in specials.iter().chain(&[values[3], values[3002]]) {
+        predicates.push(FloatPredicate::Equals(n));
+        predicates.push(FloatPredicate::NotEquals(n));
+        for inclusive in [false, true] {
+            predicates.push(float_range(Some((n, inclusive)), None));
+            predicates.push(float_range(None, Some((n, inclusive))));
+            predicates.push(float_range(Some((n, inclusive)), Some((100.0, true))));
+            predicates.push(float_range(Some((-100.0, false)), Some((n, inclusive))));
+        }
+    }
+    for predicate in &predicates {
+        let expected: Vec<bool> = values.iter().map(|v| predicate.matches_f64(*v)).collect();
+        assert_eq!(
+            predicate.filter_decoded(&values),
+            expected,
+            "f64 diverged for {predicate:?}"
+        );
+    }
+}
