@@ -54,3 +54,44 @@ fn a_forged_plain_length_does_not_force_an_unbounded_allocation() {
     assert_eq!(directory.block_count(), 0);
     assert!(directory.plain_capacity_hint() <= bytes.len());
 }
+
+/// Every lookup must agree with ranges recomputed from the raw length list by a running prefix sum, including
+/// zero-length entries, on a metadata-only buffer with no compressed bodies appended.
+#[test]
+fn lookups_match_a_prefix_sum_over_the_raw_lengths() {
+    let cases: [&[usize]; 5] = [&[], &[9], &[0, 0, 0], &[4, 0, 17, 0, 1, 250], &[u32::MAX as usize, 3]];
+    for block_lens in cases {
+        let bytes = encode(123, block_lens);
+        let directory = decode(&bytes).unwrap();
+        let mut offset = bytes.len();
+        let expected: Vec<(usize, usize)> = block_lens
+            .iter()
+            .map(|&len| {
+                let range = (offset, len);
+                offset += len;
+                range
+            })
+            .collect();
+
+        assert_eq!(directory.body_start(), bytes.len());
+        assert_eq!(directory.block_count(), block_lens.len());
+        assert_eq!(directory.plain_len(), 123);
+        assert_eq!(directory.ranges().collect::<Vec<_>>(), expected);
+        for (index, range) in expected.iter().enumerate() {
+            assert_eq!(directory.byte_range(index).unwrap(), *range);
+        }
+        assert!(directory.byte_range(block_lens.len()).is_err());
+        for first in 0..=block_lens.len() + 1 {
+            let suffix: Vec<(usize, usize)> = directory.ranges_from(first).collect();
+            assert_eq!(suffix, expected.get(first..).unwrap_or(&[]));
+        }
+    }
+}
+
+#[test]
+fn a_truncated_length_table_is_rejected() {
+    let bytes = encode(64, &[5, 6, 7]);
+    for cut in 0..bytes.len() {
+        assert!(decode(&bytes[..cut]).is_err(), "cut at {cut}");
+    }
+}

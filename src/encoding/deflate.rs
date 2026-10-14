@@ -64,7 +64,7 @@ pub fn compress(bytes: &[u8]) -> Vec<u8> {
         for granule in bytes.chunks(GRANULE_BYTES) {
             compressor.reset();
             let before = body.len();
-            deflate_granule(&mut compressor, granule, &mut body);
+            deflate_granule(&mut compressor, granule, |chunk| body.extend_from_slice(chunk));
             granule_lens.push(body.len() - before);
         }
     });
@@ -74,13 +74,28 @@ pub fn compress(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Deflates one granule through `compressor` (already [`CompressorOxide::reset`]), appending its compressed bytes
-/// straight onto `out`.
-fn deflate_granule(compressor: &mut CompressorOxide, granule: &[u8], out: &mut Vec<u8>) {
+/// The exact length [`compress`] would return for `bytes`, without keeping any compressed output. Use it when only
+/// the size matters, such as when comparing candidate layouts; the compression work itself is the same.
+pub(crate) fn compressed_len(bytes: &[u8]) -> usize {
+    // The directory header `compress` writes: block count and plain length, then one u32 length per granule.
+    let mut len = 8 + 4 * bytes.len().div_ceil(GRANULE_BYTES);
+    COMPRESSOR.with(|cell| {
+        let mut compressor = cell.borrow_mut();
+        for granule in bytes.chunks(GRANULE_BYTES) {
+            compressor.reset();
+            deflate_granule(&mut compressor, granule, |chunk| len += chunk.len());
+        }
+    });
+    len
+}
+
+/// Deflates one granule through `compressor` (already [`CompressorOxide::reset`]), handing each chunk of compressed
+/// bytes to `sink` as it is produced.
+fn deflate_granule(compressor: &mut CompressorOxide, granule: &[u8], mut sink: impl FnMut(&[u8])) {
     let mut remaining = granule;
     loop {
         let (status, bytes_in) = compress_to_output(compressor, remaining, TDEFLFlush::Finish, |chunk| {
-            out.extend_from_slice(chunk);
+            sink(chunk);
             true
         });
         remaining = remaining.get(bytes_in..).unwrap_or(&[]);
@@ -194,7 +209,8 @@ impl<'a> Page<'a> {
         let plain_len = self.directory.plain_len();
         let capacity = ((last - first + 1) * GRANULE_BYTES).min(self.directory.plain_capacity_hint());
         let mut plain = Vec::with_capacity(capacity);
-        for (granule, (start, len)) in self.directory.ranges().enumerate().skip(first).take(last - first + 1) {
+        for (offset, (start, len)) in self.directory.ranges_from(first).take(last - first + 1).enumerate() {
+            let granule = first + offset;
             let expected = GRANULE_BYTES.min(plain_len.saturating_sub(granule * GRANULE_BYTES));
             let before = plain.len();
             inflate_into(
