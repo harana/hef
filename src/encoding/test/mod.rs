@@ -1335,6 +1335,293 @@ fn raw_null_stream_borrows_the_input_bitmap_and_decodes_into_owned_output() {
     }
 }
 
+/// The null-stream parse as it stood before the run table was borrowed: every run copied into an owned list. Kept here
+/// as the reference the borrowing parse must match, result for result and error for error.
+fn reference_null_stream_read<'a>(reader: &mut Reader<'a>) -> Result<NullStream<'a>, FormatError> {
+    let row_count = reader.u32("string row count")? as usize;
+    let form = match reader.u8("null stream form")? {
+        0 | 1 if row_count > MAX_BLOCK_VALUES => {
+            return Err(FormatError::Structural {
+                rule: "null stream row count beyond the block bound",
+            });
+        }
+        0 => NullStreamForm::AllPresent,
+        1 => NullStreamForm::AllAbsent,
+        2 => {
+            let run_count = reader.u32("null stream run count")? as usize;
+            let mut runs: Vec<(u32, u32)> = Vec::with_capacity(reader.capacity_hint(run_count, 8));
+            for _ in 0..run_count {
+                let start = reader.u32("null stream run start")?;
+                let end = reader.u32("null stream run end")?;
+                if end <= start || end as usize > row_count {
+                    return Err(FormatError::Structural {
+                        rule: "null stream run must be non-empty and within the row count",
+                    });
+                }
+                if runs.last().is_some_and(|&(_, previous_end)| start <= previous_end) {
+                    return Err(FormatError::Structural {
+                        rule: "null stream runs must be sorted and non-adjacent",
+                    });
+                }
+                runs.push((start, end));
+            }
+            NullStreamForm::Runs(NullRuns::Pairs(runs))
+        }
+        3 => NullStreamForm::Raw(Cow::Borrowed(reader.take(row_count.div_ceil(8), "null bitmap")?)),
+        _ => {
+            return Err(FormatError::Structural {
+                rule: "unknown null stream form",
+            });
+        }
+    };
+    Ok(NullStream { form, row_count })
+}
+
+/// A run-form null stream's bytes: the row count, tag 2, the run count, then each run's start and end, followed by
+/// `trailing` bytes.
+fn run_form_stream(row_count: u32, run_count: u32, runs: &[(u32, u32)], trailing: &[u8]) -> Vec<u8> {
+    let mut out = Writer::new();
+    out.put_u32(row_count);
+    out.put_u8(2);
+    out.put_u32(run_count);
+    for &(start, end) in runs {
+        out.put_u32(start);
+        out.put_u32(end);
+    }
+    out.put_slice(trailing);
+    out.into_bytes()
+}
+
+/// Asserts two null streams give the same answer to every presence question: counts, per-row presence and rank, the
+/// full walk, every range walk over a grid of starts and ends (empty, short, clipped past the row count), the
+/// row-ordered views, and the Arrow null buffer.
+fn assert_same_presence_answers(actual: &NullStream, expected: &NullStream, name: &str) {
+    let rows = expected.row_count();
+    assert_eq!(actual.row_count(), rows, "{name}: row count");
+    assert_eq!(
+        actual.present_count(),
+        expected.present_count(),
+        "{name}: present count"
+    );
+    for row in 0..rows + 2 {
+        assert_eq!(
+            actual.is_present(row),
+            expected.is_present(row),
+            "{name}: is_present({row})"
+        );
+        assert_eq!(
+            actual.present_before(row),
+            expected.present_before(row),
+            "{name}: present_before({row})"
+        );
+    }
+    let walk = |stream: &NullStream| {
+        let mut walked = Vec::new();
+        stream
+            .each_row(|set| {
+                walked.push(set);
+                Ok(())
+            })
+            .unwrap();
+        walked
+    };
+    assert_eq!(walk(actual), walk(expected), "{name}: each_row");
+    let range_walk = |stream: &NullStream, start: usize, end: usize| {
+        let mut walked = Vec::new();
+        stream
+            .each_row_range(start, end, |set| {
+                walked.push(set);
+                Ok(())
+            })
+            .unwrap();
+        walked
+    };
+    let bounds = [
+        0,
+        1,
+        7,
+        39,
+        40,
+        41,
+        119,
+        120,
+        rows / 2,
+        rows.saturating_sub(1),
+        rows,
+        rows + 5,
+    ];
+    for start in bounds {
+        for end in bounds {
+            assert_eq!(
+                range_walk(actual, start, end),
+                range_walk(expected, start, end),
+                "{name}: each_row_range({start}, {end})"
+            );
+        }
+    }
+    let values = || (0..expected.present_count() as u128).map(|value| value + 1);
+    assert_eq!(
+        views_by_row(actual, values()).unwrap(),
+        views_by_row(expected, values()).unwrap(),
+        "{name}: views"
+    );
+    assert_eq!(null_buffer(actual), null_buffer(expected), "{name}: null buffer");
+}
+
+/// A run-form null stream read from a block borrows exactly the run table's bytes instead of copying the runs into a
+/// list, answers every presence question as the encoder's owned list does, and writes the same bytes back.
+#[test]
+fn run_null_stream_borrows_the_input_table_and_answers_like_the_owned_runs() {
+    let patterns: Vec<(&str, StringColumn)> = vec![
+        ("clusters x1000", string_values_with_nulls(1000, |i| (i / 40) % 3 == 0)),
+        ("clusters x4096", string_values_with_nulls(4096, |i| (i / 40) % 3 == 0)),
+        (
+            "one null cluster",
+            string_values_with_nulls(4096, |i| !(1000..3000).contains(&i)),
+        ),
+        ("leading nulls", string_values_with_nulls(1000, |i| i >= 600)),
+        ("trailing nulls", string_values_with_nulls(1000, |i| i < 400)),
+        ("first row only", string_values_with_nulls(1000, |i| i == 0)),
+        ("last row only", string_values_with_nulls(1000, |i| i == 999)),
+    ];
+    for (name, values) in patterns {
+        let derived = NullStream::from_values(&values);
+        let NullStreamForm::Runs(NullRuns::Pairs(pairs)) = &derived.form else {
+            panic!(
+                "{name}: expected the encoder to build owned runs, got {:?}",
+                derived.form
+            );
+        };
+        let run_count = pairs.len();
+        let mut out = Writer::new();
+        derived.write(&mut out);
+        let bytes = out.into_bytes();
+        let mut reader = Reader::new(&bytes);
+        let read = NullStream::read(&mut reader).unwrap();
+        assert_eq!(reader.position(), bytes.len(), "{name}: consumed");
+        match &read.form {
+            NullStreamForm::Runs(NullRuns::Encoded(table)) => {
+                assert_eq!(table.as_ptr(), bytes[9..].as_ptr(), "{name}: borrowed span start");
+                assert_eq!(table.len(), run_count * 8, "{name}: borrowed span length");
+            }
+            other => panic!("{name}: expected a borrowed run table, got {other:?}"),
+        }
+        assert_eq!(read, derived, "{name}: equal to the owned runs");
+        assert_same_presence_answers(&read, &derived, name);
+        let mut rewritten = Writer::new();
+        read.write(&mut rewritten);
+        assert_eq!(rewritten.into_bytes(), bytes, "{name}: byte-identical write");
+    }
+
+    // An empty run table is accepted and reads as no present rows, as the owned form always did.
+    let bytes = run_form_stream(10, 0, &[], &[]);
+    let read = NullStream::read(&mut Reader::new(&bytes)).unwrap();
+    let owned = NullStream {
+        form: NullStreamForm::Runs(NullRuns::Pairs(Vec::new())),
+        row_count: 10,
+    };
+    assert_eq!(read, owned, "empty table");
+    assert_same_presence_answers(&read, &owned, "empty table");
+}
+
+/// Taking ownership of a stream read from a block copies its borrowed run table, so it survives the block bytes being
+/// overwritten and dropped; an encoder-built run list moves through unchanged.
+#[test]
+fn run_null_stream_into_owned_outlives_the_input_bytes() {
+    let derived = NullStream::from_values(&string_values_with_nulls(1000, |i| (i / 40) % 3 == 0));
+    let mut out = Writer::new();
+    derived.write(&mut out);
+    let mut bytes = out.into_bytes();
+    let owned = NullStream::read(&mut Reader::new(&bytes)).unwrap().into_owned();
+    bytes.fill(0);
+    drop(bytes);
+    assert!(matches!(owned.form, NullStreamForm::Runs(NullRuns::Pairs(_))));
+    assert_eq!(owned, derived);
+    assert_same_presence_answers(&owned, &derived, "owned after drop");
+
+    let NullStreamForm::Runs(NullRuns::Pairs(pairs)) = &derived.form else {
+        panic!("expected owned runs, got {:?}", derived.form);
+    };
+    let pointer = pairs.as_ptr();
+    let kept = derived.into_owned();
+    let NullStreamForm::Runs(NullRuns::Pairs(kept_pairs)) = &kept.form else {
+        panic!("expected owned runs, got {:?}", kept.form);
+    };
+    assert_eq!(kept_pairs.as_ptr(), pointer, "already-owned runs move without a copy");
+}
+
+/// The borrowing run-table parse must accept and refuse exactly what the copying parse did, with the identical error
+/// and the identical stopping point: truncation in the count, a start, or an end; a bad early run followed by missing
+/// records (the run error wins); reversed, empty, out-of-bounds, overlapping, adjacent, and unsorted runs; an empty
+/// table; and runs at the largest accepted bounds.
+#[test]
+fn run_null_stream_parse_matches_the_copying_parse() {
+    let mut cases: Vec<(&str, Vec<u8>)> = vec![
+        ("truncated count", {
+            let mut bytes = run_form_stream(8, 0, &[], &[]);
+            bytes.truncate(7);
+            bytes
+        }),
+        ("truncated start", run_form_stream(8, 1, &[], &[0, 0])),
+        ("truncated end", run_form_stream(8, 1, &[], &[0, 0, 0, 0, 2, 0])),
+        ("valid run then missing record", run_form_stream(8, 2, &[(0, 2)], &[])),
+        (
+            "bad first run then missing records",
+            run_form_stream(8, 3, &[(3, 3)], &[]),
+        ),
+        (
+            "out of bounds first run then truncated",
+            run_form_stream(8, 3, &[(0, 9)], &[1]),
+        ),
+        ("overlap then truncated", run_form_stream(8, 3, &[(0, 4), (2, 6)], &[])),
+        ("reversed", run_form_stream(8, 1, &[(5, 2)], &[])),
+        ("empty", run_form_stream(8, 1, &[(3, 3)], &[])),
+        ("out of bounds", run_form_stream(8, 1, &[(0, 9)], &[])),
+        ("overlapping", run_form_stream(8, 2, &[(0, 4), (2, 6)], &[])),
+        ("adjacent", run_form_stream(8, 2, &[(0, 2), (2, 4)], &[])),
+        ("unsorted", run_form_stream(8, 2, &[(4, 6), (0, 2)], &[])),
+        ("forged run count", run_form_stream(8, u32::MAX, &[(0, 2)], &[])),
+        ("empty table", run_form_stream(8, 0, &[], &[])),
+        ("empty table, zero rows", run_form_stream(0, 0, &[], &[])),
+        ("run in zero rows", run_form_stream(0, 1, &[(0, 1)], &[])),
+        ("valid", run_form_stream(64, 3, &[(0, 2), (5, 9), (40, 64)], &[])),
+        (
+            "valid with trailing bytes",
+            run_form_stream(64, 2, &[(1, 2), (60, 64)], &[7, 7, 7]),
+        ),
+        ("whole u32 range", run_form_stream(u32::MAX, 1, &[(0, u32::MAX)], &[])),
+        (
+            "last u32 row",
+            run_form_stream(u32::MAX, 2, &[(0, 1), (u32::MAX - 1, u32::MAX)], &[]),
+        ),
+        (
+            "one past the u32 rows",
+            run_form_stream(u32::MAX - 1, 1, &[(0, u32::MAX)], &[]),
+        ),
+    ];
+    let valid = run_form_stream(64, 2, &[(1, 2), (60, 64)], &[]);
+    for cut in 0..valid.len() {
+        cases.push(("prefix", valid[..cut].to_vec()));
+    }
+    for (name, bytes) in &cases {
+        let mut actual_reader = Reader::new(bytes);
+        let actual = NullStream::read(&mut actual_reader);
+        let mut expected_reader = Reader::new(bytes);
+        let expected = reference_null_stream_read(&mut expected_reader);
+        assert_eq!(actual, expected, "{name} ({} bytes)", bytes.len());
+        if let Ok(stream) = &actual {
+            assert_eq!(
+                actual_reader.position(),
+                expected_reader.position(),
+                "{name}: stopping point"
+            );
+            if let NullStreamForm::Runs(runs) = &stream.form {
+                assert!(matches!(runs, NullRuns::Encoded(_)), "{name}: borrowed");
+            }
+        }
+    }
+}
+
 /// A hand-built FSST string block: one present row whose compressed bytes are `data`, under a symbol table with the
 /// given lengths (each symbol's bytes are its index repeated).
 fn forged_fsst_block(symbol_lengths: &[u8], data: &[u8]) -> Vec<u8> {
