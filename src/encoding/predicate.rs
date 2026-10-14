@@ -23,8 +23,8 @@ use super::seekable_zstd::Window;
 use super::sidecar::{PrefixKey, StringFingerprint};
 use super::{
     ALP_POWERS, ColumnData, Compression, FASTLANES_VECTOR, PackedStream, PipelineId, SideStream, StringColumn,
-    Transform, ValueKind, decode_block, decode_block_shared_with_body, mask, read_fsst_compressor, read_packed_stream,
-    unzigzag, zigzag,
+    Transform, ValueKind, decode_block, decode_block_shared_with_body, mask, prefix_sum, read_fsst_compressor,
+    read_packed_stream, unzigzag, zigzag,
 };
 use crate::error::FormatError;
 use crate::file::bytes::{Reader, slice};
@@ -1602,17 +1602,27 @@ fn filter_delta_block(body: &[u8], predicate: &NumericPredicate, kind: ValueKind
     let first = reader.u64("delta first")?;
     let deltas = read_packed_stream(&mut reader)?;
     let test = PackedLaneTest::translate(predicate, kind, 0);
-    let mut result = Vec::with_capacity(deltas.count + 1);
-    let mut current = first;
-    result.push(test.matches(0, current));
-    // One vector of deltas at a time: the running sum is a sequential walk over each restored vector, never the
-    // whole stream materialized first.
-    deltas.for_each_vector(|vector| {
-        for &delta in vector {
-            current = current.wrapping_add(unzigzag(delta) as u64);
-            result.push(test.matches(0, current));
-        }
-    });
+    let mut result = vec![false; deltas.count + 1];
+    if let Some((head, rest)) = result.split_first_mut() {
+        *head = test.matches(0, first);
+        // One vector of deltas at a time: each restored vector is rebuilt into running totals in one reused buffer
+        // ([`prefix_sum`]), then compared into its own slice of the verdicts, never the whole stream materialized.
+        let mut current = first;
+        let mut totals = [0u64; FASTLANES_VECTOR];
+        let mut verdict_vectors = rest.chunks_mut(FASTLANES_VECTOR);
+        deltas.for_each_vector(|vector| {
+            let (Some(verdicts), Some(totals)) = (verdict_vectors.next(), totals.get_mut(..vector.len())) else {
+                return;
+            };
+            for (total, &delta) in totals.iter_mut().zip(vector) {
+                *total = unzigzag(delta) as u64;
+            }
+            current = prefix_sum(totals, current);
+            for (verdict, &value) in verdicts.iter_mut().zip(totals.iter()) {
+                *verdict = test.matches(0, value);
+            }
+        });
+    }
     Ok(result)
 }
 

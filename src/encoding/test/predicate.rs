@@ -1,5 +1,7 @@
 use super::*;
-use crate::encoding::{CascadeStrategy, Compression, bitpack, encode_block, encode_block_forced_for_conformance};
+use crate::encoding::{
+    CascadeStrategy, Compression, bitpack, decode_delta_bitpack, encode_block, encode_block_forced_for_conformance,
+};
 use crate::file::bytes::Writer;
 use std::collections::BTreeSet;
 
@@ -774,6 +776,61 @@ fn delta_filter_matches_decode_then_filter_across_vector_boundaries() {
                             "width {width}, count {count}, first {first}, {kind:?}, {predicate:?}"
                         );
                     }
+                }
+            }
+        }
+    }
+}
+
+/// The fused DELTA filter, which rebuilds each vector's running totals into a buffer and compares them there, must
+/// give the same verdicts as decoding the block and filtering the decoded column, for random deltas of every sign,
+/// counts that end mid-vector, and sums that wrap.
+#[test]
+fn delta_filter_matches_decode_then_filter_decoded() {
+    let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for width in [0u32, 3, 20, 64] {
+        for count in [0usize, 1, 17, 1000, 1024, 3333] {
+            let first = next();
+            let codes: Vec<u64> = (0..count).map(|_| next() & mask(width)).collect();
+            let mut writer = Writer::new();
+            writer.put_u64(first);
+            bitpack(&codes, width, &mut writer);
+            let body = writer.into_bytes();
+            let unsigned = decode_delta_bitpack::<u64>(&mut Reader::new(&body)).unwrap();
+            let signed = decode_delta_bitpack::<i64>(&mut Reader::new(&body)).unwrap();
+            let pivot = unsigned.get(unsigned.len() / 2).copied().unwrap_or(0);
+            for (kind, column, hit) in [
+                (ValueKind::U64, ColumnData::U64(unsigned.clone()), i128::from(pivot)),
+                (
+                    ValueKind::I64,
+                    ColumnData::I64(signed.clone()),
+                    i128::from(unzigzag(pivot)),
+                ),
+            ] {
+                let predicates = [
+                    NumericPredicate::Equals(hit),
+                    NumericPredicate::NotEquals(hit),
+                    NumericPredicate::InSet(vec![hit, 0, hit + 1]),
+                    NumericPredicate::Range {
+                        lower: Some(NumericBound {
+                            inclusive: true,
+                            value: hit,
+                        }),
+                        upper: None,
+                    },
+                ];
+                for predicate in &predicates {
+                    assert_eq!(
+                        filter_delta_block(&body, predicate, kind).unwrap(),
+                        predicate.filter_decoded(&column),
+                        "width {width}, count {count}, {kind:?}, {predicate:?}"
+                    );
                 }
             }
         }
