@@ -45,6 +45,15 @@ pub const ALP_VECTOR_ESCAPE_SENTINEL: u8 = 255;
 /// doubles is 256 bytes, small enough to stay in registers while its bytes are transposed into (or out of) the planes.
 pub const BYTE_STREAM_SPLIT_TILE: usize = 32;
 
+/// The smaller padded size of a branch-free interval set, so a short `IN` list (the common case) pays 4 compares per
+/// value rather than [`BRANCH_FREE_SET_WIDE`].
+pub const BRANCH_FREE_SET_NARROW: usize = 4;
+
+/// Most intervals an integer filter compares every value against with a branch-free OR of compares, instead of a
+/// binary search. A set this size or smaller is padded up to [`BRANCH_FREE_SET_NARROW`] or this many compares; a
+/// larger one keeps the search, whose cost grows with the log of the set size rather than the size itself.
+pub const BRANCH_FREE_SET_WIDE: usize = 16;
+
 /// The leading-zero counts a Chimp block ([`super::chimp`]) can record, indexed by their 3-bit code. A value's real
 /// count of leading zero bits in its XOR with the previous value is rounded down to the nearest entry, so the code
 /// fits three bits while the common counts of a slowly changing series (12 to 24) lose almost nothing.

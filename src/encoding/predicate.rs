@@ -18,7 +18,10 @@
 //! and the caller falls back to `decode_block` + plain filter. The fast answer is exact and equals the slow path row
 //! for row. Requirements: "Compressed-data string predicates" and "Compressed-data numeric predicates".
 
-use super::constant::{PARALLEL_SCAN_MIN_GRANULE_BYTES, PARALLEL_SCAN_MIN_GRANULES, PREFIX_KEY_BYTES};
+use super::constant::{
+    BRANCH_FREE_SET_NARROW, BRANCH_FREE_SET_WIDE, PARALLEL_SCAN_MIN_GRANULE_BYTES, PARALLEL_SCAN_MIN_GRANULES,
+    PREFIX_KEY_BYTES,
+};
 use super::seekable_zstd::Window;
 use super::sidecar::{PrefixKey, StringFingerprint};
 use super::{
@@ -30,6 +33,7 @@ use crate::error::FormatError;
 use crate::file::bytes::{Reader, slice};
 use aho_corasick::{AhoCorasick, MatchKind};
 use memchr::memmem::Finder;
+use multiversion::multiversion;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -1175,23 +1179,41 @@ impl NumericPredicate {
         }
     }
 
-    /// Filters already-decoded column data. This is the reference path the compressed-data kernels must agree with.
+    /// Filters already-decoded column data, one verdict per row. This is the reference path the compressed-data
+    /// kernels must agree with.
     ///
-    /// The predicate is translated into merged, sorted ranges once ([`NativeRangeTest::translate`]) rather than
-    /// dispatched on the predicate's own enum — and, for an `IN` set, binary-searched instead of scanned — per row.
+    /// The predicate is translated once rather than dispatched on its own enum per row. A `u64` or `i64` column is
+    /// compared in its native width with one branch-free compare per row for an equality, a single range or a small
+    /// `IN` set, so the loop vectorizes; a larger `IN` set is binary-searched. Decimal and `u128` columns compare
+    /// merged `i128` ranges ([`NativeRangeTest::translate`]).
     pub fn filter_decoded(&self, data: &ColumnData) -> Vec<bool> {
-        let test = NativeRangeTest::translate(self);
         match data {
-            ColumnData::U64(values) => values.iter().map(|v| test.matches(*v as i128)).collect(),
-            ColumnData::I64(values) => values.iter().map(|v| test.matches(*v as i128)).collect(),
-            ColumnData::Decimal { values, .. } => values.iter().map(|v| test.matches(*v)).collect(),
-            ColumnData::U128(values) => values
-                .iter()
-                .map(|v| match i128::try_from(*v) {
-                    Ok(v) => test.matches(v),
-                    Err(_) => self.matches_overflowing_u128(),
-                })
-                .collect(),
+            ColumnData::U64(values) => {
+                let (intervals, negate) = u64_value_ranges(self);
+                filter_native_ints(values, |value| value, intervals, negate)
+            }
+            ColumnData::I64(values) => {
+                let (intervals, negate) = i64_value_ranges(self);
+                let keys = intervals
+                    .into_iter()
+                    .map(|(lo, hi)| (i64_order_key(lo), i64_order_key(hi)))
+                    .collect();
+                filter_native_ints(values, i64_order_key, keys, negate)
+            }
+            ColumnData::Decimal { values, .. } => {
+                let test = NativeRangeTest::translate(self);
+                values.iter().map(|v| test.matches(*v)).collect()
+            }
+            ColumnData::U128(values) => {
+                let test = NativeRangeTest::translate(self);
+                values
+                    .iter()
+                    .map(|v| match i128::try_from(*v) {
+                        Ok(v) => test.matches(v),
+                        Err(_) => self.matches_overflowing_u128(),
+                    })
+                    .collect()
+            }
             ColumnData::F64(_) | ColumnData::Strings(_) => vec![false; data.row_count()],
         }
     }
@@ -1240,9 +1262,145 @@ impl FloatPredicate {
         }
     }
 
-    /// Filters already-decoded f64 values — the reference path.
+    /// Filters already-decoded f64 values, one verdict per value: the reference path.
+    ///
+    /// The predicate is turned once into one vectorizable compare loop (equality, inequality, a range with both
+    /// ends made inclusive, or a small `IN` set OR-ed without branches), with the same IEEE answers as comparing each
+    /// value directly: NaN equals nothing and fails every bound, `!=` NaN holds for every value, and `-0.0` equals
+    /// `0.0`. A larger `IN` set is binary-searched.
     pub fn filter_decoded(&self, values: &[f64]) -> Vec<bool> {
-        values.iter().map(|v| self.matches_f64(*v)).collect()
+        match self {
+            FloatPredicate::Equals(n) => {
+                let n = *n;
+                compare_each(values, move |v| v == n)
+            }
+            FloatPredicate::InSet(set) => filter_float_set(values, set),
+            FloatPredicate::NotEquals(n) => {
+                let n = *n;
+                compare_each(values, move |v| v != n)
+            }
+            FloatPredicate::Range {
+                lower: None,
+                upper: None,
+            } => vec![true; values.len()],
+            FloatPredicate::Range { lower, upper } => {
+                match (inclusive_float_lower(lower), inclusive_float_upper(upper)) {
+                    (Some(lo), Some(hi)) => compare_each(values, move |v| (v >= lo) & (v <= hi)),
+                    _ => vec![false; values.len()],
+                }
+            }
+        }
+    }
+}
+
+/// The smallest `lo` with `v >= lo` exactly when `v` clears `lower`, for any `v` that is not NaN, or `None` when no
+/// value can clear it (`> +inf`). A missing bound becomes `-inf`, which only differs for a NaN row, and the caller
+/// uses it only next to an upper bound that a NaN row fails anyway. A NaN bound stays NaN, which every row fails.
+fn inclusive_float_lower(lower: &Option<FloatBound>) -> Option<f64> {
+    match lower {
+        None => Some(f64::NEG_INFINITY),
+        Some(bound) if bound.inclusive => Some(bound.value),
+        Some(bound) if bound.value == f64::INFINITY => None,
+        Some(bound) => Some(bound.value.next_up()),
+    }
+}
+
+/// The largest `hi` with `v <= hi` exactly when `v` clears `upper`, mirroring [`inclusive_float_lower`]; `None` for
+/// `< -inf`.
+fn inclusive_float_upper(upper: &Option<FloatBound>) -> Option<f64> {
+    match upper {
+        None => Some(f64::INFINITY),
+        Some(bound) if bound.inclusive => Some(bound.value),
+        Some(bound) if bound.value == f64::NEG_INFINITY => None,
+        Some(bound) => Some(bound.value.next_down()),
+    }
+}
+
+/// Answers a float `IN` set for every value. NaN members are dropped, since nothing equals them. A small set is
+/// padded with NaN and OR-ed over a fixed number of compares; a larger one is sorted once with `-0.0` folded into
+/// `0.0` and binary-searched, which keeps `-0.0` and `0.0` equal to each other as `==` does.
+fn filter_float_set(values: &[f64], set: &[f64]) -> Vec<bool> {
+    let members: Vec<f64> = set.iter().copied().filter(|member| !member.is_nan()).collect();
+    if members.len() <= BRANCH_FREE_SET_NARROW {
+        let padded = padded_set::<f64, BRANCH_FREE_SET_NARROW>(&members, f64::NAN);
+        return compare_each(values, move |v| {
+            padded.iter().fold(false, |hit, &member| hit | (v == member))
+        });
+    }
+    if members.len() <= BRANCH_FREE_SET_WIDE {
+        let padded = padded_set::<f64, BRANCH_FREE_SET_WIDE>(&members, f64::NAN);
+        return compare_each(values, move |v| {
+            padded.iter().fold(false, |hit, &member| hit | (v == member))
+        });
+    }
+    let mut sorted: Vec<f64> = members.into_iter().map(|member| member + 0.0).collect();
+    sorted.sort_unstable_by(f64::total_cmp);
+    compare_each(values, |v| {
+        !v.is_nan() && sorted.binary_search_by(|member| member.total_cmp(&(v + 0.0))).is_ok()
+    })
+}
+
+/// Writes `test`'s verdict for every value, in a loop with no early exit or bounds check so it vectorizes.
+/// Compiled once per instruction set and dispatched at runtime, like the unpack kernel; each `test` closure gets its
+/// own clone.
+#[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2", "aarch64+neon"))]
+fn compare_each<T: Copy>(values: &[T], test: impl Fn(T) -> bool) -> Vec<bool> {
+    let mut out = vec![false; values.len()];
+    for (slot, &value) in out.iter_mut().zip(values) {
+        *slot = test(value);
+    }
+    out
+}
+
+/// Copies `items` (at most `N`) into a fixed array of `N`, filling the rest with `fill`, so a set compare can loop a
+/// constant number of times and be fully unrolled.
+fn padded_set<T: Copy, const N: usize>(items: &[T], fill: T) -> [T; N] {
+    let mut set = [fill; N];
+    for (slot, &item) in set.iter_mut().zip(items) {
+        *slot = item;
+    }
+    set
+}
+
+/// Whether `value` lies in any `(lo, span)` interval of `set`, as a branch-free OR of unsigned compares.
+fn interval_set_hit<const N: usize>(set: &[(u64, u64); N], value: u64) -> bool {
+    set.iter()
+        .fold(false, |hit, &(lo, span)| hit | (value.wrapping_sub(lo) <= span))
+}
+
+/// Maps an `i64` onto a `u64` that sorts the same way (flipping the sign bit), so signed bounds can share the
+/// unsigned interval compares and searches.
+fn i64_order_key(value: i64) -> u64 {
+    (value as u64) ^ (i64::MIN as u64)
+}
+
+/// Answers inclusive `intervals` (in the order-preserving `u64` domain `key` maps each value into, not yet merged) for
+/// every value of a decoded integer column, then flips the verdicts when `negate` is set. One interval shape is picked
+/// up front: nothing (a constant answer), a single point, a single range (`key - lo <= hi - lo` as one unsigned
+/// compare), or a small set OR-ed over a fixed number of compares, each a vectorizable loop; a larger set is
+/// binary-searched.
+fn filter_native_ints<T: Copy>(
+    values: &[T],
+    key: impl Fn(T) -> u64 + Copy,
+    intervals: Vec<(u64, u64)>,
+    negate: bool,
+) -> Vec<bool> {
+    let intervals = merge_intervals(intervals);
+    let spans: Vec<(u64, u64)> = intervals.iter().map(|&(lo, hi)| (lo, hi - lo)).collect();
+    let fill = spans.first().copied().unwrap_or((0, 0));
+    match spans.as_slice() {
+        [] => vec![negate; values.len()],
+        &[(lo, 0)] => compare_each(values, move |v| (key(v) == lo) != negate),
+        &[(lo, span)] => compare_each(values, move |v| (key(v).wrapping_sub(lo) <= span) != negate),
+        set if set.len() <= BRANCH_FREE_SET_NARROW => {
+            let set = padded_set::<_, BRANCH_FREE_SET_NARROW>(set, fill);
+            compare_each(values, move |v| interval_set_hit(&set, key(v)) != negate)
+        }
+        set if set.len() <= BRANCH_FREE_SET_WIDE => {
+            let set = padded_set::<_, BRANCH_FREE_SET_WIDE>(set, fill);
+            compare_each(values, move |v| interval_set_hit(&set, key(v)) != negate)
+        }
+        _ => compare_each(values, |v| interval_contains(&intervals, key(v)) != negate),
     }
 }
 
@@ -1406,12 +1564,46 @@ impl PackedLaneTest {
 
     /// Fills `out` (the stream's padded length) with one verdict per lane: whether the lane satisfies the translated
     /// predicate, in one pass over the stream regardless of how many ranges (e.g. `IN` values) translated it.
+    ///
+    /// The shape of the merged ranges picks one compare for the whole block: a single point, a single interval
+    /// (`lo <= d <= hi` as the one unsigned compare `d - lo <= hi - lo`), a parity-split zigzag pair, or a small
+    /// set OR-ed without branches. Each is its own closure, so the multiversioned unpack kernel is compiled and
+    /// vectorized once per shape, with the compare and the negation fused into the same pass that unpacks the lanes.
+    /// Any other shape (a large set, or points mixed with zigzag intervals) keeps the binary search.
     fn apply(&self, stream: &PackedStream<'_>, base: u64, out: &mut [bool]) {
-        stream.unpack_into(out, |delta| self.ranges.contains(base, delta));
-        if self.negate {
-            for slot in out.iter_mut() {
-                *slot = !*slot;
+        let negate = self.negate;
+        match (
+            self.ranges.delta.as_slice(),
+            self.ranges.even.as_slice(),
+            self.ranges.odd.as_slice(),
+        ) {
+            ([], [], []) => out.fill(negate),
+            (&[(lo, hi)], [], []) if lo == hi => stream.unpack_into(out, move |delta| (delta == lo) != negate),
+            (&[(lo, hi)], [], []) => {
+                let span = hi - lo;
+                stream.unpack_into(out, move |delta| (delta.wrapping_sub(lo) <= span) != negate);
             }
+            (delta, [], []) if delta.len() <= BRANCH_FREE_SET_NARROW => {
+                apply_lane_set::<BRANCH_FREE_SET_NARROW>(stream, delta, negate, out);
+            }
+            (delta, [], []) if delta.len() <= BRANCH_FREE_SET_WIDE => {
+                apply_lane_set::<BRANCH_FREE_SET_WIDE>(stream, delta, negate, out);
+            }
+            ([], even, odd) if even.len() <= 1 && odd.len() <= 1 => {
+                // An empty half becomes a one-code interval of the other parity, which no code of its own parity
+                // can ever hit.
+                let (even_lo, even_span) = even.first().map_or((1, 0), |&(lo, hi)| (lo, hi - lo));
+                let (odd_lo, odd_span) = odd.first().map_or((0, 0), |&(lo, hi)| (lo, hi - lo));
+                stream.unpack_into(out, move |delta| {
+                    let code = base.wrapping_add(delta);
+                    // All ones for an odd code, all zeros for an even one: picks the half without a branch.
+                    let odd_mask = 0u64.wrapping_sub(code & 1);
+                    let lo = (even_lo & !odd_mask) | (odd_lo & odd_mask);
+                    let span = (even_span & !odd_mask) | (odd_span & odd_mask);
+                    (code.wrapping_sub(lo) <= span) != negate
+                });
+            }
+            _ => stream.unpack_into(out, |delta| self.ranges.contains(base, delta) != negate),
         }
     }
 
@@ -1421,6 +1613,15 @@ impl PackedLaneTest {
     fn matches(&self, base: u64, value: u64) -> bool {
         self.ranges.contains(base, value) != self.negate
     }
+}
+
+/// Unpacks `stream` into `out` testing each lane delta against `intervals` (at most `N`, merged and non-empty) with
+/// a fixed-length, branch-free OR of `N` unsigned compares, so the lane loop stays vectorizable. The set is padded to
+/// `N` by repeating its first interval, which cannot change an OR.
+fn apply_lane_set<const N: usize>(stream: &PackedStream<'_>, intervals: &[(u64, u64)], negate: bool, out: &mut [bool]) {
+    let spans: Vec<(u64, u64)> = intervals.iter().map(|&(lo, hi)| (lo, hi - lo)).collect();
+    let set = padded_set::<_, N>(&spans, spans.first().copied().unwrap_or((0, 0)));
+    stream.unpack_into(out, move |delta| interval_set_hit(&set, delta) != negate);
 }
 
 /// Inclusive u64 value intervals satisfying `predicate` — the value domain of a u64 FOR block — plus whether the

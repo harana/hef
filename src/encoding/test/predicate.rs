@@ -1699,3 +1699,269 @@ fn string_predicate_masks_agree_with_decoding_under_every_null_form() {
         }
     }
 }
+
+/// A deterministic stream of pseudo-random u64s, so the randomized kernel tests are reproducible.
+fn lcg(seed: u64) -> impl FnMut() -> u64 {
+    let mut state = seed;
+    move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state >> 11
+    }
+}
+
+/// The FOR answer for every predicate must equal `matches_i128` on each decoded value, row for row.
+fn assert_for_block_matches_i128(pipeline: PipelineId, bytes: &[u8], values: &[i128], predicates: &[NumericPredicate]) {
+    for predicate in predicates {
+        let mask = filter_numeric_block(pipeline, bytes, predicate)
+            .unwrap()
+            .expect("FOR blocks answer from packed lanes");
+        let reference: Vec<bool> = values.iter().map(|v| predicate.matches_i128(*v)).collect();
+        assert_eq!(mask, reference, "packed lane kernel diverged for {predicate:?}");
+    }
+}
+
+/// Each specialised packed lane kernel (point, negated point, one interval, small sets of both padded sizes, the
+/// parity-split zigzag range) and the binary-search fallback agree with the reference over a block whose length is
+/// not a multiple of 1024, so the padded tail of the last vector is unpacked and then dropped.
+#[test]
+fn specialised_packed_lane_kernels_agree_with_the_reference() {
+    let mut next = lcg(0x5851_F42D_4C95_7F2D);
+    let base = 1_000_000u64;
+    let values: Vec<u64> = (0..3077).map(|_| base + next() % 5_000).collect();
+    let wide: Vec<i128> = values.iter().map(|v| i128::from(*v)).collect();
+    let hit = wide[2900];
+    let set = |len: i128| NumericPredicate::InSet((0..len).map(|i| wide[0] + i * 37 - 200).collect());
+    let predicates = vec![
+        NumericPredicate::Equals(hit),
+        NumericPredicate::Equals(i128::from(base) - 1),
+        NumericPredicate::Equals(i128::from(u64::MAX)),
+        NumericPredicate::NotEquals(hit),
+        NumericPredicate::NotEquals(i128::from(u64::MAX) + 1),
+        range(Some((hit - 300, true)), Some((hit + 300, false))),
+        range(Some((hit, true)), Some((hit, true))),
+        range(Some((0, true)), Some((i128::from(u64::MAX), true))),
+        range(Some((i128::from(u64::MAX), false)), None),
+        range(Some((i128::MIN, false)), Some((i128::from(base) + 2, false))),
+        range(Some((hit, true)), Some((hit - 1, true))),
+        set(2),
+        set(4),
+        set(5),
+        set(16),
+        set(17),
+        set(40),
+        // Adjacent members merge into wider intervals before the set is padded.
+        NumericPredicate::InSet(vec![
+            hit,
+            hit + 1,
+            hit + 2,
+            wide[7],
+            wide[7] + 1,
+            -5,
+            i128::from(u64::MAX) + 3,
+        ]),
+        NumericPredicate::InSet(Vec::new()),
+    ];
+    let (pipeline, bytes) = for_u64_block(&values);
+    assert_for_block_matches_i128(pipeline, &bytes, &wide, &predicates);
+
+    let signed: Vec<i64> = (0..3077).map(|_| (next() % 6_000) as i64 - 3_000).collect();
+    let wide: Vec<i128> = signed.iter().map(|v| i128::from(*v)).collect();
+    let hit = wide[3070];
+    let set = |len: i128| NumericPredicate::InSet((0..len).map(|i| i * 41 - 400).collect());
+    let predicates = vec![
+        NumericPredicate::Equals(hit),
+        NumericPredicate::Equals(-hit - 1),
+        NumericPredicate::NotEquals(hit),
+        NumericPredicate::NotEquals(i128::from(i64::MIN) - 1),
+        range(Some((-700, true)), Some((900, false))),
+        range(Some((-700, false)), Some((-2, true))),
+        range(Some((0, true)), Some((1_500, true))),
+        range(Some((i128::from(i64::MIN), true)), None),
+        range(None, Some((i128::from(i64::MAX), false))),
+        range(Some((i128::MIN, true)), Some((i128::MIN, false))),
+        range(Some((i128::MAX, false)), None),
+        range(Some((5, true)), Some((5, true))),
+        set(3),
+        set(4),
+        set(9),
+        set(16),
+        set(25),
+    ];
+    let (pipeline, bytes) = for_i64_block(&signed);
+    assert_for_block_matches_i128(pipeline, &bytes, &wide, &predicates);
+}
+
+/// A set of ranges that mixes plain delta points with a parity-split zigzag pair has no specialised kernel; it falls
+/// back to the binary search, which still matches the scalar per-lane test in either polarity.
+#[test]
+fn mixed_delta_points_and_zigzag_ranges_fall_back_to_the_search() {
+    let mut next = lcg(0x2127_599B_F432_5C37);
+    let deltas: Vec<u64> = (0..1500).map(|_| next() % 512).collect();
+    let mut body = Writer::new();
+    bitpack(&deltas, 9, &mut body);
+    let bytes = body.into_bytes();
+    let stream = read_packed_stream(&mut Reader::new(&bytes)).unwrap();
+    let base = 40;
+    for negate in [false, true] {
+        let test = PackedLaneTest {
+            negate,
+            ranges: MergedLaneRanges::from_ranges(vec![
+                PackedLaneRange::Delta { hi: 7, lo: 7 },
+                PackedLaneRange::Zigzag {
+                    even: (100, 300),
+                    odd: (151, 401),
+                },
+            ]),
+        };
+        let mut out = vec![false; stream.padded_count()];
+        test.apply(&stream, base, &mut out);
+        out.truncate(deltas.len());
+        let expected: Vec<bool> = deltas.iter().map(|delta| test.matches(base, *delta)).collect();
+        assert_eq!(out, expected);
+    }
+}
+
+/// The decoded integer filters (constant, point, negated point, one range, both padded small-set sizes and the
+/// binary-search fallback) agree with `matches_i128` row for row, including bounds outside each type's domain,
+/// exclusive bounds at the `i128` extremes, empty ranges, and `IN` members no value of the type can equal.
+#[test]
+fn decoded_integer_filters_agree_with_the_reference() {
+    let mut next = lcg(0x9FB2_1C65_1E98_DF25);
+    let mut unsigned: Vec<u64> = (0..3001).map(|_| next() % 4_000).collect();
+    unsigned.extend_from_slice(&[0, 1, u64::MAX, u64::MAX - 1, 1 << 63]);
+    let mut signed: Vec<i64> = (0..3001).map(|_| (next() % 4_000) as i64 - 2_000).collect();
+    signed.extend_from_slice(&[i64::MIN, i64::MIN + 1, i64::MAX, i64::MAX - 1, -1, 0, 1]);
+    let set = |len: i128, start: i128| NumericPredicate::InSet((0..len).map(|i| start + i * 53).collect());
+    let extremes = [
+        i128::MIN,
+        i128::from(i64::MIN) - 1,
+        i128::from(i64::MIN),
+        -1,
+        0,
+        i128::from(i64::MAX),
+        i128::from(u64::MAX),
+        i128::from(u64::MAX) + 1,
+        i128::MAX,
+    ];
+    let mut predicates = vec![
+        NumericPredicate::InSet(Vec::new()),
+        NumericPredicate::InSet(vec![-1, i128::from(u64::MAX) + 1, i128::MIN]),
+        NumericPredicate::InSet(vec![
+            5,
+            6,
+            7,
+            8,
+            -3,
+            -2,
+            100,
+            i128::from(i64::MIN),
+            i128::from(u64::MAX),
+        ]),
+        range(None, None),
+        range(Some((10, true)), Some((9, true))),
+        range(Some((-300, true)), Some((900, false))),
+        range(Some((-300, false)), Some((-300, true))),
+    ];
+    for len in [2, 4, 5, 16, 17, 40] {
+        predicates.push(set(len, -900));
+        predicates.push(set(len, 100));
+    }
+    for &n in &extremes {
+        predicates.push(NumericPredicate::Equals(n));
+        predicates.push(NumericPredicate::NotEquals(n));
+        for inclusive in [false, true] {
+            predicates.push(range(Some((n, inclusive)), None));
+            predicates.push(range(None, Some((n, inclusive))));
+            predicates.push(range(Some((n, inclusive)), Some((1_000, true))));
+            predicates.push(range(Some((-1_000, true)), Some((n, inclusive))));
+        }
+    }
+    for value in [unsigned[17], unsigned[2999]] {
+        predicates.push(NumericPredicate::Equals(i128::from(value)));
+        predicates.push(NumericPredicate::NotEquals(i128::from(value)));
+    }
+    for value in [signed[17], signed[2999]] {
+        predicates.push(NumericPredicate::Equals(i128::from(value)));
+        predicates.push(NumericPredicate::NotEquals(i128::from(value)));
+    }
+    let unsigned_data = ColumnData::U64(unsigned.clone());
+    let signed_data = ColumnData::I64(signed.clone());
+    for predicate in &predicates {
+        let expected: Vec<bool> = unsigned
+            .iter()
+            .map(|v| predicate.matches_i128(i128::from(*v)))
+            .collect();
+        assert_eq!(
+            predicate.filter_decoded(&unsigned_data),
+            expected,
+            "u64 diverged for {predicate:?}"
+        );
+        let expected: Vec<bool> = signed.iter().map(|v| predicate.matches_i128(i128::from(*v))).collect();
+        assert_eq!(
+            predicate.filter_decoded(&signed_data),
+            expected,
+            "i64 diverged for {predicate:?}"
+        );
+    }
+}
+
+/// The decoded float filters agree with `matches_f64` row for row, with NaN, signed zeros, infinities, subnormals
+/// and the largest finite values both in the data and as bounds or set members.
+#[test]
+fn decoded_float_filters_agree_with_the_reference() {
+    let mut next = lcg(0x1405_7B7E_F767_814F);
+    let specials = [
+        f64::NAN,
+        -f64::NAN,
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::MIN_POSITIVE,
+        -f64::MIN_POSITIVE,
+        f64::from_bits(1),
+        -f64::from_bits(1),
+        f64::MAX,
+        f64::MIN,
+        1.5,
+        -2.25,
+    ];
+    let mut values: Vec<f64> = (0..3001).map(|_| (next() % 2_000) as f64 / 4.0 - 250.0).collect();
+    values.extend((0..500).map(|_| f64::from_bits(next() << 11 ^ next())));
+    values.extend_from_slice(&specials);
+    let float_range = |lower: Option<(f64, bool)>, upper: Option<(f64, bool)>| FloatPredicate::Range {
+        lower: lower.map(|(value, inclusive)| FloatBound { inclusive, value }),
+        upper: upper.map(|(value, inclusive)| FloatBound { inclusive, value }),
+    };
+    let mut predicates = vec![
+        FloatPredicate::InSet(Vec::new()),
+        FloatPredicate::InSet(vec![f64::NAN]),
+        FloatPredicate::InSet(vec![-0.0, 1.5, f64::NAN, values[9]]),
+        FloatPredicate::InSet(vec![0.0, -2.25, f64::NAN, values[9], values[10]]),
+        FloatPredicate::InSet(values.iter().step_by(150).copied().collect()),
+        FloatPredicate::InSet(values.iter().step_by(40).copied().chain(specials).collect()),
+        float_range(None, None),
+        float_range(Some((-10.0, true)), Some((10.0, false))),
+        float_range(Some((10.0, true)), Some((-10.0, true))),
+    ];
+    for &n in specials.iter().chain(&[values[3], values[3002]]) {
+        predicates.push(FloatPredicate::Equals(n));
+        predicates.push(FloatPredicate::NotEquals(n));
+        for inclusive in [false, true] {
+            predicates.push(float_range(Some((n, inclusive)), None));
+            predicates.push(float_range(None, Some((n, inclusive))));
+            predicates.push(float_range(Some((n, inclusive)), Some((100.0, true))));
+            predicates.push(float_range(Some((-100.0, false)), Some((n, inclusive))));
+        }
+    }
+    for predicate in &predicates {
+        let expected: Vec<bool> = values.iter().map(|v| predicate.matches_f64(*v)).collect();
+        assert_eq!(
+            predicate.filter_decoded(&values),
+            expected,
+            "f64 diverged for {predicate:?}"
+        );
+    }
+}
