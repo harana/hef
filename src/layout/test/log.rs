@@ -107,6 +107,44 @@ fn every_truncation_reads_as_a_torn_tail_after_the_intact_records() {
 }
 
 #[test]
+fn a_damaged_header_keeps_its_distinct_error_and_a_damaged_prefix_is_not_a_torn_tail() {
+    let object = sealed(&PAYLOADS);
+    for position in 0..LOG_HEADER_LEN {
+        let mut damaged = object.bytes.clone();
+        damaged[position] ^= 0x40;
+        let expected = match position {
+            0..4 => FormatError::BadMagic { expected: "HEFL" },
+            4 => FormatError::UnsupportedVersion {
+                field: "log format version",
+                found: u32::from(LOG_FORMAT_VERSION ^ 0x40),
+            },
+            _ => FormatError::Structural {
+                rule: "unknown profile",
+            },
+        };
+        assert_eq!(
+            LogRecords::open(&damaged).err(),
+            Some(LogReadError::Corrupt(expected)),
+            "byte {position}"
+        );
+        for cut in position + 1..LOG_HEADER_LEN {
+            assert!(
+                matches!(LogRecords::open(&damaged[..cut]), Err(LogReadError::Corrupt(_))),
+                "byte {position}, cut at {cut}"
+            );
+        }
+    }
+    let mut other_profile = object.bytes.clone();
+    other_profile[LOG_HEADER_LEN - 1] = Profile::Inbox.code();
+    assert!(matches!(
+        LogRecords::open(&other_profile),
+        Err(LogReadError::Corrupt(FormatError::Structural {
+            rule: "a log object must declare the log profile"
+        }))
+    ));
+}
+
+#[test]
 fn damage_before_the_end_is_corruption_not_a_torn_tail() {
     let object = sealed(&PAYLOADS);
     let second_payload_at = LOG_HEADER_LEN + LOG_RECORD_FRAME_LEN + PAYLOADS[0].len() + 4 + 1;
