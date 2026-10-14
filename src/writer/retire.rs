@@ -372,7 +372,7 @@ pub fn sweep_retired_files(
                     .get(&entry.file_id)
                     .copied()
             };
-            let Some(retirement) = position.map(|position| &mut next.retirements[position]) else {
+            let Some(retirement) = position.and_then(|position| next.retirements.get_mut(position)) else {
                 started_clocks.push(Retirement {
                     file_id: entry.file_id,
                     generation: next_id,
