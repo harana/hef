@@ -526,3 +526,95 @@ fn value_first_recorded_with_no_rows_takes_later_rows() {
     assert_eq!(index.bitmap(4).unwrap().ranges(), &[RowRange { end: 7, start: 5 }]);
     assert_eq!(index.len(), 1);
 }
+
+/// The runs a bit-by-bit walk of `bits` finds, the reference the word-at-a-time scan must reproduce.
+fn runs_bit_by_bit(bits: &[u8]) -> Vec<RowRange> {
+    let mut runs: Vec<RowRange> = Vec::new();
+    for row in 0..bits.len() as u64 * 8 {
+        if bits
+            .get(row as usize / 8)
+            .is_some_and(|byte| byte & (1 << (row % 8)) != 0)
+        {
+            match runs.last_mut() {
+                Some(last) if last.end == row => last.end = row + 1,
+                _ => runs.push(RowRange {
+                    start: row,
+                    end: row + 1,
+                }),
+            }
+        }
+    }
+    runs
+}
+
+/// Random bitmaps of every length from empty to several words, built from runs of random lengths (short runs that
+/// change inside a word, long ones that cross whole words and end exactly at a word or at the end), plus uniform and
+/// random-byte inputs, all scan to exactly the runs a bit-by-bit walk finds and to `from_rows` over the set rows.
+#[test]
+fn from_packed_bits_matches_a_bit_by_bit_walk_on_random_bitmaps() {
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for len in 0..=40usize {
+        let mut shapes = vec![vec![0x00u8; len], vec![0xFFu8; len]];
+        for max_run in [1u64, 3, 9, 70, 200] {
+            for _ in 0..8 {
+                let mut bits = vec![0u8; len];
+                let mut row = 0usize;
+                let mut set = next() & 1 == 1;
+                while row < len * 8 {
+                    let run = 1 + (next() % max_run) as usize;
+                    for r in row..(row + run).min(len * 8) {
+                        if set {
+                            bits[r / 8] |= 1 << (r % 8);
+                        }
+                    }
+                    row += run;
+                    set = !set;
+                }
+                shapes.push(bits);
+            }
+        }
+        shapes.push((0..len).map(|_| next() as u8).collect());
+        for bits in shapes {
+            let from_bits = RoaringRangeBitmap::from_packed_bits(&bits);
+            assert_eq!(
+                from_bits.ranges(),
+                runs_bit_by_bit(&bits).as_slice(),
+                "over {bits:02x?}"
+            );
+            assert_eq!(
+                from_bits,
+                RoaringRangeBitmap::from_rows(rows_of(&from_bits)),
+                "over {bits:02x?}"
+            );
+        }
+    }
+}
+
+/// Runs that cross word edges stay one run, and a run reaching the last bit closes at the end of the bitmap, whether
+/// the bitmap ends on a whole word or partway through one.
+#[test]
+fn from_packed_bits_keeps_runs_whole_across_words_and_to_the_end() {
+    let mut bits = vec![0u8; 24];
+    bits[7] = 0x80;
+    bits[8..16].fill(0xFF);
+    bits[16] = 0x01;
+    bits[23] = 0xC0;
+    assert_eq!(
+        RoaringRangeBitmap::from_packed_bits(&bits).ranges(),
+        &[RowRange { start: 63, end: 129 }, RowRange { start: 190, end: 192 }]
+    );
+    assert_eq!(
+        RoaringRangeBitmap::from_packed_bits(&[0xFF; 11]).ranges(),
+        &[RowRange { start: 0, end: 88 }]
+    );
+    assert_eq!(
+        RoaringRangeBitmap::from_packed_bits(&[0x00, 0, 0, 0, 0, 0, 0, 0, 0x80]).ranges(),
+        &[RowRange { start: 71, end: 72 }]
+    );
+}

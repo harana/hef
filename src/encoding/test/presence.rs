@@ -120,3 +120,21 @@ fn presence_rank_matches_a_bit_by_bit_count_at_every_row() {
         }
     }
 }
+
+/// Every byte length from empty to past three 32-byte blocks, in every bitmap shape and at every bit length up to and
+/// past the bitmap's end, counts exactly what testing the bits one at a time counts. This covers whole blocks,
+/// leftover words, leftover bytes, a partial tail byte, and a `len` longer than the bitmap.
+#[test]
+fn block_count_matches_counting_bit_by_bit_for_every_shape_and_length() {
+    for bytes in 0..=100 {
+        for bitmap in bitmap_shapes(bytes) {
+            for len in 0..=bytes * 8 + 20 {
+                assert_eq!(
+                    count_set_bits(&bitmap, len),
+                    count_bits_one_at_a_time(&bitmap, len),
+                    "bytes {bytes} len {len} bitmap {bitmap:?}"
+                );
+            }
+        }
+    }
+}

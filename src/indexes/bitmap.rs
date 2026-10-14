@@ -82,39 +82,28 @@ impl RoaringRangeBitmap {
     }
 
     /// Builds a bitmap from a packed LSB-0 bit array (bit `i % 8` of byte `i / 8` is row `i`), emitting runs straight
-    /// from the byte scan — no per-row id is ever materialized or sorted, unlike [`from_rows`](Self::from_rows) over
-    /// the same bits. All-zero and all-one bytes advance a whole byte at a time, so a mostly-present or mostly-absent
-    /// bitmap costs one branch per byte rather than one per row. The result is byte-identical to
-    /// `Self::from_rows(<every set row>)`.
+    /// from the scan; no per-row id is ever materialized or sorted, unlike [`from_rows`](Self::from_rows) over the
+    /// same bits. The scan reads 64 rows at a time and only stops where a row differs from the one before it, so a
+    /// mostly-present or mostly-absent bitmap costs one step per 64 rows rather than one per row. The result is
+    /// byte-identical to `Self::from_rows(<every set row>)`.
     pub fn from_packed_bits(bits: &[u8]) -> Self {
         let mut runs: Vec<RowRange> = Vec::new();
         // Start of the run currently being extended, still open at the scan position.
         let mut open: Option<u64> = None;
-        for (byte_index, &byte) in bits.iter().enumerate() {
-            let base = byte_index as u64 * 8;
-            match byte {
-                0x00 => {
-                    if let Some(start) = open.take() {
-                        runs.push(RowRange { start, end: base });
-                    }
-                }
-                0xFF => {
-                    if open.is_none() {
-                        open = Some(base);
-                    }
-                }
-                _ => {
-                    for bit in 0..8u64 {
-                        if byte & (1 << bit) != 0 {
-                            if open.is_none() {
-                                open = Some(base + bit);
-                            }
-                        } else if let Some(start) = open.take() {
-                            runs.push(RowRange { start, end: base + bit });
-                        }
-                    }
-                }
+        let mut words = bits.chunks_exact(8);
+        let mut base = 0u64;
+        for word in words.by_ref() {
+            let word = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
+            push_word_runs(&mut runs, &mut open, base, word);
+            base += 64;
+        }
+        if !words.remainder().is_empty() {
+            // The missing high bytes read as unset rows, so a run reaching the last byte closes at the end of `bits`.
+            let mut tail = [0u8; 8];
+            for (slot, byte) in tail.iter_mut().zip(words.remainder()) {
+                *slot = *byte;
             }
+            push_word_runs(&mut runs, &mut open, base, u64::from_le_bytes(tail));
         }
         if let Some(start) = open {
             runs.push(RowRange {
@@ -491,6 +480,23 @@ pub fn verify_bitmap_block(
 /// any is false the bitmap path must not be taken and the planner falls back to a full scan or another index.
 pub fn can_use_bitmap(info: &BitmapBlockInfo) -> bool {
     info.checksum_verified && info.directly_intersectable && info.feature_declared
+}
+
+/// Extends the runs with the 64 rows of `word` (bit `n` is row `base + n`), opening a run at each unset-to-set step
+/// and closing the open one at each set-to-unset step. `open` carries the run still open from the rows before `base`
+/// in and out, so a run crossing words stays one run. A word with no step in it, all set while a run is open or all
+/// unset while none is, costs no work beyond finding that out.
+fn push_word_runs(runs: &mut Vec<RowRange>, open: &mut Option<u64>, base: u64, word: u64) {
+    // Bit n is set where row base + n differs from the row before it; the row before base is set iff a run is open.
+    let mut steps = word ^ ((word << 1) | u64::from(open.is_some()));
+    while steps != 0 {
+        let row = base + u64::from(steps.trailing_zeros());
+        match open.take() {
+            Some(start) => runs.push(RowRange { start, end: row }),
+            None => *open = Some(row),
+        }
+        steps &= steps - 1;
+    }
 }
 
 #[cfg(test)]
