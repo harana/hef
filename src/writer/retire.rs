@@ -20,7 +20,7 @@
 //! See: hef-file-lifecycle/spec.md
 
 use super::build::{BuiltHef, HefBuildConfig};
-use super::constant::AUDIT_COMPACTION_REFUSED;
+use super::constant::{AUDIT_COMPACTION_REFUSED, LINEAR_LOOKUP_MAX_ENTRIES};
 use super::publish::{HefPublisher, MAX_REBASE_ATTEMPTS, PeerNotices, PublishFailure, Published};
 use super::upload::upload_hef;
 use crate::clock::Clock;
@@ -30,7 +30,7 @@ use crate::invariants::PublishedSet;
 use crate::layout::{Profile, decode_header};
 use crate::lifecycle::{FileType, GraphFileSummary, HefFileEntry, ManifestGeneration, PartState, Retirement};
 use crate::object_store::{ObjectStore, constant::MIN_MULTIPART_PART_BYTES, hef_object_key};
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 
 /// How long a replaced file waits at each step before the sweeper moves it on.
 ///
@@ -350,15 +350,29 @@ pub fn sweep_retired_files(
         };
         let mut report = SweepReport::default();
         let mut started_clocks = Vec::new();
+        let mut retirement_positions: Option<HashMap<u128, usize>> = None;
         for entry in &mut next.files {
             if !matches!(entry.part_state, PartState::Outdated | PartState::DeleteOnDestroy) {
                 continue;
             }
-            let Some(retirement) = next
-                .retirements
-                .iter_mut()
-                .find(|retirement| retirement.file_id == entry.file_id)
-            else {
+            // The first record for a file id wins, matching a front-to-back search.
+            let position = if next.retirements.len() <= LINEAR_LOOKUP_MAX_ENTRIES {
+                next.retirements
+                    .iter()
+                    .position(|retirement| retirement.file_id == entry.file_id)
+            } else {
+                retirement_positions
+                    .get_or_insert_with(|| {
+                        let mut positions = HashMap::with_capacity(next.retirements.len());
+                        for (position, retirement) in next.retirements.iter().enumerate() {
+                            positions.entry(retirement.file_id).or_insert(position);
+                        }
+                        positions
+                    })
+                    .get(&entry.file_id)
+                    .copied()
+            };
+            let Some(retirement) = position.map(|position| &mut next.retirements[position]) else {
                 started_clocks.push(Retirement {
                     file_id: entry.file_id,
                     generation: next_id,
@@ -397,19 +411,22 @@ pub fn sweep_retired_files(
             .map(|entry| entry.file_id)
             .collect();
         report.deleted.retain(|file_id| !still_readable.contains(file_id));
-        for entry in next
-            .files
-            .iter()
-            .filter(|entry| report.deleted.contains(&entry.file_id))
-        {
-            debug_assert!(entry.part_state.can_transition_to(PartState::Deleted));
-            objects
-                .delete(&hef_object_key(entry.tenant_id, entry.file_id))
-                .map_err(PublishFailure::Storage)?;
+        if !report.deleted.is_empty() {
+            let deleted_set: Option<HashSet<u128>> =
+                (report.deleted.len() > LINEAR_LOOKUP_MAX_ENTRIES).then(|| report.deleted.iter().copied().collect());
+            let is_deleted = |file_id: &u128| match &deleted_set {
+                Some(set) => set.contains(file_id),
+                None => report.deleted.contains(file_id),
+            };
+            for entry in next.files.iter().filter(|entry| is_deleted(&entry.file_id)) {
+                debug_assert!(entry.part_state.can_transition_to(PartState::Deleted));
+                objects
+                    .delete(&hef_object_key(entry.tenant_id, entry.file_id))
+                    .map_err(PublishFailure::Storage)?;
+            }
+            next.files.retain(|entry| !is_deleted(&entry.file_id));
+            next.retirements.retain(|retirement| !is_deleted(&retirement.file_id));
         }
-        next.files.retain(|entry| !report.deleted.contains(&entry.file_id));
-        next.retirements
-            .retain(|retirement| !report.deleted.contains(&retirement.file_id));
 
         if commit(published, head_id, next)? {
             report.generation = Some(next_id);
