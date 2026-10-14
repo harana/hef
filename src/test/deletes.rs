@@ -102,6 +102,84 @@ fn republish_tombstones_in_place_and_a_later_reinvalidation_queues_once() {
 }
 
 #[test]
+fn churning_one_event_keeps_the_queue_bounded_by_outstanding_work() {
+    // Regression for tombstone build-up: invalidating and republishing the same event over and over while another
+    // event stays pending must not grow the queue with every cycle, and once nothing is pending the queue is empty
+    // so a poll inspects no slots at all.
+    let waiting = EventId::new_test_id(1);
+    let hot = EventId::new_test_id(2);
+    let mut ledger = DerivedColumnLedger::new();
+    ledger.invalidate(waiting, &[]);
+    for cycle in 0..10_000 {
+        ledger.invalidate(hot, &[hot]);
+        ledger.republish(hot, 1.0, cycle);
+        assert!(ledger.recompute_queue.len() <= RECOMPUTE_QUEUE_COMPACTION_FLOOR + 1);
+    }
+    assert_eq!(ledger.pending_recomputes(), &[waiting]);
+
+    ledger.invalidate(hot, &[]);
+    assert_eq!(
+        ledger.pending_recomputes(),
+        &[waiting, hot],
+        "re-invalidating a completed event appends it after the jobs already waiting"
+    );
+    ledger.republish(waiting, 2.0, 1);
+    ledger.republish(hot, 3.0, 1);
+    assert!(ledger.recompute_queue.is_empty());
+    assert_eq!(ledger.published_value(waiting), Some(2.0));
+    assert_eq!(ledger.published_value(hot), Some(3.0));
+}
+
+#[test]
+fn ledger_matches_a_plain_ordered_list_under_random_invalidations_and_republishes() {
+    // Differential check of the compacting queue against the obvious model: an ordered list of pending events plus
+    // each event's last published value. Enough distinct events are used to push the queue past the compaction floor.
+    let mut ledger = DerivedColumnLedger::new();
+    let mut pending: Vec<EventId> = Vec::new();
+    let mut published: HashMap<EventId, f64> = HashMap::new();
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move |bound: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % bound
+    };
+    for step in 0..20_000u64 {
+        let event = EventId::new_test_id(u128::from(next(200)));
+        if next(2) == 0 {
+            let neighbors: Vec<EventId> = (0..next(4))
+                .map(|_| EventId::new_test_id(u128::from(next(200))))
+                .collect();
+            ledger.invalidate(event, &neighbors);
+            for id in std::iter::once(event).chain(neighbors) {
+                published.remove(&id);
+                if !pending.contains(&id) {
+                    pending.push(id);
+                }
+            }
+        } else {
+            let value = step as f64;
+            ledger.republish(event, value, step);
+            pending.retain(|id| *id != event);
+            published.insert(event, value);
+        }
+
+        assert_eq!(ledger.pending_recomputes(), pending, "step {step}");
+        for (id, position) in &ledger.queue_position {
+            assert_eq!(ledger.recompute_queue[*position], Some(*id), "step {step}");
+        }
+        assert_eq!(
+            ledger.recompute_queue.iter().flatten().count(),
+            ledger.queue_position.len()
+        );
+        for n in 0..200 {
+            let id = EventId::new_test_id(n);
+            assert_eq!(ledger.published_value(id), published.get(&id).copied(), "step {step}");
+        }
+    }
+}
+
+#[test]
 fn a_key_resumed_from_a_sealing_checkout_stays_inside_its_epoch_range() {
     // A subject key built from a keystore checkout owns only its reserved epochs: re-seals roll inside the range,
     // sealing refuses once it is spent, and the next checkout's key seals the same block under fresh nonces — so no

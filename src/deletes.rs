@@ -8,6 +8,7 @@
 //! A correction or delete also invalidates any model-derived column values computed from the event it touches, so a
 //! query never serves a number that a correction has made stale.
 
+use crate::constant::RECOMPUTE_QUEUE_COMPACTION_FLOOR;
 use crate::error::FormatError;
 use crate::events::{EventId, SequenceRange};
 use crate::file::bytes::{Reader, Writer};
@@ -316,12 +317,14 @@ pub enum DerivedColumnState {
 /// enqueued for it.
 #[derive(Debug, Default)]
 pub struct DerivedColumnLedger {
-    /// Invalidation order: `Some(id)` at a still-pending slot, `None` at a slot a later `republish` tombstoned. A
-    /// slot is cleared in place rather than removed, so `republish` never rescans the whole queue.
-    recompute_queue: Vec<Option<EventId>>,
     /// Each still-pending event's slot in `recompute_queue`, so `republish` tombstones it directly instead of
     /// searching for it.
     queue_position: HashMap<EventId, usize>,
+    /// Invalidation order: `Some(id)` at a still-pending slot, `None` at a slot a later `republish` tombstoned. A
+    /// slot is cleared in place rather than removed, so `republish` never rescans the whole queue. Tombstones are
+    /// swept out when an `invalidate` finds they make up half the queue, and the queue empties once nothing is
+    /// pending, so its length tracks the largest outstanding backlog rather than lifetime invalidations.
+    recompute_queue: Vec<Option<EventId>>,
     states: HashMap<EventId, DerivedColumnState>,
 }
 
@@ -336,6 +339,7 @@ impl DerivedColumnLedger {
         for id in std::iter::once(event_id).chain(neighbors.iter().copied()) {
             let previous = self.states.insert(id, DerivedColumnState::Pending);
             if previous != Some(DerivedColumnState::Pending) {
+                self.compact_recompute_queue();
                 let position = self.recompute_queue.len();
                 self.recompute_queue.push(Some(id));
                 self.queue_position.insert(id, position);
@@ -358,7 +362,32 @@ impl DerivedColumnLedger {
             && let Some(slot) = self.recompute_queue.get_mut(position)
         {
             *slot = None;
+            if self.queue_position.is_empty() {
+                self.recompute_queue.clear();
+            }
         }
+    }
+
+    /// Drops tombstoned slots, keeping the still-pending events in invalidation order and repointing their positions.
+    /// Runs only past the floor and once at least half the slots are tombstones, so each sweep is paid for by the
+    /// republishes that made them.
+    fn compact_recompute_queue(&mut self) {
+        let len = self.recompute_queue.len();
+        if len <= RECOMPUTE_QUEUE_COMPACTION_FLOOR || self.queue_position.len() > len / 2 {
+            return;
+        }
+        let queue_position = &mut self.queue_position;
+        let mut next = 0;
+        self.recompute_queue.retain(|slot| {
+            let Some(id) = slot else {
+                return false;
+            };
+            if let Some(position) = queue_position.get_mut(id) {
+                *position = next;
+            }
+            next += 1;
+            true
+        });
     }
 
     /// The value a query should serve for `event_id`: `None` while pending, so an invalidated event never serves its
