@@ -432,6 +432,61 @@ fn metadata_string_events() -> Vec<EventInput> {
     events
 }
 
+fn provenance_record(seed: u8, scheme: SignatureScheme) -> SignedEventProvenance {
+    SignedEventProvenance {
+        author_pubkey: [seed; 32],
+        claimed_at: TimestampValue::from_physical_nanos(1_700_000_000_000_000_000 + i64::from(seed)),
+        protocol_event_id: [seed.wrapping_add(1); 32],
+        protocol_kind: u32::from(seed),
+        scheme,
+        signature: [seed.wrapping_add(2); 64],
+    }
+}
+
+fn relationship_set(seed: u8) -> EventRelationships {
+    EventRelationships::new(vec![
+        RelationshipRef::to_event(RelationshipKind::Parent, 0x2000 + u128::from(seed)),
+        RelationshipRef::to_external(RelationshipKind::Prev, format!("$prev-{seed}").as_bytes()).unwrap(),
+        RelationshipRef::to_protocol(RelationshipKind::Root, [seed; 32]),
+        RelationshipRef::to_external(RelationshipKind::Auth, b"$a").unwrap(),
+        RelationshipRef::to_event(RelationshipKind::Related, 9),
+        RelationshipRef::to_protocol(RelationshipKind::Link, [seed.wrapping_add(3); 32]),
+    ])
+    .unwrap()
+}
+
+/// Events carrying provenance and relationships where each `Some` in the pattern says so; `Some(None)` declares an
+/// empty relationship list.
+fn side_table_events(pattern: &[(Option<SignatureScheme>, Option<Option<u8>>)]) -> Vec<EventInput> {
+    let mut events = sample_events(pattern.len());
+    for (index, (event, (scheme, relationships))) in events.iter_mut().zip(pattern).enumerate() {
+        event.provenance = scheme.map(|scheme| provenance_record(index as u8, scheme));
+        event.relationships = relationships.map(|seed| match seed {
+            Some(seed) => relationship_set(seed),
+            None => EventRelationships::new(Vec::new()).unwrap(),
+        });
+    }
+    events
+}
+
+fn side_table_patterns() -> Vec<Vec<(Option<SignatureScheme>, Option<Option<u8>>)>> {
+    let bip = Some(SignatureScheme::Bip340SchnorrSecp256k1);
+    let ed = Some(SignatureScheme::Ed25519);
+    vec![
+        vec![(None, None), (None, None), (None, None)],
+        vec![(bip, None), (None, None), (None, Some(Some(1)))],
+        vec![(None, Some(Some(2))), (None, None), (ed, None)],
+        vec![
+            (bip, None),
+            (None, Some(None)),
+            (ed, Some(Some(3))),
+            (None, None),
+            (bip, Some(Some(4))),
+        ],
+        vec![(ed, Some(Some(5))), (bip, Some(None)), (ed, Some(Some(6)))],
+    ]
+}
+
 #[test]
 fn interned_metadata_strings_build_the_same_bytes_as_before() {
     // Digest of the bytes the builder produced before the interner borrowed its strings.
@@ -464,4 +519,63 @@ fn interned_strings_share_refs_by_content_and_outlive_the_input() {
     assert_eq!(fourth.account_id, None);
     assert_eq!(third.entity_id, Some("\u{e9}v\u{e9}nement-\u{5b9f}\u{4f53}-\u{1f600}"));
     assert_eq!(third.account_id.map(str::len), Some(5 * 2000));
+}
+
+#[test]
+fn side_tables_build_the_same_bytes_as_before() {
+    let digests: Vec<String> = side_table_patterns()
+        .iter()
+        .map(|pattern| batch_digest(&side_table_events(pattern)))
+        .collect();
+    // Digests of the bytes the builder produced before side tables were written inside the record loop.
+    assert_eq!(
+        digests,
+        vec![
+            "3e0caf944ccb378c46e834500cdce1047a519ca29213df07a66d4efc2597c9a2",
+            "97fe8341d7ec7b218d35b4b703b8599fd0776575569a74997b438782fd8a1874",
+            "bf750df961a354cb857d636eec9a31bf8c1f4a501a747d3dab5b9e962bd2ef9a",
+            "3549227b245b4f598bc520c6ef9562f3ddcb8dcb73136cfdd11766c42a9e04e9",
+            "55b2b295a54af95cd457cfaab2e686f9f01fde1316ec24c29c7ac3706ae4e8e3",
+        ]
+    );
+}
+
+#[test]
+fn side_table_refs_are_zero_without_a_section_and_absent_for_events_without_entries() {
+    let patterns = side_table_patterns();
+    let decode = |pattern: &[(Option<SignatureScheme>, Option<Option<u8>>)]| {
+        let encoded = build_batch(&side_table_events(pattern), 1, 0).expect("batch builds");
+        let decoded = decode_batch(&encoded, pattern.len() as u32).expect("batch decodes");
+        let refs: Vec<(u32, u32)> = decoded
+            .events
+            .iter()
+            .map(|event| (event.variable.provenance_ref, event.variable.relationships_ref))
+            .collect();
+        (decoded.header.flags, refs)
+    };
+
+    // No side tables at all: provenance stays absent, the relationship field stays reserved zero.
+    let (flags, refs) = decode(&patterns[0]);
+    assert_eq!(flags, 0);
+    assert_eq!(refs, vec![(REF_ABSENT, 0); 3]);
+
+    // Only the first event signed, only the last related: earlier unrelated events still say absent.
+    let (flags, refs) = decode(&patterns[1]);
+    assert_eq!(flags, BATCH_FLAG_SIGNED_PROVENANCE | BATCH_FLAG_RELATIONSHIPS);
+    assert_eq!(refs, vec![(0, REF_ABSENT), (REF_ABSENT, REF_ABSENT), (REF_ABSENT, 0)]);
+
+    // Provenance refs are record indices; relationship refs are byte offsets. An empty list is a 4-byte entry.
+    let (_, refs) = decode(&patterns[3]);
+    // Count, six (kind, space) pairs, then each target in declaration order; external targets carry a length.
+    let first_set_len = 4 + 6 * 8 + 16 + 4 + "$prev-3".len() + 32 + 4 + "$a".len() + 16 + 32;
+    assert_eq!(
+        refs,
+        vec![
+            (0, REF_ABSENT),
+            (REF_ABSENT, 0),
+            (1, 4),
+            (REF_ABSENT, REF_ABSENT),
+            (2, 4 + first_set_len as u32),
+        ]
+    );
 }
