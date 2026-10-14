@@ -26,6 +26,7 @@ pub mod benchmarks;
 pub mod clock;
 pub mod columns;
 pub mod compat;
+pub mod constant;
 pub mod deletes;
 // `hef::encoding` is the one sanctioned place for `unsafe` in this crate:
 // FSST string compression reuses one scratch buffer per block through fsst-rs's capacity-contract `compress_into`,
