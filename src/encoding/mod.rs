@@ -1686,36 +1686,37 @@ fn decode_alp_rd(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
         }
         exceptions.push((index, left));
     }
-    let codes = bitunpack(reader)?;
+    let mut codes = bitunpack(reader)?;
     let rights = bitunpack(reader)?;
     if codes.len() != rights.len() {
         return Err(FormatError::Structural {
             rule: "alp-rd code and right-part streams disagree",
         });
     }
-    let mut values = Vec::with_capacity(codes.len());
-    for (code, right) in codes.iter().zip(rights.iter()) {
+    // Each code slot is overwritten in place with its reassembled float bits, so the decoded codes buffer becomes the
+    // output and no separate float vector is allocated.
+    for (slot, right) in codes.iter_mut().zip(rights.iter()) {
         if *right >> right_width != 0 {
             return Err(FormatError::Structural {
                 rule: "alp-rd right part exceeds its width",
             });
         }
         let left = dict
-            .get(*code as usize)
+            .get(*slot as usize)
             .copied()
             .ok_or(FormatError::RefOutOfRange { what: "alp-rd code" })?;
-        values.push(f64::from_bits((u64::from(left) << right_width) | *right));
+        *slot = (u64::from(left) << right_width) | *right;
     }
     for (index, left) in exceptions {
         let right = rights.get(index as usize).ok_or(FormatError::RefOutOfRange {
             what: "alp-rd exception index",
         })?;
-        let slot = values.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
+        let slot = codes.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
             what: "alp-rd exception index",
         })?;
-        *slot = f64::from_bits((u64::from(left) << right_width) | *right);
+        *slot = (u64::from(left) << right_width) | *right;
     }
-    Ok(values)
+    Ok(bytemuck::cast_vec(codes))
 }
 
 /// The stored form of one string block's null side stream. The encoder picks the smallest deterministic form for the

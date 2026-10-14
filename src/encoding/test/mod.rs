@@ -3497,6 +3497,212 @@ fn alp_rd_choose_split_matches_the_map_based_reference() {
     assert_eq!(alp_rd_choose_split(&[]), (ALP_RD_MIN_RIGHT_WIDTH, Vec::new(), 6));
 }
 
+/// The ALP-RD decoder as it stood before it reused the codes buffer for its output: the reference the in-place decode
+/// must match bit for bit, error for error.
+fn decode_alp_rd_reference(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
+    let right_width = u32::from(reader.u8("alp-rd right width")?);
+    if !(ALP_RD_MIN_RIGHT_WIDTH..=ALP_RD_MAX_RIGHT_WIDTH).contains(&right_width) {
+        return Err(FormatError::Structural {
+            rule: "alp-rd right width out of range",
+        });
+    }
+    let dict_len = reader.u8("alp-rd dictionary length")? as usize;
+    if dict_len > ALP_RD_MAX_DICT_LEN {
+        return Err(FormatError::Structural {
+            rule: "alp-rd dictionary too long",
+        });
+    }
+    let left_limit = 1u64 << (64 - right_width);
+    let mut dict = Vec::with_capacity(dict_len);
+    for _ in 0..dict_len {
+        let left = reader.u16("alp-rd dictionary entry")?;
+        if u64::from(left) >= left_limit {
+            return Err(FormatError::Structural {
+                rule: "alp-rd left part exceeds its width",
+            });
+        }
+        dict.push(left);
+    }
+    let exception_count = reader.u32("alp-rd exception count")? as usize;
+    if exception_count > MAX_BLOCK_VALUES {
+        return Err(FormatError::Structural {
+            rule: "alp-rd exception count beyond the block bound",
+        });
+    }
+    let mut exceptions = Vec::new();
+    for _ in 0..exception_count {
+        let index = reader.u32("alp-rd exception index")?;
+        let left = reader.u16("alp-rd exception left part")?;
+        if u64::from(left) >= left_limit {
+            return Err(FormatError::Structural {
+                rule: "alp-rd left part exceeds its width",
+            });
+        }
+        exceptions.push((index, left));
+    }
+    let codes = bitunpack(reader)?;
+    let rights = bitunpack(reader)?;
+    if codes.len() != rights.len() {
+        return Err(FormatError::Structural {
+            rule: "alp-rd code and right-part streams disagree",
+        });
+    }
+    let mut values = Vec::with_capacity(codes.len());
+    for (code, right) in codes.iter().zip(rights.iter()) {
+        if *right >> right_width != 0 {
+            return Err(FormatError::Structural {
+                rule: "alp-rd right part exceeds its width",
+            });
+        }
+        let left = dict
+            .get(*code as usize)
+            .copied()
+            .ok_or(FormatError::RefOutOfRange { what: "alp-rd code" })?;
+        values.push(f64::from_bits((u64::from(left) << right_width) | *right));
+    }
+    for (index, left) in exceptions {
+        let right = rights.get(index as usize).ok_or(FormatError::RefOutOfRange {
+            what: "alp-rd exception index",
+        })?;
+        let slot = values.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
+            what: "alp-rd exception index",
+        })?;
+        *slot = f64::from_bits((u64::from(left) << right_width) | *right);
+    }
+    Ok(values)
+}
+
+/// Writes a hand-built ALP-RD body, so a test can forge streams the encoder would never produce.
+fn alp_rd_body(right_width: u8, dict: &[u16], exceptions: &[(u32, u16)], codes: &[u64], rights: &[u64]) -> Vec<u8> {
+    let mut out = Writer::new();
+    out.put_u8(right_width);
+    out.put_u8(dict.len() as u8);
+    for left in dict {
+        out.put_u16(*left);
+    }
+    out.put_u32(exceptions.len() as u32);
+    for (index, left) in exceptions {
+        out.put_u32(*index);
+        out.put_u16(*left);
+    }
+    bitpack(codes, bits_needed(codes.iter().copied().max().unwrap_or(0)), &mut out);
+    bitpack(rights, bits_needed(rights.iter().copied().max().unwrap_or(0)), &mut out);
+    out.into_bytes()
+}
+
+/// Decodes `body` with both the in-place decoder and the reference, asserting identical bits or identical errors and
+/// the same bytes consumed.
+fn assert_alp_rd_decode_matches_reference(body: &[u8]) {
+    let mut reader = Reader::new(body);
+    let mut reference_reader = Reader::new(body);
+    let decoded = decode_alp_rd(&mut reader);
+    let expected = decode_alp_rd_reference(&mut reference_reader);
+    match (decoded, expected) {
+        (Ok(decoded), Ok(expected)) => {
+            let decoded: Vec<u64> = decoded.iter().map(|value| value.to_bits()).collect();
+            let expected: Vec<u64> = expected.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(decoded, expected);
+            assert_eq!(reader.remaining(), reference_reader.remaining());
+        }
+        (decoded, expected) => assert_eq!(decoded.err(), expected.err()),
+    }
+}
+
+/// Reusing the decoded codes buffer as the output must leave every float's bits unchanged: arbitrary bit patterns,
+/// special values, every dictionary length, sparse and dense exceptions, and lengths around the 1024-value vector.
+#[test]
+fn alp_rd_in_place_decode_matches_the_reference_bit_for_bit() {
+    let specials = [
+        0.0f64.to_bits(),
+        (-0.0f64).to_bits(),
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+        0x7FF8_0000_0000_0001,
+        0xFFF4_0000_DEAD_BEEF,
+        1,
+        0x800F_FFFF_FFFF_FFFF,
+    ];
+    for len in [0usize, 1, 7, 1023, 1024, 1025, 2049] {
+        for spread in [1u64, 3, 9, 64] {
+            let values: Vec<f64> = (0..len as u64)
+                .map(|i| match i % 11 {
+                    0 => f64::from_bits(specials[(i / 11) as usize % specials.len()]),
+                    _ => f64::from_bits(0x4030_0000_0000_0000 ^ ((mix(i) % spread) << 52) ^ (mix(i + 7) >> 12)),
+                })
+                .collect();
+            let mut out = Writer::new();
+            encode_alp_rd(&values, &mut out);
+            let body = out.into_bytes();
+            assert_alp_rd_decode_matches_reference(&body);
+            let decoded = decode_alp_rd(&mut Reader::new(&body)).unwrap();
+            let decoded: Vec<u64> = decoded.iter().map(|value| value.to_bits()).collect();
+            let original: Vec<u64> = values.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(decoded, original, "len {len}, spread {spread}");
+        }
+    }
+    for right_width in [ALP_RD_MIN_RIGHT_WIDTH, 52, ALP_RD_MAX_RIGHT_WIDTH] {
+        let left_mask = mask(64 - right_width);
+        for dict_len in 0..=ALP_RD_MAX_DICT_LEN {
+            let dict: Vec<u16> = (0..dict_len as u64).map(|i| (mix(i) & left_mask) as u16).collect();
+            let len = 1500usize;
+            let codes: Vec<u64> = (0..len as u64).map(|i| mix(i) % dict_len.max(1) as u64).collect();
+            let rights: Vec<u64> = (0..len as u64).map(|i| mix(i + 99) & mask(right_width)).collect();
+            // Dense, sparse, and duplicate exception indices; the last entry for an index wins.
+            let exceptions: Vec<(u32, u16)> = (0..len as u32)
+                .step_by(if dict_len == 0 { 1 } else { 37 })
+                .chain([5, 5, 1499])
+                .map(|index| (index, (mix(u64::from(index) + 3) & left_mask) as u16))
+                .collect();
+            let body = alp_rd_body(right_width as u8, &dict, &exceptions, &codes, &rights);
+            assert_alp_rd_decode_matches_reference(&body);
+        }
+    }
+}
+
+/// Corrupt ALP-RD bodies must fail with the same error the reference decoder reports, in the same order of checks.
+#[test]
+fn alp_rd_in_place_decode_rejects_corrupt_bodies_like_the_reference() {
+    let right_width = 52u8;
+    let dict = [0x403u16, 0x404];
+    let codes = vec![0u64, 1, 0, 1];
+    let rights = vec![1u64, 2, 3, 4];
+    let wide_right = 1u64 << right_width;
+    let corrupt = [
+        // Mismatched code and right-part counts.
+        alp_rd_body(right_width, &dict, &[], &codes, &rights[..3]),
+        // A code past the dictionary, including on a row an exception later replaces.
+        alp_rd_body(right_width, &dict, &[], &[0, 2, 0, 1], &rights),
+        alp_rd_body(right_width, &dict, &[(1, 0x405)], &[0, 2, 0, 1], &rights),
+        // A right part past its width, ahead of a bad code on the same row.
+        alp_rd_body(right_width, &dict, &[], &[0, 9, 0, 1], &[1, wide_right, 3, 4]),
+        // Dictionary and exception left parts past their width.
+        alp_rd_body(right_width, &[0x1000], &[], &[0, 0, 0, 0], &rights),
+        alp_rd_body(right_width, &dict, &[(0, 0x1000)], &codes, &rights),
+        // An exception index past the end.
+        alp_rd_body(right_width, &dict, &[(4, 0x405)], &codes, &rights),
+        // A right width out of range and an over-long dictionary.
+        alp_rd_body(ALP_RD_MIN_RIGHT_WIDTH as u8 - 1, &dict, &[], &codes, &rights),
+        alp_rd_body(right_width, &[0x403; ALP_RD_MAX_DICT_LEN + 1], &[], &codes, &rights),
+    ];
+    for body in &corrupt {
+        assert!(decode_alp_rd(&mut Reader::new(body)).is_err());
+        assert_alp_rd_decode_matches_reference(body);
+    }
+    // An exception count past the block bound.
+    let mut out = Writer::new();
+    out.put_u8(right_width);
+    out.put_u8(0);
+    out.put_u32(MAX_BLOCK_VALUES as u32 + 1);
+    assert_alp_rd_decode_matches_reference(&out.into_bytes());
+    // Truncation at every byte of a valid body, plus trailing bytes past it.
+    let mut body = alp_rd_body(right_width, &dict, &[(2, 0x405)], &codes, &rights);
+    for end in 0..body.len() {
+        assert_alp_rd_decode_matches_reference(&body[..end]);
+    }
+    body.extend_from_slice(&[0xAB; 5]);
+    assert_alp_rd_decode_matches_reference(&body);
+}
+
 #[test]
 fn presence_rank_and_present_position_agree_with_a_prefix_count() {
     // Every third row present, over enough rows to cross several bitmap bytes.
