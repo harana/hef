@@ -7,6 +7,7 @@ use crate::artifacts::batch::{EventInput, PayloadInput};
 use crate::artifacts::overlay::LiveOverlayStore;
 use crate::artifacts::watermark::WatermarkTracker;
 use crate::columns::{FreetextDeclaration, PromotionPlan};
+use crate::events::relationships::{EventRelationships, RelationshipKind, RelationshipRef, TargetIdSpace};
 use crate::events::variant::VariantValue;
 use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TenantId, TimestampValue};
 use crate::invariants::sim::{SerialEncodeExecutor, SimClock, SimJournalStorage, SimulatedPublishedSet};
@@ -1494,4 +1495,93 @@ fn a_lost_race_after_upload_leaves_the_object_unreferenced() {
     assert_ne!(keys[0], hef_object_key(tenant, head.files[0].file_id));
     assert_eq!(observer.rolled_back, vec![1]);
     assert!(notices.published.is_empty());
+}
+
+/// Rows read back from the journal carry each event's relationships exactly as declared — absent, present but empty,
+/// or a mixed list in its declared order with every target byte — for a range that starts and ends mid-frame, and
+/// they stay intact after the replay they were read from is dropped.
+#[test]
+fn rows_for_range_carry_declared_relationships_after_the_replay_is_dropped() {
+    let declared = |i: u64| -> Option<EventRelationships> {
+        let target = |len: usize, salt: u8| (0..len).map(|b| b as u8 ^ salt ^ i as u8).collect::<Vec<u8>>();
+        match i % 4 {
+            0 => None,
+            1 => Some(EventRelationships::new(Vec::new()).unwrap()),
+            2 => Some(
+                EventRelationships::new(vec![
+                    RelationshipRef::new(RelationshipKind::Prev, TargetIdSpace::ProtocolEventId, target(32, 1))
+                        .unwrap(),
+                    RelationshipRef::new(RelationshipKind::Auth, TargetIdSpace::ProtocolEventId, target(32, 2))
+                        .unwrap(),
+                    RelationshipRef::new(RelationshipKind::Link, TargetIdSpace::ExternalId, target(7, 3)).unwrap(),
+                ])
+                .unwrap(),
+            ),
+            _ => Some(
+                EventRelationships::new(vec![
+                    RelationshipRef::new(RelationshipKind::Link, TargetIdSpace::ExternalId, target(1, 4)).unwrap(),
+                    RelationshipRef::new(RelationshipKind::Parent, TargetIdSpace::EventId, target(16, 5)).unwrap(),
+                ])
+                .unwrap(),
+            ),
+        }
+    };
+    let frame = |first_sequence: u64| {
+        let events: Vec<EventInput> = (first_sequence..first_sequence + 8)
+            .map(|i| {
+                let mut event = event(i);
+                event.relationships = declared(i);
+                event
+            })
+            .collect();
+        let payload = crate::artifacts::batch::build_batch(&events, 1, 0).unwrap();
+        crate::artifacts::frame::build_frame(
+            &crate::artifacts::frame::FrameBuildInput {
+                flags: 0,
+                tenant_id: TenantId::new_test_id(9),
+                writer_id: 1,
+                epoch: 1,
+                first_sequence,
+                last_sequence: first_sequence + 7,
+                event_count: 8,
+                durable_batch_id: first_sequence,
+                writer_local_batch_id: first_sequence,
+                schema_generation: 1,
+                dictionary_generation_hint: 0,
+                created_at_physical: 1,
+                committed_at_physical: 2,
+            },
+            &payload,
+        )
+        .unwrap()
+    };
+    let mut storage = SimJournalStorage::new();
+    storage.append(ShardId(0), &frame(1)).unwrap();
+    storage.append(ShardId(0), &frame(9)).unwrap();
+    storage.sync(ShardId(0)).unwrap();
+    let replay = replay_segment(&storage, ShardId(0), 1, 1).unwrap();
+    let range = SequenceRange {
+        epoch: 1,
+        first_sequence: 4,
+        last_sequence: 13,
+    };
+
+    let rows = HefPublisher::new()
+        .rows_for_range(&replay, TenantId::new_test_id(9), &range)
+        .unwrap();
+    drop(replay);
+    drop(storage);
+
+    assert_eq!(
+        rows.iter().map(|row| row.sequence).collect::<Vec<_>>(),
+        (4..=13).collect::<Vec<_>>()
+    );
+    for row in &rows {
+        assert_eq!(
+            row.event.relationships,
+            declared(row.sequence),
+            "sequence {}",
+            row.sequence
+        );
+    }
 }
