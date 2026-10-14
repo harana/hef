@@ -1667,30 +1667,43 @@ fn encode_alp_rd(values: &[f64], out: &mut Writer) {
     for (slot, entry) in padded_dict.iter_mut().zip(&dict) {
         *slot = *entry;
     }
+    // Right parts are split into one vector's worth of scratch at a time, only to find their maximum; they are packed
+    // later straight from the input's bits, so no full-length right-part vector is kept.
     let mut codes = vec![0u64; values.len()];
-    let mut rights = vec![0u64; values.len()];
-    alp_rd_split_chunk(values, right_width, &padded_dict, dict.len(), &mut codes, &mut rights);
-    let mut exceptions: Vec<(u32, u16)> = Vec::new();
-    for (index, (code, value)) in codes.iter_mut().zip(values).enumerate() {
-        if *code == ALP_RD_CODE_MISS {
-            *code = 0;
-            exceptions.push((index as u32, (value.to_bits() >> right_width) as u16));
-        }
+    let mut rights = [0u64; FASTLANES_VECTOR];
+    let mut max_right = 0u64;
+    for (value_chunk, code_chunk) in values.chunks(FASTLANES_VECTOR).zip(codes.chunks_mut(FASTLANES_VECTOR)) {
+        alp_rd_split_chunk(
+            value_chunk,
+            right_width,
+            &padded_dict,
+            dict.len(),
+            code_chunk,
+            &mut rights,
+        );
+        let chunk_max = rights.iter().take(value_chunk.len()).copied().max().unwrap_or(0);
+        max_right = max_right.max(chunk_max);
     }
+    let exception_count = codes.iter().filter(|code| **code == ALP_RD_CODE_MISS).count();
     out.put_u8(right_width as u8);
     out.put_u8(dict.len() as u8);
     for left in &dict {
         out.put_u16(*left);
     }
-    out.put_u32(exceptions.len() as u32);
-    for (index, left) in &exceptions {
-        out.put_u32(*index);
-        out.put_u16(*left);
+    out.put_u32(exception_count as u32);
+    for (index, (code, value)) in codes.iter_mut().zip(values).enumerate() {
+        if *code == ALP_RD_CODE_MISS {
+            *code = 0;
+            out.put_u32(index as u32);
+            out.put_u16((value.to_bits() >> right_width) as u16);
+        }
     }
     let max_code = codes.iter().copied().max().unwrap_or(0);
     bitpack(&codes, bits_needed(max_code), out);
-    let max_right = rights.iter().copied().max().unwrap_or(0);
-    bitpack(&rights, bits_needed(max_right), out);
+    let right_mask = mask(right_width);
+    bitpack_with(values.len(), bits_needed(max_right), out, |i| {
+        values.get(i).map_or(0, |value| value.to_bits() & right_mask)
+    });
 }
 
 fn decode_alp_rd(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
@@ -1735,36 +1748,37 @@ fn decode_alp_rd(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
         }
         exceptions.push((index, left));
     }
-    let codes = bitunpack(reader)?;
+    let mut codes = bitunpack(reader)?;
     let rights = bitunpack(reader)?;
     if codes.len() != rights.len() {
         return Err(FormatError::Structural {
             rule: "alp-rd code and right-part streams disagree",
         });
     }
-    let mut values = Vec::with_capacity(codes.len());
-    for (code, right) in codes.iter().zip(rights.iter()) {
+    // Each code slot is overwritten in place with its reassembled float bits, so the decoded codes buffer becomes the
+    // output and no separate float vector is allocated.
+    for (slot, right) in codes.iter_mut().zip(rights.iter()) {
         if *right >> right_width != 0 {
             return Err(FormatError::Structural {
                 rule: "alp-rd right part exceeds its width",
             });
         }
         let left = dict
-            .get(*code as usize)
+            .get(*slot as usize)
             .copied()
             .ok_or(FormatError::RefOutOfRange { what: "alp-rd code" })?;
-        values.push(f64::from_bits((u64::from(left) << right_width) | *right));
+        *slot = (u64::from(left) << right_width) | *right;
     }
     for (index, left) in exceptions {
         let right = rights.get(index as usize).ok_or(FormatError::RefOutOfRange {
             what: "alp-rd exception index",
         })?;
-        let slot = values.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
+        let slot = codes.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
             what: "alp-rd exception index",
         })?;
-        *slot = f64::from_bits((u64::from(left) << right_width) | *right);
+        *slot = (u64::from(left) << right_width) | *right;
     }
-    Ok(values)
+    Ok(bytemuck::cast_vec(codes))
 }
 
 /// The stored form of one string block's null side stream. The encoder picks the smallest deterministic form for the
