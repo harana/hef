@@ -42,29 +42,27 @@ impl RangeSet {
             }
             Some(_) => {}
         }
-        let mut merged = Vec::with_capacity(self.ranges.len() + 1);
-        let mut new_first = first;
-        let mut new_last = last;
-        let mut placed = false;
-        for (start, end) in &self.ranges {
-            if end.saturating_add(1) < new_first && !placed {
-                merged.push((*start, *end));
-            } else if new_last.saturating_add(1) < *start {
-                if !placed {
-                    merged.push((new_first, new_last));
-                    placed = true;
-                }
-                merged.push((*start, *end));
-            } else {
-                // Overlapping or adjacent: absorb.
-                new_first = new_first.min(*start);
-                new_last = new_last.max(*end);
+        // Merge in place: find the first stored range the new one touches or overlaps, absorb every following range
+        // it reaches, and write the result back over the absorbed slots, so no replacement vector is allocated.
+        let position = self.ranges.partition_point(|(_, end)| end.saturating_add(1) < first);
+        let mut merged_first = first;
+        let mut merged_last = last;
+        let mut absorbed_end = position;
+        while let Some(&(start, end)) = self.ranges.get(absorbed_end) {
+            if start > merged_last.saturating_add(1) {
+                break;
             }
+            merged_first = merged_first.min(start);
+            merged_last = merged_last.max(end);
+            absorbed_end += 1;
         }
-        if !placed {
-            merged.push((new_first, new_last));
+        match self.ranges.get_mut(position) {
+            Some(slot) if absorbed_end > position => {
+                *slot = (merged_first, merged_last);
+                self.ranges.drain(position + 1..absorbed_end);
+            }
+            _ => self.ranges.insert(position, (first, last)),
         }
-        self.ranges = merged;
     }
 
     /// Highest `n` such that `FIRST_SEQUENCE..=n` is fully covered.
