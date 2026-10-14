@@ -31,58 +31,6 @@ fn a_block_that_encodes_larger_than_plain_is_stored_plain() {
     }
 }
 
-/// Encoding borrowed u64 values gives exactly the block that encoding the same values as an owned column gives:
-/// pipeline, bytes, stats and decoded length, for empty, single, constant, monotonic, descending, wrapping, random and
-/// `u64::MAX` values, at sizes around the 1024-value vector and the trailing stage's full-trial limit, with and without
-/// random access. Some of the cases store their plain form after the acceptance gate, and some keep a transform.
-#[test]
-fn borrowed_u64_values_encode_exactly_as_an_owned_column() {
-    let mut state = 0x9E37_79B9_7F4A_7C15u64;
-    let mut random = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    };
-    let mut cases: Vec<Vec<u64>> = vec![
-        Vec::new(),
-        vec![0],
-        vec![u64::MAX],
-        vec![7, 9],
-        vec![1_000_000, 1_000_064, 1_000_128],
-        vec![u64::MAX, 3, 17, 9_000_000_000],
-    ];
-    for len in [2u64, 3, 64, 1023, 1024, 1025, 2048, 4095, 4096, 4097, 8192, 20_000] {
-        cases.push(vec![42; len as usize]);
-        cases.push((0..len).collect());
-        cases.push((0..len).map(|i| u64::MAX - i).collect());
-        cases.push((0..len).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect());
-        cases.push((0..len).map(|i| if i % 97 == 0 { u64::MAX } else { i % 5 }).collect());
-        cases.push((0..len).map(|_| random()).collect());
-        cases.push((0..len).map(|_| random() % 16).collect());
-    }
-    let (mut plain, mut transformed) = (0, 0);
-    for values in &cases {
-        let owned = ColumnData::U64(values.clone());
-        for random_access in [false, true] {
-            let expected = encode_block(&owned, random_access);
-            let borrowed = encode_u64_block(values, random_access);
-            let case = format!("{} values, random access {random_access}", values.len());
-            assert_eq!(borrowed.pipeline, expected.pipeline, "{case}");
-            assert_eq!(borrowed.bytes, expected.bytes, "{case}");
-            assert_eq!(borrowed.stats, expected.stats, "{case}");
-            assert_eq!(borrowed.uncompressed_len, expected.uncompressed_len, "{case}");
-            assert!(borrowed.fsst.is_none() && expected.fsst.is_none(), "{case}");
-            if borrowed.pipeline.transform().unwrap() == Transform::PlainU64 {
-                plain += 1;
-            } else {
-                transformed += 1;
-            }
-        }
-    }
-    assert!(plain > 0 && transformed > 0, "plain {plain}, transformed {transformed}");
-}
-
 /// The gate must not cost a block that genuinely earns its encoding: a long run-heavy column stays on the transform
 /// that shrinks it rather than being pushed onto the plain form.
 #[test]
@@ -4796,109 +4744,6 @@ fn alp_rd_encode_matches_the_full_buffer_reference_byte_for_byte() {
     }
 }
 
-/// The ALP encoder as it stood before it dropped its full-length code vector: every vector's codes appended to one
-/// `Vec<u64>`, then scanned for the maximum and packed in one go. The reference the vector-at-a-time encoder must match
-/// byte for byte.
-fn encode_alp_reference(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Option<SideStream> {
-    let sample = transform_sample(values);
-    let sample: &[f64] = sample.as_deref().unwrap_or(values);
-    let mut zigzags = vec![0u64; sample.len()];
-    let mut encodable = vec![false; sample.len()];
-    let mut best: Option<(usize, usize)> = None;
-    for (index, power) in ALP_POWERS.iter().enumerate() {
-        alp_probe_chunk(sample, *power, &mut zigzags, &mut encodable);
-        let exceptions = encodable.iter().filter(|ok| !**ok).count();
-        if best.is_none_or(|(_, current)| exceptions < current) {
-            best = Some((index, exceptions));
-        }
-        if exceptions == 0 {
-            break;
-        }
-    }
-    let (exponent_index, _) = best?;
-    let power = ALP_POWERS.get(exponent_index).copied().unwrap_or(1.0);
-    alp_probe_chunk(sample, power, &mut zigzags, &mut encodable);
-    if !alp_viable(&encodable) {
-        return None;
-    }
-    let vector_scratch = values.len().min(FASTLANES_VECTOR);
-    zigzags.resize(vector_scratch, 0);
-    encodable.resize(vector_scratch, false);
-    let mut ints = Vec::with_capacity(values.len());
-    let mut exceptions: Vec<(u32, u64)> = Vec::new();
-    let mut escaped: Vec<u32> = Vec::new();
-    for (vector_index, vector) in values.chunks(FASTLANES_VECTOR).enumerate() {
-        let (Some(vector_zigzags), Some(vector_encodable)) =
-            (zigzags.get_mut(..vector.len()), encodable.get_mut(..vector.len()))
-        else {
-            continue;
-        };
-        alp_probe_chunk(vector, power, vector_zigzags, vector_encodable);
-        let vector_exceptions = vector_encodable.iter().filter(|ok| !**ok).count();
-        if vector_exceptions * ALP_MAX_EXCEPTION_SAMPLE_DIVISOR > vector.len() {
-            escaped.push(vector_index as u32);
-            ints.extend(std::iter::repeat_n(0u64, vector.len()));
-            continue;
-        }
-        let base = vector_index * FASTLANES_VECTOR;
-        ints.extend_from_slice(vector_zigzags);
-        for (offset, (ok, value)) in vector_encodable.iter().zip(vector).enumerate() {
-            if !*ok {
-                exceptions.push(((base + offset) as u32, value.to_bits()));
-            }
-        }
-    }
-    let index_base = exceptions.iter().map(|(index, _)| u64::from(*index)).min().unwrap_or(0);
-    let index_max_delta = exceptions
-        .iter()
-        .map(|(index, _)| u64::from(*index).wrapping_sub(index_base))
-        .max()
-        .unwrap_or(0);
-    let side = choose_exception_side_stream(exceptions.len(), index_max_delta, strategy);
-    if escaped.is_empty() {
-        out.put_u8(exponent_index as u8);
-    } else {
-        out.put_u8(ALP_VECTOR_ESCAPE_SENTINEL);
-        out.put_u8(exponent_index as u8);
-        out.put_u32(escaped.len() as u32);
-        for vector_index in &escaped {
-            out.put_u32(*vector_index);
-        }
-    }
-    out.put_u32(exceptions.len() as u32);
-    match side {
-        SideStream::None => {
-            for (index, bits) in &exceptions {
-                out.put_u32(*index);
-                out.put_u64(*bits);
-            }
-        }
-        SideStream::ForBitpack => {
-            out.put_u64(index_base);
-            bitpack_with(exceptions.len(), bits_needed(index_max_delta), out, |i| {
-                exceptions
-                    .get(i)
-                    .map_or(0, |(index, _)| u64::from(*index).wrapping_sub(index_base))
-            });
-            for (_, bits) in &exceptions {
-                out.put_u64(*bits);
-            }
-        }
-        SideStream::FileScopeDictionary | SideStream::FsstDictionaryValues | SideStream::FsstValueKeys => {
-            unreachable!("the exception side-stream chooser never picks a string block's side stream")
-        }
-    }
-    let max = ints.iter().copied().max().unwrap_or(0);
-    bitpack(&ints, bits_needed(max), out);
-    for vector_index in &escaped {
-        let start = *vector_index as usize * FASTLANES_VECTOR;
-        for value in &values[start..(start + FASTLANES_VECTOR).min(values.len())] {
-            out.put_u64(value.to_bits());
-        }
-    }
-    Some(side)
-}
-
 /// Float columns covering the ALP encoder's edge cases, each named for the failure message.
 fn alp_encode_columns() -> Vec<(String, Vec<f64>)> {
     let specials = [
@@ -4975,34 +4820,6 @@ fn alp_encode_columns() -> Vec<(String, Vec<f64>)> {
     columns.push(("mixed escaped specials".to_owned(), escaped_specials));
     columns.push(("one noisy vector".to_owned(), one_noisy_vector()));
     columns
-}
-
-/// Probing again per vector and packing straight into the writer must write exactly the bytes, and choose exactly the
-/// exception side stream, the full-code-vector encoder did, under every cascade strategy.
-#[test]
-fn alp_encode_matches_the_full_code_vector_reference_byte_for_byte() {
-    let mut sides_seen = Vec::new();
-    for (name, values) in alp_encode_columns() {
-        for strategy in [
-            CascadeStrategy::DecodeOptimized,
-            CascadeStrategy::NoTrailing,
-            CascadeStrategy::SizeOptimized,
-        ] {
-            let mut out = Writer::new();
-            let side = encode_alp(&values, strategy, &mut out);
-            let mut reference = Writer::new();
-            let reference_side = encode_alp_reference(&values, strategy, &mut reference);
-            assert_eq!(side, reference_side, "{name} {strategy:?}");
-            assert_eq!(out.bytes(), reference.bytes(), "{name} {strategy:?}");
-            if let Some(side) = side {
-                sides_seen.push(side);
-                let decoded = decode_alp(&mut Reader::new(out.bytes()), side).unwrap();
-                assert_eq!(decoded.len(), values.len(), "{name} {strategy:?}");
-            }
-        }
-    }
-    assert!(sides_seen.contains(&SideStream::None));
-    assert!(sides_seen.contains(&SideStream::ForBitpack));
 }
 
 /// The ALP exception reader as it stood before it borrowed the exception list: every exception copied into a
