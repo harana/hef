@@ -96,9 +96,9 @@ pub fn decode(bytes: &[u8]) -> Result<MiniBlockDirectory, FormatError> {
     let len_table = reader.take(block_count.saturating_mul(4), "mini-block compressed length")?;
     let body_start = reader.position();
     let mut offset = body_start;
-    for len in len_table.chunks_exact(4) {
+    for len in len_table.as_chunks::<4>().0 {
         block_starts.push(offset);
-        let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
+        let len = u32::from_le_bytes(*len) as usize;
         offset = offset.checked_add(len).ok_or(FormatError::Structural {
             rule: "mini-block compressed lengths overflow the address space",
         })?;
