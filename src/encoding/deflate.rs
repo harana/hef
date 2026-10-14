@@ -209,7 +209,8 @@ impl<'a> Page<'a> {
         let plain_len = self.directory.plain_len();
         let capacity = ((last - first + 1) * GRANULE_BYTES).min(self.directory.plain_capacity_hint());
         let mut plain = Vec::with_capacity(capacity);
-        for (granule, (start, len)) in self.directory.ranges().enumerate().skip(first).take(last - first + 1) {
+        for (offset, (start, len)) in self.directory.ranges_from(first).take(last - first + 1).enumerate() {
+            let granule = first + offset;
             let expected = GRANULE_BYTES.min(plain_len.saturating_sub(granule * GRANULE_BYTES));
             let before = plain.len();
             inflate_into(

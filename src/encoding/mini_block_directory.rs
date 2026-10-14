@@ -20,7 +20,11 @@ use crate::file::bytes::{Reader, Writer};
 /// A decoded mini-block directory: where the compressed blocks begin, how long each one runs, and the total
 /// plaintext length they inflate to.
 pub struct MiniBlockDirectory {
-    block_lens: Vec<usize>,
+    /// Absolute offset of each block's first compressed byte; a block's length is the gap to the next start (or to
+    /// `body_end` for the last block), so any block's range is one indexed lookup.
+    block_starts: Vec<usize>,
+    /// Absolute offset one past the last block's compressed bytes; equals `body_start` when there are no blocks.
+    body_end: usize,
     body_start: usize,
     plain_capacity_hint: usize,
     plain_len: usize,
@@ -29,7 +33,7 @@ pub struct MiniBlockDirectory {
 impl MiniBlockDirectory {
     /// How many mini-blocks the directory covers.
     pub fn block_count(&self) -> usize {
-        self.block_lens.len()
+        self.block_starts.len()
     }
 
     /// The byte offset, within the buffer [`decode`] was called on, where the first block's compressed bytes begin.
@@ -49,22 +53,24 @@ impl MiniBlockDirectory {
 
     /// The absolute byte range of block `index`'s compressed bytes within the buffer [`decode`] was called on.
     pub fn byte_range(&self, index: usize) -> Result<(usize, usize), FormatError> {
-        let len = *self.block_lens.get(index).ok_or(FormatError::RefOutOfRange {
+        let start = *self.block_starts.get(index).ok_or(FormatError::RefOutOfRange {
             what: "mini-block directory index",
         })?;
-        let start = self.body_start + self.block_lens.get(..index).map_or(0, |lens| lens.iter().sum());
-        Ok((start, len))
+        let end = self.block_starts.get(index + 1).copied().unwrap_or(self.body_end);
+        Ok((start, end - start))
     }
 
-    /// Every block's absolute byte range, in block order, computed with one running offset rather than a fresh
-    /// prefix sum per block — the linear-time path for a full sequential decode.
+    /// Every block's absolute byte range, in block order: the linear-time path for a full sequential decode.
     pub fn ranges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
-        let mut offset = self.body_start;
-        self.block_lens.iter().map(move |&len| {
-            let start = offset;
-            offset += len;
-            (start, len)
-        })
+        self.ranges_from(0)
+    }
+
+    /// The absolute byte ranges of blocks `first..`, in block order, without walking the blocks before `first`.
+    /// Yields nothing when `first` is at or past [`Self::block_count`].
+    pub fn ranges_from(&self, first: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let starts = self.block_starts.get(first..).unwrap_or(&[]);
+        let ends = starts.iter().skip(1).copied().chain(std::iter::once(self.body_end));
+        starts.iter().zip(ends).map(|(&start, end)| (start, end - start))
     }
 }
 
@@ -86,13 +92,21 @@ pub fn decode(bytes: &[u8]) -> Result<MiniBlockDirectory, FormatError> {
     let block_count = reader.u32("mini-block count")? as usize;
     let plain_len = reader.u32("mini-block plain length")? as usize;
     let plain_capacity_hint = reader.capacity_hint(plain_len, 1);
-    let mut block_lens = Vec::with_capacity(reader.capacity_hint(block_count, 4));
-    for _ in 0..block_count {
-        block_lens.push(reader.u32("mini-block compressed length")? as usize);
+    let mut block_starts = Vec::with_capacity(reader.capacity_hint(block_count, 4));
+    let len_table = reader.take(block_count.saturating_mul(4), "mini-block compressed length")?;
+    let body_start = reader.position();
+    let mut offset = body_start;
+    for len in len_table.chunks_exact(4) {
+        block_starts.push(offset);
+        let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
+        offset = offset.checked_add(len).ok_or(FormatError::Structural {
+            rule: "mini-block compressed lengths overflow the address space",
+        })?;
     }
     Ok(MiniBlockDirectory {
-        block_lens,
-        body_start: reader.position(),
+        block_starts,
+        body_end: offset,
+        body_start,
         plain_capacity_hint,
         plain_len,
     })
