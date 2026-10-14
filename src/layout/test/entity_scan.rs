@@ -3,6 +3,7 @@ use crate::artifacts::batch::{EventInput, PayloadInput, build_batch, decode_batc
 use crate::artifacts::frame::{FrameBuildInput, build_frame, decode_frame};
 use crate::artifacts::overlay::convert_frame;
 use crate::columns::{FreetextDeclaration, PromotionPlan};
+use crate::deletes::latest_corrected_deletion_vector;
 use crate::events::{EventFlags, StreamId, TimestampValue};
 use crate::layout::LayoutTargets;
 use crate::security::FooterEncryption;
@@ -373,4 +374,182 @@ fn a_correction_outside_the_scanned_sources_is_refused() {
         refused,
         Err(EntityScanError::CorrectionNotFound { epoch: 1, sequence: 99 })
     );
+}
+
+/// Room A's even sequences from 2 to 40, without `left_out`.
+fn room_a_without(left_out: &[u64]) -> Vec<u64> {
+    (2..=40)
+        .step_by(2)
+        .filter(|sequence| !left_out.contains(sequence))
+        .collect()
+}
+
+/// A replaced event whose replacement row was deleted is dropped, not served as the deleted replacement and not
+/// served as the superseded original.
+#[test]
+fn a_deleted_replacement_drops_the_event() {
+    let older = file(1, 20, 1, payload);
+    let newer = file(21, 40, 2, payload);
+    let mut vector = DeletionVector::new();
+    // Sequences 21..=40 sit at row ordinals 0..=19, so sequence 30 is ordinal 9.
+    vector.mark_deleted(9);
+    let deletes = RecordedDeletes {
+        corrections: vec![correction(6, 30, CorrectionType::Replacement)],
+        deleted: [(newer.header().file_id, vector)].into_iter().collect(),
+    };
+
+    let events = scan(SortDirection::Ascending, None)
+        .run(&[&older, &newer], &LiveOverlayStore::new(), &deletes)
+        .unwrap();
+
+    assert_eq!(sequences(&events), room_a_without(&[6, 30]));
+}
+
+/// A replacement that was itself replaced is followed to the end of the chain: the last replacement is served in the
+/// original's place, and neither replacement is served at its own place.
+#[test]
+fn a_chain_of_replacements_serves_the_last() {
+    let older = file(1, 20, 1, payload);
+    let newer = file(21, 40, 2, payload);
+    let deletes = RecordedDeletes {
+        corrections: vec![
+            correction(6, 30, CorrectionType::Replacement),
+            correction(30, 34, CorrectionType::Replacement),
+        ],
+        ..RecordedDeletes::default()
+    };
+
+    let events = scan(SortDirection::Ascending, None)
+        .run(&[&older, &newer], &LiveOverlayStore::new(), &deletes)
+        .unwrap();
+
+    assert_eq!(sequences(&events), room_a_without(&[30, 34]));
+    let replaced = events.iter().find(|event| event.point.sequence == 6).unwrap();
+    assert_eq!(replaced.envelope.event_id, event_id(34));
+    assert_eq!(replaced.payload, PayloadRead::Value(VariantValue::Object(payload(34))));
+}
+
+/// An amendment that was itself amended lays both over the original in chain order, so the later amendment's fields
+/// win.
+#[test]
+fn a_chain_of_amendments_applies_in_order() {
+    let older = file(1, 20, 1, |sequence| match sequence {
+        8 => BTreeMap::from([
+            ("tag".to_owned(), VariantValue::String("first".to_owned())),
+            ("text".to_owned(), VariantValue::String("first".to_owned())),
+        ]),
+        12 => BTreeMap::from([("text".to_owned(), VariantValue::String("second".to_owned()))]),
+        _ => payload(sequence),
+    });
+    let deletes = RecordedDeletes {
+        corrections: vec![
+            correction(4, 8, CorrectionType::Amendment),
+            correction(8, 12, CorrectionType::Amendment),
+        ],
+        ..RecordedDeletes::default()
+    };
+
+    let events = scan(SortDirection::Ascending, None)
+        .run(&[&older], &LiveOverlayStore::new(), &deletes)
+        .unwrap();
+
+    assert_eq!(sequences(&events), vec![2, 4, 6, 10, 14, 16, 18, 20]);
+    let amended = events.iter().find(|event| event.point.sequence == 4).unwrap();
+    assert_eq!(amended.envelope.event_id, event_id(4));
+    let mut expected = payload(4);
+    expected.insert("tag".to_owned(), VariantValue::String("first".to_owned()));
+    expected.insert("text".to_owned(), VariantValue::String("second".to_owned()));
+    assert_eq!(amended.payload, PayloadRead::Value(VariantValue::Object(expected)));
+}
+
+/// A replacement that was later retracted drops the event, rather than serving the retracted replacement or the
+/// superseded original.
+#[test]
+fn a_retracted_replacement_drops_the_event() {
+    let older = file(1, 20, 1, payload);
+    let newer = file(21, 40, 2, payload);
+    let deletes = RecordedDeletes {
+        corrections: vec![
+            correction(6, 30, CorrectionType::Replacement),
+            correction(30, 31, CorrectionType::Retraction),
+        ],
+        ..RecordedDeletes::default()
+    };
+
+    let events = scan(SortDirection::Ascending, None)
+        .run(&[&older, &newer], &LiveOverlayStore::new(), &deletes)
+        .unwrap();
+
+    assert_eq!(sequences(&events), room_a_without(&[6, 30]));
+}
+
+/// A correction chain that loops back to an event already on it is refused rather than followed forever.
+#[test]
+fn a_correction_cycle_is_refused() {
+    let older = file(1, 20, 1, payload);
+    let newer = file(21, 40, 2, payload);
+    let deletes = RecordedDeletes {
+        corrections: vec![
+            correction(6, 30, CorrectionType::Replacement),
+            correction(30, 34, CorrectionType::Replacement),
+            correction(34, 30, CorrectionType::Replacement),
+        ],
+        ..RecordedDeletes::default()
+    };
+
+    let refused = scan(SortDirection::Ascending, None).run(&[&older, &newer], &LiveOverlayStore::new(), &deletes);
+
+    assert_eq!(
+        refused,
+        Err(EntityScanError::CorrectionCycle { epoch: 1, sequence: 30 })
+    );
+}
+
+/// The latest-corrected deletion vector, handed to the scan as the file's deletion vector, marks the superseded
+/// original; the scan still serves the event once, as its replacement.
+#[test]
+fn a_latest_corrected_deletion_vector_still_serves_the_replacement_once() {
+    let older = file(1, 20, 1, payload);
+    let newer = file(21, 40, 2, payload);
+    let corrections = vec![correction(6, 30, CorrectionType::Replacement)];
+    let events_in_older: Vec<(u64, EventId)> = (1..=20).map(|sequence| (sequence - 1, event_id(sequence))).collect();
+    let vector = latest_corrected_deletion_vector(&events_in_older, &corrections);
+    assert!(vector.is_deleted(5));
+    let deletes = RecordedDeletes {
+        corrections,
+        deleted: [(older.header().file_id, vector)].into_iter().collect(),
+    };
+
+    let events = scan(SortDirection::Ascending, None)
+        .run(&[&older, &newer], &LiveOverlayStore::new(), &deletes)
+        .unwrap();
+
+    assert_eq!(sequences(&events), room_a_without(&[30]));
+    let served: Vec<&EntityEvent> = events
+        .iter()
+        .filter(|event| event.envelope.event_id == event_id(30))
+        .collect();
+    assert_eq!(served.len(), 1);
+    assert_eq!(served[0].point.sequence, 6);
+    assert!(events.iter().all(|event| event.envelope.event_id != event_id(6)));
+}
+
+/// An amended event whose original row was deleted is dropped, so the deleted payload is never served under the
+/// amendment.
+#[test]
+fn a_deleted_amended_original_drops_the_event() {
+    let older = file(1, 20, 1, payload);
+    let mut vector = DeletionVector::new();
+    // Sequences 1..=20 sit at row ordinals 0..=19, so sequence 4 is ordinal 3.
+    vector.mark_deleted(3);
+    let deletes = RecordedDeletes {
+        corrections: vec![correction(4, 8, CorrectionType::Amendment)],
+        deleted: [(older.header().file_id, vector)].into_iter().collect(),
+    };
+
+    let events = scan(SortDirection::Ascending, None)
+        .run(&[&older], &LiveOverlayStore::new(), &deletes)
+        .unwrap();
+
+    assert_eq!(sequences(&events), vec![2, 6, 10, 12, 14, 16, 18, 20]);
 }
