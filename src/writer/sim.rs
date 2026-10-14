@@ -8,6 +8,7 @@ use crate::error::StorageError;
 use crate::events::TenantId;
 use hashbrown::HashMap;
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// An in-memory safe-retry store for tests: it forgets everything when dropped, so production code backs
@@ -157,8 +158,22 @@ impl StateChunkLedger for SimStateChunkLedger {
         Ok(!std::mem::replace(&mut record.marked, true))
     }
 
-    fn records(&self) -> Result<Vec<StateChunkRecord>, StorageError> {
-        Ok(self.records_mut().values().copied().collect())
+    fn records_after(
+        &self,
+        after: Option<&[u8; 32]>,
+        limit: usize,
+        page: &mut Vec<StateChunkRecord>,
+    ) -> Result<(), StorageError> {
+        let records = self.records_mut();
+        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+        page.clear();
+        page.extend(
+            records
+                .range::<[u8; 32], _>((start, Bound::Unbounded))
+                .take(limit)
+                .map(|(_, record)| *record),
+        );
+        Ok(())
     }
 
     fn claim(&self, address: &[u8; 32], unused_since_nanos: i64) -> Result<bool, StorageError> {

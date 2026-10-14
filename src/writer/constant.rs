@@ -35,3 +35,12 @@ pub const DEFAULT_GRAPH_SEAL_AGE_NANOS: i64 = 300 * 1_000_000_000;
 /// hours, in nanoseconds. It must be at least the longest reader lease and the longest an upload may take to publish
 /// the file whose roots name its chunks.
 pub const STATE_CHUNK_GRACE_NANOS: i64 = 24 * 60 * 60 * 1_000_000_000;
+
+/// Up to this many entries, the retired-file sweeper finds a file's retirement record, or checks whether a file is
+/// being deleted, by scanning a list; past it, the sweeper builds a hash index once per attempt. Below this size the
+/// index costs more than the scans it saves.
+pub(crate) const LINEAR_LOOKUP_MAX_ENTRIES: usize = 16;
+
+/// How many ledger records a state chunk sweep reads at a time: 1024, about 48 KiB of records, which bounds the sweep's
+/// own memory however many chunks a tenant has while keeping ledger round trips to one per thousand chunks.
+pub const STATE_CHUNK_SWEEP_PAGE_RECORDS: usize = 1024;

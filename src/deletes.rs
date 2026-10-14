@@ -8,6 +8,7 @@
 //! A correction or delete also invalidates any model-derived column values computed from the event it touches, so a
 //! query never serves a number that a correction has made stale.
 
+use crate::constant::RECOMPUTE_QUEUE_COMPACTION_FLOOR;
 use crate::error::FormatError;
 use crate::events::{EventId, SequenceRange};
 use crate::file::bytes::{Reader, Writer};
@@ -261,18 +262,36 @@ pub fn latest_corrected_deletion_vector(
     events: &[(u64, EventId)],
     corrections: &[CorrectionMetadata],
 ) -> DeletionVector {
+    if events.is_empty() || corrections.is_empty() {
+        return DeletionVector::new();
+    }
     // Index the events once so each correction is a hash lookup, not a scan of every event in the file.
     let mut ordinal_by_event = HashMap::with_capacity(events.len());
     for (ordinal, id) in events {
         ordinal_by_event.entry(*id).or_insert(*ordinal);
     }
-    let mut deletion_vector = DeletionVector::new();
-    for correction in corrections {
-        if let Some(ordinal) = ordinal_by_event.get(&correction.corrects_event_id) {
-            deletion_vector.mark_deleted(*ordinal);
+    // Sort the matched ordinals once and fold repeats and neighbors into runs in place, rather than inserting each
+    // into the sorted run list, which shifts the tail on every out-of-order match.
+    let mut deleted_runs: Vec<RowRange> = corrections
+        .iter()
+        .filter_map(|correction| ordinal_by_event.get(&correction.corrects_event_id))
+        .map(|&ordinal| RowRange {
+            start: ordinal,
+            end: ordinal + 1,
+        })
+        .collect();
+    deleted_runs.sort_unstable_by_key(|run| run.start);
+    deleted_runs.dedup_by(|next, kept| {
+        let touches = next.start <= kept.end;
+        if touches {
+            kept.end = kept.end.max(next.end);
         }
+        touches
+    });
+    DeletionVector {
+        deleted_count: deleted_runs.iter().map(|run| run.end - run.start).sum(),
+        deleted_runs,
     }
-    deletion_vector
 }
 
 /// Aggregate shortcut adjustment co-published alongside a deletion vector.
@@ -316,12 +335,14 @@ pub enum DerivedColumnState {
 /// enqueued for it.
 #[derive(Debug, Default)]
 pub struct DerivedColumnLedger {
-    /// Invalidation order: `Some(id)` at a still-pending slot, `None` at a slot a later `republish` tombstoned. A
-    /// slot is cleared in place rather than removed, so `republish` never rescans the whole queue.
-    recompute_queue: Vec<Option<EventId>>,
     /// Each still-pending event's slot in `recompute_queue`, so `republish` tombstones it directly instead of
     /// searching for it.
     queue_position: HashMap<EventId, usize>,
+    /// Invalidation order: `Some(id)` at a still-pending slot, `None` at a slot a later `republish` tombstoned. A
+    /// slot is cleared in place rather than removed, so `republish` never rescans the whole queue. Tombstones are
+    /// swept out when an `invalidate` finds they make up half the queue, and the queue empties once nothing is
+    /// pending, so its length tracks the largest outstanding backlog rather than lifetime invalidations.
+    recompute_queue: Vec<Option<EventId>>,
     states: HashMap<EventId, DerivedColumnState>,
 }
 
@@ -336,6 +357,7 @@ impl DerivedColumnLedger {
         for id in std::iter::once(event_id).chain(neighbors.iter().copied()) {
             let previous = self.states.insert(id, DerivedColumnState::Pending);
             if previous != Some(DerivedColumnState::Pending) {
+                self.compact_recompute_queue();
                 let position = self.recompute_queue.len();
                 self.recompute_queue.push(Some(id));
                 self.queue_position.insert(id, position);
@@ -358,7 +380,32 @@ impl DerivedColumnLedger {
             && let Some(slot) = self.recompute_queue.get_mut(position)
         {
             *slot = None;
+            if self.queue_position.is_empty() {
+                self.recompute_queue.clear();
+            }
         }
+    }
+
+    /// Drops tombstoned slots, keeping the still-pending events in invalidation order and repointing their positions.
+    /// Runs only past the floor and once at least half the slots are tombstones, so each sweep is paid for by the
+    /// republishes that made them.
+    fn compact_recompute_queue(&mut self) {
+        let len = self.recompute_queue.len();
+        if len <= RECOMPUTE_QUEUE_COMPACTION_FLOOR || self.queue_position.len() > len / 2 {
+            return;
+        }
+        let queue_position = &mut self.queue_position;
+        let mut next = 0;
+        self.recompute_queue.retain(|slot| {
+            let Some(id) = slot else {
+                return false;
+            };
+            if let Some(position) = queue_position.get_mut(id) {
+                *position = next;
+            }
+            next += 1;
+            true
+        });
     }
 
     /// The value a query should serve for `event_id`: `None` while pending, so an invalidated event never serves its

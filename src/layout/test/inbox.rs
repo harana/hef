@@ -256,6 +256,61 @@ fn reading_a_queue_skips_deleted_rows() {
     assert_eq!(sequences(&events), vec![9, 15, 18, 21, 24, 27, 30]);
 }
 
+/// Whatever rows of a recipient survive deletion - none, all, only the last, all but the leading two, every other one,
+/// or a sparse few - each comes back with exactly the envelope and payload stored for it, still intact once the file
+/// is dropped. Covers granules holding one recipient's whole queue beside others' and queues split across granules.
+#[test]
+fn a_queue_read_returns_each_kept_rows_own_envelope_and_payload() {
+    let kept_patterns: [&[u64]; 6] = [
+        &[],
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        &[9],
+        &[2, 3, 4, 5, 6, 7, 8, 9],
+        &[1, 3, 5, 7, 9],
+        &[2, 5, 6],
+    ];
+    for granularity in [4, 64] {
+        for index in 0..RECIPIENTS {
+            for kept in kept_patterns {
+                let file = open(build_hef_file(rows(RECIPIENTS, ROWS), &config(Profile::Inbox, granularity)).unwrap());
+                let entry = file.inbox_recipients().unwrap()[index as usize];
+                let mut vector = DeletionVector::new();
+                for offset in (0..entry.row_count).filter(|offset| !kept.contains(offset)) {
+                    vector.mark_deleted(entry.first_row_ordinal + offset);
+                }
+                let expected: Vec<EntityEvent> = kept
+                    .iter()
+                    .map(|offset| {
+                        let row = entry.first_row_ordinal + offset;
+                        let granule = file
+                            .footer()
+                            .granules
+                            .iter()
+                            .find(|granule| row < granule.first_row_ordinal + u64::from(granule.row_count))
+                            .unwrap();
+                        let envelopes = file.granule_envelopes(granule.granule_id).unwrap();
+                        let envelope = envelopes[(row - granule.first_row_ordinal) as usize].clone();
+                        let at = point(envelope.stream_sequence);
+                        EntityEvent {
+                            envelope,
+                            payload: file.payload(row).unwrap(),
+                            point: at,
+                        }
+                    })
+                    .collect();
+                let deletes = Deletes(HashMap::from([(file.header().file_id, vector)]));
+
+                let events = read_inbox(&[&file], tenant(), recipient(index), &Acks::default(), &deletes).unwrap();
+                drop(file);
+                assert_eq!(
+                    events, expected,
+                    "granularity {granularity}, recipient {index}, kept {kept:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn a_file_without_a_directory_returns_the_same_queue() {
     let inbox = build(Profile::Inbox);

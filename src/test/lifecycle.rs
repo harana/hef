@@ -107,6 +107,38 @@ fn merge_width_and_jobs_per_cycle_stay_bounded() {
 }
 
 #[test]
+fn finished_files_split_runs_and_the_job_budget_stops_planning_in_sequence_order() {
+    // Listed out of order: the planner sorts by sequence, so runs are [2, 3], [5, 6, 7] and [9, 10] between the
+    // finished files 1, 4 and 8, each its own job.
+    let generation = generation(vec![
+        entry(10, 1_000, 100, PartState::Active),
+        entry(1, 100, 1_000, PartState::Active),
+        entry(3, 300, 100, PartState::Active),
+        entry(2, 200, 100, PartState::Active),
+        entry(4, 400, 1_000, PartState::Active),
+        entry(7, 700, 100, PartState::Active),
+        entry(5, 500, 100, PartState::Active),
+        entry(6, 600, 100, PartState::Active),
+        entry(8, 800, 1_000, PartState::Active),
+        entry(9, 900, 100, PartState::Active),
+    ]);
+    let file_ids = |max_jobs_per_cycle: usize| -> Vec<Vec<u128>> {
+        let policy = CompactionPolicy {
+            max_jobs_per_cycle,
+            ..policy()
+        };
+        plan_compaction_cycle(&policy, &generation, TenantId::new_test_id(7))
+            .into_iter()
+            .map(|job| job.file_ids)
+            .collect()
+    };
+    assert_eq!(file_ids(4), vec![vec![2, 3], vec![5, 6, 7], vec![9, 10]]);
+    assert_eq!(file_ids(2), vec![vec![2, 3], vec![5, 6, 7]]);
+    assert_eq!(file_ids(1), vec![vec![2, 3]]);
+    assert!(file_ids(0).is_empty(), "a zero job budget plans nothing");
+}
+
+#[test]
 fn reaching_the_roll_target_qualifies_without_doubling() {
     // 900 + 150 only grows the largest input 1.17x, but the output reaches the roll target, so the pair is finished
     // in one merge rather than deferred forever.

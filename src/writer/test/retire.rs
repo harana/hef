@@ -152,6 +152,18 @@ fn publish_directly(set: &mut SimulatedPublishedSet, generation: ManifestGenerat
     set.advance_head(id - 1, id).unwrap();
 }
 
+/// Retirement records for `file_ids`, each started at `since_nanos` in generation 1.
+fn retirements(file_ids: impl IntoIterator<Item = u128>, since_nanos: i64) -> Vec<Retirement> {
+    file_ids
+        .into_iter()
+        .map(|file_id| Retirement {
+            file_id,
+            generation: 1,
+            since_nanos,
+        })
+        .collect()
+}
+
 #[test]
 fn a_compaction_publishes_one_generation_that_adds_the_output_and_outdates_the_inputs() {
     let objects = SimObjectStore::new();
@@ -600,6 +612,99 @@ fn a_retired_file_without_a_record_starts_its_clock_instead_of_being_swept() {
         }]
     );
     assert_eq!(objects.keys().len(), 1);
+}
+
+#[test]
+fn the_first_retirement_record_for_a_file_decides_when_it_is_swept() {
+    let policy = SweepPolicy {
+        in_flight_query_horizon_nanos: 100,
+        safety_window_nanos: 1_000,
+    };
+    // Small and large catalogues take different lookup paths; both must agree.
+    for padding in [0, LINEAR_LOOKUP_MAX_ENTRIES as u128] {
+        let clock = FixedClock::at(START_NANOS + 1_000);
+        let padding_ids = 1_000..1_000 + padding;
+        let mut files = vec![entry(101, 1, 2, PartState::DeleteOnDestroy)];
+        files.extend(
+            padding_ids
+                .clone()
+                .map(|file_id| entry(file_id, 3, 4, PartState::Outdated)),
+        );
+        let mut records = retirements([101], START_NANOS);
+        records.extend(retirements([101], START_NANOS + 1_000));
+        records.extend(retirements(padding_ids, START_NANOS));
+        let mut set = SimulatedPublishedSet::new();
+        publish_directly(
+            &mut set,
+            ManifestGeneration {
+                files,
+                generation: 1,
+                retirements: records,
+                ..Default::default()
+            },
+        );
+        let objects = SimObjectStore::new();
+        objects.put_if_absent(&hef_object_key(tenant(), 101), b"hef").unwrap();
+
+        // The first record has waited out the safety window; the second has not waited at all.
+        let report = sweep_retired_files(&mut set, &objects, &policy, 0, &clock).unwrap();
+
+        assert_eq!(report.deleted, vec![101], "padding {padding}");
+        assert!(objects.keys().is_empty());
+        let (_, head) = set.head().unwrap();
+        assert!(head.retirements.iter().all(|retirement| retirement.file_id != 101));
+    }
+}
+
+#[test]
+fn a_sweep_keeps_files_still_readable_and_deletes_every_duplicate_entry() {
+    let policy = SweepPolicy {
+        in_flight_query_horizon_nanos: 100,
+        safety_window_nanos: 1_000,
+    };
+    // Short and long deletion lists take different membership paths; both must agree.
+    for due_count in [1, LINEAR_LOOKUP_MAX_ENTRIES as u128 + 1] {
+        let clock = FixedClock::at(START_NANOS + 1_000);
+        let due_ids = 200..200 + due_count;
+        let readable_alias = entry(101, 1, 2, PartState::Active);
+        let mut files = vec![entry(101, 1, 2, PartState::DeleteOnDestroy), readable_alias.clone()];
+        files.extend(
+            due_ids
+                .clone()
+                .map(|file_id| entry(file_id, 3, 4, PartState::DeleteOnDestroy)),
+        );
+        files.push(entry(300, 5, 6, PartState::DeleteOnDestroy));
+        files.push(entry(300, 5, 6, PartState::DeleteOnDestroy));
+        let mut set = SimulatedPublishedSet::new();
+        publish_directly(
+            &mut set,
+            ManifestGeneration {
+                files,
+                generation: 1,
+                retirements: retirements([101].into_iter().chain(due_ids.clone()).chain([300]), START_NANOS),
+                ..Default::default()
+            },
+        );
+        let objects = SimObjectStore::new();
+        for file_id in [101, 300].into_iter().chain(due_ids.clone()) {
+            objects
+                .put_if_absent(&hef_object_key(tenant(), file_id), b"hef")
+                .unwrap();
+        }
+
+        let report = sweep_retired_files(&mut set, &objects, &policy, 1, &clock).unwrap();
+
+        let mut expected: Vec<u128> = due_ids.collect();
+        expected.extend([300, 300]);
+        assert_eq!(report.deleted, expected, "due count {due_count}");
+        assert_eq!(objects.keys(), vec![hef_object_key(tenant(), 101)]);
+        let (_, head) = set.head().unwrap();
+        assert_eq!(
+            head.files,
+            vec![entry(101, 1, 2, PartState::DeleteOnDestroy), readable_alias]
+        );
+        assert_eq!(head.retirements, retirements([101], START_NANOS));
+    }
 }
 
 /// Acknowledgement watermarks held in memory.

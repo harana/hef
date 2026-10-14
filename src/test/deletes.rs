@@ -53,6 +53,57 @@ fn corrections_suppress_only_their_superseded_events() {
 }
 
 #[test]
+fn bulk_correction_vector_matches_marking_each_correction_in_turn() {
+    // Differential check of the sort-then-fold construction against marking each match one at a time: same runs,
+    // count and wire bytes for shuffled, reversed, duplicated, contiguous and unknown targets, repeated event ids, and
+    // ordinals near the top of the range.
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move |bound: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % bound
+    };
+    let high = u64::MAX - 1;
+    for case in 0..300u64 {
+        let event_count = next(40);
+        let events: Vec<(u64, EventId)> = (0..event_count)
+            .map(|i| {
+                let ordinal = match case % 3 {
+                    0 => next(4096),
+                    1 => next(48),
+                    _ => high - next(8),
+                };
+                (ordinal, EventId::new_test_id(u128::from(i % 30)))
+            })
+            .collect();
+        let corrections: Vec<CorrectionMetadata> = (0..next(60))
+            .map(|_| correction_of(EventId::new_test_id(u128::from(next(35)))))
+            .collect();
+
+        let mut expected = DeletionVector::new();
+        let mut first_ordinal = HashMap::new();
+        for (ordinal, id) in &events {
+            first_ordinal.entry(*id).or_insert(*ordinal);
+        }
+        for correction in &corrections {
+            if let Some(ordinal) = first_ordinal.get(&correction.corrects_event_id) {
+                expected.mark_deleted(*ordinal);
+            }
+        }
+
+        let actual = latest_corrected_deletion_vector(&events, &corrections);
+        assert_eq!(actual.deleted_runs, expected.deleted_runs, "case {case}");
+        assert_eq!(actual.deleted_count(), expected.deleted_count(), "case {case}");
+        assert_eq!(
+            encode_deletion_vector(&actual),
+            encode_deletion_vector(&expected),
+            "case {case}"
+        );
+    }
+}
+
+#[test]
 fn ledger_keeps_invalidation_order_and_never_double_queues() {
     // Regression for the keyed ledger: membership moved to hash lookups, but the queue must still read back in
     // invalidation order with no duplicates, and a republish must clear exactly its own event.
@@ -99,6 +150,84 @@ fn republish_tombstones_in_place_and_a_later_reinvalidation_queues_once() {
         "queued exactly once, not duplicated"
     );
     assert_eq!(ledger.published_value(event), None, "pending again until republished");
+}
+
+#[test]
+fn churning_one_event_keeps_the_queue_bounded_by_outstanding_work() {
+    // Regression for tombstone build-up: invalidating and republishing the same event over and over while another
+    // event stays pending must not grow the queue with every cycle, and once nothing is pending the queue is empty
+    // so a poll inspects no slots at all.
+    let waiting = EventId::new_test_id(1);
+    let hot = EventId::new_test_id(2);
+    let mut ledger = DerivedColumnLedger::new();
+    ledger.invalidate(waiting, &[]);
+    for cycle in 0..10_000 {
+        ledger.invalidate(hot, &[hot]);
+        ledger.republish(hot, 1.0, cycle);
+        assert!(ledger.recompute_queue.len() <= RECOMPUTE_QUEUE_COMPACTION_FLOOR + 1);
+    }
+    assert_eq!(ledger.pending_recomputes(), &[waiting]);
+
+    ledger.invalidate(hot, &[]);
+    assert_eq!(
+        ledger.pending_recomputes(),
+        &[waiting, hot],
+        "re-invalidating a completed event appends it after the jobs already waiting"
+    );
+    ledger.republish(waiting, 2.0, 1);
+    ledger.republish(hot, 3.0, 1);
+    assert!(ledger.recompute_queue.is_empty());
+    assert_eq!(ledger.published_value(waiting), Some(2.0));
+    assert_eq!(ledger.published_value(hot), Some(3.0));
+}
+
+#[test]
+fn ledger_matches_a_plain_ordered_list_under_random_invalidations_and_republishes() {
+    // Differential check of the compacting queue against the obvious model: an ordered list of pending events plus
+    // each event's last published value. Enough distinct events are used to push the queue past the compaction floor.
+    let mut ledger = DerivedColumnLedger::new();
+    let mut pending: Vec<EventId> = Vec::new();
+    let mut published: HashMap<EventId, f64> = HashMap::new();
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move |bound: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % bound
+    };
+    for step in 0..20_000u64 {
+        let event = EventId::new_test_id(u128::from(next(200)));
+        if next(2) == 0 {
+            let neighbors: Vec<EventId> = (0..next(4))
+                .map(|_| EventId::new_test_id(u128::from(next(200))))
+                .collect();
+            ledger.invalidate(event, &neighbors);
+            for id in std::iter::once(event).chain(neighbors) {
+                published.remove(&id);
+                if !pending.contains(&id) {
+                    pending.push(id);
+                }
+            }
+        } else {
+            let value = step as f64;
+            ledger.republish(event, value, step);
+            pending.retain(|id| *id != event);
+            published.insert(event, value);
+        }
+
+        assert_eq!(ledger.pending_recomputes(), pending, "step {step}");
+        for (id, position) in &ledger.queue_position {
+            assert_eq!(ledger.recompute_queue[*position], Some(*id), "step {step}");
+        }
+        assert_eq!(
+            ledger.recompute_queue.iter().flatten().count(),
+            ledger.queue_position.len()
+        );
+        for n in 0..200 {
+            let id = EventId::new_test_id(n);
+            assert_eq!(ledger.published_value(id), published.get(&id).copied(), "step {step}");
+        }
+    }
 }
 
 #[test]

@@ -43,15 +43,25 @@ impl HefFile {
     /// a granule. When the file holds the id more than once, the last row - the newest event - answers. `None` when the
     /// file does not hold the id.
     pub fn row_by_external_id(&self, external_id: &[u8]) -> Result<Option<u64>, FormatError> {
-        Ok(self.rows_with_external_id(external_id)?.last().copied())
+        let mut newest = None;
+        self.for_each_row_with_external_id(external_id, |row| newest = Some(row))?;
+        Ok(newest)
     }
 
     /// Every row that holds the event with `external_id`, in row order. Usually one row, or none.
     pub fn rows_with_external_id(&self, external_id: &[u8]) -> Result<Vec<u64>, FormatError> {
+        let mut rows = Vec::new();
+        self.for_each_row_with_external_id(external_id, |row| rows.push(row))?;
+        Ok(rows)
+    }
+
+    /// Hands `found` every row that holds `external_id`, in row order, confirming each index candidate against the
+    /// stored id. One decode buffer serves every candidate, so a lookup allocates no per-candidate id.
+    fn for_each_row_with_external_id(&self, external_id: &[u8], mut found: impl FnMut(u64)) -> Result<(), FormatError> {
         let id_hash = stable_hash(external_id);
         let entries = &self.footer().external_ids;
         let first = entries.partition_point(|entry| entry.id_hash < id_hash);
-        let mut rows = Vec::new();
+        let mut decoded = Vec::new();
         for entry in entries
             .get(first..)
             .unwrap_or_default()
@@ -59,11 +69,22 @@ impl HefFile {
             .take_while(|entry| entry.id_hash == id_hash)
         {
             // Two ids can share a hash, so every candidate is confirmed against the stored id.
-            if self.external_id(entry.row_ordinal)?.as_deref() == Some(external_id) {
-                rows.push(entry.row_ordinal);
+            let matches = self.with_source_form_text(column_ids::EXTERNAL_ID, entry.row_ordinal, |hex| {
+                let Some(hex) = hex else {
+                    return Ok(false);
+                };
+                decoded.resize(hex.len() / 2, 0);
+                hex_simd::decode(hex.as_bytes(), hex_simd::Out::from_slice(&mut decoded))
+                    .map(|id| &*id == external_id)
+                    .map_err(|_| FormatError::Structural {
+                        rule: "a stored external id is lowercase hex",
+                    })
+            })??;
+            if matches {
+                found(entry.row_ordinal);
             }
         }
-        Ok(rows)
+        Ok(())
     }
 
     /// Every row's external id, in row order - what a cross-file index records for this file.
@@ -108,15 +129,27 @@ impl HefFile {
     /// The granule's block is decoded once and kept in the reader's decoded-block cache, so a run of point reads (an
     /// event-id lookup confirming each candidate, say) pays one decode per granule.
     fn source_form_text(&self, column_id: u32, row_ordinal: u64) -> Result<Option<String>, FormatError> {
+        self.with_source_form_text(column_id, row_ordinal, |text| text.map(str::to_owned))
+    }
+
+    /// Runs `visit` on one row's text in a source-form column, borrowed from the cached block instead of copied out;
+    /// it sees `None` when the file has no such column or the row has no value.
+    fn with_source_form_text<T>(
+        &self,
+        column_id: u32,
+        row_ordinal: u64,
+        visit: impl FnOnce(Option<&str>) -> T,
+    ) -> Result<T, FormatError> {
         if !has_column(self.footer(), column_id) {
-            return Ok(None);
+            return Ok(visit(None));
         }
         let granule = granule_holding(self.footer(), row_ordinal)?;
-        self.cached_string_at(
+        self.with_cached_string_at(
             column_id,
             granule.granule_id,
             granule.row_count,
             row_ordinal - granule.first_row_ordinal,
+            visit,
         )
     }
 }

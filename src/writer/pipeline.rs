@@ -11,7 +11,7 @@
 //! flushing autonomously.
 
 use super::error::{FlushError, LeaseError, QueueError};
-use super::queue::{CommitQueue, PendingRecord, QueueRegion, peek_steal};
+use super::queue::{CommitQueue, PendingRecord, QueueRegion, peek_steal_raw};
 use super::reserve::{FORCE_COMMIT_IDLE_NANOS, SequenceAllocator};
 use super::retry::{RetryReceipt, SafeRetryStore, StatusClass};
 use crate::artifacts::batch::{EventInput, build_batch, decode_batch};
@@ -267,16 +267,15 @@ impl WorkerCommitPipeline {
         epoch: u64,
         same_steal_group: bool,
     ) -> Result<usize, QueueError> {
-        let Some((region, records)) = peek_steal(peer, self.tenant_id, epoch, same_steal_group) else {
+        let Some((region, records)) = peek_steal_raw(peer, self.tenant_id, epoch, same_steal_group) else {
             return Ok(0);
         };
-        let count = records.len();
         // Confirm room before taking ownership: a steal must not claim records this queue cannot hold, or they would
         // vanish from the source without ever landing here. The stolen bytes are already in this queue's own wire
         // format (peer and thief encode records identically), so they are copied in rather than decoded and
         // re-encoded. `records` borrows from `peer`, so it is not touched again past this call — the source is
         // claimed from immediately below.
-        let Some(admission) = self.queue.admit_encoded(&records)? else {
+        let Some((admission, count)) = self.queue.admit_raw(records)? else {
             return Ok(0);
         };
         // Claim the region on the source. A failed claim means another worker took it first; discard the copy and
