@@ -18,11 +18,15 @@ The write path SHALL follow this pipeline: validate → serialize into a pending
 - **THEN** HARDENED becomes COMMITTED immediately and the client may be acknowledged
 
 ### Requirement: Single protected payload record with safe retry
-The system SHALL NOT require both a full KV buffer payload and an HEJ payload before acknowledgement; HEJ SHALL be the protected event payload record. Safe-retry state SHALL use client/connector delivery identity, scope, commit receipt, HEJ frame cursor, status class, expiry, and minimal dedupe metadata, and SHALL be reconstructable after restart/takeover from retained replay-guard rows plus HEJ coverage. Replaying a retained HEJ frame SHALL NOT enqueue duplicate events while the original acknowledgement is within the replay-guard window.
+The system SHALL NOT require both a full KV buffer payload and an HEJ payload before acknowledgement; HEJ SHALL be the protected event payload record. Safe-retry state SHALL use client/connector delivery identity, scope, commit receipt, HEJ frame cursor, status class, expiry, and minimal dedupe metadata, and SHALL be reconstructable after restart/takeover from retained replay-guard rows plus HEJ coverage. Replaying a retained HEJ frame SHALL NOT enqueue duplicate events while the original acknowledgement is within the replay-guard window. A retry of a delivery whose earlier attempt was appended but whose durability is unknown SHALL NOT be enqueued while that attempt's receipt is within the replay-guard window; it SHALL be reported as unresolved until replay finds the frame durable in HEJ, which settles the receipt as acknowledged.
 
 #### Scenario: Replay within guard window
 - **WHEN** a retained HEJ frame is replayed while the original acknowledgement is still within the replay-guard window
 - **THEN** no duplicate events are enqueued
+
+#### Scenario: Retry after a failed durability barrier
+- **WHEN** a client retries a delivery whose earlier attempt was appended but whose sync or verification read failed
+- **THEN** the retry is reported as unresolved and no second copy is appended
 
 ### Requirement: Idempotent HEF publication
 Publishing HEF from HEJ SHALL follow this sequence and atomically publish the manifest entry, projection metadata, deletion-vector generation, and coverage watermarks. The publisher SHALL be idempotent: re-publishing the same journal range SHALL produce either the same file identity or a safely replaceable file. LiveOverlay segments SHALL become evictable only after the new published HEF range is visible, and HEJ retention/segment recycling SHALL advance only after publication and the configured recovery safety window.

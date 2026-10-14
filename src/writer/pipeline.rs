@@ -77,6 +77,11 @@ pub enum Submission {
     Duplicate(RetryReceipt),
     /// Validated and queued (READY); not yet durable.
     Ready,
+    /// An earlier attempt of this same delivery was appended to the journal, but whether it became durable is still
+    /// unknown, so nothing was queued: a second copy could land next to the first. Carries that attempt's receipt.
+    /// Retry later; the delivery is answered as a duplicate once replay finds the frame in the journal, and is queued
+    /// again once the receipt's guard window has passed.
+    Unresolved(RetryReceipt),
 }
 
 /// The outcome of one committed frame.
@@ -144,7 +149,8 @@ impl WorkerCommitPipeline {
 
     /// Queues one event (READY): no durability, no visibility, no final sequence yet. A retry of an event this tenant
     /// already committed inside the replay-guard window (same dedupe identity) is not queued again; you get
-    /// `Submission::Duplicate` with the original receipt to answer the client with.
+    /// `Submission::Duplicate` with the original receipt to answer the client with. A retry of a delivery whose earlier
+    /// attempt may or may not have become durable is not queued either; you get `Submission::Unresolved`.
     pub fn submit(
         &mut self,
         event: EventInput,
@@ -155,8 +161,8 @@ impl WorkerCommitPipeline {
         if event.envelope.tenant_id != self.tenant_id {
             return Err(QueueError::TenantMismatch);
         }
-        if let Some(receipt) = self.committed_duplicate(&event, retry, clock) {
-            return Ok(Submission::Duplicate(receipt));
+        if let Some(submission) = self.earlier_attempt(&event, retry, clock) {
+            return Ok(submission);
         }
         self.queue.push(&PendingRecord {
             tenant_id: self.tenant_id,
@@ -174,7 +180,8 @@ impl WorkerCommitPipeline {
     /// receipt per event.
     ///
     /// Returns one `Submission` per event, in order. Events this tenant already committed inside the replay-guard
-    /// window come back as `Submission::Duplicate` with their original receipt and are left out of the batch.
+    /// window come back as `Submission::Duplicate` with their original receipt, and deliveries whose earlier attempt
+    /// may or may not have become durable come back as `Submission::Unresolved`; both are left out of the batch.
     pub fn submit_batch(
         &mut self,
         events: Vec<EventInput>,
@@ -188,8 +195,8 @@ impl WorkerCommitPipeline {
         let mut submissions = Vec::with_capacity(events.len());
         let mut records = Vec::with_capacity(events.len());
         for event in events {
-            match self.committed_duplicate(&event, retry, clock) {
-                Some(receipt) => submissions.push(Submission::Duplicate(receipt)),
+            match self.earlier_attempt(&event, retry, clock) {
+                Some(submission) => submissions.push(submission),
                 None => {
                     submissions.push(Submission::Ready);
                     records.push(PendingRecord {
@@ -214,16 +221,25 @@ impl WorkerCommitPipeline {
         Ok(submissions)
     }
 
-    /// The original receipt when this tenant already committed an event with `event`'s dedupe identity inside the
-    /// replay-guard window.
-    fn committed_duplicate(
+    /// The answer for `event` when an earlier attempt means it must not be queued: `Duplicate` when this tenant already
+    /// committed an event with its dedupe identity inside the replay-guard window, `Unresolved` when an earlier attempt
+    /// of its delivery holds an unexpired `Indeterminate` receipt. `None` means the event may be queued.
+    fn earlier_attempt(
         &self,
         event: &EventInput,
         retry: &mut dyn SafeRetryStore,
         clock: &dyn MonotonicClock,
-    ) -> Option<RetryReceipt> {
+    ) -> Option<Submission> {
+        let now = clock.now_nanos();
         let dedupe = (event.envelope.dedupe_hash_low, event.envelope.dedupe_hash_high);
-        retry.acknowledged_within_guard(self.tenant_id, dedupe, clock.now_nanos())
+        if let Some(receipt) = retry.acknowledged_within_guard(self.tenant_id, dedupe, now) {
+            return Some(Submission::Duplicate(receipt));
+        }
+        let delivery_identity = (event.connector_delivery_hash_low, event.connector_delivery_hash_high);
+        retry
+            .lookup(self.tenant_id, delivery_identity)
+            .filter(|receipt| receipt.status_class == StatusClass::Indeterminate && receipt.expiry_physical_nanos > now)
+            .map(Submission::Unresolved)
     }
 
     /// Steals same-tenant/same-epoch pending records from a topology-local peer queue into this worker's queue. The peer
