@@ -445,7 +445,6 @@ const fn fastlanes_words_per_lane(bits: usize) -> usize {
 /// elsewhere — recovers sixteen lanes' worth at a time with only shifts and masks. `width` must be the true bit width
 /// of the data (every value fits in `width` bits); a zero width writes nothing but the count, since every value is then
 /// zero.
-#[cfg(test)]
 fn bitpack(values: &[u64], width: u32, out: &mut Writer) {
     out.put_u32(values.len() as u32);
     out.put_u8(width as u8);
@@ -1271,10 +1270,6 @@ fn alp_viable(encodable: &[bool]) -> bool {
 /// position — so one pathological 1024-value stretch costs its own bytes, never the whole block's eligibility. A block
 /// with no escaped vector keeps the original layout byte for byte. Returns the inner encoding chosen for the exception
 /// index stream (the recorded second cascade level), or `None` when ALP is not viable for this data.
-///
-/// The scaled integers are never held as a full-length vector: a first pass probes one 1024-value vector at a time to
-/// collect the exceptions, the escaped vectors and the widest code, and a second pass probes each kept vector again to
-/// pack its codes straight into `out`.
 fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Option<SideStream> {
     let sample = transform_sample(values);
     let sample: &[f64] = sample.as_deref().unwrap_or(values);
@@ -1302,7 +1297,7 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
     let vector_scratch = values.len().min(FASTLANES_VECTOR);
     zigzags.resize(vector_scratch, 0);
     encodable.resize(vector_scratch, false);
-    let mut max_code = 0u64;
+    let mut ints = Vec::with_capacity(values.len());
     let mut exceptions: Vec<(u32, u64)> = Vec::new();
     let mut escaped: Vec<u32> = Vec::new();
     for (vector_index, vector) in values.chunks(FASTLANES_VECTOR).enumerate() {
@@ -1315,12 +1310,13 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
         let vector_exceptions = vector_encodable.iter().filter(|ok| !**ok).count();
         if vector_exceptions * ALP_MAX_EXCEPTION_SAMPLE_DIVISOR > vector.len() {
             escaped.push(vector_index as u32);
+            ints.extend(std::iter::repeat_n(0u64, vector.len()));
             continue;
         }
         let base = vector_index * FASTLANES_VECTOR;
-        // The kernel already wrote zigzag codes with 0 in every exception slot, so the codes only feed the maximum and
-        // only the exceptions walk per value.
-        max_code = max_code.max(vector_zigzags.iter().copied().max().unwrap_or(0));
+        // The kernel already wrote zigzag codes with 0 in every exception slot, so the codes append wholesale and only
+        // the exceptions walk per value.
+        ints.extend_from_slice(vector_zigzags);
         for (offset, (ok, value)) in vector_encodable.iter().zip(vector).enumerate() {
             if !*ok {
                 exceptions.push(((base + offset) as u32, value.to_bits()));
@@ -1368,27 +1364,8 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
             unreachable!("the exception side-stream chooser never picks a string block's side stream")
         }
     }
-    // Escaped vectors pack as zero codes without a probe; every other vector is probed again under the chosen power,
-    // which writes the same codes the first pass saw. The escaped indexes ascend, so one cursor walks them in step.
-    let mut next_escaped = escaped.iter().peekable();
-    alp_rd_bitpack_vectors(values.len(), bits_needed(max_code), out, |vector_index, buffer| {
-        buffer.fill(0);
-        if next_escaped
-            .next_if(|escaped_index| **escaped_index as usize == vector_index)
-            .is_some()
-        {
-            return;
-        }
-        let start = vector_index * FASTLANES_VECTOR;
-        let vector = values
-            .get(start..values.len().min(start + FASTLANES_VECTOR))
-            .unwrap_or(&[]);
-        if let (Some(vector_codes), Some(vector_encodable)) =
-            (buffer.get_mut(..vector.len()), encodable.get_mut(..vector.len()))
-        {
-            alp_probe_chunk(vector, power, vector_codes, vector_encodable);
-        }
-    });
+    let max = ints.iter().copied().max().unwrap_or(0);
+    bitpack(&ints, bits_needed(max), out);
     // Raw payloads ride after the packed words, where a sequential decoder already knows the value count needed to
     // size each escaped vector.
     for vector_index in &escaped {
@@ -3652,7 +3629,12 @@ fn stats_for(data: &ColumnData) -> BlockStats {
         max_f64: None,
     };
     match data {
-        ColumnData::U64(values) => stats = u64_stats(values),
+        ColumnData::U64(values) => {
+            if let Some((min, max)) = min_max(values) {
+                stats.min_i128 = Some(i128::from(min));
+                stats.max_i128 = Some(i128::from(max));
+            }
+        }
         ColumnData::I64(values) => {
             if let Some((min, max)) = min_max(values) {
                 stats.min_i128 = Some(i128::from(min));
@@ -3685,19 +3667,6 @@ fn stats_for(data: &ColumnData) -> BlockStats {
         }
     }
     stats
-}
-
-/// The statistics of a u64 block: its row count and its smallest and largest value.
-fn u64_stats(values: &[u64]) -> BlockStats {
-    let bounds = min_max(values);
-    BlockStats {
-        max_f64: None,
-        max_i128: bounds.map(|(_, max)| i128::from(max)),
-        min_f64: None,
-        min_i128: bounds.map(|(min, _)| i128::from(min)),
-        null_count: 0,
-        row_count: values.len() as u32,
-    }
 }
 
 /// Whole-block byte size at or below which the trailing cascade compresses the block with both codecs and keeps the
@@ -4245,44 +4214,10 @@ fn encode_block_inner(
     // misleading sample encoded larger than its plain form is stored plain instead, so an unlucky sample costs the
     // wasted trial encode and never a bigger block. The comparison is a pure function of the encoded output, so two
     // nodes encoding the same rows still store the same bytes.
-    keep_within_plain_form(
-        block,
-        forced.is_some() || replay_trailing.is_some(),
-        raw_value_bytes(data),
-        || plain_form(data, random_access, strategy, shared),
-    )
-}
-
-/// Encodes u64 values borrowed from the caller exactly as [`encode_block`] encodes the same values handed over as a
-/// [`ColumnData::U64`] block (same pipeline, bytes and stats), so a caller that keeps its values need not copy them
-/// into a column first.
-pub(crate) fn encode_u64_block(values: &[u64], random_access: bool) -> EncodedBlock {
-    let strategy = CascadeStrategy::DecodeOptimized;
-    let block = encode_u64_form(values, random_access, strategy, None, None);
-    keep_within_plain_form(block, false, (values.len() * 8) as u64, || {
-        encode_u64_form(
-            values,
-            random_access,
-            strategy,
-            Some(Transform::PlainU64),
-            Some(Compression::None),
-        )
-    })
-}
-
-/// The acceptance gate behind [`encode_block_inner`]: keeps `block` when its form was `named` by the caller or it
-/// stores no more than `raw_bytes`, the raw size of its values; otherwise builds the plain form with `build_plain`
-/// and keeps whichever is smaller, `block` on a tie.
-fn keep_within_plain_form(
-    block: EncodedBlock,
-    named: bool,
-    raw_bytes: u64,
-    build_plain: impl FnOnce() -> EncodedBlock,
-) -> EncodedBlock {
-    if named || block.bytes.len() as u64 <= raw_bytes {
+    if forced.is_some() || replay_trailing.is_some() || block.bytes.len() as u64 <= raw_value_bytes(data) {
         return block;
     }
-    let plain = build_plain();
+    let plain = plain_form(data, random_access, strategy, shared);
     if plain.bytes.len() < block.bytes.len() {
         plain
     } else {
@@ -4311,7 +4246,11 @@ fn encode_chosen_form(
     let mut fsst = None;
     let mut frame_breaks = Vec::new();
     let (transform, kind) = match data {
-        ColumnData::U64(values) => (encode_u64_body(values, forced, strategy, &mut out), ValueKind::U64),
+        ColumnData::U64(values) => {
+            let transform = forced.unwrap_or_else(|| choose_u64_transform(values, strategy));
+            encode_u64_with(transform, values, &mut out);
+            (transform, ValueKind::U64)
+        }
         ColumnData::I64(values) => {
             let transform = forced.unwrap_or_else(|| choose_i64_transform(values, strategy));
             encode_i64_with(transform, values, &mut out);
@@ -4379,77 +4318,7 @@ fn encode_chosen_form(
             (transform, ValueKind::String)
         }
     };
-    let (compression, bytes, uncompressed_len) = apply_trailing_stage(
-        out.into_bytes(),
-        transform,
-        side,
-        &frame_breaks,
-        random_access,
-        strategy,
-        replay_trailing,
-    );
-    EncodedBlock {
-        pipeline: PipelineId::new(transform, compression, kind).with_side_stream(side),
-        bytes,
-        fsst,
-        stats,
-        uncompressed_len,
-    }
-}
-
-/// [`encode_chosen_form`] for u64 values borrowed from the caller: the same transform choice, body and trailing stage
-/// the owned [`ColumnData::U64`] path runs, without the acceptance gate.
-fn encode_u64_form(
-    values: &[u64],
-    random_access: bool,
-    strategy: CascadeStrategy,
-    forced: Option<Transform>,
-    replay_trailing: Option<Compression>,
-) -> EncodedBlock {
-    let mut out = Writer::with_capacity(values.len() * 8);
-    let transform = encode_u64_body(values, forced, strategy, &mut out);
-    let (compression, bytes, uncompressed_len) = apply_trailing_stage(
-        out.into_bytes(),
-        transform,
-        SideStream::None,
-        &[],
-        random_access,
-        strategy,
-        replay_trailing,
-    );
-    EncodedBlock {
-        pipeline: PipelineId::new(transform, compression, ValueKind::U64).with_side_stream(SideStream::None),
-        bytes,
-        fsst: None,
-        stats: u64_stats(values),
-        uncompressed_len,
-    }
-}
-
-/// Writes u64 `values` into `out` with the `forced` transform, or the one sampling picks under `strategy`, and returns
-/// the transform used.
-fn encode_u64_body(
-    values: &[u64],
-    forced: Option<Transform>,
-    strategy: CascadeStrategy,
-    out: &mut Writer,
-) -> Transform {
-    let transform = forced.unwrap_or_else(|| choose_u64_transform(values, strategy));
-    encode_u64_with(transform, values, out);
-    transform
-}
-
-/// Runs the trailing compression stage over a block's `body`, as far as `random_access`, the cascade depth and a
-/// replayed codec allow, and returns the codec applied, the stored bytes, and the body's length before compression.
-fn apply_trailing_stage(
-    body: Vec<u8>,
-    transform: Transform,
-    side: SideStream,
-    frame_breaks: &[usize],
-    random_access: bool,
-    strategy: CascadeStrategy,
-    replay_trailing: Option<Compression>,
-) -> (Compression, Vec<u8>, u64) {
+    let body = out.into_bytes();
     // The decoded length is the block content before the trailing compression stage — captured now, since `body` is
     // consumed by the compression call below.
     let uncompressed_len = body.len() as u64;
@@ -4457,7 +4326,7 @@ fn apply_trailing_stage(
     let (compression, bytes) = if random_access {
         // Random access preserved: per-value offsets stay addressable, so only the seekable Zstandard family (which
         // preserves it too) may still apply; every other trailing stage is skipped.
-        apply_seekable_frames(transform, body, strategy, frame_breaks)
+        apply_seekable_frames(transform, body, strategy, &frame_breaks)
     } else if !cascade_level_fits(depth_so_far) {
         // A trailing stage would exceed the declared maximum cascade depth, so it is not added — however well it
         // would have sampled.
@@ -4467,7 +4336,13 @@ fn apply_trailing_stage(
     } else {
         apply_trailing(body, strategy)
     };
-    (compression, bytes, uncompressed_len)
+    EncodedBlock {
+        pipeline: PipelineId::new(transform, compression, kind).with_side_stream(side),
+        bytes,
+        fsst,
+        stats,
+        uncompressed_len,
+    }
 }
 
 /// One value of a FastLanes transposed stream, read straight from the packed words that hold it.
