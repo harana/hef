@@ -1819,15 +1819,17 @@ fn decode_alp_rd(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
     }
     // A left part carrying bits at or above the split would collide with the right part on reassembly.
     let left_limit = 1u64 << (64 - right_width);
-    let mut dict = Vec::with_capacity(dict_len);
-    for _ in 0..dict_len {
+    // The dictionary padded to its maximum length and pre-shifted into place, so each lane's lookup is an in-range
+    // indexed load rather than a checked one; a code past the real entries is caught by its own flag below.
+    let mut shifted_lefts = [0u64; ALP_RD_MAX_DICT_LEN];
+    for slot in shifted_lefts.iter_mut().take(dict_len) {
         let left = reader.u16("alp-rd dictionary entry")?;
         if u64::from(left) >= left_limit {
             return Err(FormatError::Structural {
                 rule: "alp-rd left part exceeds its width",
             });
         }
-        dict.push(left);
+        *slot = u64::from(left) << right_width;
     }
     let exception_count = reader.u32("alp-rd exception count")? as usize;
     if exception_count > MAX_BLOCK_VALUES {
@@ -1846,37 +1848,86 @@ fn decode_alp_rd(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
         }
         exceptions.push((index, left));
     }
-    let mut codes = bitunpack(reader)?;
-    let rights = bitunpack(reader)?;
-    if codes.len() != rights.len() {
+    let codes = read_packed_stream(reader)?;
+    let rights = read_packed_stream(reader)?;
+    if codes.count != rights.count {
         return Err(FormatError::Structural {
             rule: "alp-rd code and right-part streams disagree",
         });
     }
-    // Each code slot is overwritten in place with its reassembled float bits, so the decoded codes buffer becomes the
-    // output and no separate float vector is allocated.
-    for (slot, right) in codes.iter_mut().zip(rights.iter()) {
-        if *right >> right_width != 0 {
-            return Err(FormatError::Structural {
-                rule: "alp-rd right part exceeds its width",
-            });
-        }
-        let left = dict
-            .get(*slot as usize)
+    // The codes are unpacked straight into the output as their shifted left parts. A left part shifted by at least
+    // `ALP_RD_MIN_RIGHT_WIDTH` has a clear bit 0, which carries the lane's "code out of range" flag until the right
+    // parts are joined in.
+    let dict_len = dict_len as u64;
+    let mut values = vec![0u64; codes.padded_count()];
+    codes.unpack_into(&mut values, |code| {
+        let left = shifted_lefts
+            .get(code as usize % ALP_RD_MAX_DICT_LEN)
             .copied()
-            .ok_or(FormatError::RefOutOfRange { what: "alp-rd code" })?;
-        *slot = (u64::from(left) << right_width) | *right;
+            .unwrap_or(0);
+        left | u64::from(code >= dict_len)
+    });
+    let mut invalid = 0u64;
+    let mut value_vectors = values.chunks_mut(FASTLANES_VECTOR);
+    rights.for_each_vector(|right_vector| {
+        if let Some(value_vector) = value_vectors.next() {
+            invalid |= alp_rd_join_rights(value_vector, right_vector, right_width);
+        }
+    });
+    if invalid != 0 {
+        return Err(alp_rd_first_invalid_row(&codes, &rights, dict_len, right_width));
     }
+    values.truncate(codes.count);
+    let right_mask = mask(right_width);
     for (index, left) in exceptions {
-        let right = rights.get(index as usize).ok_or(FormatError::RefOutOfRange {
+        let slot = values.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
             what: "alp-rd exception index",
         })?;
-        let slot = codes.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
-            what: "alp-rd exception index",
-        })?;
-        *slot = (u64::from(left) << right_width) | *right;
+        *slot = (u64::from(left) << right_width) | (*slot & right_mask);
     }
-    Ok(bytemuck::cast_vec(codes))
+    Ok(bytemuck::cast_vec(values))
+}
+
+/// ORs each right part into its row of `values` (shifted left parts carrying a bit-0 "bad code" flag) and returns a
+/// nonzero mask if any row had a bad code or a right part reaching past `right_width`: one check per vector instead
+/// of a branch per row.
+///
+/// Compiled once per instruction set and dispatched on the CPU features detected at runtime; every clone computes the
+/// same ORs and shifts, so the values are identical whichever clone runs.
+#[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2", "aarch64+neon"))]
+fn alp_rd_join_rights(values: &mut [u64], rights: &[u64], right_width: u32) -> u64 {
+    let mut invalid = 0u64;
+    for (slot, right) in values.iter_mut().zip(rights) {
+        invalid |= (*slot & 1) | (right >> right_width);
+        *slot |= right;
+    }
+    invalid
+}
+
+/// The error the row-by-row ALP-RD check reports for a block already known to hold a bad row: the first row whose
+/// right part reaches past `right_width` or whose code is past the dictionary, checked in that order within a row.
+/// Only runs on malformed input, so it simply unpacks both streams again.
+fn alp_rd_first_invalid_row(
+    codes: &PackedStream<'_>,
+    rights: &PackedStream<'_>,
+    dict_len: u64,
+    right_width: u32,
+) -> FormatError {
+    let mut code_values = vec![0u64; codes.padded_count()];
+    codes.unpack_into(&mut code_values, |code| code);
+    let mut right_values = vec![0u64; rights.padded_count()];
+    rights.unpack_into(&mut right_values, |right| right);
+    for (code, right) in code_values.iter().zip(&right_values).take(codes.count) {
+        if *right >> right_width != 0 {
+            return FormatError::Structural {
+                rule: "alp-rd right part exceeds its width",
+            };
+        }
+        if *code >= dict_len {
+            return FormatError::RefOutOfRange { what: "alp-rd code" };
+        }
+    }
+    FormatError::RefOutOfRange { what: "alp-rd code" }
 }
 
 /// The stored form of one string block's null side stream. The encoder picks the smallest deterministic form for the

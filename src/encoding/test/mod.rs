@@ -4244,6 +4244,70 @@ fn alp_rd_in_place_decode_rejects_corrupt_bodies_like_the_reference() {
     assert_alp_rd_decode_matches_reference(&body);
 }
 
+/// The vector-at-a-time ALP-RD decode gives back every bit of pseudo-random columns of pseudo-random lengths, whose
+/// top bits cluster into dictionaries of every size, with NaN payloads, signed zeros and subnormals mixed in.
+#[test]
+fn alp_rd_round_trips_randomized_columns() {
+    let specials = [
+        f64::NAN.to_bits(),
+        0xFFF8_0000_DEAD_BEEF,
+        (-0.0f64).to_bits(),
+        0.0f64.to_bits(),
+        1,
+        0x800F_FFFF_FFFF_FFFF,
+    ];
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    for _ in 0..40 {
+        let len = (pseudo_random(&mut state) % 5000) as usize;
+        let spread = 1 + pseudo_random(&mut state) % 12;
+        let values: Vec<f64> = (0..len)
+            .map(|i| {
+                let noise = pseudo_random(&mut state);
+                if i % 97 == 3 {
+                    f64::from_bits(specials[(noise % specials.len() as u64) as usize])
+                } else {
+                    f64::from_bits(0x3FF0_0000_0000_0000 ^ ((noise % spread) << 52) ^ (noise >> 12))
+                }
+            })
+            .collect();
+        let mut out = Writer::new();
+        encode_alp_rd(&values, &mut out);
+        let body = out.into_bytes();
+        assert_alp_rd_decode_matches_reference(&body);
+        let decoded = decode_alp_rd(&mut Reader::new(&body)).unwrap();
+        assert_eq!(float_bits(&decoded), float_bits(&values), "len {len}, spread {spread}");
+    }
+}
+
+/// A forged dictionary code past the real entries is refused with the same error whether it points into the unused
+/// padding of the dictionary or past its padded length, in any vector of the block, and even when the codes also
+/// carry a right part past its width on a later row.
+#[test]
+fn alp_rd_decode_rejects_a_forged_out_of_range_code() {
+    let right_width = 52u8;
+    let dict = [0x403u16, 0x404, 0x3FF];
+    let len = 3000usize;
+    let rights: Vec<u64> = (0..len as u64).map(|i| mix(i) & mask(u32::from(right_width))).collect();
+    let forged_codes = [3u64, 7, ALP_RD_MAX_DICT_LEN as u64, ALP_RD_MAX_DICT_LEN as u64 + 1, 255];
+    for bad_code in forged_codes {
+        for bad_row in [0usize, 1023, 1024, 2999] {
+            let mut codes: Vec<u64> = (0..len as u64).map(|i| i % 3).collect();
+            codes[bad_row] = bad_code;
+            let body = alp_rd_body(right_width, &dict, &[], &codes, &rights);
+            assert_eq!(
+                decode_alp_rd(&mut Reader::new(&body)),
+                Err(FormatError::RefOutOfRange { what: "alp-rd code" }),
+                "code {bad_code} at row {bad_row}"
+            );
+            assert_alp_rd_decode_matches_reference(&body);
+            let mut wide_rights = rights.clone();
+            wide_rights[len - 1] = 1u64 << right_width;
+            let body = alp_rd_body(right_width, &dict, &[], &codes, &wide_rights);
+            assert_alp_rd_decode_matches_reference(&body);
+        }
+    }
+}
+
 /// The ALP-RD encoder as it stood before it dropped its full-length right-part and exception buffers: the reference
 /// the leaner encoder must match byte for byte.
 fn encode_alp_rd_reference(values: &[f64], out: &mut Writer) {
