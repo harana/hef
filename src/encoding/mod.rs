@@ -2447,38 +2447,30 @@ fn decode_dictionary_string(
             rule: "shared-scope dictionary block without its file alphabet",
         })?;
         let codes = bitunpack(reader)?;
-        let present = resolve_dictionary_codes(&codes, alphabet)?;
-        return merge_nulls(&nulls, present.len(), |index| {
-            present.get(index).copied().ok_or(FormatError::RefOutOfRange {
-                what: "dictionary code",
-            })
-        });
+        return merge_nulls(&nulls, codes.len(), |index| dictionary_entry(&codes, alphabet, index));
     }
     let dict_count = reader.u32("dictionary count")? as usize;
     let dictionary = read_dictionary_values(reader, dict_count, side)?;
     let codes = bitunpack(reader)?;
-    let present = resolve_dictionary_codes(&codes, &dictionary)?;
-    merge_nulls(&nulls, present.len(), |index| {
-        present.get(index).copied().ok_or(FormatError::RefOutOfRange {
-            what: "dictionary code",
-        })
+    merge_nulls(&nulls, codes.len(), |index| {
+        dictionary_entry(&codes, &dictionary, index)
     })
 }
 
-/// Resolves each stored code to the dictionary entry it names, borrowed rather than copied — the codes outnumber the
-/// entries, so a dense column would otherwise copy the same handful of values once per row.
-fn resolve_dictionary_codes<'a>(codes: &[u64], dictionary: &'a [String]) -> Result<Vec<&'a str>, FormatError> {
+/// The dictionary entry that stored code `index` names, borrowed rather than copied: the codes outnumber the entries,
+/// so a dense column would otherwise copy the same handful of values once per row.
+fn dictionary_entry<'a, T: AsRef<str>>(
+    codes: &[u64],
+    dictionary: &'a [T],
+    index: usize,
+) -> Result<&'a str, FormatError> {
     codes
-        .iter()
-        .map(|code| {
-            dictionary
-                .get(*code as usize)
-                .map(String::as_str)
-                .ok_or(FormatError::RefOutOfRange {
-                    what: "dictionary code",
-                })
+        .get(index)
+        .and_then(|&code| dictionary.get(code as usize))
+        .map(AsRef::as_ref)
+        .ok_or(FormatError::RefOutOfRange {
+            what: "dictionary code",
         })
-        .collect()
 }
 
 /// fsst-rs's lossy perfect-hash-table size (`fsst::lossy_pht::HASH_TABLE_SIZE`), pinned with fsst-rs 0.5.11. A slot

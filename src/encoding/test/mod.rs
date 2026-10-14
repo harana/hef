@@ -2381,6 +2381,67 @@ fn zero_width_dictionary_range_decode_matches_the_whole_block() {
     }
 }
 
+/// A hand-built dictionary block: the null stream of `values`, then `entries` as a plain local value stream (or no
+/// value stream at all when `entries` is `None`, the file scope), then `codes` bitpacked.
+fn forged_dictionary_block(values: &StringColumn, entries: Option<&[&str]>, codes: &[u64]) -> (PipelineId, Vec<u8>) {
+    let mut out = Writer::new();
+    NullStream::from_values(values).write(&mut out);
+    let side = match entries {
+        Some(entries) => {
+            out.put_u32(entries.len() as u32);
+            write_offsets(entries.iter().map(|entry| entry.len()), &mut out).unwrap();
+            for entry in entries {
+                out.put_slice(entry.as_bytes());
+            }
+            SideStream::None
+        }
+        None => SideStream::FileScopeDictionary,
+    };
+    bitpack(codes, bits_needed(codes.iter().copied().max().unwrap_or(0)), &mut out);
+    let pipeline =
+        PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String).with_side_stream(side);
+    (pipeline, out.into_bytes())
+}
+
+/// The whole-block dictionary decode checks every stored code, surplus ones included, before it walks the null
+/// stream, so a code past the dictionary wins over a count disagreement, for local and file-scope dictionaries alike.
+#[test]
+fn dictionary_whole_block_decode_checks_every_code_before_weaving_nulls() {
+    let alphabet = vec!["a".to_owned(), "\u{e9}t\u{e9}".to_owned()];
+    let entries = ["a", "\u{e9}t\u{e9}"];
+    let values: StringColumn = (0..4).map(|i| (i != 1).then_some("x")).collect();
+    let disagree = FormatError::Structural {
+        rule: "null bitmap disagrees with present count",
+    };
+    let out_of_range = FormatError::RefOutOfRange {
+        what: "dictionary code",
+    };
+    for local in [Some(entries.as_slice()), None] {
+        let decode = |codes: &[u64]| {
+            let (pipeline, bytes) = forged_dictionary_block(&values, local, codes);
+            decode_block_shared(pipeline, &bytes, Some(&alphabet))
+        };
+        assert_eq!(
+            decode(&[1, 0, 1]).unwrap(),
+            ColumnData::Strings(vec![Some("\u{e9}t\u{e9}"), None, Some("a"), Some("\u{e9}t\u{e9}")].into())
+        );
+        assert_eq!(decode(&[0, 1]).unwrap_err(), disagree, "too few codes");
+        assert_eq!(decode(&[0, 1, 0, 1]).unwrap_err(), disagree, "too many codes");
+        assert_eq!(decode(&[0, 1, 0, 2]).unwrap_err(), out_of_range, "invalid surplus code");
+        assert_eq!(decode(&[2, 1]).unwrap_err(), out_of_range, "invalid code with too few");
+    }
+
+    let absent: StringColumn = (0..3).map(|_| None::<&str>).collect();
+    let (pipeline, bytes) = forged_dictionary_block(&absent, Some(&[]), &[]);
+    assert_eq!(decode_block(pipeline, &bytes).unwrap(), ColumnData::Strings(absent));
+    let (pipeline, bytes) = forged_dictionary_block(&values, Some(&[]), &[0, 0, 0]);
+    assert_eq!(
+        decode_block(pipeline, &bytes).unwrap_err(),
+        out_of_range,
+        "empty dictionary"
+    );
+}
+
 /// Long free-text bodies, the shape `choose_string_transform` sends to the raw arena: high cardinality, average
 /// length past `FSST_MAX_AVERAGE_VALUE_LEN`, one row in nine absent.
 fn long_free_text(rows: usize) -> Vec<Option<String>> {
