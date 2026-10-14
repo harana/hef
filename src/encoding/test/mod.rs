@@ -2271,6 +2271,116 @@ fn dictionary_range_decode_matches_whole_block_across_vector_boundaries() {
     }
 }
 
+/// A hand-built dictionary block whose codes are zero bits wide: the null stream of `values`, then `entries` as the
+/// value stream (plain, FSST with an empty symbol table and every byte escaped, or nothing at file scope), then a
+/// zero-width code stream of `codes` values.
+fn zero_width_dictionary_block(
+    values: &StringColumn,
+    entries: &[&str],
+    side: SideStream,
+    codes: usize,
+) -> (PipelineId, Vec<u8>) {
+    let mut out = Writer::new();
+    NullStream::from_values(values).write(&mut out);
+    match side {
+        SideStream::FileScopeDictionary => {}
+        SideStream::FsstDictionaryValues => {
+            out.put_u32(entries.len() as u32);
+            out.put_u16(0);
+            write_offsets(entries.iter().map(|entry| entry.len() * 2), &mut out).unwrap();
+            for byte in entries.iter().flat_map(|entry| entry.bytes()) {
+                out.put_u8(255);
+                out.put_u8(byte);
+            }
+        }
+        _ => {
+            out.put_u32(entries.len() as u32);
+            write_offsets(entries.iter().map(|entry| entry.len()), &mut out).unwrap();
+            for entry in entries {
+                out.put_slice(entry.as_bytes());
+            }
+        }
+    }
+    out.put_u32(codes as u32);
+    out.put_u8(0);
+    let pipeline =
+        PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String).with_side_stream(side);
+    (pipeline, out.into_bytes())
+}
+
+/// A zero-width dictionary block names entry 0 for every present row. Its range decode must match the whole-block
+/// decode for local, FSST-value and file-scope dictionaries under every null form, and must look entry 0 up only when
+/// the range selects a present row, so an empty dictionary fails exactly when a present row is requested.
+#[test]
+fn zero_width_dictionary_range_decode_matches_the_whole_block() {
+    let alphabet = vec!["only \u{e9}".to_owned(), "other".to_owned()];
+    let rows = 2000usize;
+    let patterns: [(&str, fn(usize) -> bool); 4] = [
+        ("all present", |_| true),
+        ("all absent", |_| false),
+        ("leading and trailing nulls", |i| (5..1500).contains(&i)),
+        ("scattered bitmap", |i| i % 3 != 1),
+    ];
+    let shared = Some(alphabet.as_slice());
+    for (name, present) in patterns {
+        let values: StringColumn = (0..rows).map(|i| present(i).then_some(alphabet[0].as_str())).collect();
+        let count = values.iter().flatten().count();
+        for side in [
+            SideStream::None,
+            SideStream::FsstDictionaryValues,
+            SideStream::FileScopeDictionary,
+        ] {
+            let (pipeline, bytes) = zero_width_dictionary_block(&values, &[alphabet[0].as_str()], side, count);
+            assert_eq!(
+                decode_block_shared(pipeline, &bytes, shared).unwrap(),
+                ColumnData::Strings(values.clone()),
+                "{name} {side:?}: full decode"
+            );
+            for (start, end) in [
+                (0, rows),
+                (0, 1),
+                (3, 9),
+                (1023, 1025),
+                (1990, rows + 50),
+                (rows, rows + 5),
+            ] {
+                let expected: StringColumn = values
+                    .iter()
+                    .skip(start)
+                    .take(end.min(rows).saturating_sub(start))
+                    .collect();
+                assert_eq!(
+                    decode_block_range_shared(pipeline, &bytes, shared, start, end).unwrap(),
+                    ColumnData::Strings(expected),
+                    "{name} {side:?}: range {start}..{end}"
+                );
+            }
+        }
+    }
+
+    let half: StringColumn = (0..10).map(|i| (i >= 5).then_some("x")).collect();
+    let (pipeline, bytes) = zero_width_dictionary_block(&half, &[], SideStream::None, 5);
+    assert_eq!(
+        decode_block_range(pipeline, &bytes, 0, 5).unwrap(),
+        ColumnData::Strings((0..5).map(|_| None::<&str>).collect()),
+        "no present row selected, so the empty dictionary is never consulted"
+    );
+    for result in [
+        decode_block_range(pipeline, &bytes, 3, 8),
+        decode_block(pipeline, &bytes),
+    ] {
+        assert!(
+            matches!(
+                result,
+                Err(FormatError::RefOutOfRange {
+                    what: "dictionary code"
+                })
+            ),
+            "{result:?}"
+        );
+    }
+}
+
 /// Long free-text bodies, the shape `choose_string_transform` sends to the raw arena: high cardinality, average
 /// length past `FSST_MAX_AVERAGE_VALUE_LEN`, one row in nine absent.
 fn long_free_text(rows: usize) -> Vec<Option<String>> {

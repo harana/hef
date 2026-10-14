@@ -4356,8 +4356,18 @@ fn decode_dictionary_string_range(
         )
     };
     if width == 0 {
-        let zero_codes = vec![0u64; present_end - present_start];
-        return materialize(&zero_codes);
+        // Every code is 0, so each present row names entry 0, looked up only when a present row is selected.
+        return merge_nulls_range(
+            &nulls,
+            present_end - present_start,
+            |_| {
+                entries.first().copied().ok_or(FormatError::RefOutOfRange {
+                    what: "dictionary code",
+                })
+            },
+            start,
+            effective_end,
+        );
     }
     let bits = width as usize;
     let words_per_lane = fastlanes_words_per_lane(bits);
