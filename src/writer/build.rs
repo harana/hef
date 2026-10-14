@@ -4108,13 +4108,15 @@ fn build_hef_file_sealed_in_order(
         // edit, which would toggle sharing between otherwise-identical files and re-encode untouched stripes.
         // Borrows straight into the granule/analytical column data instead of cloning every distinct value: the
         // winning alphabet (if any) is cloned exactly once, below, instead of every observed value being cloned up
-        // front. A column whose second granule already disagrees with its first is dropped from `granule_sets`
-        // after that one comparison, so a file-wide non-shareable column (the common case for a high-cardinality
-        // string) does not keep collecting sets from every remaining granule.
+        // front. Each column keeps only its first observed set and how many observations matched it; every later set
+        // is compared against the first and dropped straight away, so candidate memory does not grow with the
+        // granule count. A column whose set disagrees with its first is marked diverged and skips every remaining
+        // observation, so a file-wide non-shareable column (the common case for a high-cardinality string) does not
+        // keep building sets for every remaining granule.
         fn observe_alphabet<'a>(
             column_id: u32,
             values: impl Iterator<Item = &'a str>,
-            granule_sets: &mut BTreeMap<u32, Vec<std::collections::BTreeSet<&'a str>>>,
+            candidates: &mut BTreeMap<u32, (std::collections::BTreeSet<&'a str>, usize)>,
             diverged: &mut HashSet<u32>,
         ) {
             if diverged.contains(&column_id) {
@@ -4127,21 +4129,28 @@ fn build_hef_file_sealed_in_order(
                 }
                 set.insert(value);
             }
-            let sets = granule_sets.entry(column_id).or_default();
-            if sets.first().is_some_and(|first| *first != set) {
-                diverged.insert(column_id);
-                return;
+            match candidates.entry(column_id) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert((set, 1));
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    let (first, matching) = slot.get_mut();
+                    if *first != set {
+                        diverged.insert(column_id);
+                        return;
+                    }
+                    *matching += 1;
+                }
             }
-            sets.push(set);
         }
-        let mut granule_sets: BTreeMap<u32, Vec<std::collections::BTreeSet<&str>>> = BTreeMap::new();
+        let mut candidates: BTreeMap<u32, (std::collections::BTreeSet<&str>, usize)> = BTreeMap::new();
         let mut diverged: HashSet<u32> = HashSet::default();
         for granule in &granules {
             for block in &granule.blocks {
                 if shareable_column(block.column_id)
                     && let ColumnData::Strings(values) = &block.data
                 {
-                    observe_alphabet(block.column_id, values.iter_present(), &mut granule_sets, &mut diverged);
+                    observe_alphabet(block.column_id, values.iter_present(), &mut candidates, &mut diverged);
                 }
             }
         }
@@ -4151,19 +4160,17 @@ fn build_hef_file_sealed_in_order(
             {
                 for (g_start, g_end) in &granule_row_ranges {
                     let present = (*g_start..*g_end).filter_map(|index| values.get(index).flatten());
-                    observe_alphabet(col.column_id, present, &mut granule_sets, &mut diverged);
+                    observe_alphabet(col.column_id, present, &mut candidates, &mut diverged);
                 }
             }
         }
-        for (column_id, sets) in granule_sets {
-            let Some(first) = sets.first() else { continue };
-            if sets.len() > 1
+        for (column_id, (first, matching)) in candidates {
+            if matching > 1
                 && !first.is_empty()
                 && first.len() <= SHARED_DICTIONARY_MAX_VALUES
                 // The footer stores each value behind a u16 length prefix; a longer value cannot be represented,
                 // so its column keeps block-local dictionaries.
                 && first.iter().all(|value| value.len() <= u16::MAX as usize)
-                && sets.iter().all(|set| set == first)
             {
                 shared_alphabets.insert(column_id, first.iter().map(|value| (*value).to_owned()).collect());
             }

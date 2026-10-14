@@ -221,8 +221,10 @@ impl HefPublisher {
             let header = &frame.header;
             // Decode only harana_hej_compact_batch_v1 (enforced by the frame validator) with full batch validation.
             let (_, payload) = decode_frame(&frame.frame_bytes).map_err(PublishFailure::Format)?;
-            let batch = decode_batch(payload, header.event_count).map_err(PublishFailure::Format)?;
-            for (row_index, event) in batch.events.iter().enumerate() {
+            let mut batch = decode_batch(payload, header.event_count).map_err(PublishFailure::Format)?;
+            // Each selected row takes its relationships and provenance out of the decoded event rather than cloning
+            // them; the batch is dropped at the end of this frame, so nothing reads them afterwards.
+            for (row_index, event) in batch.events.iter_mut().enumerate() {
                 let sequence = header.first_sequence + row_index as u64;
                 if sequence < range.first_sequence || sequence > range.last_sequence {
                     continue;
@@ -256,8 +258,8 @@ impl HefPublisher {
                         source_delivery: event.source_delivery.map(str::to_owned),
                         connector_delivery_hash_low: event.variable.connector_delivery_hash_low,
                         connector_delivery_hash_high: event.variable.connector_delivery_hash_high,
-                        provenance: event.provenance.clone(),
-                        relationships: event.relationships.clone(),
+                        provenance: event.provenance.take(),
+                        relationships: event.relationships.take(),
                     },
                 });
             }

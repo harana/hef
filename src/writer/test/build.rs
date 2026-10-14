@@ -3520,6 +3520,68 @@ fn a_status_like_column_shares_one_file_scope_alphabet() {
     }
 }
 
+/// The file-scope alphabet the promoted kind column ends up with when each 16-row granule draws its kind values from
+/// the given set, or `None` when the column keeps block-local dictionaries.
+fn kind_alphabet_for_granules(granule_kinds: &[&[&str]]) -> Option<Vec<String>> {
+    let rows: Vec<HefRow> = granule_kinds
+        .iter()
+        .enumerate()
+        .flat_map(|(granule, kinds)| {
+            (0..16u64).map(move |offset| {
+                let i = granule as u64 * 16 + offset;
+                let mut kind_row = row(i);
+                if let PayloadInput::Variant(VariantValue::Object(fields)) = &mut kind_row.event.payload {
+                    fields.insert(
+                        "kind".to_owned(),
+                        VariantValue::String(kinds[offset as usize % kinds.len()].to_owned()),
+                    );
+                }
+                kind_row
+            })
+        })
+        .collect();
+    let built = build_hef_file(rows, &config()).unwrap();
+    built
+        .footer
+        .shared_dictionaries
+        .iter()
+        .find(|entry| entry.column_id == crate::columns::column_ids::PROMOTED_BASE)
+        .map(|entry| entry.values.clone())
+}
+
+/// Shared-alphabet discovery keeps only the first granule's set and a count of granules that matched it: a later
+/// granule that disagrees stops the count but does not discard the matches already seen, while a disagreement at the
+/// second granule leaves a single match and so no shared alphabet. Pins the selection the discovery has always made,
+/// whatever order the values arrive in.
+#[test]
+fn shared_alphabet_discovery_counts_matches_before_the_first_divergence() {
+    let abc: &[&str] = &["a", "b", "c"];
+    let cba: &[&str] = &["c", "b", "a"];
+    let other: &[&str] = &["a", "b", "z"];
+    let expected = Some(vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]);
+    assert_eq!(
+        kind_alphabet_for_granules(&[abc, cba]),
+        expected,
+        "row order does not matter"
+    );
+    assert_eq!(kind_alphabet_for_granules(&[abc, cba, abc, abc]), expected);
+    assert_eq!(
+        kind_alphabet_for_granules(&[abc, abc, other]),
+        expected,
+        "a late divergence keeps the earlier matches"
+    );
+    assert_eq!(
+        kind_alphabet_for_granules(&[abc, other, abc]),
+        None,
+        "an early divergence leaves one match"
+    );
+    assert_eq!(
+        kind_alphabet_for_granules(&[abc]),
+        None,
+        "a single granule never shares"
+    );
+}
+
 /// A sealed file gains a membership index artifact without a single byte of it changing: the heat-gated plan targets
 /// the promoted columns, the built artifact seals and round-trips, its terms prune values the column never holds and
 /// keep the rest — and granules the artifact does not cover simply stay on the footer tier. Implements
