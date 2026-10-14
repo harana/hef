@@ -50,7 +50,7 @@ use crate::file::bytes::{Reader, Writer};
 use crate::indexes::probabilistic::BinaryFuseFilter;
 use hashbrown::HashSet;
 use std::collections::BTreeMap;
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// Which relationship an edge records between two events of one subject.
@@ -339,7 +339,16 @@ pub fn encode_graph_blocks(
         .first_sn
         .checked_add(row_count)
         .ok_or(refuse("graph sequence numbers overflow"))?;
-    let mut reverse: Vec<[Vec<u64>; GRAPH_EDGE_KINDS]> = vec![Default::default(); graph.rows.len()];
+    // Each event's children inside the file live in one flat buffer, built in two walks over the parent lists: this
+    // validating walk counts the children of each `(row, kind)` slot, and once the whole graph has been checked a
+    // second walk writes them in, ascending, at the positions the counts leave each slot.
+    let reverse_slot = |target: u64, kind: EdgeKind| {
+        target
+            .checked_sub(graph.first_sn)
+            .filter(|&row| row < row_count)
+            .map(|row| row as usize * GRAPH_EDGE_KINDS + kind.slot())
+    };
+    let mut reverse_counts = vec![0usize; graph.rows.len() * GRAPH_EDGE_KINDS];
     // One duplicate-check set for every parent list, cleared between lists, so a list allocates only when it needs
     // more room than every list before it.
     let mut seen = HashSet::new();
@@ -353,12 +362,8 @@ pub fn encode_graph_blocks(
                 if !seen.insert(target) {
                     return Err(refuse("a graph event names the same parent twice"));
                 }
-                if let Some(children) = target
-                    .checked_sub(graph.first_sn)
-                    .and_then(|row| reverse.get_mut(row as usize))
-                    .and_then(|slots| slots.get_mut(kind.slot()))
-                {
-                    children.push(sn);
+                if let Some(count) = reverse_slot(target, kind).and_then(|slot| reverse_counts.get_mut(slot)) {
+                    *count += 1;
                 }
             }
         }
@@ -409,6 +414,32 @@ pub fn encode_graph_blocks(
             return Err(refuse("a graph inbound edge is repeated"));
         }
     }
+    // Slot `s` of the reverse lists runs from `reverse_bounds[s]` up to `reverse_bounds[s + 1]`.
+    let mut reverse_bounds = Vec::with_capacity(reverse_counts.len() + 1);
+    let mut total = 0;
+    reverse_bounds.push(total);
+    for &count in &reverse_counts {
+        total += count;
+        reverse_bounds.push(total);
+    }
+    let mut reverse_children = vec![0u64; total];
+    // The counts are spent, so their buffer becomes each slot's next write position.
+    let mut cursors = reverse_counts;
+    for (cursor, &start) in cursors.iter_mut().zip(&reverse_bounds) {
+        *cursor = start;
+    }
+    for (sn, row) in (graph.first_sn..).zip(&graph.rows) {
+        for (kind, targets) in [(EdgeKind::Prev, &row.prev), (EdgeKind::Auth, &row.auth)] {
+            for &target in targets {
+                if let Some(cursor) = reverse_slot(target, kind).and_then(|slot| cursors.get_mut(slot))
+                    && let Some(child) = reverse_children.get_mut(*cursor)
+                {
+                    *child = sn;
+                    *cursor += 1;
+                }
+            }
+        }
+    }
 
     let mut blocks = BTreeMap::new();
     for granule in granules {
@@ -425,7 +456,7 @@ pub fn encode_graph_blocks(
         encode_csr(
             &mut out,
             first_sn,
-            &slot_lists(reverse.get(range.clone()).unwrap_or_default()),
+            &flat_slot_lists(&reverse_bounds, &reverse_children, range.clone()),
         )?;
         encode_csr(
             &mut out,
@@ -470,6 +501,25 @@ pub fn state_root_entries(graph: &GraphInput, row_count: u64) -> Result<Vec<Stat
 
 fn slot_lists(lists: &[[Vec<u64>; GRAPH_EDGE_KINDS]]) -> Vec<[&[u64]; GRAPH_EDGE_KINDS]> {
     lists.iter().map(|[prev, auth]| [&prev[..], &auth[..]]).collect()
+}
+
+/// The lists of `rows` kept flat in `children`: slot `row * GRAPH_EDGE_KINDS + kind` runs from `bounds[slot]` up to
+/// `bounds[slot + 1]`.
+fn flat_slot_lists<'a>(
+    bounds: &[usize],
+    children: &'a [u64],
+    rows: Range<usize>,
+) -> Vec<[&'a [u64]; GRAPH_EDGE_KINDS]> {
+    rows.map(|row| {
+        std::array::from_fn(|kind| {
+            let slot = row * GRAPH_EDGE_KINDS + kind;
+            match (bounds.get(slot), bounds.get(slot + 1)) {
+                (Some(&start), Some(&end)) => children.get(start..end).unwrap_or_default(),
+                _ => &[],
+            }
+        })
+    })
+    .collect()
 }
 
 fn encode_csr(out: &mut Writer, first_sn: u64, rows: &[[&[u64]; GRAPH_EDGE_KINDS]]) -> Result<(), FormatError> {

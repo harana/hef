@@ -469,6 +469,53 @@ fn graph_blocks_match_the_builder_as_first_written() {
     }
 }
 
+/// The flat reverse lists give the same blocks as a child vector per slot on graphs shaped to stress them: no edges,
+/// every event naming every earlier one (and parents before the file), and one event every other names, each cut into
+/// one-row granules, seven-row granules and one granule for the whole file.
+#[test]
+fn flat_reverse_lists_match_a_vector_per_slot() {
+    let rows = 60u64;
+    let shaped = |first_sn: u64, parents: &dyn Fn(u64) -> RowEdges| GraphInput {
+        chain_cover: None,
+        depth: None,
+        first_sn,
+        inbound: Vec::new(),
+        rows: (first_sn..first_sn + rows).map(parents).collect(),
+        state_roots: BTreeMap::new(),
+        subject: b"room".to_vec(),
+        unresolved: Vec::new(),
+    };
+    let unlinked = shaped(1 << 40, &|_| RowEdges::default());
+    let dense = shaped(5, &|sn| RowEdges {
+        auth: (0..sn).collect(),
+        prev: (5..sn).rev().collect(),
+    });
+    let star = shaped(0, &|sn| RowEdges {
+        auth: if sn > 0 { vec![0] } else { Vec::new() },
+        prev: sn.checked_sub(1).into_iter().collect(),
+    });
+    let cuts = [
+        (0..rows).map(|row| granule(row as u32, row, 1)).collect::<Vec<_>>(),
+        (0..rows)
+            .step_by(7)
+            .map(|row| granule(row as u32, row, (rows - row).min(7) as u32))
+            .collect(),
+        vec![granule(0, 0, rows as u32)],
+    ];
+    for graph in [&unlinked, &dense, &star] {
+        for granules in &cuts {
+            assert_eq!(
+                encode_graph_blocks(graph, rows, granules),
+                encode_graph_blocks_as_first_written(graph, rows, granules)
+            );
+        }
+    }
+    let blocks = encode_graph_blocks(&star, rows, &cuts[2]).unwrap();
+    let edges = decode_granule_edges(&blocks[&0], 0, rows as u32, rows, false).unwrap();
+    assert_eq!(edges.children(0, EdgeKind::Auth), (1..rows).collect::<Vec<_>>());
+    assert_eq!(edges.children(0, EdgeKind::Prev), [1]);
+}
+
 /// A repeated parent at the start, middle or end of a list, or competing with a parent that is not earlier in the
 /// same list, is refused with the same rule as before, whichever comes first.
 #[test]
