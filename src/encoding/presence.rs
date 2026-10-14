@@ -10,23 +10,16 @@
 //!
 //! See: hef-encodings-and-compression/spec.md
 
+use multiversion::multiversion;
+
 /// Counts the set bits in the first `len` bit positions of a packed bitmap.
 ///
-/// Whole 64-bit words are popcounted at a time, then the leftover bytes, then the partial tail byte masked to the
-/// bits `len` actually names — so bits past `len` never count, whatever the byte holds. A `bitmap` shorter than `len`
-/// bits treats every missing bit as unset.
+/// The whole bytes are counted in bulk (see [`count_ones`]), then the partial tail byte is masked to the bits `len`
+/// actually names, so bits past `len` never count, whatever the byte holds. A `bitmap` shorter than `len` bits treats
+/// every missing bit as unset.
 pub(crate) fn count_set_bits(bitmap: &[u8], len: usize) -> usize {
     let full_bytes = (len / 8).min(bitmap.len());
-    let mut words = bitmap.get(..full_bytes).unwrap_or(bitmap).chunks_exact(8);
-    let mut count: usize = words
-        .by_ref()
-        .map(|word| u64::from_le_bytes(word.try_into().unwrap_or([0; 8])).count_ones() as usize)
-        .sum();
-    count += words
-        .remainder()
-        .iter()
-        .map(|byte| byte.count_ones() as usize)
-        .sum::<usize>();
+    let mut count = count_ones(bitmap.get(..full_bytes).unwrap_or(bitmap));
     let tail_bits = len % 8;
     if tail_bits > 0
         && let Some(&byte) = bitmap.get(full_bytes)
@@ -35,6 +28,39 @@ pub(crate) fn count_set_bits(bitmap: &[u8], len: usize) -> usize {
         count += (byte & mask).count_ones() as usize;
     }
     count
+}
+
+/// Counts every set bit in `bytes`.
+///
+/// Takes 32 bytes at a time as four independent 64-bit word counts, which lets the compiler turn the loop into vector
+/// popcounts. It is compiled once per instruction set and the best one for the running CPU is picked at run time; the
+/// portable build is the plain word loop. Leftover whole words, then leftover bytes, finish the count.
+#[multiversion(targets(
+    "x86_64+avx512f+avx512bw+avx512dq+avx512vl+avx512vpopcntdq",
+    "x86_64+avx512f+avx512bw+avx512dq+avx512vl",
+    "x86_64+avx2",
+    "aarch64+neon"
+))]
+fn count_ones(bytes: &[u8]) -> usize {
+    let mut blocks = bytes.chunks_exact(32);
+    let mut lanes = [0u64; 4];
+    for block in blocks.by_ref() {
+        for (lane, word) in lanes.iter_mut().zip(block.chunks_exact(8)) {
+            *lane += u64::from(u64::from_le_bytes(word.try_into().unwrap_or([0; 8])).count_ones());
+        }
+    }
+    let mut words = blocks.remainder().chunks_exact(8);
+    let mut count: u64 = lanes.iter().sum();
+    count += words
+        .by_ref()
+        .map(|word| u64::from(u64::from_le_bytes(word.try_into().unwrap_or([0; 8])).count_ones()))
+        .sum::<u64>();
+    count += words
+        .remainder()
+        .iter()
+        .map(|byte| u64::from(byte.count_ones()))
+        .sum::<u64>();
+    count as usize
 }
 
 /// Counts how many non-null rows appear before `row_idx` in the null bitmap. A `row_idx` past the bitmap counts every
@@ -67,13 +93,9 @@ pub(crate) struct PresenceRank {
 impl PresenceRank {
     /// Indexes `bitmap`, which every later probe must pass back in.
     pub(crate) fn new(bitmap: &[u8]) -> Self {
-        let mut present_before_word = Vec::with_capacity(bitmap.len().div_ceil(8));
-        let mut running = 0u32;
-        for word in bitmap.chunks(8) {
-            present_before_word.push(running);
-            running += load_word(word).count_ones();
+        Self {
+            present_before_word: present_before_each_word(bitmap),
         }
-        Self { present_before_word }
     }
 
     /// The dense position of `row` among the present rows of `bitmap` — the bitmap this rank was built over — or
@@ -90,6 +112,31 @@ impl PresenceRank {
         let below_row = (1u64 << (row % 64)) - 1;
         Some(before_word + (word & below_row).count_ones() as usize)
     }
+}
+
+/// The running present-count before each 64-bit word of `bitmap`, one entry per eight bytes with a partial last word
+/// getting an entry too. Built per instruction set like [`count_ones`], so each word costs a hardware popcount.
+#[multiversion(targets(
+    "x86_64+avx512f+avx512bw+avx512dq+avx512vl+avx512vpopcntdq",
+    "x86_64+avx512f+avx512bw+avx512dq+avx512vl",
+    "x86_64+avx2",
+    "aarch64+neon"
+))]
+fn present_before_each_word(bitmap: &[u8]) -> Vec<u32> {
+    let mut words = bitmap.chunks_exact(8);
+    let mut running = 0u32;
+    let mut present_before_word: Vec<u32> = words
+        .by_ref()
+        .map(|word| {
+            let before = running;
+            running += u64::from_le_bytes(word.try_into().unwrap_or([0; 8])).count_ones();
+            before
+        })
+        .collect();
+    if !words.remainder().is_empty() {
+        present_before_word.push(running);
+    }
+    present_before_word
 }
 
 /// Reads up to eight bitmap bytes as one little-endian word, so bit `n` of the word is bit `n % 8` of byte `n / 8`; a
