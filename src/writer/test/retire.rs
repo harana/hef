@@ -79,9 +79,10 @@ fn build_config() -> HefBuildConfig {
     }
 }
 
-/// The compaction output: one file holding sequences 1 through 4.
-fn merged_file() -> BuiltHef {
-    let rows = (1..=4)
+/// One epoch-1 file holding a row at each of `sequences`.
+fn file_of(sequences: impl IntoIterator<Item = u64>) -> BuiltHef {
+    let rows = sequences
+        .into_iter()
         .map(|sequence| HefRow {
             epoch: 1,
             sequence,
@@ -89,6 +90,34 @@ fn merged_file() -> BuiltHef {
         })
         .collect();
     build_hef_file(rows, &build_config()).unwrap()
+}
+
+/// The compaction output: one file holding sequences 1 through 4.
+fn merged_file() -> BuiltHef {
+    file_of(1..=4)
+}
+
+/// Stores a file holding a row at each of `sequences` in `objects` and returns its `Active` entry covering
+/// `first_sequence..=last_sequence`, as a compaction input.
+fn stored_input(
+    objects: &SimObjectStore,
+    first_sequence: u64,
+    last_sequence: u64,
+    sequences: impl IntoIterator<Item = u64>,
+) -> HefFileEntry {
+    let built = file_of(sequences);
+    objects
+        .put_if_absent(&hef_object_key(tenant(), built.file_id), &built.bytes)
+        .unwrap();
+    HefFileEntry {
+        file_seal: built.file_seal,
+        ..entry(built.file_id, first_sequence, last_sequence, PartState::Active)
+    }
+}
+
+fn outdated(mut entry: HefFileEntry) -> HefFileEntry {
+    entry.part_state = PartState::Outdated;
+    entry
 }
 
 fn entry(file_id: u128, first_sequence: u64, last_sequence: u64, part_state: PartState) -> HefFileEntry {
@@ -125,16 +154,18 @@ fn publish_directly(set: &mut SimulatedPublishedSet, generation: ManifestGenerat
 
 #[test]
 fn a_compaction_publishes_one_generation_that_adds_the_output_and_outdates_the_inputs() {
+    let objects = SimObjectStore::new();
+    let first = stored_input(&objects, 1, 2, 1..=2);
+    let second = stored_input(&objects, 3, 4, 3..=4);
     let mut set = SimulatedPublishedSet::new();
     publish_directly(
         &mut set,
         ManifestGeneration {
-            files: vec![entry(101, 1, 2, PartState::Active), entry(102, 3, 4, PartState::Active)],
+            files: vec![first.clone(), second.clone()],
             generation: 1,
             ..Default::default()
         },
     );
-    let objects = SimObjectStore::new();
     let mut notices = NoopPeerNotices::default();
     let clock = FixedClock::at(START_NANOS);
     let built = merged_file();
@@ -144,7 +175,7 @@ fn a_compaction_publishes_one_generation_that_adds_the_output_and_outdates_the_i
         .publish_compaction(
             built,
             &build_config(),
-            &[102, 101],
+            &[second.file_id, first.file_id],
             &mut set,
             &objects,
             &mut notices,
@@ -163,9 +194,9 @@ fn a_compaction_publishes_one_generation_that_adds_the_output_and_outdates_the_i
     assert_eq!(
         head.files,
         vec![
-            entry(101, 1, 2, PartState::Outdated),
-            entry(102, 3, 4, PartState::Outdated),
-            published.entry.clone(),
+            outdated(first.clone()),
+            outdated(second.clone()),
+            published.entry.clone()
         ]
     );
     assert_eq!(
@@ -183,12 +214,12 @@ fn a_compaction_publishes_one_generation_that_adds_the_output_and_outdates_the_i
         head.retirements,
         vec![
             Retirement {
-                file_id: 102,
+                file_id: second.file_id,
                 generation: 2,
                 since_nanos: START_NANOS
             },
             Retirement {
-                file_id: 101,
+                file_id: first.file_id,
                 generation: 2,
                 since_nanos: START_NANOS
             },
@@ -204,7 +235,9 @@ fn a_compaction_publishes_one_generation_that_adds_the_output_and_outdates_the_i
 #[test]
 fn a_compacted_graph_file_publishes_its_summary_in_the_manifest_entry() {
     let mut set = SimulatedPublishedSet::new();
-    let mut inputs = vec![entry(101, 1, 2, PartState::Active), entry(102, 3, 4, PartState::Active)];
+    let objects = SimObjectStore::new();
+    let mut inputs = vec![stored_input(&objects, 1, 2, 1..=2), stored_input(&objects, 3, 4, 3..=4)];
+    let input_ids: Vec<u128> = inputs.iter().map(|input| input.file_id).collect();
     for input in &mut inputs {
         input.profile = crate::layout::Profile::Graph;
     }
@@ -243,9 +276,9 @@ fn a_compacted_graph_file_publishes_its_summary_in_the_manifest_entry() {
         .publish_compaction(
             built,
             &config,
-            &[101, 102],
+            &input_ids,
             &mut set,
-            &SimObjectStore::new(),
+            &objects,
             &mut NoopPeerNotices::default(),
             &FixedClock::at(START_NANOS),
         )
@@ -293,6 +326,79 @@ fn a_compaction_over_a_gap_is_refused_before_anything_is_written() {
     assert!(matches!(result, Err(PublishFailure::Verification(_))));
     assert_eq!(set.head().unwrap().0, 1);
     assert!(objects.keys().is_empty());
+}
+
+#[test]
+fn a_compaction_output_that_drops_rows_is_refused_before_anything_is_written() {
+    // The inputs hold sequences 1 to 10 and declare no deletes; an output holding only 3 and 4 lies inside their
+    // coverage, so it passes the range check, but publishing it would advertise rows it does not contain.
+    let objects = SimObjectStore::new();
+    let first = stored_input(&objects, 1, 5, 1..=5);
+    let second = stored_input(&objects, 6, 10, 6..=10);
+    let mut set = SimulatedPublishedSet::new();
+    publish_directly(
+        &mut set,
+        ManifestGeneration {
+            files: vec![first.clone(), second.clone()],
+            generation: 1,
+            ..Default::default()
+        },
+    );
+    let shortened = file_of(3..=4);
+    let shortened_key = hef_object_key(tenant(), shortened.file_id);
+
+    let result = HefPublisher::new().publish_compaction(
+        shortened,
+        &build_config(),
+        &[first.file_id, second.file_id],
+        &mut set,
+        &objects,
+        &mut NoopPeerNotices::default(),
+        &FixedClock::at(START_NANOS),
+    );
+
+    assert!(matches!(result, Err(PublishFailure::Verification(_))));
+    assert_eq!(set.head().unwrap().0, 1);
+    assert_eq!(objects.object(&shortened_key), None, "nothing is uploaded");
+}
+
+#[test]
+fn a_compaction_whose_input_ends_in_void_sequences_still_publishes() {
+    // Sequence 3 was a void record: the first input covers it without a row, so the faithful output holds rows 1, 2
+    // and 4 and its header ends short of nothing the inputs hold.
+    let objects = SimObjectStore::new();
+    let first = stored_input(&objects, 1, 3, 1..=2);
+    let second = stored_input(&objects, 4, 4, [4]);
+    let mut set = SimulatedPublishedSet::new();
+    publish_directly(
+        &mut set,
+        ManifestGeneration {
+            files: vec![first.clone(), second.clone()],
+            generation: 1,
+            ..Default::default()
+        },
+    );
+
+    let published = HefPublisher::new()
+        .publish_compaction(
+            file_of([1, 2, 4]),
+            &build_config(),
+            &[first.file_id, second.file_id],
+            &mut set,
+            &objects,
+            &mut NoopPeerNotices::default(),
+            &FixedClock::at(START_NANOS),
+        )
+        .unwrap();
+
+    assert_eq!(
+        published.entry.coverage,
+        SequenceRange {
+            epoch: 1,
+            first_sequence: 1,
+            last_sequence: 4
+        }
+    );
 }
 
 #[test]
