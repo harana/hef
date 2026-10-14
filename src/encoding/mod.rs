@@ -455,25 +455,25 @@ fn bitpack(values: &[u64], width: u32, out: &mut Writer) {
     let words_per_vector = FASTLANES_LANES * fastlanes_words_per_lane(bits);
     let vectors = values.len().div_ceil(FASTLANES_VECTOR);
     let value_mask = mask(width);
-    let mut packed = vec![0u64; vectors * words_per_vector];
-    // Whole vectors are gathered straight out of `values` — nothing is copied to reach them.
-    let mut whole = values.chunks_exact(FASTLANES_VECTOR);
-    for (packed_vector, in_vector) in packed.chunks_exact_mut(words_per_vector).zip(whole.by_ref()) {
-        bitpack_vector(in_vector, packed_vector, width, value_mask);
-    }
-    // A trailing partial vector is the one that needs a buffer of its own: its values go into a zero-filled vector,
-    // exactly matching the tail fill the transposed layout defines, and are then gathered like any other.
-    let tail = whole.remainder();
-    if !tail.is_empty()
-        && let Some(packed_vector) = packed.chunks_exact_mut(words_per_vector).nth(vectors - 1)
+    let packed = out.reserve_bytes(vectors * words_per_vector * 8);
+    let mut scratch = [0u64; FASTLANES_VECTOR];
+    let mut padded = [0u64; FASTLANES_VECTOR];
+    for (packed_vector, in_vector) in packed
+        .chunks_exact_mut(words_per_vector * 8)
+        .zip(values.chunks(FASTLANES_VECTOR))
     {
-        let mut padded = [0u64; FASTLANES_VECTOR];
-        for (slot, value) in padded.iter_mut().zip(tail) {
-            *slot = *value;
-        }
-        bitpack_vector(&padded, packed_vector, width, value_mask);
+        // Whole vectors are gathered straight out of `values`. A trailing partial vector goes into a zero-filled
+        // vector first, exactly matching the tail fill the transposed layout defines.
+        let in_vector = if in_vector.len() == FASTLANES_VECTOR {
+            in_vector
+        } else {
+            for (slot, value) in padded.iter_mut().zip(in_vector) {
+                *slot = *value;
+            }
+            &padded
+        };
+        pack_vector_into(in_vector, &mut scratch, packed_vector, width, value_mask);
     }
-    out.put_u64_slice(&packed);
 }
 
 /// [`bitpack`] for a caller whose values are not already a `&[u64]` slice: `lane(i)` produces value `i` on demand
@@ -491,17 +491,44 @@ fn bitpack_with(len: usize, width: u32, out: &mut Writer, lane: impl Fn(usize) -
     let words_per_vector = FASTLANES_LANES * fastlanes_words_per_lane(bits);
     let vectors = len.div_ceil(FASTLANES_VECTOR);
     let value_mask = mask(width);
-    let mut packed = vec![0u64; vectors * words_per_vector];
+    let packed = out.reserve_bytes(vectors * words_per_vector * 8);
     let mut buffer = [0u64; FASTLANES_VECTOR];
-    for (vector_index, packed_vector) in packed.chunks_exact_mut(words_per_vector).enumerate() {
+    let mut scratch = [0u64; FASTLANES_VECTOR];
+    for (vector_index, packed_vector) in packed.chunks_exact_mut(words_per_vector * 8).enumerate() {
         let base = vector_index * FASTLANES_VECTOR;
         let this_len = FASTLANES_VECTOR.min(len.saturating_sub(base));
         for (offset, slot) in buffer.iter_mut().enumerate() {
             *slot = if offset < this_len { lane(base + offset) } else { 0 };
         }
-        bitpack_vector(&buffer, packed_vector, width, value_mask);
+        pack_vector_into(&buffer, &mut scratch, packed_vector, width, value_mask);
     }
-    out.put_u64_slice(&packed);
+}
+
+/// Packs one whole 1024-value vector and writes its words little-endian into `packed_vector`, that vector's slot in the
+/// output.
+///
+/// The kernel works on aligned `u64` words, so it packs into `scratch` (8 KiB, enough for one vector at width 64) and
+/// only that vector's words are copied out; the output bytes sit at an arbitrary offset in the writer and are never
+/// reinterpreted as words. Staging memory stays at one vector however long the stream is: a caller holding this
+/// scratch plus a 1024-value input buffer uses about 16 KiB of stack.
+fn pack_vector_into(
+    in_vector: &[u64],
+    scratch: &mut [u64; FASTLANES_VECTOR],
+    packed_vector: &mut [u8],
+    width: u32,
+    value_mask: u64,
+) {
+    let words = scratch.get_mut(..packed_vector.len() / 8).unwrap_or(&mut []);
+    // The kernel ORs bits into its destination, so every vector starts from zeroed words.
+    words.fill(0);
+    bitpack_vector(in_vector, words, width, value_mask);
+    if cfg!(target_endian = "little") {
+        packed_vector.copy_from_slice(bytemuck::cast_slice(words));
+    } else {
+        for (bytes, word) in packed_vector.chunks_exact_mut(8).zip(words.iter()) {
+            bytes.copy_from_slice(&word.to_le_bytes());
+        }
+    }
 }
 
 /// Gathers one whole 1024-value vector into the packed words of its own vector slot, in the FastLanes transposed order.
@@ -604,6 +631,28 @@ impl PackedStream<'_> {
             return;
         }
         unpack_vectors(self.packed, self.width, out, lane);
+    }
+
+    /// Hands `consume` the stream's values in their original order, one 1024-value vector at a time, never including
+    /// the padding after the last value. Each vector is unpacked into one reused 8 KiB buffer, so a caller that walks
+    /// the values once never holds the whole stream. A zero-width stream yields its count of zeros.
+    fn for_each_vector(&self, mut consume: impl FnMut(&[u64])) {
+        let mut buffer = [0u64; FASTLANES_VECTOR];
+        let bytes_per_vector = FASTLANES_LANES * fastlanes_words_per_lane(self.width as usize) * 8;
+        // A zero-width stream has no packed bytes; `max(1)` only keeps the chunk size legal for it.
+        let mut packed_vectors = self.packed.chunks(bytes_per_vector.max(1));
+        let mut remaining = self.count;
+        while remaining > 0 {
+            let rows = remaining.min(FASTLANES_VECTOR);
+            if self.width != 0 {
+                let Some(packed_vector) = packed_vectors.next() else {
+                    return;
+                };
+                unpack_vectors(packed_vector, self.width, &mut buffer, |packed| packed);
+            }
+            consume(buffer.get(..rows).unwrap_or(&[]));
+            remaining -= rows;
+        }
     }
 }
 

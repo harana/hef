@@ -1,5 +1,5 @@
 use super::*;
-use crate::encoding::{CascadeStrategy, Compression, encode_block, encode_block_forced_for_conformance};
+use crate::encoding::{CascadeStrategy, Compression, bitpack, encode_block, encode_block_forced_for_conformance};
 use crate::file::bytes::Writer;
 use std::collections::BTreeSet;
 
@@ -692,6 +692,128 @@ fn delta_encoded_equals_not_equals_and_in_set_match_the_reference() {
             "diverged for {predicate:?}"
         );
     }
+}
+
+/// A raw DELTA body: the first value, then `codes` (zigzag deltas) bit-packed at `width`, with the stream's count
+/// header rewritten to `count` so trailing codes become nonzero padding the filter must ignore.
+fn delta_body(first: u64, codes: &[u64], width: u32, count: usize) -> Vec<u8> {
+    let mut writer = Writer::new();
+    writer.put_u64(first);
+    bitpack(codes, width, &mut writer);
+    let mut body = writer.into_bytes();
+    body[8..12].copy_from_slice(&(count as u32).to_le_bytes());
+    body
+}
+
+/// The DELTA filter walks the stream one unpacked vector at a time; its verdicts must equal decoding every value and
+/// filtering, across vector boundaries, extreme widths, wrapping prefix sums and nonzero padding past the count.
+#[test]
+fn delta_filter_matches_decode_then_filter_across_vector_boundaries() {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state
+    };
+    for width in [0u32, 1, 63, 64] {
+        for count in [0usize, 1, 1023, 1024, 1025, 2048, 2049] {
+            for first in [0u64, u64::MAX - 3, i64::MAX as u64 - 1] {
+                // Pad the codes to whole vectors with nonzero values; only `count` of them are logical.
+                let padded = count.div_ceil(1024).max(1) * 1024;
+                let codes: Vec<u64> = (0..padded)
+                    .map(|_| if width == 0 { 0 } else { next() & mask(width) | 1 })
+                    .collect();
+                let body = delta_body(first, &codes, width, count);
+                let mut values = vec![first];
+                for code in &codes[..count] {
+                    let last = *values.last().unwrap();
+                    values.push(last.wrapping_add(unzigzag(*code) as u64));
+                }
+                let hit = values[values.len() / 2];
+                for (kind, column) in [
+                    (ValueKind::U64, ColumnData::U64(values.clone())),
+                    (
+                        ValueKind::I64,
+                        ColumnData::I64(values.iter().map(|value| unzigzag(*value)).collect()),
+                    ),
+                ] {
+                    let signed_hit = i128::from(unzigzag(hit));
+                    let hit = if kind == ValueKind::U64 {
+                        i128::from(hit)
+                    } else {
+                        signed_hit
+                    };
+                    let predicates = [
+                        NumericPredicate::Equals(hit),
+                        NumericPredicate::NotEquals(hit),
+                        NumericPredicate::InSet(vec![hit, -1, i128::from(u64::MAX)]),
+                        NumericPredicate::InSet(Vec::new()),
+                        NumericPredicate::Range {
+                            lower: Some(NumericBound {
+                                inclusive: false,
+                                value: hit - 1000,
+                            }),
+                            upper: Some(NumericBound {
+                                inclusive: true,
+                                value: hit,
+                            }),
+                        },
+                        NumericPredicate::Range {
+                            lower: None,
+                            upper: Some(NumericBound {
+                                inclusive: false,
+                                value: 0,
+                            }),
+                        },
+                    ];
+                    for predicate in &predicates {
+                        assert_eq!(
+                            filter_delta_block(&body, predicate, kind).unwrap(),
+                            predicate.filter_decoded(&column),
+                            "width {width}, count {count}, first {first}, {kind:?}, {predicate:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The streaming DELTA filter keeps the stream's validation: a width past 64, a truncated header or packed vector and a
+/// zero-width count past the block bound are refused, while bytes after the stream are still ignored.
+#[test]
+fn delta_filter_keeps_its_stream_validation() {
+    let predicate = NumericPredicate::NotEquals(0);
+    let body = delta_body(7, &[2; 2048], 2, 1500);
+    assert_eq!(
+        filter_delta_block(&body, &predicate, ValueKind::U64).unwrap().len(),
+        1501
+    );
+
+    let mut too_wide = body.clone();
+    too_wide[12] = 65;
+    assert!(filter_delta_block(&too_wide, &predicate, ValueKind::U64).is_err());
+    assert!(filter_delta_block(&body[..10], &predicate, ValueKind::U64).is_err());
+    let mut three_vectors = body.clone();
+    three_vectors[8..12].copy_from_slice(&2100u32.to_le_bytes());
+    assert!(filter_delta_block(&three_vectors, &predicate, ValueKind::U64).is_err());
+    assert!(filter_delta_block(&body[..body.len() - 1], &predicate, ValueKind::U64).is_err());
+
+    let too_many_zeros = delta_body(7, &[], 0, (1 << 24) + 1);
+    assert!(filter_delta_block(&too_many_zeros, &predicate, ValueKind::U64).is_err());
+    let zeros = delta_body(7, &[], 0, 3);
+    assert_eq!(
+        filter_delta_block(&zeros, &predicate, ValueKind::U64).unwrap(),
+        vec![true; 4]
+    );
+
+    let mut trailing = body.clone();
+    trailing.extend_from_slice(&[0xFF; 5]);
+    assert_eq!(
+        filter_delta_block(&trailing, &predicate, ValueKind::U64).unwrap(),
+        filter_delta_block(&body, &predicate, ValueKind::U64).unwrap()
+    );
 }
 
 /// Decimal128's compressed-data kernel translates the predicate once into native `i128` intervals
