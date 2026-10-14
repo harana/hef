@@ -1018,7 +1018,7 @@ fn null_stream_picks_the_smallest_form() {
 
 /// The null-stream derivation as it stood before the counting first pass: build every present-row run, then pick the
 /// form from them. Kept here as the reference the current derivation must match byte for byte.
-fn reference_null_stream(values: &StringColumn) -> NullStream {
+fn reference_null_stream(values: &StringColumn) -> NullStream<'static> {
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for (index, value) in values.iter().enumerate() {
         if value.is_some() {
@@ -1043,7 +1043,7 @@ fn reference_null_stream(values: &StringColumn) -> NullStream {
                 raw[row / 8] |= 1 << (row % 8);
             }
         }
-        NullStreamForm::Raw(raw)
+        NullStreamForm::Raw(Cow::Owned(raw))
     };
     NullStream { form, row_count }
 }
@@ -1212,7 +1212,7 @@ fn string_transforms_round_trip_under_every_null_stream_form() {
 fn null_stream_refuses_malformed_input() {
     let read = |bytes: &[u8]| {
         let mut reader = Reader::new(bytes);
-        NullStream::read(&mut reader)
+        NullStream::read(&mut reader).map(NullStream::into_owned)
     };
     let stream = |row_count: u32, form: u8, rest: &[u8]| {
         let mut out = Writer::new();
@@ -1234,6 +1234,53 @@ fn null_stream_refuses_malformed_input() {
     let unsorted = [2u32.to_le_bytes().as_slice(), &run(4, 6), &run(0, 2)].concat();
     assert!(read(&stream(8, 2, &unsorted)).is_err(), "unsorted runs");
     assert!(read(&stream(64, 3, &[0xFF; 4])).is_err(), "truncated raw bitmap");
+}
+
+/// A raw-form null stream read from a block borrows its bitmap straight out of the input instead of copying it, the
+/// encoder's derived stream owns its bitmap, and both write the same bytes. Decodes of a raw-form block still return
+/// output that outlives the block bytes.
+#[test]
+fn raw_null_stream_borrows_the_input_bitmap_and_decodes_into_owned_output() {
+    let derived = NullStream::from_values(&string_values_with_nulls(300, |i| i % 2 == 0));
+    assert!(matches!(derived.form, NullStreamForm::Raw(Cow::Owned(_))));
+    let mut out = Writer::new();
+    derived.write(&mut out);
+    let bytes = out.into_bytes();
+    let read = NullStream::read(&mut Reader::new(&bytes)).unwrap();
+    match &read.form {
+        NullStreamForm::Raw(Cow::Borrowed(bits)) => {
+            assert_eq!(bits.as_ptr(), bytes[5..].as_ptr());
+            assert_eq!(bits.len(), 300usize.div_ceil(8));
+        }
+        other => panic!("expected a borrowed raw bitmap, got {other:?}"),
+    }
+    assert_eq!(read, derived);
+    let mut rewritten = Writer::new();
+    read.write(&mut rewritten);
+    assert_eq!(rewritten.into_bytes(), bytes);
+
+    let values: Vec<Option<String>> = (0..300).map(|i| (i % 2 == 0).then(|| format!("v{i}-\u{e9}"))).collect();
+    let data = ColumnData::Strings(values.clone().into());
+    for transform in [Transform::DictionaryString, Transform::FsstString, Transform::RawString] {
+        let block =
+            encode_block_forced_for_conformance(&data, false, CascadeStrategy::DecodeOptimized, transform).unwrap();
+        let mut bytes = block.bytes.clone();
+        let full = decode_block(block.pipeline, &bytes).unwrap();
+        let range = decode_block_range(block.pipeline, &bytes, 3, 10).unwrap();
+        let views = decode_string_block_views(block.pipeline, &bytes).unwrap().unwrap();
+        bytes.fill(0);
+        drop(bytes);
+        assert_eq!(full, data, "{transform:?}: full decode");
+        assert_eq!(
+            range,
+            ColumnData::Strings(values[3..10].to_vec().into()),
+            "{transform:?}: range decode"
+        );
+        let viewed: Vec<Option<String>> = (0..views.len())
+            .map(|row| views.is_valid(row).then(|| views.value(row).to_string()))
+            .collect();
+        assert_eq!(viewed, values, "{transform:?}: views");
+    }
 }
 
 /// A hand-built FSST string block: one present row whose compressed bytes are `data`, under a symbol table with the
@@ -2287,6 +2334,243 @@ fn dictionary_range_decode_matches_whole_block_across_vector_boundaries() {
     }
 }
 
+/// A hand-built dictionary block whose codes are zero bits wide: the null stream of `values`, then `entries` as the
+/// value stream (plain, FSST with an empty symbol table and every byte escaped, or nothing at file scope), then a
+/// zero-width code stream of `codes` values.
+fn zero_width_dictionary_block(
+    values: &StringColumn,
+    entries: &[&str],
+    side: SideStream,
+    codes: usize,
+) -> (PipelineId, Vec<u8>) {
+    let mut out = Writer::new();
+    NullStream::from_values(values).write(&mut out);
+    match side {
+        SideStream::FileScopeDictionary => {}
+        SideStream::FsstDictionaryValues => {
+            out.put_u32(entries.len() as u32);
+            out.put_u16(0);
+            write_offsets(entries.iter().map(|entry| entry.len() * 2), &mut out).unwrap();
+            for byte in entries.iter().flat_map(|entry| entry.bytes()) {
+                out.put_u8(255);
+                out.put_u8(byte);
+            }
+        }
+        _ => {
+            out.put_u32(entries.len() as u32);
+            write_offsets(entries.iter().map(|entry| entry.len()), &mut out).unwrap();
+            for entry in entries {
+                out.put_slice(entry.as_bytes());
+            }
+        }
+    }
+    out.put_u32(codes as u32);
+    out.put_u8(0);
+    let pipeline =
+        PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String).with_side_stream(side);
+    (pipeline, out.into_bytes())
+}
+
+/// A zero-width dictionary block names entry 0 for every present row. Its range decode must match the whole-block
+/// decode for local, FSST-value and file-scope dictionaries under every null form, and must look entry 0 up only when
+/// the range selects a present row, so an empty dictionary fails exactly when a present row is requested.
+#[test]
+fn zero_width_dictionary_range_decode_matches_the_whole_block() {
+    let alphabet = vec!["only \u{e9}".to_owned(), "other".to_owned()];
+    let rows = 2000usize;
+    let patterns: [(&str, fn(usize) -> bool); 4] = [
+        ("all present", |_| true),
+        ("all absent", |_| false),
+        ("leading and trailing nulls", |i| (5..1500).contains(&i)),
+        ("scattered bitmap", |i| i % 3 != 1),
+    ];
+    let shared = Some(alphabet.as_slice());
+    for (name, present) in patterns {
+        let values: StringColumn = (0..rows).map(|i| present(i).then_some(alphabet[0].as_str())).collect();
+        let count = values.iter().flatten().count();
+        for side in [
+            SideStream::None,
+            SideStream::FsstDictionaryValues,
+            SideStream::FileScopeDictionary,
+        ] {
+            let (pipeline, bytes) = zero_width_dictionary_block(&values, &[alphabet[0].as_str()], side, count);
+            assert_eq!(
+                decode_block_shared(pipeline, &bytes, shared).unwrap(),
+                ColumnData::Strings(values.clone()),
+                "{name} {side:?}: full decode"
+            );
+            for (start, end) in [
+                (0, rows),
+                (0, 1),
+                (3, 9),
+                (1023, 1025),
+                (1990, rows + 50),
+                (rows, rows + 5),
+            ] {
+                let expected: StringColumn = values
+                    .iter()
+                    .skip(start)
+                    .take(end.min(rows).saturating_sub(start))
+                    .collect();
+                assert_eq!(
+                    decode_block_range_shared(pipeline, &bytes, shared, start, end).unwrap(),
+                    ColumnData::Strings(expected),
+                    "{name} {side:?}: range {start}..{end}"
+                );
+            }
+        }
+    }
+
+    let half: StringColumn = (0..10).map(|i| (i >= 5).then_some("x")).collect();
+    let (pipeline, bytes) = zero_width_dictionary_block(&half, &[], SideStream::None, 5);
+    assert_eq!(
+        decode_block_range(pipeline, &bytes, 0, 5).unwrap(),
+        ColumnData::Strings((0..5).map(|_| None::<&str>).collect()),
+        "no present row selected, so the empty dictionary is never consulted"
+    );
+    for result in [
+        decode_block_range(pipeline, &bytes, 3, 8),
+        decode_block(pipeline, &bytes),
+    ] {
+        assert!(
+            matches!(
+                result,
+                Err(FormatError::RefOutOfRange {
+                    what: "dictionary code"
+                })
+            ),
+            "{result:?}"
+        );
+    }
+}
+
+/// A hand-built dictionary block: the null stream of `values`, then `entries` as a plain local value stream (or no
+/// value stream at all when `entries` is `None`, the file scope), then `codes` bitpacked.
+fn forged_dictionary_block(values: &StringColumn, entries: Option<&[&str]>, codes: &[u64]) -> (PipelineId, Vec<u8>) {
+    let mut out = Writer::new();
+    NullStream::from_values(values).write(&mut out);
+    let side = match entries {
+        Some(entries) => {
+            out.put_u32(entries.len() as u32);
+            write_offsets(entries.iter().map(|entry| entry.len()), &mut out).unwrap();
+            for entry in entries {
+                out.put_slice(entry.as_bytes());
+            }
+            SideStream::None
+        }
+        None => SideStream::FileScopeDictionary,
+    };
+    bitpack(codes, bits_needed(codes.iter().copied().max().unwrap_or(0)), &mut out);
+    let pipeline =
+        PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String).with_side_stream(side);
+    (pipeline, out.into_bytes())
+}
+
+/// The whole-block dictionary decode checks every stored code, surplus ones included, before it walks the null
+/// stream, so a code past the dictionary wins over a count disagreement, for local and file-scope dictionaries alike.
+#[test]
+fn dictionary_whole_block_decode_checks_every_code_before_weaving_nulls() {
+    let alphabet = vec!["a".to_owned(), "\u{e9}t\u{e9}".to_owned()];
+    let entries = ["a", "\u{e9}t\u{e9}"];
+    let values: StringColumn = (0..4).map(|i| (i != 1).then_some("x")).collect();
+    let disagree = FormatError::Structural {
+        rule: "null bitmap disagrees with present count",
+    };
+    let out_of_range = FormatError::RefOutOfRange {
+        what: "dictionary code",
+    };
+    for local in [Some(entries.as_slice()), None] {
+        let decode = |codes: &[u64]| {
+            let (pipeline, bytes) = forged_dictionary_block(&values, local, codes);
+            decode_block_shared(pipeline, &bytes, Some(&alphabet))
+        };
+        assert_eq!(
+            decode(&[1, 0, 1]).unwrap(),
+            ColumnData::Strings(vec![Some("\u{e9}t\u{e9}"), None, Some("a"), Some("\u{e9}t\u{e9}")].into())
+        );
+        assert_eq!(decode(&[0, 1]).unwrap_err(), disagree, "too few codes");
+        assert_eq!(decode(&[0, 1, 0, 1]).unwrap_err(), disagree, "too many codes");
+        assert_eq!(decode(&[0, 1, 0, 2]).unwrap_err(), out_of_range, "invalid surplus code");
+        assert_eq!(decode(&[2, 1]).unwrap_err(), out_of_range, "invalid code with too few");
+    }
+
+    let absent: StringColumn = (0..3).map(|_| None::<&str>).collect();
+    let (pipeline, bytes) = forged_dictionary_block(&absent, Some(&[]), &[]);
+    assert_eq!(decode_block(pipeline, &bytes).unwrap(), ColumnData::Strings(absent));
+    let (pipeline, bytes) = forged_dictionary_block(&values, Some(&[]), &[0, 0, 0]);
+    assert_eq!(
+        decode_block(pipeline, &bytes).unwrap_err(),
+        out_of_range,
+        "empty dictionary"
+    );
+}
+
+/// The whole-block dictionary decode checks every local entry, unused ones included, before it reads the codes, so a
+/// malformed entry wins over a bad code or a count disagreement, for plain and FSST value streams alike.
+#[test]
+fn dictionary_whole_block_decode_checks_every_entry_before_the_codes() {
+    let values: StringColumn = (0..3).map(|_| Some("x")).collect();
+    let plain = |offsets: &[u32], data: &[u8], codes: &[u64]| {
+        let mut out = Writer::new();
+        NullStream::from_values(&values).write(&mut out);
+        out.put_u32(offsets.len() as u32 - 1);
+        for &offset in offsets {
+            out.put_u32(offset);
+        }
+        out.put_slice(data);
+        bitpack(codes, bits_needed(codes.iter().copied().max().unwrap_or(0)), &mut out);
+        let pipeline = PipelineId::new(Transform::DictionaryString, Compression::None, ValueKind::String);
+        decode_block(pipeline, &out.into_bytes())
+    };
+    let utf8 = FormatError::InvalidUtf8 {
+        what: "dictionary entry",
+    };
+    assert_eq!(
+        plain(&[0, 1, 3], "a\u{e9}".as_bytes(), &[1, 0, 1]).unwrap(),
+        ColumnData::Strings(vec![Some("\u{e9}"), Some("a"), Some("\u{e9}")].into())
+    );
+    assert_eq!(
+        plain(&[1, 2, 4], "za\u{e9}".as_bytes(), &[0, 0, 1]).unwrap(),
+        ColumnData::Strings(vec![Some("a"), Some("a"), Some("\u{e9}")].into()),
+        "a leading offset other than zero"
+    );
+    assert_eq!(
+        plain(&[0, 1, 2], b"a\xFF", &[0, 0, 0]).unwrap_err(),
+        utf8,
+        "unused invalid entry"
+    );
+    assert_eq!(
+        plain(&[0, 1, 2], b"a\xFF", &[0, 9]).unwrap_err(),
+        utf8,
+        "beats a bad code and count"
+    );
+    assert_eq!(
+        plain(&[0, 1, 3], "\u{e9}b".as_bytes(), &[0, 0, 0]).unwrap_err(),
+        utf8,
+        "split character"
+    );
+    assert_eq!(
+        plain(&[0, 2, 1, 3], b"abc", &[0, 0, 0]).unwrap_err(),
+        FormatError::Structural {
+            rule: "dictionary offsets must be non-decreasing",
+        }
+    );
+    assert!(matches!(
+        plain(&[0, 1, 9], b"ab", &[0, 0, 0]),
+        Err(FormatError::Truncated { .. })
+    ));
+
+    let long = "y".repeat(DICTIONARY_FSST_MAX_VALUE_LEN + 1);
+    let (pipeline, bytes) = zero_width_dictionary_block(&values, &[long.as_str()], SideStream::FsstDictionaryValues, 1);
+    assert_eq!(
+        decode_block(pipeline, &bytes).unwrap_err(),
+        FormatError::Structural {
+            rule: "dictionary entry exceeds the FSST value cap",
+        },
+        "the cap beats a count disagreement"
+    );
+}
+
 /// Long free-text bodies, the shape `choose_string_transform` sends to the raw arena: high cardinality, average
 /// length past `FSST_MAX_AVERAGE_VALUE_LEN`, one row in nine absent.
 fn long_free_text(rows: usize) -> Vec<Option<String>> {
@@ -2324,6 +2608,69 @@ fn a_raw_string_block_holding_invalid_utf8_is_rejected() {
     assert!(decode_block(pipeline, &forged).is_err());
     assert!(decode_string_block_views(pipeline, &forged).is_err());
     assert!(decode_block_range(pipeline, &forged, 0, 1).is_err());
+}
+
+/// A hand-built raw string block: the null stream of `values`, then `offsets.len() - 1` stored values whose offset
+/// table is `offsets` over the byte arena `data`.
+fn forged_raw_string_block(values: &StringColumn, offsets: &[u32], data: &[u8]) -> Vec<u8> {
+    let mut out = Writer::new();
+    NullStream::from_values(values).write(&mut out);
+    out.put_u32(offsets.len().saturating_sub(1) as u32);
+    for &offset in offsets {
+        out.put_u32(offset);
+    }
+    out.put_slice(data);
+    out.into_bytes()
+}
+
+/// The whole-block raw string decode checks every stored value, surplus ones included, before it walks the null
+/// stream, so a malformed value wins over a count disagreement; a count disagreement alone is refused either way.
+#[test]
+fn raw_string_whole_block_decode_validates_every_value_before_weaving_nulls() {
+    let pipeline = PipelineId::new(Transform::RawString, Compression::None, ValueKind::String);
+    let values: StringColumn = (0..4).map(|i| (i != 1).then_some("x")).collect();
+    let decode =
+        |offsets: &[u32], data: &[u8]| decode_block(pipeline, &forged_raw_string_block(&values, offsets, data));
+    let disagree = FormatError::Structural {
+        rule: "null bitmap disagrees with present count",
+    };
+    let utf8 = FormatError::InvalidUtf8 { what: "raw string" };
+
+    assert_eq!(
+        decode(&[0, 1, 1, 3], "a\u{e9}".as_bytes()).unwrap(),
+        ColumnData::Strings(vec![Some("a"), None, Some(""), Some("\u{e9}")].into())
+    );
+    assert_eq!(decode(&[0, 1, 2], b"ab").unwrap_err(), disagree, "too few values");
+    assert_eq!(
+        decode(&[0, 1, 2, 3, 4], b"abcd").unwrap_err(),
+        disagree,
+        "too many values"
+    );
+    assert_eq!(
+        decode(&[0, 1, 2, 3, 4], b"abc\xFF").unwrap_err(),
+        utf8,
+        "invalid surplus value"
+    );
+    assert_eq!(
+        decode(&[0, 1, 2], b"\xFFb").unwrap_err(),
+        utf8,
+        "invalid value with too few"
+    );
+    assert_eq!(
+        decode(&[0, 2, 1, 3], b"abc").unwrap_err(),
+        FormatError::Structural {
+            rule: "raw string offsets must be non-decreasing",
+        }
+    );
+    assert!(matches!(
+        decode(&[0, 1, 2, 9], b"abc"),
+        Err(FormatError::Truncated { .. })
+    ));
+    assert_eq!(
+        decode(&[2, 3, 4, 5], b"zzabc").unwrap(),
+        ColumnData::Strings(vec![Some("a"), None, Some("b"), Some("c")].into()),
+        "a leading offset other than zero"
+    );
 }
 
 /// A raw-string block stores a byte arena behind an offset table, so one row's bytes are reachable without decoding
