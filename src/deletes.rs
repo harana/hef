@@ -262,18 +262,36 @@ pub fn latest_corrected_deletion_vector(
     events: &[(u64, EventId)],
     corrections: &[CorrectionMetadata],
 ) -> DeletionVector {
+    if events.is_empty() || corrections.is_empty() {
+        return DeletionVector::new();
+    }
     // Index the events once so each correction is a hash lookup, not a scan of every event in the file.
     let mut ordinal_by_event = HashMap::with_capacity(events.len());
     for (ordinal, id) in events {
         ordinal_by_event.entry(*id).or_insert(*ordinal);
     }
-    let mut deletion_vector = DeletionVector::new();
-    for correction in corrections {
-        if let Some(ordinal) = ordinal_by_event.get(&correction.corrects_event_id) {
-            deletion_vector.mark_deleted(*ordinal);
+    // Sort the matched ordinals once and fold repeats and neighbors into runs in place, rather than inserting each
+    // into the sorted run list, which shifts the tail on every out-of-order match.
+    let mut deleted_runs: Vec<RowRange> = corrections
+        .iter()
+        .filter_map(|correction| ordinal_by_event.get(&correction.corrects_event_id))
+        .map(|&ordinal| RowRange {
+            start: ordinal,
+            end: ordinal + 1,
+        })
+        .collect();
+    deleted_runs.sort_unstable_by_key(|run| run.start);
+    deleted_runs.dedup_by(|next, kept| {
+        let touches = next.start <= kept.end;
+        if touches {
+            kept.end = kept.end.max(next.end);
         }
+        touches
+    });
+    DeletionVector {
+        deleted_count: deleted_runs.iter().map(|run| run.end - run.start).sum(),
+        deleted_runs,
     }
-    deletion_vector
 }
 
 /// Aggregate shortcut adjustment co-published alongside a deletion vector.

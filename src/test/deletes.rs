@@ -53,6 +53,57 @@ fn corrections_suppress_only_their_superseded_events() {
 }
 
 #[test]
+fn bulk_correction_vector_matches_marking_each_correction_in_turn() {
+    // Differential check of the sort-then-fold construction against marking each match one at a time: same runs,
+    // count and wire bytes for shuffled, reversed, duplicated, contiguous and unknown targets, repeated event ids, and
+    // ordinals near the top of the range.
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move |bound: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % bound
+    };
+    let high = u64::MAX - 1;
+    for case in 0..300u64 {
+        let event_count = next(40);
+        let events: Vec<(u64, EventId)> = (0..event_count)
+            .map(|i| {
+                let ordinal = match case % 3 {
+                    0 => next(4096),
+                    1 => next(48),
+                    _ => high - next(8),
+                };
+                (ordinal, EventId::new_test_id(u128::from(i % 30)))
+            })
+            .collect();
+        let corrections: Vec<CorrectionMetadata> = (0..next(60))
+            .map(|_| correction_of(EventId::new_test_id(u128::from(next(35)))))
+            .collect();
+
+        let mut expected = DeletionVector::new();
+        let mut first_ordinal = HashMap::new();
+        for (ordinal, id) in &events {
+            first_ordinal.entry(*id).or_insert(*ordinal);
+        }
+        for correction in &corrections {
+            if let Some(ordinal) = first_ordinal.get(&correction.corrects_event_id) {
+                expected.mark_deleted(*ordinal);
+            }
+        }
+
+        let actual = latest_corrected_deletion_vector(&events, &corrections);
+        assert_eq!(actual.deleted_runs, expected.deleted_runs, "case {case}");
+        assert_eq!(actual.deleted_count(), expected.deleted_count(), "case {case}");
+        assert_eq!(
+            encode_deletion_vector(&actual),
+            encode_deletion_vector(&expected),
+            "case {case}"
+        );
+    }
+}
+
+#[test]
 fn ledger_keeps_invalidation_order_and_never_double_queues() {
     // Regression for the keyed ledger: membership moved to hash lookups, but the queue must still read back in
     // invalidation order with no duplicates, and a republish must clear exactly its own event.
