@@ -13,7 +13,7 @@
 //!
 //! See: hef-file-lifecycle/spec.md
 
-use super::constant::STATE_CHUNK_GRACE_NANOS;
+use super::constant::{STATE_CHUNK_GRACE_NANOS, STATE_CHUNK_SWEEP_PAGE_RECORDS};
 use crate::artifacts::state_chunk::{ObjectStoreStateChunks, StateChunk, StateRoot, read_state_chunk};
 use crate::clock::Clock;
 use crate::error::{StateChunkError, StorageError};
@@ -42,8 +42,16 @@ pub trait StateChunkLedger {
     /// Returns `true` when it was not marked yet.
     fn mark(&self, address: &[u8; 32]) -> Result<bool, StorageError>;
 
-    /// Every recorded chunk.
-    fn records(&self) -> Result<Vec<StateChunkRecord>, StorageError>;
+    /// Replaces the contents of `page` with up to `limit` records, in increasing address order, whose addresses come
+    /// strictly after `after` (from the lowest address when `None`). A page shorter than `limit` means no records come
+    /// after it. Read from an ordered index on the address, so a page costs no more than its own records, and hold no
+    /// lock or transaction once the call returns: the sweep claims and forgets records between pages.
+    fn records_after(
+        &self,
+        after: Option<&[u8; 32]>,
+        limit: usize,
+        page: &mut Vec<StateChunkRecord>,
+    ) -> Result<(), StorageError>;
 
     /// Claims the chunk at `address` for deletion when it is unmarked, unclaimed, and no upload used it after
     /// `unused_since_nanos`. Returns whether it did.
@@ -94,6 +102,11 @@ pub struct StateChunkSweep {
 /// deleted. A chunk a previous sweep claimed but did not finish deleting is deleted now. Each object is deleted before
 /// its ledger record is dropped, so a crash in between leaves the record for the next sweep, whose repeat delete is
 /// harmless.
+///
+/// The ledger is read a page of [`STATE_CHUNK_SWEEP_PAGE_RECORDS`] records at a time in address order, so the sweep's
+/// own memory does not grow with the ledger (the returned list of deleted chunks still does). A record an upload adds
+/// during the sweep is visited only if its address is past the current page; either way it was just used, so it is
+/// kept until a later sweep.
 pub fn sweep_state_chunks(
     head: &ManifestGeneration,
     tenant_id: TenantId,
@@ -128,18 +141,26 @@ pub fn sweep_state_chunks(
     }
 
     let unused_since = clock.now_nanos().saturating_sub(STATE_CHUNK_GRACE_NANOS);
-    for record in ledger.records()? {
-        if record.claimed
-            || (!record.marked
-                && record.last_used_nanos <= unused_since
-                && ledger.claim(&record.address, unused_since)?)
-        {
-            objects.delete(&state_chunk_object_key(tenant_id, &record.address))?;
-            ledger.forget(&record.address)?;
-            sweep.deleted.push(record.address);
+    let mut page = Vec::with_capacity(STATE_CHUNK_SWEEP_PAGE_RECORDS);
+    let mut after = None;
+    loop {
+        ledger.records_after(after.as_ref(), STATE_CHUNK_SWEEP_PAGE_RECORDS, &mut page)?;
+        for record in &page {
+            if record.claimed
+                || (!record.marked
+                    && record.last_used_nanos <= unused_since
+                    && ledger.claim(&record.address, unused_since)?)
+            {
+                objects.delete(&state_chunk_object_key(tenant_id, &record.address))?;
+                ledger.forget(&record.address)?;
+                sweep.deleted.push(record.address);
+            }
+        }
+        match page.last() {
+            Some(last) if page.len() == STATE_CHUNK_SWEEP_PAGE_RECORDS => after = Some(last.address),
+            _ => return Ok(sweep),
         }
     }
-    Ok(sweep)
 }
 
 #[cfg(test)]

@@ -40,3 +40,7 @@ pub const STATE_CHUNK_GRACE_NANOS: i64 = 24 * 60 * 60 * 1_000_000_000;
 /// being deleted, by scanning a list; past it, the sweeper builds a hash index once per attempt. Below this size the
 /// index costs more than the scans it saves.
 pub(crate) const LINEAR_LOOKUP_MAX_ENTRIES: usize = 16;
+
+/// How many ledger records a state chunk sweep reads at a time: 1024, about 48 KiB of records, which bounds the sweep's
+/// own memory however many chunks a tenant has while keeping ledger round trips to one per thousand chunks.
+pub const STATE_CHUNK_SWEEP_PAGE_RECORDS: usize = 1024;
