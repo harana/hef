@@ -364,6 +364,41 @@ pub struct QueueRegion {
     pub start: u64,
 }
 
+/// Walks the records of one queue region in order, handing back each record's encoded bytes without copying them and
+/// stepping over the skip markers at the wrap boundary. Cloning it starts a second walk from the same place. A record
+/// whose length runs past the buffer yields [`QueueError::Codec`] and ends the walk.
+///
+/// See: hef-write-path/spec.md
+#[derive(Clone, Debug)]
+pub(crate) struct RawRecords<'a> {
+    cursor: u64,
+    end: u64,
+    queue: &'a CommitQueue,
+}
+
+impl<'a> Iterator for RawRecords<'a> {
+    type Item = Result<&'a [u8], QueueError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let queue = self.queue;
+        while self.cursor < self.end {
+            let len = queue.read_u64_at(self.cursor);
+            if len == SKIP_MARKER {
+                self.cursor += queue.capacity - (self.cursor % queue.capacity);
+                continue;
+            }
+            let offset = queue.offset_of(self.cursor + LEN_HEADER);
+            let Some(bytes) = queue.buffer.get(offset..offset + len as usize) else {
+                self.cursor = self.end;
+                return Some(Err(QueueError::Codec));
+            };
+            self.cursor += (LEN_HEADER + len).next_multiple_of(RECORD_ALIGN);
+            return Some(Ok(bytes));
+        }
+        None
+    }
+}
+
 /// The bounded circular commit queue. Cursors are absolute (monotonic); buffer offsets are cursor mod capacity. Records
 /// never wrap: a record that would cross the buffer end is preceded by a skip marker to the next wrap boundary.
 #[derive(Debug)]
@@ -538,25 +573,23 @@ impl CommitQueue {
     /// thief's queue by copying these same bytes — [`decode_pending`] followed by [`encode_pending_into`] would
     /// reproduce the identical bytes at the cost of decoding and re-encoding every field of every record.
     pub fn copy_pending_raw(&self) -> Result<(QueueRegion, Vec<&[u8]>), QueueError> {
-        let start = self.clean_cursor;
-        let end = self.dirty_cursor;
-        let mut records = Vec::new();
-        let mut cursor = start;
-        while cursor < end {
-            let len = self.read_u64_at(cursor);
-            if len == SKIP_MARKER {
-                cursor += self.capacity - (cursor % self.capacity);
-                continue;
-            }
-            let offset = self.offset_of(cursor + LEN_HEADER);
-            let bytes = self
-                .buffer
-                .get(offset..offset + len as usize)
-                .ok_or(QueueError::Codec)?;
-            records.push(bytes);
-            cursor += (LEN_HEADER + len).next_multiple_of(RECORD_ALIGN);
-        }
-        Ok((QueueRegion { start, end }, records))
+        let (region, records) = self.pending_raw();
+        Ok((region, records.collect::<Result<_, _>>()?))
+    }
+
+    /// The stealable region `clean..dirty` and a walk over its raw encoded record bytes, without collecting them.
+    /// Clone the walk to read the region a second time.
+    pub(crate) fn pending_raw(&self) -> (QueueRegion, RawRecords<'_>) {
+        let region = QueueRegion {
+            end: self.dirty_cursor,
+            start: self.clean_cursor,
+        };
+        let records = RawRecords {
+            cursor: region.start,
+            end: region.end,
+            queue: self,
+        };
+        (region, records)
     }
 
     /// Copies the longest prefix of the stealable region whose records all belong to `tenant_id` and `epoch`, ending
@@ -642,10 +675,52 @@ impl CommitQueue {
     /// records it cannot hold — a claimed record is then guaranteed a slot here and can never be dropped between the
     /// two queues.
     pub fn admit_encoded(&self, records: &[&[u8]]) -> Result<Option<QueueAdmission>, QueueError> {
-        self.admit_placed(records.len(), records.iter().map(|r| r.len()).sum(), |index, out| {
+        let Some(total_len) = self.fits_whole(records.iter().map(|record| Ok(record.len())))? else {
+            return Ok(None);
+        };
+        self.admit_placed(records.len(), total_len, |index, out| {
             out.put_slice(records[index]);
             Ok(())
         })
+    }
+
+    /// Like [`admit_encoded`](Self::admit_encoded), but reads the records straight out of a peer queue's region (from
+    /// [`pending_raw`](Self::pending_raw)) and also returns how many records it admitted. Every record is checked to
+    /// fit before anything is allocated or copied, so a region that does not fit costs no buffers.
+    pub(crate) fn admit_raw(&self, records: RawRecords<'_>) -> Result<Option<(QueueAdmission, usize)>, QueueError> {
+        let mut count = 0;
+        let lengths = records.clone().map(|record| {
+            count += 1;
+            record.map(<[u8]>::len)
+        });
+        let Some(total_len) = self.fits_whole(lengths)? else {
+            return Ok(None);
+        };
+        let mut replay = records;
+        let admission = self.admit_placed(count, total_len, |_, out| {
+            out.put_slice(replay.next().ok_or(QueueError::Codec)??);
+            Ok(())
+        })?;
+        Ok(admission.map(|admission| (admission, count)))
+    }
+
+    /// The summed length of records with these payload lengths when every one of them, appended in order, fits in
+    /// this queue's free space right now, or `None` when the batch does not fit whole. Allocates nothing.
+    fn fits_whole(
+        &self,
+        lengths: impl IntoIterator<Item = Result<usize, QueueError>>,
+    ) -> Result<Option<usize>, QueueError> {
+        let mut cursor = self.dirty_cursor;
+        let mut total_len = 0usize;
+        for len in lengths {
+            let len = len?;
+            let Some((_, next)) = self.placement(cursor, len) else {
+                return Ok(None);
+            };
+            cursor = next;
+            total_len = total_len.checked_add(len).ok_or(QueueError::Codec)?;
+        }
+        Ok(Some(total_len))
     }
 
     /// Shared placement loop behind [`admit`](Self::admit) and [`admit_encoded`](Self::admit_encoded): writes
@@ -767,18 +842,29 @@ pub fn peek_steal(
     frame_epoch: u64,
     same_steal_group: bool,
 ) -> Option<(QueueRegion, Vec<&[u8]>)> {
+    let (region, records) = peek_steal_raw(target, frame_tenant, frame_epoch, same_steal_group)?;
+    Some((region, records.collect::<Result<_, _>>().ok()?))
+}
+
+/// [`peek_steal`] without collecting the records: the same checks, but the stealable region comes back as a walk over
+/// its raw record bytes for [`CommitQueue::admit_raw`], so a steal never builds a list of the records it moves.
+pub(crate) fn peek_steal_raw(
+    target: &CommitQueue,
+    frame_tenant: TenantId,
+    frame_epoch: u64,
+    same_steal_group: bool,
+) -> Option<(QueueRegion, RawRecords<'_>)> {
     if !same_steal_group {
         return None;
     }
-    let (region, records) = target.copy_pending_raw().ok()?;
+    let (region, records) = target.pending_raw();
     if region.start == region.end {
         return None;
     }
-    if records
-        .iter()
-        .any(|record| peek_tenant_epoch(record) != Some((frame_tenant, frame_epoch)))
-    {
-        return None;
+    for record in records.clone() {
+        if peek_tenant_epoch(record.ok()?) != Some((frame_tenant, frame_epoch)) {
+            return None;
+        }
     }
     Some((region, records))
 }
