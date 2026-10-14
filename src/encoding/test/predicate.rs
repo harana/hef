@@ -1,5 +1,8 @@
 use super::*;
-use crate::encoding::{CascadeStrategy, Compression, bitpack, encode_block, encode_block_forced_for_conformance};
+use crate::encoding::{
+    CascadeStrategy, Compression, NullStream, NullStreamForm, bitpack, encode_block,
+    encode_block_forced_for_conformance,
+};
 use crate::file::bytes::Writer;
 use std::collections::BTreeSet;
 
@@ -1488,5 +1491,156 @@ fn merging_intervals_in_place_matches_merging_by_copying() {
     for case in interval_cases(&i128_points) {
         let expected = merge_intervals_by_copying(case.clone(), |hi: i128| hi.saturating_add(1));
         assert_eq!(merge_intervals_i128(case.clone()), expected, "i128 input {case:?}");
+    }
+}
+
+/// The row-mask weave as it stood before it took the verdicts by value: a second mask built row by row for every null
+/// form. Kept here as the reference the current weave must match, mask for mask and error for error.
+fn reference_weave_present(nulls: &NullStream, present: &[bool]) -> Result<Vec<bool>, FormatError> {
+    let mut mask = Vec::with_capacity(nulls.row_count());
+    let mut verdicts = present.iter();
+    nulls.each_row(|set| {
+        if set {
+            let verdict = verdicts.next().ok_or(FormatError::Structural {
+                rule: "null bitmap disagrees with present count",
+            })?;
+            mask.push(*verdict);
+        } else {
+            mask.push(false);
+        }
+        Ok(())
+    })?;
+    if verdicts.next().is_some() {
+        return Err(FormatError::Structural {
+            rule: "null bitmap disagrees with present count",
+        });
+    }
+    Ok(mask)
+}
+
+/// Whether row `i` carries a value, for each named null shape the weave tests sweep.
+/// A named rule saying whether row `n` holds a value.
+type NullShape = (&'static str, fn(usize) -> bool);
+
+fn null_shapes() -> [NullShape; 4] {
+    [
+        ("all absent", |_| false),
+        ("all present", |_| true),
+        ("clustered", |i| (i / 100) % 3 != 1),
+        ("scattered", |i| i % 2 == 0),
+    ]
+}
+
+/// Null streams in each of the four stored forms, over row counts on both sides of a packed vector's 1024 rows.
+fn null_streams_of_every_form() -> Vec<(String, NullStream<'static>)> {
+    let mut streams = vec![(
+        "all present x0".to_owned(),
+        NullStream {
+            form: NullStreamForm::AllPresent,
+            row_count: 0,
+        },
+    )];
+    for rows in [1usize, 2, 1023, 1024, 1025] {
+        for (shape, present) in null_shapes() {
+            let values: StringColumn = (0..rows).map(|i| present(i).then(|| format!("v{i}"))).collect();
+            streams.push((format!("{shape} x{rows}"), NullStream::from_values(&values)));
+        }
+    }
+    streams
+}
+
+/// Weaving takes its verdicts by value and must still give the same mask, or the same error, as the copying weave for
+/// every null form: too few, exactly enough, and too many verdicts, all-true, all-false, and mixed.
+#[test]
+fn weaving_owned_verdicts_matches_the_copying_weave_for_every_null_form() {
+    let mut forms = BTreeSet::new();
+    for (name, nulls) in null_streams_of_every_form() {
+        forms.insert(match nulls.form {
+            NullStreamForm::AllAbsent => "all absent",
+            NullStreamForm::AllPresent => "all present",
+            NullStreamForm::Raw(_) => "raw",
+            NullStreamForm::Runs(_) => "runs",
+        });
+        let present_count = nulls.present_count();
+        for len in [present_count.saturating_sub(1), present_count, present_count + 1] {
+            let verdict_shapes: [fn(usize) -> bool; 3] = [|_| true, |_| false, |i| i % 3 == 0];
+            for verdict in verdict_shapes {
+                let verdicts: Vec<bool> = (0..len).map(verdict).collect();
+                assert_eq!(
+                    weave_present(&nulls, verdicts.clone()),
+                    reference_weave_present(&nulls, &verdicts),
+                    "{name}: {len} verdicts for {present_count} present rows"
+                );
+            }
+        }
+    }
+    assert_eq!(forms.len(), 4, "every null form is exercised: {forms:?}");
+}
+
+/// When every row is present the verdicts already are the row mask, so weaving hands back the very vector it was
+/// given (same allocation, same capacity, same length), and refuses one verdict too few or too many with the same
+/// error as before.
+#[test]
+fn weaving_an_all_present_block_returns_the_verdict_vector_itself() {
+    for rows in [1usize, 2, 1023, 1024, 1025] {
+        let values: StringColumn = (0..rows).map(|i| Some(format!("v{i}"))).collect();
+        let nulls = NullStream::from_values(&values);
+        assert!(matches!(nulls.form, NullStreamForm::AllPresent), "x{rows}: all present");
+        let mut verdicts = Vec::with_capacity(rows + 64);
+        verdicts.extend((0..rows).map(|i| i % 3 == 0));
+        let expected = verdicts.clone();
+        let (pointer, capacity) = (verdicts.as_ptr(), verdicts.capacity());
+        let mask = weave_present(&nulls, verdicts).unwrap();
+        assert_eq!(mask.as_ptr(), pointer, "x{rows}: same allocation");
+        assert_eq!(mask.capacity(), capacity, "x{rows}: same capacity");
+        assert_eq!(mask, expected, "x{rows}: same verdicts");
+        for len in [rows - 1, rows + 1] {
+            assert_eq!(
+                weave_present(&nulls, vec![true; len]),
+                Err(FormatError::Structural {
+                    rule: "null bitmap disagrees with present count",
+                }),
+                "x{rows}: {len} verdicts refused"
+            );
+        }
+    }
+}
+
+/// Every string predicate kernel that weaves its verdicts into a row mask must agree with decode-then-filter under
+/// each null form, at row counts on both sides of a packed vector, across dictionary, FSST (with and without
+/// per-value keys) and raw blocks, including present empty strings and non-ASCII text.
+#[test]
+fn string_predicate_masks_agree_with_decoding_under_every_null_form() {
+    let datasets: [fn(usize) -> String; 4] = [
+        |i| ["apple", "banana", "", "d\u{e9}j\u{e0}"][i % 4].to_owned(),
+        |i| format!("id-{i:05}"),
+        |i| format!("{i:05}-order-line-reference-{i:05}"),
+        |i| format!("{}-{i}", "x".repeat(80)),
+    ];
+    let predicates = [
+        equals("banana"),
+        equals("id-00007"),
+        StringPredicate::NotEquals("apple".to_owned()),
+        StringPredicate::InSet(vec!["apple".to_owned(), "id-00002".to_owned(), "apple".to_owned()]),
+        contains("an"),
+        contains("0"),
+        contains(""),
+        contains("\u{e9}"),
+        StringPredicate::Range {
+            lower: Some(bound("00100", true)),
+            upper: Some(bound("id-00500", false)),
+        },
+    ];
+    for rows in [1usize, 2, 1023, 1024, 1025] {
+        for (_, present) in null_shapes() {
+            for value in datasets {
+                let values: Vec<Option<String>> = (0..rows).map(|i| present(i).then(|| value(i))).collect();
+                for predicate in &predicates {
+                    for random_access in [false, true] {
+                        check(&values, predicate, random_access);
+                    }
+                }
+            }
+        }
     }
 }

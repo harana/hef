@@ -1490,3 +1490,42 @@ fn time_series_rollups_round_trip_and_ride_only_a_time_series_footer_over_its_ro
     }
     assert_eq!(decode_footer(&encode_footer(&not_a_float)).unwrap_err(), refused);
 }
+
+/// The bytes of every section in an encoded section area, by id.
+fn section_bytes_by_id(area: &SectionArea) -> Vec<(u32, Vec<u8>)> {
+    area.directory
+        .iter()
+        .map(|(id, range)| (*id, area.bytes.bytes()[range.clone()].to_vec()))
+        .collect()
+}
+
+#[test]
+fn time_series_rollups_section_holds_exactly_the_standalone_encoding() {
+    let footer = time_series_footer();
+    let mut without = time_series_footer();
+    without.time_series_rollups = None;
+    let with_sections = section_bytes_by_id(&encode_sections(&footer));
+    let without_sections = section_bytes_by_id(&encode_sections(&without));
+
+    let rollups = footer.time_series_rollups.as_ref().unwrap();
+    let rollup_sections: Vec<&Vec<u8>> = with_sections
+        .iter()
+        .filter(|(id, _)| *id == sections::TIME_SERIES_ROLLUPS)
+        .map(|(_, bytes)| bytes)
+        .collect();
+    assert_eq!(rollup_sections, vec![&rollups.encode()]);
+    // Every other section is unchanged and in the same order.
+    let others: Vec<(u32, Vec<u8>)> = with_sections
+        .into_iter()
+        .filter(|(id, _)| *id != sections::TIME_SERIES_ROLLUPS)
+        .collect();
+    assert_eq!(others, without_sections);
+
+    let bytes = encode_footer(&footer);
+    let (_, offset, len) = find_directory_entry(&bytes, sections::TIME_SERIES_ROLLUPS);
+    assert_eq!(&bytes[offset..offset + len], rollups.encode().as_slice());
+    assert_eq!(
+        decode_footer(&bytes).unwrap().time_series_rollups,
+        footer.time_series_rollups
+    );
+}

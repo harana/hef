@@ -461,3 +461,154 @@ fn a_row_bounded_scan_matches_every_row_of_its_range() {
         }
     }
 }
+
+/// How [`TimeSeriesRollups::encode`] wrote its bytes before it gained `encode_into`, kept to check the two agree.
+fn reference_encode(rollups: &TimeSeriesRollups) -> Vec<u8> {
+    let mut out = Writer::new();
+    out.put_i64(rollups.bucket_nanos);
+    out.put_u32(rollups.column_ids.len() as u32);
+    for column_id in &rollups.column_ids {
+        out.put_u32(*column_id);
+    }
+    out.put_u32(rollups.buckets.len() as u32);
+    for bucket in &rollups.buckets {
+        out.put_i64(bucket.bucket);
+        out.put_u64(bucket.first_row_ordinal);
+        out.put_u64(bucket.row_count);
+        for aggregate in &bucket.aggregates {
+            out.put_u64(aggregate.count);
+            out.put_u64(aggregate.sum.to_bits());
+            out.put_u64(aggregate.min.to_bits());
+            out.put_u64(aggregate.max.to_bits());
+        }
+    }
+    out.into_bytes()
+}
+
+fn aggregate_of(count: u64, sum: f64, min: f64, max: f64) -> FloatAggregate {
+    FloatAggregate { count, max, min, sum }
+}
+
+/// Rollups covering the shapes the encoder must write unchanged, including ones decode would refuse.
+fn encoder_cases() -> Vec<TimeSeriesRollups> {
+    let quiet_nan = f64::from_bits(0x7FF8_0000_0000_0001);
+    let negative_nan = f64::from_bits(0xFFF8_0000_0000_0BAD);
+    let signalling_nan = f64::from_bits(0x7FF0_0000_0000_0001);
+    let special = vec![
+        aggregate_of(0, -0.0, 0.0, -0.0),
+        aggregate_of(u64::MAX, f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY),
+        aggregate_of(3, quiet_nan, negative_nan, signalling_nan),
+        aggregate_of(1, f64::MIN_POSITIVE, f64::MIN, f64::MAX),
+    ];
+    let many_columns: Vec<u32> = (0..40).map(|i| column_ids::PROMOTED_BASE + i).collect();
+    let many_buckets: Vec<RollupBucket> = (0..300u64)
+        .map(|i| RollupBucket {
+            aggregates: many_columns
+                .iter()
+                .map(|&c| aggregate_of(i, i as f64 * 0.5, -(c as f64), c as f64))
+                .collect(),
+            bucket: i as i64 - 150,
+            first_row_ordinal: i * 7,
+            row_count: 7,
+        })
+        .collect();
+    vec![
+        // No columns and no buckets.
+        TimeSeriesRollups {
+            bucket_nanos: 1,
+            buckets: Vec::new(),
+            column_ids: Vec::new(),
+        },
+        // Columns but no buckets.
+        TimeSeriesRollups {
+            bucket_nanos: BUCKET_NANOS,
+            buckets: Vec::new(),
+            column_ids: vec![CPU, TEMPERATURE],
+        },
+        // Buckets but no columns.
+        TimeSeriesRollups {
+            bucket_nanos: BUCKET_NANOS,
+            buckets: vec![RollupBucket {
+                aggregates: Vec::new(),
+                bucket: -5,
+                first_row_ordinal: 0,
+                row_count: 3,
+            }],
+            column_ids: Vec::new(),
+        },
+        // Extreme integers, signed zero, infinities and several NaN payloads.
+        TimeSeriesRollups {
+            bucket_nanos: i64::MAX,
+            buckets: vec![
+                RollupBucket {
+                    aggregates: special.clone(),
+                    bucket: i64::MIN,
+                    first_row_ordinal: 0,
+                    row_count: u64::MAX,
+                },
+                RollupBucket {
+                    aggregates: special,
+                    bucket: i64::MAX,
+                    first_row_ordinal: u64::MAX,
+                    row_count: 1,
+                },
+            ],
+            column_ids: vec![0, 1, u32::MAX - 1, u32::MAX],
+        },
+        // Many buckets and columns, on both sides of bucket zero.
+        TimeSeriesRollups {
+            bucket_nanos: BUCKET_NANOS,
+            buckets: many_buckets,
+            column_ids: many_columns,
+        },
+        // Aggregate lists shorter and longer than the column list: written as they are, refused only on decode.
+        TimeSeriesRollups {
+            bucket_nanos: BUCKET_NANOS,
+            buckets: vec![
+                RollupBucket {
+                    aggregates: vec![aggregate_of(1, 1.0, 1.0, 1.0)],
+                    bucket: 0,
+                    first_row_ordinal: 0,
+                    row_count: 1,
+                },
+                RollupBucket {
+                    aggregates: vec![aggregate_of(1, 2.0, 2.0, 2.0); 3],
+                    bucket: 1,
+                    first_row_ordinal: 1,
+                    row_count: 1,
+                },
+            ],
+            column_ids: vec![CPU, TEMPERATURE],
+        },
+    ]
+}
+
+#[test]
+fn encode_into_appends_exactly_the_old_encoder_bytes_after_existing_content() {
+    for (case, rollups) in encoder_cases().iter().enumerate() {
+        let expected = reference_encode(rollups);
+        assert_eq!(rollups.encode(), expected, "case {case}");
+        for prefix in [&[][..], &[0xAB][..], &[1, 2, 3, 4, 5, 6, 7][..]] {
+            let mut out = Writer::new();
+            out.put_slice(prefix);
+            rollups.encode_into(&mut out);
+            let bytes = out.into_bytes();
+            assert_eq!(&bytes[..prefix.len()], prefix, "case {case}");
+            assert_eq!(&bytes[prefix.len()..], expected.as_slice(), "case {case}");
+        }
+    }
+}
+
+#[test]
+fn encode_of_a_built_file_matches_the_old_encoder() {
+    let rollups = open(&build(Profile::TimeSeries, Some(BUCKET_NANOS)))
+        .time_series_rollups()
+        .unwrap()
+        .clone();
+    let mut out = Writer::new();
+    out.put_u64(u64::MAX);
+    rollups.encode_into(&mut out);
+    let bytes = out.into_bytes();
+    assert_eq!(&bytes[8..], reference_encode(&rollups).as_slice());
+    assert_eq!(rollups.encode(), reference_encode(&rollups));
+}

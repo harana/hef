@@ -31,6 +31,58 @@ fn a_block_that_encodes_larger_than_plain_is_stored_plain() {
     }
 }
 
+/// Encoding borrowed u64 values gives exactly the block that encoding the same values as an owned column gives:
+/// pipeline, bytes, stats and decoded length, for empty, single, constant, monotonic, descending, wrapping, random and
+/// `u64::MAX` values, at sizes around the 1024-value vector and the trailing stage's full-trial limit, with and without
+/// random access. Some of the cases store their plain form after the acceptance gate, and some keep a transform.
+#[test]
+fn borrowed_u64_values_encode_exactly_as_an_owned_column() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut random = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut cases: Vec<Vec<u64>> = vec![
+        Vec::new(),
+        vec![0],
+        vec![u64::MAX],
+        vec![7, 9],
+        vec![1_000_000, 1_000_064, 1_000_128],
+        vec![u64::MAX, 3, 17, 9_000_000_000],
+    ];
+    for len in [2u64, 3, 64, 1023, 1024, 1025, 2048, 4095, 4096, 4097, 8192, 20_000] {
+        cases.push(vec![42; len as usize]);
+        cases.push((0..len).collect());
+        cases.push((0..len).map(|i| u64::MAX - i).collect());
+        cases.push((0..len).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect());
+        cases.push((0..len).map(|i| if i % 97 == 0 { u64::MAX } else { i % 5 }).collect());
+        cases.push((0..len).map(|_| random()).collect());
+        cases.push((0..len).map(|_| random() % 16).collect());
+    }
+    let (mut plain, mut transformed) = (0, 0);
+    for values in &cases {
+        let owned = ColumnData::U64(values.clone());
+        for random_access in [false, true] {
+            let expected = encode_block(&owned, random_access);
+            let borrowed = encode_u64_block(values, random_access);
+            let case = format!("{} values, random access {random_access}", values.len());
+            assert_eq!(borrowed.pipeline, expected.pipeline, "{case}");
+            assert_eq!(borrowed.bytes, expected.bytes, "{case}");
+            assert_eq!(borrowed.stats, expected.stats, "{case}");
+            assert_eq!(borrowed.uncompressed_len, expected.uncompressed_len, "{case}");
+            assert!(borrowed.fsst.is_none() && expected.fsst.is_none(), "{case}");
+            if borrowed.pipeline.transform().unwrap() == Transform::PlainU64 {
+                plain += 1;
+            } else {
+                transformed += 1;
+            }
+        }
+    }
+    assert!(plain > 0 && transformed > 0, "plain {plain}, transformed {transformed}");
+}
+
 /// The gate must not cost a block that genuinely earns its encoding: a long run-heavy column stays on the transform
 /// that shrinks it rather than being pushed onto the plain form.
 #[test]
@@ -1035,7 +1087,7 @@ fn reference_null_stream(values: &StringColumn) -> NullStream<'static> {
     } else if runs == [(0, row_count as u32)] {
         NullStreamForm::AllPresent
     } else if 4 + runs.len() * 8 < row_count.div_ceil(8) {
-        NullStreamForm::Runs(runs)
+        NullStreamForm::Runs(NullRuns::Pairs(runs))
     } else {
         let mut raw = vec![0u8; row_count.div_ceil(8)];
         for &(start, end) in &runs {
@@ -1280,6 +1332,293 @@ fn raw_null_stream_borrows_the_input_bitmap_and_decodes_into_owned_output() {
             .map(|row| views.is_valid(row).then(|| views.value(row).to_string()))
             .collect();
         assert_eq!(viewed, values, "{transform:?}: views");
+    }
+}
+
+/// The null-stream parse as it stood before the run table was borrowed: every run copied into an owned list. Kept here
+/// as the reference the borrowing parse must match, result for result and error for error.
+fn reference_null_stream_read<'a>(reader: &mut Reader<'a>) -> Result<NullStream<'a>, FormatError> {
+    let row_count = reader.u32("string row count")? as usize;
+    let form = match reader.u8("null stream form")? {
+        0 | 1 if row_count > MAX_BLOCK_VALUES => {
+            return Err(FormatError::Structural {
+                rule: "null stream row count beyond the block bound",
+            });
+        }
+        0 => NullStreamForm::AllPresent,
+        1 => NullStreamForm::AllAbsent,
+        2 => {
+            let run_count = reader.u32("null stream run count")? as usize;
+            let mut runs: Vec<(u32, u32)> = Vec::with_capacity(reader.capacity_hint(run_count, 8));
+            for _ in 0..run_count {
+                let start = reader.u32("null stream run start")?;
+                let end = reader.u32("null stream run end")?;
+                if end <= start || end as usize > row_count {
+                    return Err(FormatError::Structural {
+                        rule: "null stream run must be non-empty and within the row count",
+                    });
+                }
+                if runs.last().is_some_and(|&(_, previous_end)| start <= previous_end) {
+                    return Err(FormatError::Structural {
+                        rule: "null stream runs must be sorted and non-adjacent",
+                    });
+                }
+                runs.push((start, end));
+            }
+            NullStreamForm::Runs(NullRuns::Pairs(runs))
+        }
+        3 => NullStreamForm::Raw(Cow::Borrowed(reader.take(row_count.div_ceil(8), "null bitmap")?)),
+        _ => {
+            return Err(FormatError::Structural {
+                rule: "unknown null stream form",
+            });
+        }
+    };
+    Ok(NullStream { form, row_count })
+}
+
+/// A run-form null stream's bytes: the row count, tag 2, the run count, then each run's start and end, followed by
+/// `trailing` bytes.
+fn run_form_stream(row_count: u32, run_count: u32, runs: &[(u32, u32)], trailing: &[u8]) -> Vec<u8> {
+    let mut out = Writer::new();
+    out.put_u32(row_count);
+    out.put_u8(2);
+    out.put_u32(run_count);
+    for &(start, end) in runs {
+        out.put_u32(start);
+        out.put_u32(end);
+    }
+    out.put_slice(trailing);
+    out.into_bytes()
+}
+
+/// Asserts two null streams give the same answer to every presence question: counts, per-row presence and rank, the
+/// full walk, every range walk over a grid of starts and ends (empty, short, clipped past the row count), the
+/// row-ordered views, and the Arrow null buffer.
+fn assert_same_presence_answers(actual: &NullStream, expected: &NullStream, name: &str) {
+    let rows = expected.row_count();
+    assert_eq!(actual.row_count(), rows, "{name}: row count");
+    assert_eq!(
+        actual.present_count(),
+        expected.present_count(),
+        "{name}: present count"
+    );
+    for row in 0..rows + 2 {
+        assert_eq!(
+            actual.is_present(row),
+            expected.is_present(row),
+            "{name}: is_present({row})"
+        );
+        assert_eq!(
+            actual.present_before(row),
+            expected.present_before(row),
+            "{name}: present_before({row})"
+        );
+    }
+    let walk = |stream: &NullStream| {
+        let mut walked = Vec::new();
+        stream
+            .each_row(|set| {
+                walked.push(set);
+                Ok(())
+            })
+            .unwrap();
+        walked
+    };
+    assert_eq!(walk(actual), walk(expected), "{name}: each_row");
+    let range_walk = |stream: &NullStream, start: usize, end: usize| {
+        let mut walked = Vec::new();
+        stream
+            .each_row_range(start, end, |set| {
+                walked.push(set);
+                Ok(())
+            })
+            .unwrap();
+        walked
+    };
+    let bounds = [
+        0,
+        1,
+        7,
+        39,
+        40,
+        41,
+        119,
+        120,
+        rows / 2,
+        rows.saturating_sub(1),
+        rows,
+        rows + 5,
+    ];
+    for start in bounds {
+        for end in bounds {
+            assert_eq!(
+                range_walk(actual, start, end),
+                range_walk(expected, start, end),
+                "{name}: each_row_range({start}, {end})"
+            );
+        }
+    }
+    let values = || (1..=expected.present_count() as u128).collect::<Vec<_>>().into_iter();
+    assert_eq!(
+        views_by_row(actual, values()).unwrap(),
+        views_by_row(expected, values()).unwrap(),
+        "{name}: views"
+    );
+    assert_eq!(null_buffer(actual), null_buffer(expected), "{name}: null buffer");
+}
+
+/// A run-form null stream read from a block borrows exactly the run table's bytes instead of copying the runs into a
+/// list, answers every presence question as the encoder's owned list does, and writes the same bytes back.
+#[test]
+fn run_null_stream_borrows_the_input_table_and_answers_like_the_owned_runs() {
+    let patterns: Vec<(&str, StringColumn)> = vec![
+        ("clusters x1000", string_values_with_nulls(1000, |i| (i / 40) % 3 == 0)),
+        ("clusters x4096", string_values_with_nulls(4096, |i| (i / 40) % 3 == 0)),
+        (
+            "one null cluster",
+            string_values_with_nulls(4096, |i| !(1000..3000).contains(&i)),
+        ),
+        ("leading nulls", string_values_with_nulls(1000, |i| i >= 600)),
+        ("trailing nulls", string_values_with_nulls(1000, |i| i < 400)),
+        ("first row only", string_values_with_nulls(1000, |i| i == 0)),
+        ("last row only", string_values_with_nulls(1000, |i| i == 999)),
+    ];
+    for (name, values) in patterns {
+        let derived = NullStream::from_values(&values);
+        let NullStreamForm::Runs(NullRuns::Pairs(pairs)) = &derived.form else {
+            panic!(
+                "{name}: expected the encoder to build owned runs, got {:?}",
+                derived.form
+            );
+        };
+        let run_count = pairs.len();
+        let mut out = Writer::new();
+        derived.write(&mut out);
+        let bytes = out.into_bytes();
+        let mut reader = Reader::new(&bytes);
+        let read = NullStream::read(&mut reader).unwrap();
+        assert_eq!(reader.position(), bytes.len(), "{name}: consumed");
+        match &read.form {
+            NullStreamForm::Runs(NullRuns::Encoded(table)) => {
+                assert_eq!(table.as_ptr(), bytes[9..].as_ptr(), "{name}: borrowed span start");
+                assert_eq!(table.len(), run_count * 8, "{name}: borrowed span length");
+            }
+            other => panic!("{name}: expected a borrowed run table, got {other:?}"),
+        }
+        assert_eq!(read, derived, "{name}: equal to the owned runs");
+        assert_same_presence_answers(&read, &derived, name);
+        let mut rewritten = Writer::new();
+        read.write(&mut rewritten);
+        assert_eq!(rewritten.into_bytes(), bytes, "{name}: byte-identical write");
+    }
+
+    // An empty run table is accepted and reads as no present rows, as the owned form always did.
+    let bytes = run_form_stream(10, 0, &[], &[]);
+    let read = NullStream::read(&mut Reader::new(&bytes)).unwrap();
+    let owned = NullStream {
+        form: NullStreamForm::Runs(NullRuns::Pairs(Vec::new())),
+        row_count: 10,
+    };
+    assert_eq!(read, owned, "empty table");
+    assert_same_presence_answers(&read, &owned, "empty table");
+}
+
+/// Taking ownership of a stream read from a block copies its borrowed run table, so it survives the block bytes being
+/// overwritten and dropped; an encoder-built run list moves through unchanged.
+#[test]
+fn run_null_stream_into_owned_outlives_the_input_bytes() {
+    let derived = NullStream::from_values(&string_values_with_nulls(1000, |i| (i / 40) % 3 == 0));
+    let mut out = Writer::new();
+    derived.write(&mut out);
+    let mut bytes = out.into_bytes();
+    let owned = NullStream::read(&mut Reader::new(&bytes)).unwrap().into_owned();
+    bytes.fill(0);
+    drop(bytes);
+    assert!(matches!(owned.form, NullStreamForm::Runs(NullRuns::Pairs(_))));
+    assert_eq!(owned, derived);
+    assert_same_presence_answers(&owned, &derived, "owned after drop");
+
+    let NullStreamForm::Runs(NullRuns::Pairs(pairs)) = &derived.form else {
+        panic!("expected owned runs, got {:?}", derived.form);
+    };
+    let pointer = pairs.as_ptr();
+    let kept = derived.into_owned();
+    let NullStreamForm::Runs(NullRuns::Pairs(kept_pairs)) = &kept.form else {
+        panic!("expected owned runs, got {:?}", kept.form);
+    };
+    assert_eq!(kept_pairs.as_ptr(), pointer, "already-owned runs move without a copy");
+}
+
+/// The borrowing run-table parse must accept and refuse exactly what the copying parse did, with the identical error
+/// and the identical stopping point: truncation in the count, a start, or an end; a bad early run followed by missing
+/// records (the run error wins); reversed, empty, out-of-bounds, overlapping, adjacent, and unsorted runs; an empty
+/// table; and runs at the largest accepted bounds.
+#[test]
+fn run_null_stream_parse_matches_the_copying_parse() {
+    let mut cases: Vec<(&str, Vec<u8>)> = vec![
+        ("truncated count", {
+            let mut bytes = run_form_stream(8, 0, &[], &[]);
+            bytes.truncate(7);
+            bytes
+        }),
+        ("truncated start", run_form_stream(8, 1, &[], &[0, 0])),
+        ("truncated end", run_form_stream(8, 1, &[], &[0, 0, 0, 0, 2, 0])),
+        ("valid run then missing record", run_form_stream(8, 2, &[(0, 2)], &[])),
+        (
+            "bad first run then missing records",
+            run_form_stream(8, 3, &[(3, 3)], &[]),
+        ),
+        (
+            "out of bounds first run then truncated",
+            run_form_stream(8, 3, &[(0, 9)], &[1]),
+        ),
+        ("overlap then truncated", run_form_stream(8, 3, &[(0, 4), (2, 6)], &[])),
+        ("reversed", run_form_stream(8, 1, &[(5, 2)], &[])),
+        ("empty", run_form_stream(8, 1, &[(3, 3)], &[])),
+        ("out of bounds", run_form_stream(8, 1, &[(0, 9)], &[])),
+        ("overlapping", run_form_stream(8, 2, &[(0, 4), (2, 6)], &[])),
+        ("adjacent", run_form_stream(8, 2, &[(0, 2), (2, 4)], &[])),
+        ("unsorted", run_form_stream(8, 2, &[(4, 6), (0, 2)], &[])),
+        ("forged run count", run_form_stream(8, u32::MAX, &[(0, 2)], &[])),
+        ("empty table", run_form_stream(8, 0, &[], &[])),
+        ("empty table, zero rows", run_form_stream(0, 0, &[], &[])),
+        ("run in zero rows", run_form_stream(0, 1, &[(0, 1)], &[])),
+        ("valid", run_form_stream(64, 3, &[(0, 2), (5, 9), (40, 64)], &[])),
+        (
+            "valid with trailing bytes",
+            run_form_stream(64, 2, &[(1, 2), (60, 64)], &[7, 7, 7]),
+        ),
+        ("whole u32 range", run_form_stream(u32::MAX, 1, &[(0, u32::MAX)], &[])),
+        (
+            "last u32 row",
+            run_form_stream(u32::MAX, 2, &[(0, 1), (u32::MAX - 1, u32::MAX)], &[]),
+        ),
+        (
+            "one past the u32 rows",
+            run_form_stream(u32::MAX - 1, 1, &[(0, u32::MAX)], &[]),
+        ),
+    ];
+    let valid = run_form_stream(64, 2, &[(1, 2), (60, 64)], &[]);
+    for cut in 0..valid.len() {
+        cases.push(("prefix", valid[..cut].to_vec()));
+    }
+    for (name, bytes) in &cases {
+        let mut actual_reader = Reader::new(bytes);
+        let actual = NullStream::read(&mut actual_reader);
+        let mut expected_reader = Reader::new(bytes);
+        let expected = reference_null_stream_read(&mut expected_reader);
+        assert_eq!(actual, expected, "{name} ({} bytes)", bytes.len());
+        if let Ok(stream) = &actual {
+            assert_eq!(
+                actual_reader.position(),
+                expected_reader.position(),
+                "{name}: stopping point"
+            );
+            if let NullStreamForm::Runs(runs) = &stream.form {
+                assert!(matches!(runs, NullRuns::Encoded(_)), "{name}: borrowed");
+            }
+        }
     }
 }
 
@@ -4278,6 +4617,683 @@ fn alp_rd_encode_matches_the_full_buffer_reference_byte_for_byte() {
             let decoded: Vec<u64> = decoded.iter().map(|value| value.to_bits()).collect();
             let original: Vec<u64> = values.iter().map(|value| value.to_bits()).collect();
             assert_eq!(decoded, original, "len {len}");
+        }
+    }
+}
+
+/// The ALP encoder as it stood before it dropped its full-length code vector: every vector's codes appended to one
+/// `Vec<u64>`, then scanned for the maximum and packed in one go. The reference the vector-at-a-time encoder must match
+/// byte for byte.
+fn encode_alp_reference(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Option<SideStream> {
+    let sample = transform_sample(values);
+    let sample: &[f64] = sample.as_deref().unwrap_or(values);
+    let mut zigzags = vec![0u64; sample.len()];
+    let mut encodable = vec![false; sample.len()];
+    let mut best: Option<(usize, usize)> = None;
+    for (index, power) in ALP_POWERS.iter().enumerate() {
+        alp_probe_chunk(sample, *power, &mut zigzags, &mut encodable);
+        let exceptions = encodable.iter().filter(|ok| !**ok).count();
+        if best.is_none_or(|(_, current)| exceptions < current) {
+            best = Some((index, exceptions));
+        }
+        if exceptions == 0 {
+            break;
+        }
+    }
+    let (exponent_index, _) = best?;
+    let power = ALP_POWERS.get(exponent_index).copied().unwrap_or(1.0);
+    alp_probe_chunk(sample, power, &mut zigzags, &mut encodable);
+    if !alp_viable(&encodable) {
+        return None;
+    }
+    let vector_scratch = values.len().min(FASTLANES_VECTOR);
+    zigzags.resize(vector_scratch, 0);
+    encodable.resize(vector_scratch, false);
+    let mut ints = Vec::with_capacity(values.len());
+    let mut exceptions: Vec<(u32, u64)> = Vec::new();
+    let mut escaped: Vec<u32> = Vec::new();
+    for (vector_index, vector) in values.chunks(FASTLANES_VECTOR).enumerate() {
+        let (Some(vector_zigzags), Some(vector_encodable)) =
+            (zigzags.get_mut(..vector.len()), encodable.get_mut(..vector.len()))
+        else {
+            continue;
+        };
+        alp_probe_chunk(vector, power, vector_zigzags, vector_encodable);
+        let vector_exceptions = vector_encodable.iter().filter(|ok| !**ok).count();
+        if vector_exceptions * ALP_MAX_EXCEPTION_SAMPLE_DIVISOR > vector.len() {
+            escaped.push(vector_index as u32);
+            ints.extend(std::iter::repeat_n(0u64, vector.len()));
+            continue;
+        }
+        let base = vector_index * FASTLANES_VECTOR;
+        ints.extend_from_slice(vector_zigzags);
+        for (offset, (ok, value)) in vector_encodable.iter().zip(vector).enumerate() {
+            if !*ok {
+                exceptions.push(((base + offset) as u32, value.to_bits()));
+            }
+        }
+    }
+    let index_base = exceptions.iter().map(|(index, _)| u64::from(*index)).min().unwrap_or(0);
+    let index_max_delta = exceptions
+        .iter()
+        .map(|(index, _)| u64::from(*index).wrapping_sub(index_base))
+        .max()
+        .unwrap_or(0);
+    let side = choose_exception_side_stream(exceptions.len(), index_max_delta, strategy);
+    if escaped.is_empty() {
+        out.put_u8(exponent_index as u8);
+    } else {
+        out.put_u8(ALP_VECTOR_ESCAPE_SENTINEL);
+        out.put_u8(exponent_index as u8);
+        out.put_u32(escaped.len() as u32);
+        for vector_index in &escaped {
+            out.put_u32(*vector_index);
+        }
+    }
+    out.put_u32(exceptions.len() as u32);
+    match side {
+        SideStream::None => {
+            for (index, bits) in &exceptions {
+                out.put_u32(*index);
+                out.put_u64(*bits);
+            }
+        }
+        SideStream::ForBitpack => {
+            out.put_u64(index_base);
+            bitpack_with(exceptions.len(), bits_needed(index_max_delta), out, |i| {
+                exceptions
+                    .get(i)
+                    .map_or(0, |(index, _)| u64::from(*index).wrapping_sub(index_base))
+            });
+            for (_, bits) in &exceptions {
+                out.put_u64(*bits);
+            }
+        }
+        SideStream::FileScopeDictionary | SideStream::FsstDictionaryValues | SideStream::FsstValueKeys => {
+            unreachable!("the exception side-stream chooser never picks a string block's side stream")
+        }
+    }
+    let max = ints.iter().copied().max().unwrap_or(0);
+    bitpack(&ints, bits_needed(max), out);
+    for vector_index in &escaped {
+        let start = *vector_index as usize * FASTLANES_VECTOR;
+        for value in &values[start..(start + FASTLANES_VECTOR).min(values.len())] {
+            out.put_u64(value.to_bits());
+        }
+    }
+    Some(side)
+}
+
+/// Float columns covering the ALP encoder's edge cases, each named for the failure message.
+fn alp_encode_columns() -> Vec<(String, Vec<f64>)> {
+    let specials = [
+        -0.0f64,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7FF8_0000_0000_0001),
+        f64::from_bits(0xFFF4_0000_DEAD_BEEF),
+        f64::from_bits(1),
+        1.0e300,
+    ];
+    let noise = |i: usize| f64::from_bits(0x3FF0_0000_0000_0000 | (mix(i as u64) & 0x000F_FFFF_FFFF_FFFF));
+    let mut columns: Vec<(String, Vec<f64>)> = vec![
+        ("empty".to_owned(), Vec::new()),
+        ("singleton".to_owned(), vec![0.25]),
+        ("singleton nan".to_owned(), vec![f64::NAN]),
+    ];
+    for len in [1usize, 2, 1023, 1024, 1025, 2048, 3001, 5000] {
+        // Quarter steps: no exceptions.
+        columns.push((format!("quarters {len}"), (0..len).map(|i| (i as f64) * 0.25).collect()));
+        // Every value zero: a zero-width code stream.
+        columns.push((format!("zeros {len}"), vec![0.0; len]));
+        // Large integers: codes near the scaled-magnitude bound, so a high width.
+        columns.push((
+            format!("wide {len}"),
+            (0..len).map(|i| (mix(i as u64) >> 12) as f64 - 2.0e15).collect(),
+        ));
+        // Negative hundredths with sparse specials: a handful of exceptions per vector.
+        let mut sparse: Vec<f64> = (0..len).map(|i| -(i as f64) / 100.0).collect();
+        for (slot, special) in sparse.iter_mut().step_by(97).zip(specials.iter().cycle()) {
+            *slot = *special;
+        }
+        columns.push((format!("sparse specials {len}"), sparse));
+        // Every tenth value noise: many exceptions, none of them enough to escape a vector.
+        columns.push((
+            format!("dense {len}"),
+            (0..len)
+                .map(|i| if i % 10 == 3 { noise(i) } else { (i as f64) * 0.5 })
+                .collect(),
+        ));
+    }
+    // Every tenth value noise over 64 vectors: enough closely spaced exceptions that the frame-of-reference index
+    // stream beats the plain one.
+    columns.push((
+        "dense long".to_owned(),
+        (0..65_536)
+            .map(|i| if i % 10 == 3 { noise(i) } else { (i as f64) * 0.5 })
+            .collect(),
+    ));
+    // Vector 0 sits exactly at the escape bound (kept), vector 1 one past it (escaped), vector 2 is clean, vector 3 is
+    // entirely noise (escaped), and the partial tail is noise (escaped).
+    let per_vector_noise = [128usize, 129, 0, 1024, 1024];
+    let mut mixed: Vec<f64> = Vec::new();
+    for (vector_index, noisy) in per_vector_noise.iter().enumerate() {
+        let len = if vector_index == 4 { 500 } else { FASTLANES_VECTOR };
+        for offset in 0..len {
+            let i = vector_index * FASTLANES_VECTOR + offset;
+            mixed.push(if offset < *noisy { noise(i) } else { (i as f64) * 0.125 });
+        }
+    }
+    columns.push(("mixed escapes".to_owned(), mixed.clone()));
+    // The same block, but its escaped vectors carry specials rather than mantissa noise.
+    let escaped_specials: Vec<f64> = mixed
+        .iter()
+        .enumerate()
+        .map(|(i, value)| {
+            if value.to_bits() & 0x3FF0_0000_0000_0000 == 0x3FF0_0000_0000_0000 && i % 2 == 0 {
+                specials.get(i % specials.len()).copied().unwrap_or(0.0)
+            } else {
+                *value
+            }
+        })
+        .collect();
+    columns.push(("mixed escaped specials".to_owned(), escaped_specials));
+    columns.push(("one noisy vector".to_owned(), one_noisy_vector()));
+    columns
+}
+
+/// Probing again per vector and packing straight into the writer must write exactly the bytes, and choose exactly the
+/// exception side stream, the full-code-vector encoder did, under every cascade strategy.
+#[test]
+fn alp_encode_matches_the_full_code_vector_reference_byte_for_byte() {
+    let mut sides_seen = Vec::new();
+    for (name, values) in alp_encode_columns() {
+        for strategy in [
+            CascadeStrategy::DecodeOptimized,
+            CascadeStrategy::NoTrailing,
+            CascadeStrategy::SizeOptimized,
+        ] {
+            let mut out = Writer::new();
+            let side = encode_alp(&values, strategy, &mut out);
+            let mut reference = Writer::new();
+            let reference_side = encode_alp_reference(&values, strategy, &mut reference);
+            assert_eq!(side, reference_side, "{name} {strategy:?}");
+            assert_eq!(out.bytes(), reference.bytes(), "{name} {strategy:?}");
+            if let Some(side) = side {
+                sides_seen.push(side);
+                let decoded = decode_alp(&mut Reader::new(out.bytes()), side).unwrap();
+                assert_eq!(decoded.len(), values.len(), "{name} {strategy:?}");
+            }
+        }
+    }
+    assert!(sides_seen.contains(&SideStream::None));
+    assert!(sides_seen.contains(&SideStream::ForBitpack));
+}
+
+/// The ALP exception reader as it stood before it borrowed the exception list: every exception copied into a
+/// `(index, bits)` record. The reference the borrowed reader must match.
+fn decode_alp_exceptions_reference(reader: &mut Reader<'_>, side: SideStream) -> Result<Vec<(u32, u64)>, FormatError> {
+    let exception_count = reader.u32("alp exception count")? as usize;
+    let mut exceptions = Vec::with_capacity(reader.capacity_hint(exception_count, 12));
+    match side {
+        SideStream::FileScopeDictionary | SideStream::FsstDictionaryValues | SideStream::FsstValueKeys => {
+            return Err(FormatError::Structural {
+                rule: "alp blocks never carry a string block's side stream",
+            });
+        }
+        SideStream::None => {
+            for _ in 0..exception_count {
+                let index = reader.u32("alp exception index")?;
+                let bits = reader.u64("alp exception bits")?;
+                exceptions.push((index, bits));
+            }
+        }
+        SideStream::ForBitpack => {
+            let indexes: Vec<u64> = decode_for_bitpack(reader)?;
+            if indexes.len() != exception_count {
+                return Err(FormatError::Structural {
+                    rule: "alp exception index stream disagrees with the exception count",
+                });
+            }
+            for index in indexes {
+                let bits = reader.u64("alp exception bits")?;
+                let index = u32::try_from(index).map_err(|_| FormatError::RefOutOfRange {
+                    what: "alp exception index",
+                })?;
+                exceptions.push((index, bits));
+            }
+        }
+    }
+    Ok(exceptions)
+}
+
+/// The full ALP decoder as it stood before it borrowed the exception list, patching from collected records.
+fn decode_alp_reference(reader: &mut Reader<'_>, side: SideStream) -> Result<Vec<f64>, FormatError> {
+    let mut exponent_index = reader.u8("alp exponent")? as usize;
+    let mut escaped = Vec::new();
+    if exponent_index == usize::from(ALP_VECTOR_ESCAPE_SENTINEL) {
+        exponent_index = reader.u8("alp exponent")? as usize;
+        escaped = read_alp_escaped_vectors(reader)?;
+    }
+    let power = ALP_POWERS.get(exponent_index).copied().ok_or(FormatError::Structural {
+        rule: "alp exponent out of range",
+    })?;
+    let exceptions = decode_alp_exceptions_reference(reader, side)?;
+    let stream = read_packed_stream(reader)?;
+    let mut values = vec![0f64; stream.padded_count()];
+    // Reconstruction (unzigzag, convert, divide) rides inside the unpack's lane writes, so the block decodes in one
+    // pass. A stream narrow enough for the branch-free conversion takes the form that vectorizes; a wider (forged or
+    // pathological) stream keeps the scalar conversion, whose semantics both forms share where they overlap.
+    if stream.width <= ALP_EXACT_CONVERT_MAX_WIDTH {
+        stream.unpack_into(&mut values, |packed| alp_narrow_int_to_f64(packed) / power);
+    } else {
+        stream.unpack_into(&mut values, |packed| (unzigzag(packed) as f64) / power);
+    }
+    values.truncate(stream.count);
+    for (index, bits) in exceptions {
+        let slot = values.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
+            what: "alp exception index",
+        })?;
+        *slot = f64::from_bits(bits);
+    }
+    apply_alp_escapes(reader, &escaped, &mut values)?;
+    Ok(values)
+}
+
+/// The ALP range decoder as it stood before it borrowed the exception list, collecting the in-range records first.
+fn decode_alp_range_reference(
+    reader: &mut Reader<'_>,
+    side: SideStream,
+    start: usize,
+    end: usize,
+) -> Result<Vec<f64>, FormatError> {
+    let mut exponent_index = reader.u8("alp exponent")? as usize;
+    let mut escaped = Vec::new();
+    if exponent_index == usize::from(ALP_VECTOR_ESCAPE_SENTINEL) {
+        exponent_index = reader.u8("alp exponent")? as usize;
+        escaped = read_alp_escaped_vectors(reader)?;
+    }
+    let power = ALP_POWERS.get(exponent_index).copied().ok_or(FormatError::Structural {
+        rule: "alp exponent out of range",
+    })?;
+    let exceptions: Vec<(usize, u64)> = decode_alp_exceptions_reference(reader, side)?
+        .into_iter()
+        .filter_map(|(index, bits)| {
+            let index = index as usize;
+            (index >= start && index < end).then(|| (index - start, bits))
+        })
+        .collect();
+    let count = reader.u32("bitpack count")? as usize;
+    let width = u32::from(reader.u8("bitpack width")?);
+    if width > 64 {
+        return Err(FormatError::Structural {
+            rule: "bit width beyond 64",
+        });
+    }
+    let effective_end = end.min(count);
+    let effective_len = effective_end.saturating_sub(start);
+    if effective_len == 0 {
+        return Ok(Vec::new());
+    }
+    // Words consumed from the packed stream so far, so the escape patch below can seek to the raw payloads behind it.
+    let mut consumed_words = 0usize;
+    let unscale = |packed: u64| (unzigzag(packed) as f64) / power;
+    let mut values: Vec<f64> = if width == 0 {
+        // A zero-width stream stores no words, so the count is pure output amplification; fail closed beyond the block
+        // bound (allocation-light decoding of untrusted bytes), matching `bitunpack`.
+        if count > MAX_BLOCK_VALUES {
+            return Err(FormatError::Structural {
+                rule: "zero-width bitpack count beyond the block bound",
+            });
+        }
+        vec![unscale(0); effective_len]
+    } else {
+        let bits_per_val = width as usize;
+        let words_per_lane = fastlanes_words_per_lane(bits_per_val);
+        let vector_start = start / FASTLANES_VECTOR;
+        let vector_end = effective_end.div_ceil(FASTLANES_VECTOR);
+        let words_per_vector = FASTLANES_LANES * words_per_lane;
+        // Seek past vectors before vector_start without loading them.
+        let skip_words = vector_start * words_per_vector;
+        reader.take(skip_words.saturating_mul(8), "bitpack skip word")?;
+        // Load only the words covering [vector_start, vector_end).
+        let needed_words = (vector_end - vector_start) * words_per_vector;
+        let packed_bytes = reader.take(needed_words.saturating_mul(8), "bitpack word")?;
+        consumed_words = skip_words + needed_words;
+        with_unpack_buffer(|buffer| {
+            unpack_fastlanes_range_into(packed_bytes, width, start, effective_end, buffer)
+                .iter()
+                .map(|packed| unscale(*packed))
+                .collect()
+        })
+    };
+    for (rel_idx, bits) in exceptions {
+        if let Some(slot) = values.get_mut(rel_idx) {
+            *slot = f64::from_bits(bits);
+        }
+    }
+    if !escaped.is_empty() {
+        // Seek past the packed words this range decode left unread, landing on the raw escape payloads, then patch the
+        // escaped vectors that overlap [start, effective_end).
+        let total_words = if width == 0 {
+            0
+        } else {
+            count.div_ceil(FASTLANES_VECTOR) * FASTLANES_LANES * fastlanes_words_per_lane(width as usize)
+        };
+        reader.take(
+            total_words.saturating_sub(consumed_words).saturating_mul(8),
+            "bitpack skip word",
+        )?;
+        for vector_index in &escaped {
+            let vector_start = *vector_index as usize * FASTLANES_VECTOR;
+            if vector_start >= count {
+                return Err(FormatError::RefOutOfRange {
+                    what: "alp escaped vector index",
+                });
+            }
+            let vector_end = (vector_start + FASTLANES_VECTOR).min(count);
+            let raw = reader.take((vector_end - vector_start) * 8, "alp escaped value")?;
+            for row in vector_start.max(start)..vector_end.min(effective_end) {
+                let word = raw
+                    .get((row - vector_start) * 8..(row - vector_start) * 8 + 8)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .unwrap_or(0);
+                if let Some(slot) = values.get_mut(row - start) {
+                    *slot = f64::from_bits(word);
+                }
+            }
+        }
+    }
+    Ok(values)
+}
+
+/// Writes an ALP block by hand (exponent index 2) so a test can place any exception list, packed code stream and
+/// escape payload, including ones the encoder never writes: duplicates, unsorted or out-of-range indexes, and indexes
+/// past `u32` under the frame-of-reference side stream.
+fn handmade_alp_block(
+    side: SideStream,
+    exceptions: &[(u64, u64)],
+    escaped: &[u32],
+    codes: &[u64],
+    raw: &[u64],
+) -> Vec<u8> {
+    let mut out = Writer::new();
+    if escaped.is_empty() {
+        out.put_u8(2);
+    } else {
+        out.put_u8(ALP_VECTOR_ESCAPE_SENTINEL);
+        out.put_u8(2);
+        out.put_u32(escaped.len() as u32);
+        for vector_index in escaped {
+            out.put_u32(*vector_index);
+        }
+    }
+    out.put_u32(exceptions.len() as u32);
+    if side == SideStream::ForBitpack {
+        let indexes: Vec<u64> = exceptions.iter().map(|(index, _)| *index).collect();
+        encode_for_bitpack(&indexes, &mut out);
+        for (_, bits) in exceptions {
+            out.put_u64(*bits);
+        }
+    } else {
+        for (index, bits) in exceptions {
+            out.put_u32(*index as u32);
+            out.put_u64(*bits);
+        }
+    }
+    bitpack(codes, bits_needed(codes.iter().copied().max().unwrap_or(0)), &mut out);
+    for word in raw {
+        out.put_u64(*word);
+    }
+    out.into_bytes()
+}
+
+/// Row ranges covering empty, inverted, single-row, vector-straddling, partial and past-the-end requests.
+fn alp_parity_ranges() -> [(usize, usize); 14] {
+    [
+        (0, 0),
+        (5, 3),
+        (0, 1),
+        (0, 10),
+        (3, 1500),
+        (1000, 1100),
+        (1023, 1025),
+        (1024, 2048),
+        (2000, 6000),
+        (4095, 4096),
+        (4500, 4600),
+        (5000, 9000),
+        (10_000, 20_000),
+        (0, usize::MAX),
+    ]
+}
+
+/// The borrowed exception list must decode every block, well-formed or not, to exactly the float bits, or exactly
+/// the error, the record-collecting decoders produced, for a full decode and for every range in `ranges`.
+fn assert_alp_decoders_match_reference(body: &[u8], side: SideStream, ranges: &[(usize, usize)], label: &str) {
+    let bits = |decoded: Result<Vec<f64>, FormatError>| {
+        decoded.map(|values| values.iter().map(|value| value.to_bits()).collect::<Vec<u64>>())
+    };
+    assert_eq!(
+        bits(decode_alp(&mut Reader::new(body), side)),
+        bits(decode_alp_reference(&mut Reader::new(body), side)),
+        "{label}: full decode"
+    );
+    for (start, end) in ranges {
+        assert_eq!(
+            bits(decode_alp_range(&mut Reader::new(body), side, *start, *end)),
+            bits(decode_alp_range_reference(&mut Reader::new(body), side, *start, *end)),
+            "{label}: range [{start}, {end})"
+        );
+    }
+}
+
+/// Encoder output across both exception side streams, no to many exceptions, escaped vectors and special values
+/// decodes identically, in full and over every range, with and without the borrowed exception list.
+#[test]
+fn alp_decode_with_borrowed_exceptions_matches_the_record_reference() {
+    let mut sides_seen = Vec::new();
+    for (name, values) in alp_encode_columns() {
+        for strategy in [CascadeStrategy::DecodeOptimized, CascadeStrategy::SizeOptimized] {
+            let mut out = Writer::new();
+            let Some(side) = encode_alp(&values, strategy, &mut out) else {
+                continue;
+            };
+            sides_seen.push(side);
+            assert_alp_decoders_match_reference(out.bytes(), side, &alp_parity_ranges(), &name);
+        }
+    }
+    assert!(sides_seen.contains(&SideStream::None));
+    assert!(sides_seen.contains(&SideStream::ForBitpack));
+}
+
+/// Cutting a block short at every byte must fail with the same error, at the same field, as before, including in the
+/// exception list and the escape payloads, for both side streams.
+#[test]
+fn alp_decode_with_borrowed_exceptions_fails_on_truncation_like_the_record_reference() {
+    // Vector 0 carries a few exceptions; the partial tail vector is noise, so it is escaped.
+    let values: Vec<f64> = (0..1200)
+        .map(|i| {
+            if i >= 1024 {
+                f64::from_bits(0x3FF0_0000_0000_0000 | (mix(i as u64) & 0x000F_FFFF_FFFF_FFFF))
+            } else if i % 101 == 7 {
+                f64::from_bits(0x7FF8_0000_0000_0000 | i as u64)
+            } else {
+                (i as f64) * 0.25
+            }
+        })
+        .collect();
+    let ranges = [(0, 1200), (0, 5), (1000, 1100), (1100, 1200), (3000, 4000)];
+    let mut sides_seen = Vec::new();
+    for strategy in [CascadeStrategy::DecodeOptimized, CascadeStrategy::SizeOptimized] {
+        let mut out = Writer::new();
+        let side = encode_alp(&values, strategy, &mut out).expect("a mostly regular block encodes as ALP");
+        sides_seen.push(side);
+        let body = out.into_bytes();
+        for cut in 0..body.len() {
+            let truncated = body.get(..cut).unwrap_or(&[]);
+            assert_alp_decoders_match_reference(truncated, side, &ranges, &format!("{side:?} cut at {cut}"));
+        }
+    }
+    // Hand-built blocks pin each side stream regardless of what the chooser picks for the data above.
+    let exceptions: Vec<(u64, u64)> = (0..40).map(|i| (i * 7 + 3, mix(i))).collect();
+    let codes: Vec<u64> = (0..600).map(|i| zigzag(i - 300)).collect();
+    for side in [SideStream::None, SideStream::ForBitpack] {
+        sides_seen.push(side);
+        let body = handmade_alp_block(side, &exceptions, &[], &codes, &[]);
+        for cut in 0..body.len() {
+            let truncated = body.get(..cut).unwrap_or(&[]);
+            assert_alp_decoders_match_reference(truncated, side, &ranges, &format!("handmade {side:?} cut at {cut}"));
+        }
+    }
+    assert!(sides_seen.contains(&SideStream::None));
+    assert!(sides_seen.contains(&SideStream::ForBitpack));
+}
+
+/// Malformed and unusual exception lists (duplicates, unsorted and out-of-range indexes, indexes past `u32`, count
+/// mismatches, frame-of-reference overflow, string side streams, bad packed headers, and blocks broken in two places
+/// at once) produce the same floats or the same first error as before.
+#[test]
+fn alp_decode_with_borrowed_exceptions_handles_malformed_lists_like_the_record_reference() {
+    let codes: Vec<u64> = (0..1500).map(|i| zigzag(i % 97 - 48)).collect();
+    let nan = 0x7FF8_0000_0000_00AB;
+    let neg_zero = (-0.0f64).to_bits();
+    let lists: [(&str, Vec<(u64, u64)>); 8] = [
+        ("none", vec![]),
+        ("one", vec![(4, nan)]),
+        (
+            "duplicates and unsorted",
+            vec![(900, nan), (5, neg_zero), (900, f64::INFINITY.to_bits()), (2, 1)],
+        ),
+        ("dense", (0..1500).step_by(3).map(|i| (i, mix(i))).collect()),
+        ("past the output", vec![(3, nan), (1500, nan)]),
+        ("far past the output", vec![(u64::from(u32::MAX), nan)]),
+        ("inside an escaped vector", vec![(1030, nan), (10, neg_zero)]),
+        ("past u32", vec![(7, nan), (1 << 33, nan)]),
+    ];
+    let raw: Vec<u64> = (0..476).map(|i| f64::NEG_INFINITY.to_bits() ^ i).collect();
+    for (name, exceptions) in &lists {
+        for side in [SideStream::None, SideStream::ForBitpack] {
+            for (escaped, raw) in [(&[][..], &[][..]), (&[1u32][..], &raw[..]), (&[1u32, 9][..], &raw[..])] {
+                let body = handmade_alp_block(side, exceptions, escaped, &codes, raw);
+                let label = format!("{name} {side:?} escaped {escaped:?}");
+                assert_alp_decoders_match_reference(&body, side, &alp_parity_ranges(), &label);
+                // A block written for one side stream but read as another, or as a string block's side stream.
+                for other in [
+                    SideStream::None,
+                    SideStream::ForBitpack,
+                    SideStream::FileScopeDictionary,
+                    SideStream::FsstDictionaryValues,
+                    SideStream::FsstValueKeys,
+                ] {
+                    assert_alp_decoders_match_reference(
+                        &body,
+                        other,
+                        &alp_parity_ranges(),
+                        &format!("{label} as {other:?}"),
+                    );
+                }
+            }
+        }
+    }
+
+    // Duplicates resolve last-write-wins, and an escaped vector's raw payload overrides an exception inside it.
+    let body = handmade_alp_block(
+        SideStream::None,
+        &[(5, nan), (5, neg_zero), (1030, nan)],
+        &[1],
+        &codes,
+        &raw,
+    );
+    let decoded = decode_alp(&mut Reader::new(&body), SideStream::None).unwrap();
+    assert_eq!(decoded.get(5).map(|value| value.to_bits()), Some(neg_zero));
+    assert_eq!(decoded.get(1030).map(|value| value.to_bits()), raw.get(6).copied());
+
+    // A frame-of-reference record whose bits are cut short reports the truncation before its index past `u32`.
+    let mut forged = Writer::new();
+    forged.put_u8(2);
+    forged.put_u32(1);
+    encode_for_bitpack(&[1 << 33], &mut forged);
+    let forged = forged.into_bytes();
+    assert_alp_decoders_match_reference(
+        &forged,
+        SideStream::ForBitpack,
+        &alp_parity_ranges(),
+        "truncated bits past u32",
+    );
+    assert_eq!(
+        decode_alp(&mut Reader::new(&forged), SideStream::ForBitpack),
+        Err(FormatError::Truncated {
+            what: "alp exception bits"
+        })
+    );
+
+    // The exception count disagrees with the index stream, and the bits are missing too: the count check comes first.
+    let mut mismatch = Writer::new();
+    mismatch.put_u8(2);
+    mismatch.put_u32(2);
+    encode_for_bitpack(&[4], &mut mismatch);
+    assert_alp_decoders_match_reference(
+        mismatch.bytes(),
+        SideStream::ForBitpack,
+        &alp_parity_ranges(),
+        "count mismatch",
+    );
+
+    // A frame-of-reference base so close to the top that a packed delta carries it past `u64::MAX`.
+    let mut overflow = Writer::new();
+    overflow.put_u8(2);
+    overflow.put_u32(2);
+    overflow.put_u64(u64::MAX - 1);
+    bitpack(&[0, 5], 3, &mut overflow);
+    overflow.put_u64(nan);
+    overflow.put_u64(nan);
+    bitpack(&codes, 7, &mut overflow);
+    assert_alp_decoders_match_reference(
+        overflow.bytes(),
+        SideStream::ForBitpack,
+        &alp_parity_ranges(),
+        "base overflow",
+    );
+
+    // A valid exception list in front of a forged packed header: a width past 64, then a zero-width count past the
+    // block bound, each with an exception index past the output, so the header error must win in a full decode.
+    for (width, count) in [(65u8, 4u32), (0, u32::MAX), (0, 1 << 25), (0, 3)] {
+        for side in [SideStream::None, SideStream::ForBitpack] {
+            let mut forged = Writer::new();
+            forged.put_u8(2);
+            forged.put_u32(2);
+            if side == SideStream::ForBitpack {
+                encode_for_bitpack(&[1, 9_000_000], &mut forged);
+                forged.put_u64(nan);
+                forged.put_u64(nan);
+            } else {
+                for index in [1u32, 9_000_000] {
+                    forged.put_u32(index);
+                    forged.put_u64(nan);
+                }
+            }
+            forged.put_u32(count);
+            forged.put_u8(width);
+            assert_alp_decoders_match_reference(
+                forged.bytes(),
+                side,
+                &alp_parity_ranges(),
+                &format!("forged header width {width} count {count} {side:?}"),
+            );
+        }
+    }
+
+    // An empty body and a body holding only the exponent fail at the same field.
+    for body in [
+        &[][..],
+        &[2u8][..],
+        &[ALP_VECTOR_ESCAPE_SENTINEL][..],
+        &[30u8, 0, 0, 0, 0][..],
+    ] {
+        for side in [SideStream::None, SideStream::FsstValueKeys] {
+            assert_alp_decoders_match_reference(body, side, &alp_parity_ranges(), &format!("short body {body:?}"));
         }
     }
 }

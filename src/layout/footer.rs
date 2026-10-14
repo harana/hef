@@ -1374,7 +1374,7 @@ fn encode_sections(footer: &Footer) -> SectionArea {
     }
 
     if let Some(rollups) = &footer.time_series_rollups {
-        sections.push(sections::TIME_SERIES_ROLLUPS, |out| out.put_slice(&rollups.encode()));
+        sections.push(sections::TIME_SERIES_ROLLUPS, |out| rollups.encode_into(out));
     }
 
     // The sparse shredded key set: optional, emitted only when the writer stored sparse columns.
