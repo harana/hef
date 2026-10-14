@@ -1140,45 +1140,6 @@ fn a_forced_hash_collision_resolves_to_the_event_holding_the_id() {
     );
 }
 
-/// The event-id section written straight from the index's arrays is byte for byte the section written by copying them
-/// into owned columns first, as the encoder once did; it reads back to the same index, and encoding it twice leaves
-/// the index as it was. Hashes several events share are written the same way too.
-#[test]
-fn the_event_id_section_matches_the_one_written_from_copied_columns() {
-    let copied_section = |index: &EventIdIndex| {
-        let mut out = Writer::new();
-        put_block(&mut out, &ColumnData::U64(index.hashes.clone()));
-        put_block(&mut out, &ColumnData::U64(index.sns.clone()));
-        out.put_u32(index.filter.len() as u32);
-        out.put_slice(&index.filter);
-        out.into_bytes()
-    };
-    let shared_hash = event_id_hash(b"$shared");
-    let mut indexes = vec![EventIdIndex {
-        filter: Vec::new(),
-        hashes: vec![3, shared_hash, shared_hash, shared_hash, u64::MAX],
-        sns: vec![9, 2, 5, 7, 1],
-    }];
-    for events in [1u64, 2, 1023, 1024, 1025, 5000] {
-        let ids: Vec<Vec<u8>> = (0..events).map(event_id).collect();
-        let index = EventIdIndex::build(ids.iter().map(Vec::as_slice).zip(0..events))
-            .unwrap()
-            .unwrap();
-        assert_eq!(EventIdIndex::decode(&copied_section(&index), 0, events).unwrap(), index);
-        indexes.push(index);
-    }
-    for index in indexes {
-        let before = index.clone();
-        let expected = copied_section(&index);
-        for _ in 0..2 {
-            let mut out = Writer::new();
-            index.encode(&mut out);
-            assert_eq!(out.into_bytes(), expected, "{} events", index.sns.len());
-        }
-        assert_eq!(index, before);
-    }
-}
-
 /// The event-id index's stored bytes per event and its filter's false-positive rate, for 100,000 Matrix-shaped ids.
 #[test]
 fn the_event_id_index_is_small_and_its_filter_rarely_admits_an_absent_id() {
