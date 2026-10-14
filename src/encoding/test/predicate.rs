@@ -1519,7 +1519,10 @@ fn reference_weave_present(nulls: &NullStream, present: &[bool]) -> Result<Vec<b
 }
 
 /// Whether row `i` carries a value, for each named null shape the weave tests sweep.
-fn null_shapes() -> [(&'static str, fn(usize) -> bool); 4] {
+/// A named rule saying whether row `n` holds a value.
+type NullShape = (&'static str, fn(usize) -> bool);
+
+fn null_shapes() -> [NullShape; 4] {
     [
         ("all absent", |_| false),
         ("all present", |_| true),

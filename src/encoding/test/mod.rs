@@ -1087,7 +1087,7 @@ fn reference_null_stream(values: &StringColumn) -> NullStream<'static> {
     } else if runs == [(0, row_count as u32)] {
         NullStreamForm::AllPresent
     } else if 4 + runs.len() * 8 < row_count.div_ceil(8) {
-        NullStreamForm::Runs(runs)
+        NullStreamForm::Runs(NullRuns::Pairs(runs))
     } else {
         let mut raw = vec![0u8; row_count.div_ceil(8)];
         for &(start, end) in &runs {
@@ -1459,7 +1459,7 @@ fn assert_same_presence_answers(actual: &NullStream, expected: &NullStream, name
             );
         }
     }
-    let values = || (0..expected.present_count() as u128).map(|value| value + 1);
+    let values = || (1..=expected.present_count() as u128).collect::<Vec<_>>().into_iter();
     assert_eq!(
         views_by_row(actual, values()).unwrap(),
         views_by_row(expected, values()).unwrap(),
@@ -4765,6 +4765,14 @@ fn alp_encode_columns() -> Vec<(String, Vec<f64>)> {
                 .collect(),
         ));
     }
+    // Every tenth value noise over 64 vectors: enough closely spaced exceptions that the frame-of-reference index
+    // stream beats the plain one.
+    columns.push((
+        "dense long".to_owned(),
+        (0..65_536)
+            .map(|i| if i % 10 == 3 { noise(i) } else { (i as f64) * 0.5 })
+            .collect(),
+    ));
     // Vector 0 sits exactly at the escape bound (kept), vector 1 one past it (escaped), vector 2 is clean, vector 3 is
     // entirely noise (escaped), and the partial tail is noise (escaped).
     let per_vector_noise = [128usize, 129, 0, 1024, 1024];
