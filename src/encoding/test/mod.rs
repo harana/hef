@@ -3131,6 +3131,93 @@ fn shared_scope_dictionary_blocks_store_codes_only_and_translate_once() {
     assert!(forged.side_stream().is_err(), "the external scope is reserved");
 }
 
+/// Preparing a file-scope alphabet builds its arena and views straight from the alphabet, byte for byte the same as
+/// concatenating it and taking views over the boundaries: empty, single and many entries, duplicates, empty text,
+/// Unicode, and lengths either side of Arrow's twelve-byte inline limit.
+#[test]
+fn prepared_shared_dictionary_matches_concatenated_views() {
+    let mut many: Vec<String> = [0usize, 1, 11, 12, 13, 300]
+        .iter()
+        .map(|&len| "x".repeat(len))
+        .collect();
+    many.extend(
+        [
+            "",
+            "dup",
+            "dup",
+            "naive cafe \u{e9}\u{1f600}",
+            "\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30ad}",
+        ]
+        .map(str::to_owned),
+    );
+    many.extend((0..500).map(|i| format!("value number {i}")));
+    for alphabet in [Vec::new(), vec!["only one long entry here".to_owned()], many] {
+        let entries: Vec<&str> = alphabet.iter().map(String::as_str).collect();
+        let (arena, bounds) = concatenate(&entries);
+        let expected = views_over(&arena, &bounds).unwrap();
+        let prepared = prepare_shared_string_view_dictionary(&alphabet).unwrap();
+        assert_eq!(
+            prepared.arena.as_slice(),
+            arena.as_slice(),
+            "{} entries",
+            alphabet.len()
+        );
+        assert_eq!(prepared.entry_views, expected, "{} entries", alphabet.len());
+    }
+}
+
+/// The prepared dictionary owns its text: it keeps decoding repeated shared-scope blocks after the alphabet it was
+/// built from is dropped.
+#[test]
+fn prepared_shared_dictionary_outlives_its_alphabet() {
+    let alphabet: Vec<String> = ["a value long enough to sit in the arena", "blue", "red", "yellow"]
+        .map(str::to_owned)
+        .to_vec();
+    let values: Vec<Option<String>> = (0..600)
+        .map(|i| (i % 7 != 0).then(|| alphabet[i % 4].clone()))
+        .collect();
+    let block = encode_block_with_shared_dictionary(
+        &ColumnData::Strings(values.clone().into()),
+        false,
+        CascadeStrategy::DecodeOptimized,
+        Some(&alphabet),
+    );
+    assert_eq!(block.pipeline.side_stream().unwrap(), SideStream::FileScopeDictionary);
+    let prepared = prepare_shared_string_view_dictionary(&alphabet).unwrap();
+    drop(alphabet);
+    for _ in 0..2 {
+        let bytes = block.bytes.clone();
+        let views = decode_string_block_views_shared_prepared(block.pipeline, &bytes, None, Some(&prepared))
+            .unwrap()
+            .expect("dictionary blocks decode to views");
+        drop(bytes);
+        for (row, expected) in values.iter().enumerate() {
+            assert_eq!(
+                views.is_valid(row).then(|| views.value(row)),
+                expected.as_deref(),
+                "row {row}"
+            );
+        }
+    }
+}
+
+/// The arena length check accepts exactly what a `u32` view offset can address and refuses one byte more, or a sum
+/// that overflows, with the same structural error the boundary walk reports.
+#[test]
+fn view_arena_len_is_checked_at_the_u32_limit() {
+    let max = u32::MAX as usize;
+    assert_eq!(view_arena_len([]).unwrap(), 0);
+    assert_eq!(view_arena_len([max - 12, 12]).unwrap(), max);
+    for lens in [vec![max - 12, 13], vec![max, 1], vec![usize::MAX, 1]] {
+        assert!(matches!(
+            view_arena_len(lens),
+            Err(FormatError::Structural {
+                rule: "string arena larger than a view offset can address"
+            })
+        ));
+    }
+}
+
 /// The scope decision is a per-block size trial, not a coverage rule: a block whose two distinct values sit at the
 /// far ends of a 1024-entry alphabet would pay ten-bit codes at file scope, so its one-bit local dictionary wins —
 /// while a block spanning the whole alphabet drops the value stream and takes the file scope.

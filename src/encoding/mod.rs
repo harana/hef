@@ -2947,13 +2947,30 @@ pub(crate) struct SharedStringViewDictionary {
 pub(crate) fn prepare_shared_string_view_dictionary(
     shared: &[String],
 ) -> Result<SharedStringViewDictionary, FormatError> {
-    let entries: Vec<&str> = shared.iter().map(String::as_str).collect();
-    let (arena, bounds) = concatenate(&entries);
-    let entry_views = views_over(&arena, &bounds)?;
+    // Sized and checked up front, so an alphabet too large for a view to address is refused before its arena is
+    // allocated rather than after. Every entry is already a `String`, so each view spans valid UTF-8 by construction.
+    let mut arena = Vec::with_capacity(view_arena_len(shared.iter().map(String::len))?);
+    let mut entry_views = Vec::with_capacity(shared.len());
+    for value in shared {
+        // The whole arena fits a `u32`, checked above, so every start within it does too.
+        entry_views.push(make_view(value.as_bytes(), 0, arena.len() as u32));
+        arena.extend_from_slice(value.as_bytes());
+    }
     Ok(SharedStringViewDictionary {
         arena: Buffer::from(arena),
         entry_views,
     })
+}
+
+/// The byte length of values of lengths `lens` laid end to end, refused when it overflows or a view's `u32` offset
+/// could not address its end.
+fn view_arena_len(lens: impl IntoIterator<Item = usize>) -> Result<usize, FormatError> {
+    lens.into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .filter(|&total| u32::try_from(total).is_ok())
+        .ok_or(FormatError::Structural {
+            rule: "string arena larger than a view offset can address",
+        })
 }
 
 /// [`decode_string_block_views_shared`] with a prepared representation of the same file-scope alphabet. The prepared
