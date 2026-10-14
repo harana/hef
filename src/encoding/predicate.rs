@@ -1942,12 +1942,13 @@ fn filter_alp_block(body: &[u8], side: SideStream, predicate: &FloatPredicate) -
     let mut verdicts = vec![false; stream.padded_count()];
     test.apply(&stream, &mut verdicts);
     verdicts.truncate(stream.count);
-    for (index, bits) in exceptions {
+    exceptions.try_for_each(|index, bits| {
         let slot = verdicts.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
             what: "alp exception index",
         })?;
         *slot = predicate.matches_f64(f64::from_bits(bits));
-    }
+        Ok(())
+    })?;
     // Escaped vectors store their raw floats after the packed words; judge each one directly, walking the payloads in
     // the same order `apply_alp_escapes` does.
     for vector_index in &escaped {

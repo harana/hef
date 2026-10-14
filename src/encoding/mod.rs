@@ -1440,22 +1440,63 @@ fn apply_alp_escapes(reader: &mut Reader<'_>, escaped: &[u32], values: &mut [f64
     Ok(())
 }
 
-/// Reads an ALP block's exception list, honouring the recorded side-stream inner encoding.
-fn decode_alp_exceptions(reader: &mut Reader<'_>, side: SideStream) -> Result<Vec<(u32, u64)>, FormatError> {
+/// The values an ALP block stores exactly, beside its scaled integers: each one's row index and its raw float bits.
+///
+/// The list is checked when it is read but stays borrowed from the block's bytes, so decoding never copies the
+/// exceptions into records of their own; [`Self::try_for_each`] reads them back in stored order.
+///
+/// See: hef-encodings-and-compression/spec.md
+enum AlpExceptions<'a> {
+    /// Stored plainly: each exception's 4-byte index sits in front of its 8-byte bits.
+    Interleaved(&'a [u8]),
+    /// Stored with a frame-of-reference index stream: the indexes are already decoded (each checked to fit a `u32`),
+    /// and `bits` holds one 8-byte word per index, in the same order.
+    Separate { bits: &'a [u8], indexes: Vec<u64> },
+}
+
+impl AlpExceptions<'_> {
+    /// Hands each exception's row index and raw float bits to `patch`, in stored order, stopping at the first error
+    /// `patch` returns.
+    fn try_for_each(&self, mut patch: impl FnMut(u32, u64) -> Result<(), FormatError>) -> Result<(), FormatError> {
+        match self {
+            Self::Interleaved(records) => {
+                for record in records.chunks_exact(size_of::<u32>() + size_of::<u64>()) {
+                    let (index, bits) = record.split_at_checked(size_of::<u32>()).unwrap_or((&[], &[]));
+                    patch(
+                        u32::from_le_bytes(index.try_into().unwrap_or([0; 4])),
+                        u64::from_le_bytes(bits.try_into().unwrap_or([0; 8])),
+                    )?;
+                }
+            }
+            Self::Separate { bits, indexes } => {
+                for (index, word) in indexes.iter().zip(bits.chunks_exact(size_of::<u64>())) {
+                    patch(*index as u32, u64::from_le_bytes(word.try_into().unwrap_or([0; 8])))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Reads an ALP block's exception list, honouring the recorded side-stream inner encoding, and leaves `reader` just
+/// past it. Every field is checked in the order it is stored, so a malformed list fails exactly where it breaks; the
+/// exceptions themselves stay borrowed from `reader`'s bytes.
+fn decode_alp_exceptions<'a>(reader: &mut Reader<'a>, side: SideStream) -> Result<AlpExceptions<'a>, FormatError> {
     let exception_count = reader.u32("alp exception count")? as usize;
-    let mut exceptions = Vec::with_capacity(reader.capacity_hint(exception_count, 12));
     match side {
         SideStream::FileScopeDictionary | SideStream::FsstDictionaryValues | SideStream::FsstValueKeys => {
-            return Err(FormatError::Structural {
+            Err(FormatError::Structural {
                 rule: "alp blocks never carry a string block's side stream",
-            });
+            })
         }
         SideStream::None => {
+            let mut records = *reader;
             for _ in 0..exception_count {
-                let index = reader.u32("alp exception index")?;
-                let bits = reader.u64("alp exception bits")?;
-                exceptions.push((index, bits));
+                reader.u32("alp exception index")?;
+                reader.u64("alp exception bits")?;
             }
+            let records = records.take(reader.position() - records.position(), "alp exception index")?;
+            Ok(AlpExceptions::Interleaved(records))
         }
         SideStream::ForBitpack => {
             let indexes: Vec<u64> = decode_for_bitpack(reader)?;
@@ -1464,16 +1505,17 @@ fn decode_alp_exceptions(reader: &mut Reader<'_>, side: SideStream) -> Result<Ve
                     rule: "alp exception index stream disagrees with the exception count",
                 });
             }
-            for index in indexes {
-                let bits = reader.u64("alp exception bits")?;
-                let index = u32::try_from(index).map_err(|_| FormatError::RefOutOfRange {
+            let mut bits = *reader;
+            for index in &indexes {
+                reader.u64("alp exception bits")?;
+                u32::try_from(*index).map_err(|_| FormatError::RefOutOfRange {
                     what: "alp exception index",
                 })?;
-                exceptions.push((index, bits));
             }
+            let bits = bits.take(reader.position() - bits.position(), "alp exception bits")?;
+            Ok(AlpExceptions::Separate { bits, indexes })
         }
     }
-    Ok(exceptions)
 }
 
 fn decode_alp(reader: &mut Reader<'_>, side: SideStream) -> Result<Vec<f64>, FormatError> {
@@ -1498,12 +1540,13 @@ fn decode_alp(reader: &mut Reader<'_>, side: SideStream) -> Result<Vec<f64>, For
         stream.unpack_into(&mut values, |packed| (unzigzag(packed) as f64) / power);
     }
     values.truncate(stream.count);
-    for (index, bits) in exceptions {
+    exceptions.try_for_each(|index, bits| {
         let slot = values.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
             what: "alp exception index",
         })?;
         *slot = f64::from_bits(bits);
-    }
+        Ok(())
+    })?;
     apply_alp_escapes(reader, &escaped, &mut values)?;
     Ok(values)
 }
@@ -4353,13 +4396,7 @@ fn decode_alp_range(
     let power = ALP_POWERS.get(exponent_index).copied().ok_or(FormatError::Structural {
         rule: "alp exponent out of range",
     })?;
-    let exceptions: Vec<(usize, u64)> = decode_alp_exceptions(reader, side)?
-        .into_iter()
-        .filter_map(|(index, bits)| {
-            let index = index as usize;
-            (index >= start && index < end).then(|| (index - start, bits))
-        })
-        .collect();
+    let exceptions = decode_alp_exceptions(reader, side)?;
     let count = reader.u32("bitpack count")? as usize;
     let width = u32::from(reader.u8("bitpack width")?);
     if width > 64 {
@@ -4404,11 +4441,17 @@ fn decode_alp_range(
                 .collect()
         })
     };
-    for (rel_idx, bits) in exceptions {
-        if let Some(slot) = values.get_mut(rel_idx) {
+    // Only exceptions inside the requested rows patch; any other is skipped without a bounds error.
+    exceptions.try_for_each(|index, bits| {
+        let index = index as usize;
+        if index >= start
+            && index < end
+            && let Some(slot) = values.get_mut(index - start)
+        {
             *slot = f64::from_bits(bits);
         }
-    }
+        Ok(())
+    })?;
     if !escaped.is_empty() {
         // Seek past the packed words this range decode left unread, landing on the raw escape payloads, then patch the
         // escaped vectors that overlap [start, effective_end).
