@@ -59,8 +59,24 @@ impl LearnedPositionIndex {
     /// PGM index), so the extra slack keeps every range boundary inside the confirmation window. Returns an index
     /// ready to answer range seek queries.
     pub fn build(column_id: u32, projection_id: u32, keys: &[i64], error_bound: u64) -> Self {
-        let row_count = keys.len() as u64;
-        let segments = fit_segments(keys, error_bound);
+        let rows: Vec<u64> = (0..keys.len() as u64).collect();
+        Self::build_at_rows(column_id, projection_id, keys, &rows, keys.len() as u64, error_bound)
+    }
+
+    /// Builds a learned position index for a column whose values do not sit on every row, such as one with nulls.
+    ///
+    /// Give the sorted ascending present keys, the row each one sits at (`rows[i]` holds `keys[i]`, ascending), and
+    /// the total row count. Seek windows then name those real rows, so a reader confirms the boundary on the rows it
+    /// actually scans. Otherwise as [`LearnedPositionIndex::build`].
+    pub fn build_at_rows(
+        column_id: u32,
+        projection_id: u32,
+        keys: &[i64],
+        rows: &[u64],
+        row_count: u64,
+        error_bound: u64,
+    ) -> Self {
+        let segments = fit_segments(keys, rows, error_bound);
         Self {
             column_id,
             direction: SortDirection::Ascending,
@@ -164,13 +180,12 @@ impl LearnedPositionIndex {
     }
 
     fn model_eval(&self, key: i64) -> u64 {
-        // partition_point on `key_lo < key` lands on the *first* segment whose key_lo == key, so a duplicated key
-        // that spans multiple segments resolves to the earliest one, not the last.
         let i = self.segments.partition_point(|s| s.key_lo < key);
         let seg_index = if i < self.segments.len() && self.segments[i].key_lo == key {
             i
         } else if i == 0 {
-            return 0;
+            // Below every stored key: the boundary is the first stored key's row.
+            return self.segments.first().map_or(0, |seg| seg.intercept as u64);
         } else {
             i - 1
         };
@@ -233,41 +248,43 @@ impl<'a> LearnedSeek<'a> {
 /// Fits a minimal piecewise linear model whose maximum per-point error is at most `error_bound` rows, using a greedy
 /// cone-intersection algorithm.
 ///
+/// The fitted points are each distinct key at the row of its first occurrence (the boundary a seek for it must find),
+/// plus, where the next distinct key leaves a gap, the key just past the previous one at the next key's row: every
+/// key in the gap has that row as its boundary, so a long duplicate run or a run of null rows cannot pull a gap key's
+/// estimate back to the start of the run. Fitting each key once also keeps segment keys strictly ascending, which
+/// [`LearnedPositionIndex::decode`] requires.
+///
 /// For each segment the algorithm maintains the range of slopes `[slope_lo, slope_hi]` consistent with all points seen
 /// so far staying within the error budget. When a new point would make that range empty, a new segment starts.
-fn fit_segments(keys: &[i64], error_bound: u64) -> Vec<Segment> {
-    if keys.is_empty() {
-        return Vec::new();
+fn fit_segments(keys: &[i64], rows: &[u64], error_bound: u64) -> Vec<Segment> {
+    let mut points: Vec<(i64, u64)> = Vec::new();
+    for (&key, &row) in keys.iter().zip(rows) {
+        match points.last().map(|&(last, _)| last) {
+            Some(last) if last == key => continue,
+            Some(last) if (last as i128) + 1 < key as i128 => points.push((last + 1, row)),
+            _ => {}
+        }
+        points.push((key, row));
     }
 
     let error = error_bound as f64;
     let mut segments: Vec<Segment> = Vec::new();
     let mut seg_start = 0usize;
 
-    while let Some(&key0) = keys.get(seg_start) {
-        let pos0 = seg_start as f64;
+    while let Some(&(key0, row0)) = points.get(seg_start) {
+        let pos0 = row0 as f64;
 
         let mut slope_lo = f64::NEG_INFINITY;
         let mut slope_hi = f64::INFINITY;
         let mut chosen_slope = 0.0f64;
         let mut seg_end = seg_start;
 
-        for (i, &key) in keys.iter().enumerate().skip(seg_start + 1) {
+        for (i, &(key, row)) in points.iter().enumerate().skip(seg_start + 1) {
             let dk = (key as i128 - key0 as i128) as f64;
 
-            if dk == 0.0 {
-                // Duplicate key at a different row: only fits if the row distance from pos0 stays within budget (slope
-                // is 0 here).
-                if (pos0 - i as f64).abs() > error {
-                    break;
-                }
-                seg_end = i;
-                continue;
-            }
-
-            // Slope range for point i to stay within error_bound of pos_i.
-            let s_lo = (i as f64 - error - pos0) / dk;
-            let s_hi = (i as f64 + error - pos0) / dk;
+            // Slope range for point i to stay within error_bound of its row.
+            let s_lo = (row as f64 - error - pos0) / dk;
+            let s_hi = (row as f64 + error - pos0) / dk;
             let new_lo = slope_lo.max(s_lo);
             let new_hi = slope_hi.min(s_hi);
 
