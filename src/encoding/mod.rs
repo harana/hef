@@ -632,6 +632,28 @@ impl PackedStream<'_> {
         }
         unpack_vectors(self.packed, self.width, out, lane);
     }
+
+    /// Hands `consume` the stream's values in their original order, one 1024-value vector at a time, never including
+    /// the padding after the last value. Each vector is unpacked into one reused 8 KiB buffer, so a caller that walks
+    /// the values once never holds the whole stream. A zero-width stream yields its count of zeros.
+    fn for_each_vector(&self, mut consume: impl FnMut(&[u64])) {
+        let mut buffer = [0u64; FASTLANES_VECTOR];
+        let bytes_per_vector = FASTLANES_LANES * fastlanes_words_per_lane(self.width as usize) * 8;
+        // A zero-width stream has no packed bytes; `max(1)` only keeps the chunk size legal for it.
+        let mut packed_vectors = self.packed.chunks(bytes_per_vector.max(1));
+        let mut remaining = self.count;
+        while remaining > 0 {
+            let rows = remaining.min(FASTLANES_VECTOR);
+            if self.width != 0 {
+                let Some(packed_vector) = packed_vectors.next() else {
+                    return;
+                };
+                unpack_vectors(packed_vector, self.width, &mut buffer, |packed| packed);
+            }
+            consume(buffer.get(..rows).unwrap_or(&[]));
+            remaining -= rows;
+        }
+    }
 }
 
 /// Unpacks whole FastLanes vectors from `packed` (written by [`bitpack`]) into `out`, applying `lane` to every value.
