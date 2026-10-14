@@ -206,4 +206,44 @@ fn compressed_len_matches_compress_on_float_fallback_trials() {
     for raw in [plain, split] {
         assert_eq!(compressed_len(&raw), compress(&raw).len());
     }
+
+/// A raw deflate stream for one byte inside a directory that declares two plaintext bytes must be rejected by every
+/// decode path, not only the range reader: the full decode once accepted the short output.
+#[test]
+fn a_granule_shorter_than_the_declared_plain_length_is_rejected_on_every_path() {
+    let packed = [
+        0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x4b, 0x04, 0x00,
+    ];
+    assert_eq!(plain_len(&packed).unwrap(), 2);
+    assert!(matches!(decompress(&packed), Err(FormatError::Structural { .. })));
+    assert!(matches!(
+        decompress_granule(&packed, 0),
+        Err(FormatError::Structural { .. })
+    ));
+    let page = Page::open(&packed).unwrap();
+    assert!(matches!(
+        page.decompress_granules(0, 0),
+        Err(FormatError::Structural { .. })
+    ));
+}
+
+/// Granules off the fixed grid break the offsets random access depends on, so the full decode and the single-granule
+/// decode reject them even when the total plain length is truthful.
+#[test]
+fn every_decode_path_rejects_granules_off_the_fixed_grid() {
+    let raw = multi_granule_bytes();
+    let split = GRANULE_BYTES + 100;
+    let granules = [&raw[..split], &raw[split..]];
+    let compressed: Vec<Vec<u8>> = granules
+        .iter()
+        .map(|granule| miniz_oxide::deflate::compress_to_vec(granule, 6))
+        .collect();
+    let lens: Vec<usize> = compressed.iter().map(Vec::len).collect();
+    let mut packed = super::mini_block_directory::encode(raw.len(), &lens);
+    for granule in &compressed {
+        packed.extend_from_slice(granule);
+    }
+
+    assert!(decompress(&packed).is_err());
+    assert!(decompress_granule(&packed, 0).is_err());
 }

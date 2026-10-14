@@ -98,7 +98,7 @@ pub struct ReplayedFrame {
 /// How the replay scan ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayTail {
-    /// The scan consumed the written extent cleanly.
+    /// The scan consumed the written extent cleanly, or reached a zero block with only zeros after it.
     Clean,
     /// A torn or corrupt frame was found: replay truncates here. When `trailing_nonzero` is set, non-zero bytes exist
     /// beyond the truncation point — bit rot rather than a clean torn tail — and the operator surface should flag the
@@ -135,7 +135,18 @@ pub fn replay_segment(
     while offset + u64::from(FRAME_ALIGN) <= extent {
         let head_block = storage.read(shard, offset, FRAME_ALIGN)?;
         if super::is_all_zero(&head_block) {
-            // Zeroed (recycled) space: the segment ends here.
+            // Zeroed (recycled or preallocated) space: the segment ends here, unless non-zero data hides past it. That
+            // data is not a clean end, so it is flagged like any trailing data rather than passed over in silence.
+            let beyond = truncated(storage, shard, offset, offset + u64::from(FRAME_ALIGN), extent)?;
+            if matches!(
+                beyond,
+                ReplayTail::Truncated {
+                    trailing_nonzero: true,
+                    ..
+                }
+            ) {
+                tail = beyond;
+            }
             recycled = true;
             break;
         }
@@ -210,12 +221,16 @@ pub fn replay_segment(
 }
 
 /// Recovers one segment at startup: replays it, then cuts the shard back to the last complete frame when replay found
-/// a torn or corrupt one. Returns the same outcome [`replay_segment`] does.
+/// a torn or corrupt one, or zero padding after the last frame. Returns the same outcome [`replay_segment`] does.
 ///
 /// Replay on its own only reports where the damage starts. Without this cut the next append lands *after* the bad
 /// frame, and because replay stops at the first frame it cannot read, everything written from then on is unreachable
 /// forever. The storage layer cannot make the cut on its own — it sees 4096-byte blocks and a frame torn on a block
 /// boundary looks perfectly aligned to it — so the offset has to come from replay, which decodes frames.
+///
+/// Zero padding inside the written extent is cut for the same reason: appends land at the end of the extent, so one
+/// left behind a zero block would sit past the point where replay stops. Non-zero data past a zero block is reported
+/// as a truncated tail with `trailing_nonzero` set, never as a clean end.
 ///
 /// Running this twice over the same bytes is safe: the second run replays the already-shortened extent cleanly and
 /// truncates nothing.
@@ -226,8 +241,15 @@ pub fn recover_segment(
     generation: u64,
 ) -> Result<ReplayOutcome, StorageError> {
     let outcome = replay_segment(&*storage, shard, segment_id, generation)?;
-    if let ReplayTail::Truncated { offset, .. } = outcome.tail {
-        storage.truncate(shard, offset)?;
+    let last_good_end = match outcome.tail {
+        ReplayTail::Clean => outcome
+            .frames
+            .last()
+            .map_or(0, |frame| frame.offset + frame.frame_bytes.len() as u64),
+        ReplayTail::Truncated { offset, .. } => offset,
+    };
+    if last_good_end < storage.extent(shard)? {
+        storage.truncate(shard, last_good_end)?;
     }
     Ok(outcome)
 }

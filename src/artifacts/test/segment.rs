@@ -137,6 +137,57 @@ fn recovery_leaves_an_undamaged_segment_untouched() {
 }
 
 #[test]
+fn recovery_cuts_zero_padding_so_a_later_append_replays() {
+    // F14: frame A followed by a zero block inside the written extent replays cleanly, but the next append used to land
+    // past the zero block, where replay always stops, so frame B was unreachable.
+    let frame_a = sample_frame(1, 1, 1);
+    let frame_b = sample_frame(1, 1, 60);
+    let mut storage = SimJournalStorage::new();
+    storage.append(ShardId(0), &frame_a).unwrap();
+    storage.append(ShardId(0), &vec![0u8; 4096]).unwrap();
+    storage.sync(ShardId(0)).unwrap();
+
+    let recovered = recover_segment(&mut storage, ShardId(0), 1, 1).unwrap();
+    assert_eq!(recovered.tail, ReplayTail::Clean);
+    assert_eq!(recovered.frames.len(), 1);
+    let end_of_a = frame_a.len() as u64;
+    assert_eq!(
+        storage.extent(ShardId(0)).unwrap(),
+        end_of_a,
+        "recovery cuts the zero padding"
+    );
+
+    assert_eq!(storage.append(ShardId(0), &frame_b).unwrap(), end_of_a);
+    storage.sync(ShardId(0)).unwrap();
+    let replay = replay_segment(&storage, ShardId(0), 1, 1).unwrap();
+    assert_eq!(replay.frames.len(), 2, "frames A and B both replay");
+    assert_eq!(replay.tail, ReplayTail::Clean);
+}
+
+#[test]
+fn non_zero_data_past_a_zero_block_is_flagged_not_a_clean_end() {
+    // A zero block followed by a real frame must not read as a clean segment end that hides the frame behind it.
+    let frame_a = sample_frame(1, 1, 1);
+    let frame_c = sample_frame(1, 1, 60);
+    let mut storage = SimJournalStorage::new();
+    storage.append(ShardId(0), &frame_a).unwrap();
+    let zero_offset = storage.append(ShardId(0), &vec![0u8; 4096]).unwrap();
+    storage.append(ShardId(0), &frame_c).unwrap();
+    storage.sync(ShardId(0)).unwrap();
+
+    let replay = replay_segment(&storage, ShardId(0), 1, 1).unwrap();
+    assert_eq!(replay.frames.len(), 1);
+    assert_eq!(
+        replay.tail,
+        ReplayTail::Truncated {
+            offset: zero_offset,
+            trailing_nonzero: true,
+        },
+        "non-zero data hidden past a zero block is suspicious trailing data"
+    );
+}
+
+#[test]
 fn chain_init_and_chain_next_are_deterministic_and_order_sensitive() {
     let a = [1u8; 32];
     let b = [2u8; 32];
