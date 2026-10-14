@@ -206,6 +206,7 @@ fn compressed_len_matches_compress_on_float_fallback_trials() {
     for raw in [plain, split] {
         assert_eq!(compressed_len(&raw), compress(&raw).len());
     }
+}
 
 /// A raw deflate stream for one byte inside a directory that declares two plaintext bytes must be rejected by every
 /// decode path, not only the range reader: the full decode once accepted the short output.

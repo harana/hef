@@ -361,7 +361,8 @@ fn bitmap_builder_maps_values_to_their_granule_rows_exactly() {
 /// it: clamping the bound to zero once probed [0, 0] and proved the granule absent.
 #[test]
 fn a_range_probe_below_zero_never_proves_a_granule_of_negative_values_absent() {
-    let keys = membership_keys(&crate::encoding::ColumnData::I64(vec![-5])).unwrap();
+    let data = crate::encoding::ColumnData::I64(vec![-5]);
+    let keys = membership_keys(&data).unwrap();
     let artifact = IndexArtifact::new(
         ArtifactCoverage {
             deletion_vector_generation: 0,

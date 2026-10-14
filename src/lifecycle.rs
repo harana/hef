@@ -292,7 +292,7 @@ pub fn plan_compaction_cycle(
     for entry in candidates.iter().copied().map(Some).chain([None]) {
         let small = entry.filter(|entry| entry.size_bytes < policy.roll_target_bytes);
         if let Some(next) = small
-            && run.last().is_none_or(|last| follows_on(*last, next))
+            && run.last().is_none_or(|last| follows_on(last, next))
         {
             run.push(next);
             continue;
