@@ -1,5 +1,6 @@
 use super::super::frame::{self, FrameBuildInput};
 use super::*;
+use crate::events::provenance::sha256_digest;
 use crate::events::sim::{SimulatedEventAuthor, signed_event_payload};
 use crate::events::variant::encode_value;
 use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TenantId, TimestampValue};
@@ -402,4 +403,65 @@ fn a_dictionary_encoded_after_a_prefix_matches_its_standalone_bytes() {
         assert_eq!(out.bytes().get(..6), Some(&b"prefix"[..]));
         assert_eq!(out.bytes().get(6..), Some(standalone.as_slice()));
     }
+}
+
+fn batch_digest(events: &[EventInput]) -> String {
+    let encoded = build_batch(events, 1, 0).expect("batch builds");
+    sha256_digest(&encoded)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Metadata strings that exercise the interner: equal text in separate allocations, the same text across different
+/// fields, Unicode, a long value, `None` and `Some("")`.
+fn metadata_string_events() -> Vec<EventInput> {
+    let mut events = sample_events(4);
+    if let [first, second, third, fourth] = events.as_mut_slice() {
+        first.source_schema = Some("crm".to_owned());
+        first.envelope.actor_id = Some("acct-1".to_owned());
+        second.envelope.actor_id = Some(String::new());
+        second.source_delivery = None;
+        third.envelope.entity_id = Some("\u{e9}v\u{e9}nement-\u{5b9f}\u{4f53}-\u{1f600}".to_owned());
+        third.envelope.account_id = Some("long-".repeat(2000));
+        third.source_schema = Some(String::new());
+        fourth.envelope.event_type = "opportunity".to_owned();
+        fourth.source_delivery = Some("delivery-0".to_owned());
+        fourth.envelope.account_id = None;
+    }
+    events
+}
+
+#[test]
+fn interned_metadata_strings_build_the_same_bytes_as_before() {
+    // Digest of the bytes the builder produced before the interner borrowed its strings.
+    assert_eq!(
+        batch_digest(&metadata_string_events()),
+        "bf4eba2460e8fe9df6b2fe65c5bd642e44017150881ed421975bc1c6a10a3506"
+    );
+}
+
+#[test]
+fn interned_strings_share_refs_by_content_and_outlive_the_input() {
+    let events = metadata_string_events();
+    let encoded = build_batch(&events, 1, 0).expect("batch builds");
+    drop(events);
+    let decoded = decode_batch(&encoded, 4).expect("batch decodes after the input is dropped");
+    let [first, second, third, fourth] = decoded.events.as_slice() else {
+        panic!("four events");
+    };
+    // Equal text in separate allocations and across fields resolves to one string-table entry.
+    assert_eq!(first.fixed.source_string_ref, fourth.fixed.source_string_ref);
+    assert_eq!(first.variable.source_schema_ref, first.fixed.source_string_ref);
+    assert_eq!(first.variable.actor_id_string_ref, first.variable.account_id_string_ref);
+    assert_eq!(fourth.fixed.event_type_string_ref, fourth.fixed.entity_type_string_ref);
+    assert_eq!(fourth.variable.source_delivery_ref, first.variable.source_delivery_ref);
+    // `Some("")` is a real interned string; `None` stays absent.
+    assert_eq!(second.actor_id, Some(""));
+    assert_eq!(third.source_schema, Some(""));
+    assert_eq!(second.variable.actor_id_string_ref, third.variable.source_schema_ref);
+    assert_eq!(second.variable.source_delivery_ref, REF_ABSENT);
+    assert_eq!(fourth.account_id, None);
+    assert_eq!(third.entity_id, Some("\u{e9}v\u{e9}nement-\u{5b9f}\u{4f53}-\u{1f600}"));
+    assert_eq!(third.account_id.map(str::len), Some(5 * 2000));
 }

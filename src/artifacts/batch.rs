@@ -20,7 +20,6 @@ use crate::events::{EventEnvelope, EventFlags, EventId, StreamId, TimestampValue
 use crate::file::bytes::{Reader, Writer, slice};
 use hashbrown::HashMap;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use uuid::Uuid;
 
 /// Variable-record payload flag bit 0: the payload bytes are a UTF-8 internal immutable payload reference, not an
@@ -267,27 +266,25 @@ pub struct DecodedBatch<'a> {
 
 /// String interner preserving first-insertion refs.
 ///
-/// The lookup table and the ordered value list share one allocation per distinct value — an `Arc<str>` cloned into
-/// both — rather than each holding its own copy of the text.
+/// It borrows every string from the events being packed, which outlive the build, so interning copies no text.
 #[derive(Default)]
-struct StringTableBuilder {
-    refs: HashMap<Arc<str>, u32>,
-    strings: Vec<Arc<str>>,
+struct StringTableBuilder<'a> {
+    refs: HashMap<&'a str, u32>,
+    strings: Vec<&'a str>,
 }
 
-impl StringTableBuilder {
-    fn intern(&mut self, value: &str) -> u32 {
+impl<'a> StringTableBuilder<'a> {
+    fn intern(&mut self, value: &'a str) -> u32 {
         if let Some(existing) = self.refs.get(value) {
             return *existing;
         }
         let next = self.strings.len() as u32;
-        let value: Arc<str> = Arc::from(value);
-        self.strings.push(Arc::clone(&value));
+        self.strings.push(value);
         self.refs.insert(value, next);
         next
     }
 
-    fn intern_optional(&mut self, value: Option<&str>) -> u32 {
+    fn intern_optional(&mut self, value: Option<&'a str>) -> u32 {
         match value {
             Some(value) => self.intern(value),
             None => REF_ABSENT,
