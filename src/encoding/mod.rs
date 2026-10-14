@@ -445,6 +445,7 @@ const fn fastlanes_words_per_lane(bits: usize) -> usize {
 /// elsewhere — recovers sixteen lanes' worth at a time with only shifts and masks. `width` must be the true bit width
 /// of the data (every value fits in `width` bits); a zero width writes nothing but the count, since every value is then
 /// zero.
+#[cfg(test)]
 fn bitpack(values: &[u64], width: u32, out: &mut Writer) {
     out.put_u32(values.len() as u32);
     out.put_u8(width as u8);
@@ -1270,6 +1271,10 @@ fn alp_viable(encodable: &[bool]) -> bool {
 /// position — so one pathological 1024-value stretch costs its own bytes, never the whole block's eligibility. A block
 /// with no escaped vector keeps the original layout byte for byte. Returns the inner encoding chosen for the exception
 /// index stream (the recorded second cascade level), or `None` when ALP is not viable for this data.
+///
+/// The scaled integers are never held as a full-length vector: a first pass probes one 1024-value vector at a time to
+/// collect the exceptions, the escaped vectors and the widest code, and a second pass probes each kept vector again to
+/// pack its codes straight into `out`.
 fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Option<SideStream> {
     let sample = transform_sample(values);
     let sample: &[f64] = sample.as_deref().unwrap_or(values);
@@ -1297,7 +1302,7 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
     let vector_scratch = values.len().min(FASTLANES_VECTOR);
     zigzags.resize(vector_scratch, 0);
     encodable.resize(vector_scratch, false);
-    let mut ints = Vec::with_capacity(values.len());
+    let mut max_code = 0u64;
     let mut exceptions: Vec<(u32, u64)> = Vec::new();
     let mut escaped: Vec<u32> = Vec::new();
     for (vector_index, vector) in values.chunks(FASTLANES_VECTOR).enumerate() {
@@ -1310,13 +1315,12 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
         let vector_exceptions = vector_encodable.iter().filter(|ok| !**ok).count();
         if vector_exceptions * ALP_MAX_EXCEPTION_SAMPLE_DIVISOR > vector.len() {
             escaped.push(vector_index as u32);
-            ints.extend(std::iter::repeat_n(0u64, vector.len()));
             continue;
         }
         let base = vector_index * FASTLANES_VECTOR;
-        // The kernel already wrote zigzag codes with 0 in every exception slot, so the codes append wholesale and only
-        // the exceptions walk per value.
-        ints.extend_from_slice(vector_zigzags);
+        // The kernel already wrote zigzag codes with 0 in every exception slot, so the codes only feed the maximum and
+        // only the exceptions walk per value.
+        max_code = max_code.max(vector_zigzags.iter().copied().max().unwrap_or(0));
         for (offset, (ok, value)) in vector_encodable.iter().zip(vector).enumerate() {
             if !*ok {
                 exceptions.push(((base + offset) as u32, value.to_bits()));
@@ -1364,8 +1368,27 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
             unreachable!("the exception side-stream chooser never picks a string block's side stream")
         }
     }
-    let max = ints.iter().copied().max().unwrap_or(0);
-    bitpack(&ints, bits_needed(max), out);
+    // Escaped vectors pack as zero codes without a probe; every other vector is probed again under the chosen power,
+    // which writes the same codes the first pass saw. The escaped indexes ascend, so one cursor walks them in step.
+    let mut next_escaped = escaped.iter().peekable();
+    alp_rd_bitpack_vectors(values.len(), bits_needed(max_code), out, |vector_index, buffer| {
+        buffer.fill(0);
+        if next_escaped
+            .next_if(|escaped_index| **escaped_index as usize == vector_index)
+            .is_some()
+        {
+            return;
+        }
+        let start = vector_index * FASTLANES_VECTOR;
+        let vector = values
+            .get(start..values.len().min(start + FASTLANES_VECTOR))
+            .unwrap_or(&[]);
+        if let (Some(vector_codes), Some(vector_encodable)) =
+            (buffer.get_mut(..vector.len()), encodable.get_mut(..vector.len()))
+        {
+            alp_probe_chunk(vector, power, vector_codes, vector_encodable);
+        }
+    });
     // Raw payloads ride after the packed words, where a sequential decoder already knows the value count needed to
     // size each escaped vector.
     for vector_index in &escaped {
@@ -1417,22 +1440,63 @@ fn apply_alp_escapes(reader: &mut Reader<'_>, escaped: &[u32], values: &mut [f64
     Ok(())
 }
 
-/// Reads an ALP block's exception list, honouring the recorded side-stream inner encoding.
-fn decode_alp_exceptions(reader: &mut Reader<'_>, side: SideStream) -> Result<Vec<(u32, u64)>, FormatError> {
+/// The values an ALP block stores exactly, beside its scaled integers: each one's row index and its raw float bits.
+///
+/// The list is checked when it is read but stays borrowed from the block's bytes, so decoding never copies the
+/// exceptions into records of their own; [`Self::try_for_each`] reads them back in stored order.
+///
+/// See: hef-encodings-and-compression/spec.md
+enum AlpExceptions<'a> {
+    /// Stored plainly: each exception's 4-byte index sits in front of its 8-byte bits.
+    Interleaved(&'a [u8]),
+    /// Stored with a frame-of-reference index stream: the indexes are already decoded (each checked to fit a `u32`),
+    /// and `bits` holds one 8-byte word per index, in the same order.
+    Separate { bits: &'a [u8], indexes: Vec<u64> },
+}
+
+impl AlpExceptions<'_> {
+    /// Hands each exception's row index and raw float bits to `patch`, in stored order, stopping at the first error
+    /// `patch` returns.
+    fn try_for_each(&self, mut patch: impl FnMut(u32, u64) -> Result<(), FormatError>) -> Result<(), FormatError> {
+        match self {
+            Self::Interleaved(records) => {
+                for record in records.chunks_exact(size_of::<u32>() + size_of::<u64>()) {
+                    let (index, bits) = record.split_at_checked(size_of::<u32>()).unwrap_or((&[], &[]));
+                    patch(
+                        u32::from_le_bytes(index.try_into().unwrap_or([0; 4])),
+                        u64::from_le_bytes(bits.try_into().unwrap_or([0; 8])),
+                    )?;
+                }
+            }
+            Self::Separate { bits, indexes } => {
+                for (index, word) in indexes.iter().zip(bits.chunks_exact(size_of::<u64>())) {
+                    patch(*index as u32, u64::from_le_bytes(word.try_into().unwrap_or([0; 8])))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Reads an ALP block's exception list, honouring the recorded side-stream inner encoding, and leaves `reader` just
+/// past it. Every field is checked in the order it is stored, so a malformed list fails exactly where it breaks; the
+/// exceptions themselves stay borrowed from `reader`'s bytes.
+fn decode_alp_exceptions<'a>(reader: &mut Reader<'a>, side: SideStream) -> Result<AlpExceptions<'a>, FormatError> {
     let exception_count = reader.u32("alp exception count")? as usize;
-    let mut exceptions = Vec::with_capacity(reader.capacity_hint(exception_count, 12));
     match side {
         SideStream::FileScopeDictionary | SideStream::FsstDictionaryValues | SideStream::FsstValueKeys => {
-            return Err(FormatError::Structural {
+            Err(FormatError::Structural {
                 rule: "alp blocks never carry a string block's side stream",
-            });
+            })
         }
         SideStream::None => {
+            let mut records = *reader;
             for _ in 0..exception_count {
-                let index = reader.u32("alp exception index")?;
-                let bits = reader.u64("alp exception bits")?;
-                exceptions.push((index, bits));
+                reader.u32("alp exception index")?;
+                reader.u64("alp exception bits")?;
             }
+            let records = records.take(reader.position() - records.position(), "alp exception index")?;
+            Ok(AlpExceptions::Interleaved(records))
         }
         SideStream::ForBitpack => {
             let indexes: Vec<u64> = decode_for_bitpack(reader)?;
@@ -1441,16 +1505,17 @@ fn decode_alp_exceptions(reader: &mut Reader<'_>, side: SideStream) -> Result<Ve
                     rule: "alp exception index stream disagrees with the exception count",
                 });
             }
-            for index in indexes {
-                let bits = reader.u64("alp exception bits")?;
-                let index = u32::try_from(index).map_err(|_| FormatError::RefOutOfRange {
+            let mut bits = *reader;
+            for index in &indexes {
+                reader.u64("alp exception bits")?;
+                u32::try_from(*index).map_err(|_| FormatError::RefOutOfRange {
                     what: "alp exception index",
                 })?;
-                exceptions.push((index, bits));
             }
+            let bits = bits.take(reader.position() - bits.position(), "alp exception bits")?;
+            Ok(AlpExceptions::Separate { bits, indexes })
         }
     }
-    Ok(exceptions)
 }
 
 fn decode_alp(reader: &mut Reader<'_>, side: SideStream) -> Result<Vec<f64>, FormatError> {
@@ -1475,12 +1540,13 @@ fn decode_alp(reader: &mut Reader<'_>, side: SideStream) -> Result<Vec<f64>, For
         stream.unpack_into(&mut values, |packed| (unzigzag(packed) as f64) / power);
     }
     values.truncate(stream.count);
-    for (index, bits) in exceptions {
+    exceptions.try_for_each(|index, bits| {
         let slot = values.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
             what: "alp exception index",
         })?;
         *slot = f64::from_bits(bits);
-    }
+        Ok(())
+    })?;
     apply_alp_escapes(reader, &escaped, &mut values)?;
     Ok(values)
 }
@@ -4432,13 +4498,7 @@ fn decode_alp_range(
     let power = ALP_POWERS.get(exponent_index).copied().ok_or(FormatError::Structural {
         rule: "alp exponent out of range",
     })?;
-    let exceptions: Vec<(usize, u64)> = decode_alp_exceptions(reader, side)?
-        .into_iter()
-        .filter_map(|(index, bits)| {
-            let index = index as usize;
-            (index >= start && index < end).then(|| (index - start, bits))
-        })
-        .collect();
+    let exceptions = decode_alp_exceptions(reader, side)?;
     let count = reader.u32("bitpack count")? as usize;
     let width = u32::from(reader.u8("bitpack width")?);
     if width > 64 {
@@ -4483,11 +4543,17 @@ fn decode_alp_range(
                 .collect()
         })
     };
-    for (rel_idx, bits) in exceptions {
-        if let Some(slot) = values.get_mut(rel_idx) {
+    // Only exceptions inside the requested rows patch; any other is skipped without a bounds error.
+    exceptions.try_for_each(|index, bits| {
+        let index = index as usize;
+        if index >= start
+            && index < end
+            && let Some(slot) = values.get_mut(index - start)
+        {
             *slot = f64::from_bits(bits);
         }
-    }
+        Ok(())
+    })?;
     if !escaped.is_empty() {
         // Seek past the packed words this range decode left unread, landing on the raw escape payloads, then patch the
         // escaped vectors that overlap [start, effective_end).
