@@ -253,6 +253,9 @@ pub struct CorrectionMetadata {
 /// `corrections` supersedes. A raw-history view applies no such vector and keeps both the original and the
 /// correcting event visible; a latest-corrected view applies it so the superseded event is suppressed and the
 /// correction is shown.
+///
+/// An entity scan accepts this vector from `DeletesAndCorrections::deletion_vector`: it reads the mark on a corrected
+/// event as supersession rather than deletion, so the event is still served once, as its latest correction.
 pub fn latest_corrected_deletion_vector(
     events: &[(u64, EventId)],
     corrections: &[CorrectionMetadata],

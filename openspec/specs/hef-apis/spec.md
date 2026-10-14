@@ -35,7 +35,7 @@ The `EventContextReader` API (`plan_context_scan`, `read_context_packets`) and i
 - **THEN** results enforce tenant/admin authorization and omit object-store credentials, local paths, payload bytes, and embedding values
 
 ### Requirement: Entity event scan
-The reader SHALL read any stored row back as its event (the full envelope and the payload) from a published HEF file and from a LiveOverlay segment alike. It SHALL expose an entity scan that takes a tenant, an entity's identity hashes, an inclusive `(epoch, sequence)` range, a direction, and an optional limit, runs over a set of HEF files plus the LiveOverlay, and returns that entity's events in sequence order. Where the same sequence point appears more than once, the copy from the newest file generation SHALL be served, and a published copy SHALL win over the LiveOverlay. The scan SHALL skip rows a deletion vector deletes and SHALL serve each corrected event as its latest correction in the original's place: a replacement serves the correcting event, an amendment serves the original with the amendment's payload fields laid over its own, and a retraction drops the event; a correcting event SHALL NOT also be served at its own place. Deletion vectors and corrections SHALL be read through an interface the embedding application backs with its durable storage, never held by the scan itself. A correction whose correcting event is in none of the scanned sources SHALL be refused rather than serving the superseded original.
+The reader SHALL read any stored row back as its event (the full envelope and the payload) from a published HEF file and from a LiveOverlay segment alike. It SHALL expose an entity scan that takes a tenant, an entity's identity hashes, an inclusive `(epoch, sequence)` range, a direction, and an optional limit, runs over a set of HEF files plus the LiveOverlay, and returns that entity's events in sequence order. Where the same sequence point appears more than once, the copy from the newest file generation SHALL be served, and a published copy SHALL win over the LiveOverlay. The scan SHALL skip rows a deletion vector deletes and SHALL serve each corrected event as its latest correction in the original's place: a replacement serves the correcting event, an amendment serves the original with the amendment's payload fields laid over its own, and a retraction drops the event; a correcting event SHALL NOT also be served at its own place. A correction that was itself corrected SHALL be followed to the end of the chain, applying each hop in order (amendments laid over the version before them, a replacement swapping in its event), and a retraction anywhere on the chain SHALL drop the event. A deletion vector's mark SHALL count only at the end of an event's chain: a mark on a corrected row reads as its supersession (as a latest-corrected deletion vector records it), so the latest correction is still served once, while a deleted last row drops the event rather than serving a superseded version. A chain that loops back to an event already on it SHALL be refused. Deletion vectors and corrections SHALL be read through an interface the embedding application backs with its durable storage, never held by the scan itself. A correction whose correcting event is in none of the scanned sources SHALL be refused rather than serving the superseded original.
 
 #### Scenario: Scan spans files and overlay
 - **WHEN** one entity's events are spread over two published files and the LiveOverlay
@@ -52,4 +52,12 @@ The reader SHALL read any stored row back as its event (the full envelope and th
 #### Scenario: Replacement correction returned instead of the original
 - **WHEN** one of the entity's events has a replacement correction
 - **THEN** the scan serves the correcting event in the original's place, never the original, and does not serve the correcting event a second time
+
+#### Scenario: Correction chain followed to its end
+- **WHEN** an event is replaced by a second event that is itself replaced by a third
+- **THEN** the scan serves the third event in the original's place, and serves neither the original nor the second event
+
+#### Scenario: Deleted or retracted correction drops the event
+- **WHEN** an event's replacement has its row deleted, or is itself retracted
+- **THEN** the scan serves neither the replacement nor the superseded original
 
