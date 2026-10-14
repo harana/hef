@@ -477,7 +477,7 @@ fn filter_shared_dictionary(body: &[u8], translated: &SharedDictionaryPredicate)
     let mut present = vec![false; stream.padded_count()];
     stream.unpack_into(&mut present, |code| translated.test.matches(code));
     present.truncate(stream.count);
-    weave_present(&nulls, &present)
+    weave_present(&nulls, present)
 }
 
 /// Answers `predicate` over an encoded string block, decoding the block only when no compressed-data kernel applies.
@@ -619,7 +619,7 @@ fn filter_dictionary(body: &[u8], side: SideStream, predicate: &StringPredicate)
     let mut present = vec![false; stream.padded_count()];
     stream.unpack_into(&mut present, |code| test.matches(code));
     present.truncate(stream.count);
-    weave_present(&nulls, &present)
+    weave_present(&nulls, present)
 }
 
 /// Which compressed search terms an equality-class predicate accepts. The terms are pre-compressed under the block's
@@ -681,7 +681,7 @@ fn filter_fsst(body: &[u8], predicate: &StringPredicate) -> Result<Vec<bool>, Fo
         let compressed = slice(data, *start, end - start, "fsst value")?;
         present.push(test.matches(compressed));
     }
-    weave_present(&nulls, &present)
+    weave_present(&nulls, present)
 }
 
 /// The per-value keys an FSST block stores after its arena when it records [`SideStream::FsstValueKeys`]: a run of
@@ -772,7 +772,7 @@ fn filter_fsst_contains(body: &[u8], side: SideStream, matcher: &ContainsMatcher
             "fsst offsets must be non-decreasing",
             |text, bounds| matcher.mark_arena(text, bounds),
         )?;
-        return weave_present(&nulls, &scatter(present_count, &candidates, verdicts));
+        return weave_present(&nulls, scatter(present_count, &candidates, verdicts));
     }
     let present = super::with_fsst_arena_bytes(
         &compressor,
@@ -782,7 +782,7 @@ fn filter_fsst_contains(body: &[u8], side: SideStream, matcher: &ContainsMatcher
         "fsst offsets must be non-decreasing",
         |text, bounds| matcher.mark_arena(text, bounds),
     )?;
-    weave_present(&nulls, &present)
+    weave_present(&nulls, present)
 }
 
 /// Count-only form of [`filter_fsst_contains`]. It performs all the same structural validation and candidate pruning,
@@ -998,7 +998,7 @@ fn filter_fsst_range(body: &[u8], predicate: &StringPredicate) -> Result<Vec<boo
             }
         }
     }
-    weave_present(&nulls, &present)
+    weave_present(&nulls, present)
 }
 
 /// Whether a value with prefix key `key` clears one end of a range: `Some(true)` when it satisfies the bound,
@@ -1060,7 +1060,7 @@ fn filter_raw_contains(body: &[u8], matcher: &ContainsMatcher) -> Result<Vec<boo
     let offsets = super::read_offsets(&mut reader, present_count)?;
     let data_len = offsets.last().copied().unwrap_or(0);
     let data = reader.take(data_len, "raw string data")?;
-    weave_present(&nulls, &matcher.mark_arena(data, &offsets))
+    weave_present(&nulls, matcher.mark_arena(data, &offsets))
 }
 
 /// Count-only raw-arena substring kernel: the bytes are searched in place and no row mask is built.
@@ -1083,7 +1083,18 @@ fn count_raw_contains(body: &[u8], matcher: &ContainsMatcher) -> Result<usize, F
 
 /// Expands a per-present-value verdict back to one bool per row, marking absent (null) rows `false`. Mirrors how the
 /// decoders thread the stored values back through the null side stream.
-fn weave_present(nulls: &super::NullStream, present: &[bool]) -> Result<Vec<bool>, FormatError> {
+///
+/// Takes the verdicts by value: when every row is present they already are the row mask, so they are handed back as
+/// they are, with no second mask allocated or copied.
+fn weave_present(nulls: &super::NullStream, present: Vec<bool>) -> Result<Vec<bool>, FormatError> {
+    if matches!(nulls.form, super::NullStreamForm::AllPresent) {
+        if present.len() != nulls.row_count() {
+            return Err(FormatError::Structural {
+                rule: "null bitmap disagrees with present count",
+            });
+        }
+        return Ok(present);
+    }
     let mut mask = Vec::with_capacity(nulls.row_count());
     let mut verdicts = present.iter();
     nulls.each_row(|set| {
@@ -1942,12 +1953,13 @@ fn filter_alp_block(body: &[u8], side: SideStream, predicate: &FloatPredicate) -
     let mut verdicts = vec![false; stream.padded_count()];
     test.apply(&stream, &mut verdicts);
     verdicts.truncate(stream.count);
-    for (index, bits) in exceptions {
+    exceptions.try_for_each(|index, bits| {
         let slot = verdicts.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
             what: "alp exception index",
         })?;
         *slot = predicate.matches_f64(f64::from_bits(bits));
-    }
+        Ok(())
+    })?;
     // Escaped vectors store their raw floats after the packed words; judge each one directly, walking the payloads in
     // the same order `apply_alp_escapes` does.
     for vector_index in &escaped {

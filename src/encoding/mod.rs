@@ -445,6 +445,7 @@ const fn fastlanes_words_per_lane(bits: usize) -> usize {
 /// elsewhere — recovers sixteen lanes' worth at a time with only shifts and masks. `width` must be the true bit width
 /// of the data (every value fits in `width` bits); a zero width writes nothing but the count, since every value is then
 /// zero.
+#[cfg(test)]
 fn bitpack(values: &[u64], width: u32, out: &mut Writer) {
     out.put_u32(values.len() as u32);
     out.put_u8(width as u8);
@@ -1270,6 +1271,10 @@ fn alp_viable(encodable: &[bool]) -> bool {
 /// position — so one pathological 1024-value stretch costs its own bytes, never the whole block's eligibility. A block
 /// with no escaped vector keeps the original layout byte for byte. Returns the inner encoding chosen for the exception
 /// index stream (the recorded second cascade level), or `None` when ALP is not viable for this data.
+///
+/// The scaled integers are never held as a full-length vector: a first pass probes one 1024-value vector at a time to
+/// collect the exceptions, the escaped vectors and the widest code, and a second pass probes each kept vector again to
+/// pack its codes straight into `out`.
 fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Option<SideStream> {
     let sample = transform_sample(values);
     let sample: &[f64] = sample.as_deref().unwrap_or(values);
@@ -1297,7 +1302,7 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
     let vector_scratch = values.len().min(FASTLANES_VECTOR);
     zigzags.resize(vector_scratch, 0);
     encodable.resize(vector_scratch, false);
-    let mut ints = Vec::with_capacity(values.len());
+    let mut max_code = 0u64;
     let mut exceptions: Vec<(u32, u64)> = Vec::new();
     let mut escaped: Vec<u32> = Vec::new();
     for (vector_index, vector) in values.chunks(FASTLANES_VECTOR).enumerate() {
@@ -1310,13 +1315,12 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
         let vector_exceptions = vector_encodable.iter().filter(|ok| !**ok).count();
         if vector_exceptions * ALP_MAX_EXCEPTION_SAMPLE_DIVISOR > vector.len() {
             escaped.push(vector_index as u32);
-            ints.extend(std::iter::repeat_n(0u64, vector.len()));
             continue;
         }
         let base = vector_index * FASTLANES_VECTOR;
-        // The kernel already wrote zigzag codes with 0 in every exception slot, so the codes append wholesale and only
-        // the exceptions walk per value.
-        ints.extend_from_slice(vector_zigzags);
+        // The kernel already wrote zigzag codes with 0 in every exception slot, so the codes only feed the maximum and
+        // only the exceptions walk per value.
+        max_code = max_code.max(vector_zigzags.iter().copied().max().unwrap_or(0));
         for (offset, (ok, value)) in vector_encodable.iter().zip(vector).enumerate() {
             if !*ok {
                 exceptions.push(((base + offset) as u32, value.to_bits()));
@@ -1364,8 +1368,27 @@ fn encode_alp(values: &[f64], strategy: CascadeStrategy, out: &mut Writer) -> Op
             unreachable!("the exception side-stream chooser never picks a string block's side stream")
         }
     }
-    let max = ints.iter().copied().max().unwrap_or(0);
-    bitpack(&ints, bits_needed(max), out);
+    // Escaped vectors pack as zero codes without a probe; every other vector is probed again under the chosen power,
+    // which writes the same codes the first pass saw. The escaped indexes ascend, so one cursor walks them in step.
+    let mut next_escaped = escaped.iter().peekable();
+    alp_rd_bitpack_vectors(values.len(), bits_needed(max_code), out, |vector_index, buffer| {
+        buffer.fill(0);
+        if next_escaped
+            .next_if(|escaped_index| **escaped_index as usize == vector_index)
+            .is_some()
+        {
+            return;
+        }
+        let start = vector_index * FASTLANES_VECTOR;
+        let vector = values
+            .get(start..values.len().min(start + FASTLANES_VECTOR))
+            .unwrap_or(&[]);
+        if let (Some(vector_codes), Some(vector_encodable)) =
+            (buffer.get_mut(..vector.len()), encodable.get_mut(..vector.len()))
+        {
+            alp_probe_chunk(vector, power, vector_codes, vector_encodable);
+        }
+    });
     // Raw payloads ride after the packed words, where a sequential decoder already knows the value count needed to
     // size each escaped vector.
     for vector_index in &escaped {
@@ -1417,22 +1440,63 @@ fn apply_alp_escapes(reader: &mut Reader<'_>, escaped: &[u32], values: &mut [f64
     Ok(())
 }
 
-/// Reads an ALP block's exception list, honouring the recorded side-stream inner encoding.
-fn decode_alp_exceptions(reader: &mut Reader<'_>, side: SideStream) -> Result<Vec<(u32, u64)>, FormatError> {
+/// The values an ALP block stores exactly, beside its scaled integers: each one's row index and its raw float bits.
+///
+/// The list is checked when it is read but stays borrowed from the block's bytes, so decoding never copies the
+/// exceptions into records of their own; [`Self::try_for_each`] reads them back in stored order.
+///
+/// See: hef-encodings-and-compression/spec.md
+enum AlpExceptions<'a> {
+    /// Stored plainly: each exception's 4-byte index sits in front of its 8-byte bits.
+    Interleaved(&'a [u8]),
+    /// Stored with a frame-of-reference index stream: the indexes are already decoded (each checked to fit a `u32`),
+    /// and `bits` holds one 8-byte word per index, in the same order.
+    Separate { bits: &'a [u8], indexes: Vec<u64> },
+}
+
+impl AlpExceptions<'_> {
+    /// Hands each exception's row index and raw float bits to `patch`, in stored order, stopping at the first error
+    /// `patch` returns.
+    fn try_for_each(&self, mut patch: impl FnMut(u32, u64) -> Result<(), FormatError>) -> Result<(), FormatError> {
+        match self {
+            Self::Interleaved(records) => {
+                for record in records.chunks_exact(size_of::<u32>() + size_of::<u64>()) {
+                    let (index, bits) = record.split_at_checked(size_of::<u32>()).unwrap_or((&[], &[]));
+                    patch(
+                        u32::from_le_bytes(index.try_into().unwrap_or([0; 4])),
+                        u64::from_le_bytes(bits.try_into().unwrap_or([0; 8])),
+                    )?;
+                }
+            }
+            Self::Separate { bits, indexes } => {
+                for (index, word) in indexes.iter().zip(bits.chunks_exact(size_of::<u64>())) {
+                    patch(*index as u32, u64::from_le_bytes(word.try_into().unwrap_or([0; 8])))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Reads an ALP block's exception list, honouring the recorded side-stream inner encoding, and leaves `reader` just
+/// past it. Every field is checked in the order it is stored, so a malformed list fails exactly where it breaks; the
+/// exceptions themselves stay borrowed from `reader`'s bytes.
+fn decode_alp_exceptions<'a>(reader: &mut Reader<'a>, side: SideStream) -> Result<AlpExceptions<'a>, FormatError> {
     let exception_count = reader.u32("alp exception count")? as usize;
-    let mut exceptions = Vec::with_capacity(reader.capacity_hint(exception_count, 12));
     match side {
         SideStream::FileScopeDictionary | SideStream::FsstDictionaryValues | SideStream::FsstValueKeys => {
-            return Err(FormatError::Structural {
+            Err(FormatError::Structural {
                 rule: "alp blocks never carry a string block's side stream",
-            });
+            })
         }
         SideStream::None => {
+            let mut records = *reader;
             for _ in 0..exception_count {
-                let index = reader.u32("alp exception index")?;
-                let bits = reader.u64("alp exception bits")?;
-                exceptions.push((index, bits));
+                reader.u32("alp exception index")?;
+                reader.u64("alp exception bits")?;
             }
+            let records = records.take(reader.position() - records.position(), "alp exception index")?;
+            Ok(AlpExceptions::Interleaved(records))
         }
         SideStream::ForBitpack => {
             let indexes: Vec<u64> = decode_for_bitpack(reader)?;
@@ -1441,16 +1505,17 @@ fn decode_alp_exceptions(reader: &mut Reader<'_>, side: SideStream) -> Result<Ve
                     rule: "alp exception index stream disagrees with the exception count",
                 });
             }
-            for index in indexes {
-                let bits = reader.u64("alp exception bits")?;
-                let index = u32::try_from(index).map_err(|_| FormatError::RefOutOfRange {
+            let mut bits = *reader;
+            for index in &indexes {
+                reader.u64("alp exception bits")?;
+                u32::try_from(*index).map_err(|_| FormatError::RefOutOfRange {
                     what: "alp exception index",
                 })?;
-                exceptions.push((index, bits));
             }
+            let bits = bits.take(reader.position() - bits.position(), "alp exception bits")?;
+            Ok(AlpExceptions::Separate { bits, indexes })
         }
     }
-    Ok(exceptions)
 }
 
 fn decode_alp(reader: &mut Reader<'_>, side: SideStream) -> Result<Vec<f64>, FormatError> {
@@ -1475,12 +1540,13 @@ fn decode_alp(reader: &mut Reader<'_>, side: SideStream) -> Result<Vec<f64>, For
         stream.unpack_into(&mut values, |packed| (unzigzag(packed) as f64) / power);
     }
     values.truncate(stream.count);
-    for (index, bits) in exceptions {
+    exceptions.try_for_each(|index, bits| {
         let slot = values.get_mut(index as usize).ok_or(FormatError::RefOutOfRange {
             what: "alp exception index",
         })?;
         *slot = f64::from_bits(bits);
-    }
+        Ok(())
+    })?;
     apply_alp_escapes(reader, &escaped, &mut values)?;
     Ok(values)
 }
@@ -1946,8 +2012,80 @@ enum NullStreamForm<'a> {
     Raw(Cow<'a, [u8]>),
     /// Sorted, disjoint, non-adjacent `[start, end)` runs of present rows — the roaring-style run form, smallest when
     /// nulls cluster (the usual case for event data).
-    Runs(Vec<(u32, u32)>),
+    Runs(NullRuns<'a>),
 }
+
+/// The present-row runs of a string block's null stream: either a list the encoder just built, or the run table still
+/// sitting in the block bytes it was read from, so a transient decode never copies it into a list of its own.
+///
+/// Both kinds answer the same questions (how many runs, the run at a position, every run in order) and compare
+/// equal when they hold the same runs.
+///
+/// See: hef-encodings-and-compression/spec.md
+#[derive(Debug, Clone)]
+enum NullRuns<'a> {
+    /// The stored table: each run's start then end as little-endian `u32`s, already validated by [`NullStream::read`].
+    Encoded(&'a [u8]),
+    Pairs(Vec<(u32, u32)>),
+}
+
+impl NullRuns<'_> {
+    fn len(&self) -> usize {
+        match self {
+            NullRuns::Encoded(bytes) => bytes.len() / 8,
+            NullRuns::Pairs(pairs) => pairs.len(),
+        }
+    }
+
+    /// The `[start, end)` run at `index`, or `None` past the last run.
+    fn get(&self, index: usize) -> Option<(u32, u32)> {
+        match self {
+            NullRuns::Encoded(bytes) => {
+                let offset = index.checked_mul(8)?;
+                let start = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+                let end = bytes
+                    .get(offset.checked_add(4)?..offset.checked_add(8)?)?
+                    .try_into()
+                    .ok()?;
+                Some((u32::from_le_bytes(start), u32::from_le_bytes(end)))
+            }
+            NullRuns::Pairs(pairs) => pairs.get(index).copied(),
+        }
+    }
+
+    /// Every run, in row order.
+    fn iter(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.iter_from(0)
+    }
+
+    /// The runs from index `first` on, in row order, without visiting the ones before it.
+    fn iter_from(&self, first: usize) -> impl Iterator<Item = (u32, u32)> + '_ {
+        (first..self.len()).filter_map(|index| self.get(index))
+    }
+
+    /// The index of the first run for which `keep_going` is false, given that it holds for a prefix of the runs:
+    /// the run-list counterpart of a slice's `partition_point`.
+    fn partition_point(&self, mut keep_going: impl FnMut((u32, u32)) -> bool) -> usize {
+        let (mut low, mut high) = (0usize, self.len());
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.get(middle).is_some_and(&mut keep_going) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low
+    }
+}
+
+impl PartialEq for NullRuns<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for NullRuns<'_> {}
 
 /// One string block's presence-of-value stream, shared by every string transform (dictionary, FSST, raw) instead of
 /// each writing its own unconditional raw bitmap. An all-present block stores zero null bytes; clustered nulls store
@@ -2001,7 +2139,7 @@ impl<'a> NullStream<'a> {
         } else if 4 + run_count * 8 < row_count.div_ceil(8) {
             let mut runs: Vec<(u32, u32)> = Vec::with_capacity(run_count);
             each_present_run(presence, |start, end| runs.push((start as u32, end as u32)));
-            NullStreamForm::Runs(runs)
+            NullStreamForm::Runs(NullRuns::Pairs(runs))
         } else {
             // LSB-0: row `8 * byte + bit` is bit `bit` of byte `byte`.
             let mut raw = vec![0u8; row_count.div_ceil(8)];
@@ -2025,7 +2163,7 @@ impl<'a> NullStream<'a> {
             NullStreamForm::Runs(runs) => {
                 out.put_u8(2);
                 out.put_u32(runs.len() as u32);
-                for &(start, end) in runs {
+                for (start, end) in runs.iter() {
                     out.put_u32(start);
                     out.put_u32(end);
                 }
@@ -2054,7 +2192,10 @@ impl<'a> NullStream<'a> {
             1 => NullStreamForm::AllAbsent,
             2 => {
                 let run_count = reader.u32("null stream run count")? as usize;
-                let mut runs = Vec::with_capacity(reader.capacity_hint(run_count, 8));
+                // Validate run by run through `reader`, so a bad early run is reported before a later truncation,
+                // then borrow exactly the bytes those runs occupied.
+                let mut table = *reader;
+                let mut previous_end: Option<u32> = None;
                 for _ in 0..run_count {
                     let start = reader.u32("null stream run start")?;
                     let end = reader.u32("null stream run end")?;
@@ -2063,14 +2204,15 @@ impl<'a> NullStream<'a> {
                             rule: "null stream run must be non-empty and within the row count",
                         });
                     }
-                    if runs.last().is_some_and(|&(_, previous_end)| start <= previous_end) {
+                    if previous_end.is_some_and(|previous_end| start <= previous_end) {
                         return Err(FormatError::Structural {
                             rule: "null stream runs must be sorted and non-adjacent",
                         });
                     }
-                    runs.push((start, end));
+                    previous_end = Some(end);
                 }
-                NullStreamForm::Runs(runs)
+                let consumed = reader.position() - table.position();
+                NullStreamForm::Runs(NullRuns::Encoded(table.take(consumed, "null stream runs")?))
             }
             3 => NullStreamForm::Raw(Cow::Borrowed(reader.take(row_count.div_ceil(8), "null bitmap")?)),
             _ => {
@@ -2082,13 +2224,15 @@ impl<'a> NullStream<'a> {
         Ok(Self { form, row_count })
     }
 
-    /// The same stream, copying a borrowed raw bitmap so it no longer depends on the bytes it was read from.
+    /// The same stream, copying a borrowed raw bitmap or run table so it no longer depends on the bytes it was read
+    /// from.
     fn into_owned(self) -> NullStream<'static> {
         let form = match self.form {
             NullStreamForm::AllAbsent => NullStreamForm::AllAbsent,
             NullStreamForm::AllPresent => NullStreamForm::AllPresent,
             NullStreamForm::Raw(bits) => NullStreamForm::Raw(Cow::Owned(bits.into_owned())),
-            NullStreamForm::Runs(runs) => NullStreamForm::Runs(runs),
+            NullStreamForm::Runs(NullRuns::Pairs(pairs)) => NullStreamForm::Runs(NullRuns::Pairs(pairs)),
+            NullStreamForm::Runs(runs) => NullStreamForm::Runs(NullRuns::Pairs(runs.iter().collect())),
         };
         NullStream {
             form,
@@ -2106,7 +2250,7 @@ impl<'a> NullStream<'a> {
             NullStreamForm::AllAbsent => 0,
             NullStreamForm::AllPresent => self.row_count,
             NullStreamForm::Raw(bits) => count_set_bits(bits, self.row_count),
-            NullStreamForm::Runs(runs) => runs.iter().map(|&(start, end)| (end - start) as usize).sum(),
+            NullStreamForm::Runs(runs) => runs.iter().map(|(start, end)| (end - start) as usize).sum(),
         }
     }
 
@@ -2120,10 +2264,10 @@ impl<'a> NullStream<'a> {
             NullStreamForm::AllPresent => true,
             NullStreamForm::Raw(bits) => bits.get(row / 8).is_some_and(|byte| byte & (1 << (row % 8)) != 0),
             NullStreamForm::Runs(runs) => {
-                let idx = runs.partition_point(|&(start, _)| start as usize <= row);
+                let idx = runs.partition_point(|(start, _)| start as usize <= row);
                 idx.checked_sub(1)
                     .and_then(|i| runs.get(i))
-                    .is_some_and(|&(_, end)| row < end as usize)
+                    .is_some_and(|(_, end)| row < end as usize)
             }
         }
     }
@@ -2138,8 +2282,8 @@ impl<'a> NullStream<'a> {
             NullStreamForm::Raw(bits) => count_present_before(bits, row),
             NullStreamForm::Runs(runs) => runs
                 .iter()
-                .take_while(|&&(start, _)| (start as usize) < row)
-                .map(|&(start, end)| (end as usize).min(row) - start as usize)
+                .take_while(|&(start, _)| (start as usize) < row)
+                .map(|(start, end)| (end as usize).min(row) - start as usize)
                 .sum(),
         }
     }
@@ -2170,7 +2314,7 @@ impl<'a> NullStream<'a> {
             }
             NullStreamForm::Runs(runs) => {
                 let mut cursor = 0usize;
-                for &(start, end) in runs {
+                for (start, end) in runs.iter() {
                     for _ in cursor..start as usize {
                         row(false)?;
                     }
@@ -2218,8 +2362,8 @@ impl<'a> NullStream<'a> {
             }
             NullStreamForm::Runs(runs) => {
                 let mut cursor = start;
-                let first = runs.partition_point(|&(_, run_end)| (run_end as usize) <= start);
-                for &(run_start, run_end) in &runs[first..] {
+                let first = runs.partition_point(|(_, run_end)| (run_end as usize) <= start);
+                for (run_start, run_end) in runs.iter_from(first) {
                     let run_start = (run_start as usize).max(start);
                     let run_end = (run_end as usize).min(end);
                     if run_start >= end {
@@ -3523,7 +3667,7 @@ fn views_by_row(nulls: &NullStream, mut values: impl ExactSizeIterator<Item = u1
         }
         NullStreamForm::Runs(runs) => {
             let mut views = vec![0u128; rows];
-            for &(start, end) in runs {
+            for (start, end) in runs.iter() {
                 // `NullStream::read` and `from_values` keep every run inside the row count.
                 for slot in views.get_mut(start as usize..end as usize).into_iter().flatten() {
                     *slot = values.next().unwrap_or(0);
@@ -3549,7 +3693,7 @@ fn null_buffer(nulls: &NullStream) -> Option<NullBuffer> {
         ))),
         NullStreamForm::Runs(runs) => {
             let mut builder = BooleanBufferBuilder::new(nulls.row_count());
-            for &(start, end) in runs {
+            for (start, end) in runs.iter() {
                 let (start, end) = (start as usize, end as usize);
                 if builder.len() < start {
                     builder.append_n(start - builder.len(), false);
@@ -3614,12 +3758,7 @@ fn stats_for(data: &ColumnData) -> BlockStats {
         max_f64: None,
     };
     match data {
-        ColumnData::U64(values) => {
-            if let Some((min, max)) = min_max(values) {
-                stats.min_i128 = Some(i128::from(min));
-                stats.max_i128 = Some(i128::from(max));
-            }
-        }
+        ColumnData::U64(values) => stats = u64_stats(values),
         ColumnData::I64(values) => {
             if let Some((min, max)) = min_max(values) {
                 stats.min_i128 = Some(i128::from(min));
@@ -3652,6 +3791,19 @@ fn stats_for(data: &ColumnData) -> BlockStats {
         }
     }
     stats
+}
+
+/// The statistics of a u64 block: its row count and its smallest and largest value.
+fn u64_stats(values: &[u64]) -> BlockStats {
+    let bounds = min_max(values);
+    BlockStats {
+        max_f64: None,
+        max_i128: bounds.map(|(_, max)| i128::from(max)),
+        min_f64: None,
+        min_i128: bounds.map(|(min, _)| i128::from(min)),
+        null_count: 0,
+        row_count: values.len() as u32,
+    }
 }
 
 /// Whole-block byte size at or below which the trailing cascade compresses the block with both codecs and keeps the
@@ -4199,10 +4351,44 @@ fn encode_block_inner(
     // misleading sample encoded larger than its plain form is stored plain instead, so an unlucky sample costs the
     // wasted trial encode and never a bigger block. The comparison is a pure function of the encoded output, so two
     // nodes encoding the same rows still store the same bytes.
-    if forced.is_some() || replay_trailing.is_some() || block.bytes.len() as u64 <= raw_value_bytes(data) {
+    keep_within_plain_form(
+        block,
+        forced.is_some() || replay_trailing.is_some(),
+        raw_value_bytes(data),
+        || plain_form(data, random_access, strategy, shared),
+    )
+}
+
+/// Encodes u64 values borrowed from the caller exactly as [`encode_block`] encodes the same values handed over as a
+/// [`ColumnData::U64`] block (same pipeline, bytes and stats), so a caller that keeps its values need not copy them
+/// into a column first.
+pub(crate) fn encode_u64_block(values: &[u64], random_access: bool) -> EncodedBlock {
+    let strategy = CascadeStrategy::DecodeOptimized;
+    let block = encode_u64_form(values, random_access, strategy, None, None);
+    keep_within_plain_form(block, false, (values.len() * 8) as u64, || {
+        encode_u64_form(
+            values,
+            random_access,
+            strategy,
+            Some(Transform::PlainU64),
+            Some(Compression::None),
+        )
+    })
+}
+
+/// The acceptance gate behind [`encode_block_inner`]: keeps `block` when its form was `named` by the caller or it
+/// stores no more than `raw_bytes`, the raw size of its values; otherwise builds the plain form with `build_plain`
+/// and keeps whichever is smaller, `block` on a tie.
+fn keep_within_plain_form(
+    block: EncodedBlock,
+    named: bool,
+    raw_bytes: u64,
+    build_plain: impl FnOnce() -> EncodedBlock,
+) -> EncodedBlock {
+    if named || block.bytes.len() as u64 <= raw_bytes {
         return block;
     }
-    let plain = plain_form(data, random_access, strategy, shared);
+    let plain = build_plain();
     if plain.bytes.len() < block.bytes.len() {
         plain
     } else {
@@ -4231,11 +4417,7 @@ fn encode_chosen_form(
     let mut fsst = None;
     let mut frame_breaks = Vec::new();
     let (transform, kind) = match data {
-        ColumnData::U64(values) => {
-            let transform = forced.unwrap_or_else(|| choose_u64_transform(values, strategy));
-            encode_u64_with(transform, values, &mut out);
-            (transform, ValueKind::U64)
-        }
+        ColumnData::U64(values) => (encode_u64_body(values, forced, strategy, &mut out), ValueKind::U64),
         ColumnData::I64(values) => {
             let transform = forced.unwrap_or_else(|| choose_i64_transform(values, strategy));
             encode_i64_with(transform, values, &mut out);
@@ -4303,7 +4485,77 @@ fn encode_chosen_form(
             (transform, ValueKind::String)
         }
     };
-    let body = out.into_bytes();
+    let (compression, bytes, uncompressed_len) = apply_trailing_stage(
+        out.into_bytes(),
+        transform,
+        side,
+        &frame_breaks,
+        random_access,
+        strategy,
+        replay_trailing,
+    );
+    EncodedBlock {
+        pipeline: PipelineId::new(transform, compression, kind).with_side_stream(side),
+        bytes,
+        fsst,
+        stats,
+        uncompressed_len,
+    }
+}
+
+/// [`encode_chosen_form`] for u64 values borrowed from the caller: the same transform choice, body and trailing stage
+/// the owned [`ColumnData::U64`] path runs, without the acceptance gate.
+fn encode_u64_form(
+    values: &[u64],
+    random_access: bool,
+    strategy: CascadeStrategy,
+    forced: Option<Transform>,
+    replay_trailing: Option<Compression>,
+) -> EncodedBlock {
+    let mut out = Writer::with_capacity(values.len() * 8);
+    let transform = encode_u64_body(values, forced, strategy, &mut out);
+    let (compression, bytes, uncompressed_len) = apply_trailing_stage(
+        out.into_bytes(),
+        transform,
+        SideStream::None,
+        &[],
+        random_access,
+        strategy,
+        replay_trailing,
+    );
+    EncodedBlock {
+        pipeline: PipelineId::new(transform, compression, ValueKind::U64).with_side_stream(SideStream::None),
+        bytes,
+        fsst: None,
+        stats: u64_stats(values),
+        uncompressed_len,
+    }
+}
+
+/// Writes u64 `values` into `out` with the `forced` transform, or the one sampling picks under `strategy`, and returns
+/// the transform used.
+fn encode_u64_body(
+    values: &[u64],
+    forced: Option<Transform>,
+    strategy: CascadeStrategy,
+    out: &mut Writer,
+) -> Transform {
+    let transform = forced.unwrap_or_else(|| choose_u64_transform(values, strategy));
+    encode_u64_with(transform, values, out);
+    transform
+}
+
+/// Runs the trailing compression stage over a block's `body`, as far as `random_access`, the cascade depth and a
+/// replayed codec allow, and returns the codec applied, the stored bytes, and the body's length before compression.
+fn apply_trailing_stage(
+    body: Vec<u8>,
+    transform: Transform,
+    side: SideStream,
+    frame_breaks: &[usize],
+    random_access: bool,
+    strategy: CascadeStrategy,
+    replay_trailing: Option<Compression>,
+) -> (Compression, Vec<u8>, u64) {
     // The decoded length is the block content before the trailing compression stage — captured now, since `body` is
     // consumed by the compression call below.
     let uncompressed_len = body.len() as u64;
@@ -4311,7 +4563,7 @@ fn encode_chosen_form(
     let (compression, bytes) = if random_access {
         // Random access preserved: per-value offsets stay addressable, so only the seekable Zstandard family (which
         // preserves it too) may still apply; every other trailing stage is skipped.
-        apply_seekable_frames(transform, body, strategy, &frame_breaks)
+        apply_seekable_frames(transform, body, strategy, frame_breaks)
     } else if !cascade_level_fits(depth_so_far) {
         // A trailing stage would exceed the declared maximum cascade depth, so it is not added — however well it
         // would have sampled.
@@ -4321,13 +4573,7 @@ fn encode_chosen_form(
     } else {
         apply_trailing(body, strategy)
     };
-    EncodedBlock {
-        pipeline: PipelineId::new(transform, compression, kind).with_side_stream(side),
-        bytes,
-        fsst,
-        stats,
-        uncompressed_len,
-    }
+    (compression, bytes, uncompressed_len)
 }
 
 /// One value of a FastLanes transposed stream, read straight from the packed words that hold it.
@@ -4436,13 +4682,7 @@ fn decode_alp_range(
     let power = ALP_POWERS.get(exponent_index).copied().ok_or(FormatError::Structural {
         rule: "alp exponent out of range",
     })?;
-    let exceptions: Vec<(usize, u64)> = decode_alp_exceptions(reader, side)?
-        .into_iter()
-        .filter_map(|(index, bits)| {
-            let index = index as usize;
-            (index >= start && index < end).then(|| (index - start, bits))
-        })
-        .collect();
+    let exceptions = decode_alp_exceptions(reader, side)?;
     let count = reader.u32("bitpack count")? as usize;
     let width = u32::from(reader.u8("bitpack width")?);
     if width > 64 {
@@ -4487,11 +4727,17 @@ fn decode_alp_range(
                 .collect()
         })
     };
-    for (rel_idx, bits) in exceptions {
-        if let Some(slot) = values.get_mut(rel_idx) {
+    // Only exceptions inside the requested rows patch; any other is skipped without a bounds error.
+    exceptions.try_for_each(|index, bits| {
+        let index = index as usize;
+        if index >= start
+            && index < end
+            && let Some(slot) = values.get_mut(index - start)
+        {
             *slot = f64::from_bits(bits);
         }
-    }
+        Ok(())
+    })?;
     if !escaped.is_empty() {
         // Seek past the packed words this range decode left unread, landing on the raw escape payloads, then patch the
         // escaped vectors that overlap [start, effective_end).
