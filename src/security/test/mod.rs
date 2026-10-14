@@ -67,7 +67,7 @@ fn a_sealing_key_never_rolls_past_its_reserved_epoch_range() {
     // it is spent the key refuses to seal — it must never wander into epochs another checkout (a concurrent node, or
     // the next restart) owns, because that is exactly how a nonce would repeat.
     let scheme = AeadScheme::default();
-    let mut first = SealedContentKey::with_epoch_range(ContentKey::new([7u8; 32]), 0, 2, scheme);
+    let mut first = SealedContentKey::with_epoch_range(ContentKey::new([7u8; 32]), 0, 2, scheme).unwrap();
     let sealed_a = first.encrypt(9, FILE_ID, b"a").unwrap();
     let sealed_b = first.encrypt(9, FILE_ID, b"b").unwrap();
     assert!(
@@ -76,7 +76,7 @@ fn a_sealing_key_never_rolls_past_its_reserved_epoch_range() {
     );
 
     // The next checkout's range starts where the first ended, so even the same block id seals under fresh nonces.
-    let mut second = SealedContentKey::with_epoch_range(ContentKey::new([7u8; 32]), 2, 4, scheme);
+    let mut second = SealedContentKey::with_epoch_range(ContentKey::new([7u8; 32]), 2, 4, scheme).unwrap();
     let sealed_c = second.encrypt(9, FILE_ID, b"c").unwrap();
 
     let nonce_len = scheme.nonce_len();
@@ -85,6 +85,19 @@ fn a_sealing_key_never_rolls_past_its_reserved_epoch_range() {
         .map(|blob| blob.get(..nonce_len))
         .collect();
     assert_eq!(nonces.len(), 3, "no nonce may repeat within or across checkouts");
+}
+
+#[test]
+fn an_empty_or_inverted_epoch_reservation_is_rejected() {
+    // F9: a reservation that owns no epochs must never seal, even on its first seal before any epoch roll.
+    let scheme = AeadScheme::default();
+    assert!(SealedContentKey::with_epoch_range(ContentKey::new([7u8; 32]), 2, 2, scheme).is_none());
+    assert!(SealedContentKey::with_epoch_range(ContentKey::new([7u8; 32]), 3, 2, scheme).is_none());
+    let mut exhausted = SealedContentKey::new(ContentKey::new([7u8; 32]), u64::MAX, scheme);
+    assert!(
+        exhausted.encrypt(9, FILE_ID, b"a").is_none(),
+        "the first seal must check the epoch limit, not only epoch rolls"
+    );
 }
 
 #[test]

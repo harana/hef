@@ -115,18 +115,17 @@ pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
         });
     }
     let mut plain = Vec::with_capacity(directory.plain_capacity_hint());
-    for (start, len) in directory.ranges() {
-        inflate_into(
+    for (granule, (start, len)) in directory.ranges().enumerate() {
+        inflate_expected(
             slice(bytes, start, len, "deflate granule")?,
-            GRANULE_BYTES,
-            MAX_GRANULE_UNCOMPRESSED_BYTES,
+            expected_granule_len(plain_len, granule),
             &mut plain,
         )?;
-        if plain.len() > plain_len {
-            return Err(FormatError::Structural {
-                rule: "deflate granule decompressed to more bytes than the directory declares",
-            });
-        }
+    }
+    if plain.len() != plain_len {
+        return Err(FormatError::Structural {
+            rule: "deflate page decompressed to a length other than the directory declares",
+        });
     }
     Ok(plain)
 }
@@ -134,12 +133,12 @@ pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
 /// Inflates just granule `granule`, reading only that granule's compressed bytes — the mechanism behind
 /// "Single-granule random access on a deflate page".
 pub fn decompress_granule(bytes: &[u8], granule: usize) -> Result<Vec<u8>, FormatError> {
-    let (start, len) = granule_byte_range(bytes, granule)?;
+    let directory = mini_block_directory::decode(bytes)?;
+    let (start, len) = directory.byte_range(granule)?;
     let mut plain = Vec::new();
-    inflate_into(
+    inflate_expected(
         slice(bytes, start, len, "deflate granule")?,
-        GRANULE_BYTES,
-        MAX_GRANULE_UNCOMPRESSED_BYTES,
+        expected_granule_len(directory.plain_len(), granule),
         &mut plain,
     )?;
     Ok(plain)
@@ -185,22 +184,34 @@ impl<'a> Page<'a> {
         let capacity = ((last - first + 1) * GRANULE_BYTES).min(self.directory.plain_capacity_hint());
         let mut plain = Vec::with_capacity(capacity);
         for (granule, (start, len)) in self.directory.ranges().enumerate().skip(first).take(last - first + 1) {
-            let expected = GRANULE_BYTES.min(plain_len.saturating_sub(granule * GRANULE_BYTES));
-            let before = plain.len();
-            inflate_into(
+            inflate_expected(
                 slice(self.bytes, start, len, "deflate granule")?,
-                expected.max(1),
-                MAX_GRANULE_UNCOMPRESSED_BYTES,
+                expected_granule_len(plain_len, granule),
                 &mut plain,
             )?;
-            if plain.len() - before != expected {
-                return Err(FormatError::Structural {
-                    rule: "deflate granule length disagrees with the directory's plain length",
-                });
-            }
         }
         Ok(plain)
     }
+}
+
+/// The plaintext length granule `granule` must inflate to on a page declaring `plain_len` bytes: [`GRANULE_BYTES`]
+/// for all but the final granule, the declared remainder for the final one.
+fn expected_granule_len(plain_len: usize, granule: usize) -> usize {
+    GRANULE_BYTES.min(plain_len.saturating_sub(granule.saturating_mul(GRANULE_BYTES)))
+}
+
+/// Inflates one granule onto `out` and fails unless it produced exactly `expected` bytes, so every decode path holds
+/// granules to the fixed stride random-access offsets depend on.
+fn inflate_expected(compressed: &[u8], expected: usize, out: &mut Vec<u8>) -> Result<(), FormatError> {
+    let before = out.len();
+    inflate_into(compressed, expected.max(1), MAX_GRANULE_UNCOMPRESSED_BYTES, out)?;
+    if out.len() - before != expected {
+        out.truncate(before);
+        return Err(FormatError::Structural {
+            rule: "deflate granule length disagrees with the directory's plain length",
+        });
+    }
+    Ok(())
 }
 
 /// Inflates one granule's compressed bytes through this thread's reused [`DECOMPRESSOR`], appending the plaintext

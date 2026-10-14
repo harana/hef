@@ -107,12 +107,9 @@ fn a_key_resumed_from_a_sealing_checkout_stays_inside_its_epoch_range() {
     // sealing refuses once it is spent, and the next checkout's key seals the same block under fresh nonces — so no
     // two runs (restart or concurrent node) can ever repeat a nonce.
     let scheme = AeadScheme::default();
-    let mut resumed = SubjectContentKey::from_sealing_key(SealedContentKey::with_epoch_range(
-        ContentKey::new([5u8; 32]),
-        0,
-        2,
-        scheme,
-    ));
+    let mut resumed = SubjectContentKey::from_sealing_key(
+        SealedContentKey::with_epoch_range(ContentKey::new([5u8; 32]), 0, 2, scheme).unwrap(),
+    );
     let first = resumed.encrypt(7, FILE_ID, b"original").unwrap();
     let second = resumed.encrypt(7, FILE_ID, b"corrected").unwrap();
     assert!(
@@ -120,12 +117,9 @@ fn a_key_resumed_from_a_sealing_checkout_stays_inside_its_epoch_range() {
         "a spent epoch range refuses to seal rather than enter another checkout's epochs"
     );
 
-    let mut next_checkout = SubjectContentKey::from_sealing_key(SealedContentKey::with_epoch_range(
-        ContentKey::new([5u8; 32]),
-        2,
-        4,
-        scheme,
-    ));
+    let mut next_checkout = SubjectContentKey::from_sealing_key(
+        SealedContentKey::with_epoch_range(ContentKey::new([5u8; 32]), 2, 4, scheme).unwrap(),
+    );
     let third = next_checkout.encrypt(7, FILE_ID, b"after restart").unwrap();
     assert_eq!(
         next_checkout.key_epoch(),
