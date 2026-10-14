@@ -123,6 +123,10 @@ pub const MAX_RETAINED_INFLATE_BYTES: usize = 4 << 20;
 /// The most bytes one FSST symbol — and so one stored code — expands to.
 pub const FSST_MAX_SYMBOL_BYTES: usize = 8;
 
+/// Stored per-value keys of an FSST block that one pass of the filter scan decides together: one bit each in a 64-bit
+/// verdict word, so the survivors are read back out with a trailing-zero count rather than a test per value.
+pub const FSST_KEY_SCAN_CHUNK: usize = u64::BITS as usize;
+
 /// Bytes one stored [`super::sidecar::PrefixKey`] occupies: its prefix bytes plus the length byte.
 pub const PREFIX_KEY_BYTES: usize = PREFIX_KEY_PREFIX_LEN + 1;
 

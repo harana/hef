@@ -335,6 +335,172 @@ fn fsst_substring_candidates_are_pruned_by_fingerprints() {
     assert!(check(&values, &contains_all(&["order", "nope"], false), true));
 }
 
+/// A small xorshift stream, so the randomized key-scan cases replay exactly on every run.
+struct KeyScanRng(u64);
+
+impl KeyScanRng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound as u64) as usize
+    }
+
+    /// Text over a three-letter alphabet that includes the zero byte the prefix keys pad with, so values tie on all
+    /// seven prefix bytes, run shorter than the prefix, and differ from a padded prefix only by length.
+    fn text(&mut self, len: usize) -> String {
+        (0..len).map(|_| ['a', 'b', '\0'][self.below(3)]).collect()
+    }
+
+    /// A value the keys must order: null, empty, shorter than the prefix, or long.
+    fn value(&mut self) -> Option<String> {
+        match self.below(10) {
+            0 => None,
+            1 => Some(String::new()),
+            2 | 3 => {
+                let len = 1 + self.below(9);
+                Some(self.text(len))
+            }
+            _ => {
+                let len = 30 + self.below(30);
+                Some(self.text(len))
+            }
+        }
+    }
+
+    /// A missing bound, or one on a stored value, a value exactly the prefix width, or a short value, either way
+    /// inclusive or exclusive.
+    fn bound(&mut self, values: &[Option<String>]) -> Option<StringBound> {
+        let value = match self.below(4) {
+            0 => return None,
+            1 => values
+                .get(self.below(values.len()))
+                .cloned()
+                .flatten()
+                .unwrap_or_default(),
+            2 => self.text(PREFIX_KEY_PREFIX_LEN),
+            _ => {
+                let len = self.below(12);
+                self.text(len)
+            }
+        };
+        Some(bound(&value, self.below(2) == 0))
+    }
+}
+
+/// An FSST block over `values` that stores the per-value keys, without a trailing stage.
+fn keyed_fsst_block(values: &[Option<String>]) -> (StringColumn, crate::encoding::EncodedBlock) {
+    let column: StringColumn = values.to_vec().into();
+    let block = encode_block_forced_for_conformance(
+        &ColumnData::Strings(column.clone()),
+        true,
+        CascadeStrategy::NoTrailing,
+        Transform::FsstString,
+    )
+    .unwrap();
+    assert_eq!(block.pipeline.side_stream().unwrap(), SideStream::FsstValueKeys);
+    (column, block)
+}
+
+/// Row counts around the 64-value scan chunk, so full chunks, short tails and a lone partial chunk all run.
+fn key_scan_row_counts() -> [usize; 9] {
+    [1, 7, 63, 64, 65, 127, 128, 129, 300]
+}
+
+/// The chunked prefix-key range scan agrees row for row with decode-and-filter across random values and bounds:
+/// lower-only, upper-only and two-sided ranges, inclusive and exclusive ends, bounds equal to a stored value or to
+/// its prefix, and nulls, empty strings and values shorter than the prefix.
+#[test]
+fn chunked_prefix_key_ranges_agree_with_the_decoded_filter() {
+    let mut rng = KeyScanRng(0x9E37_79B9_7F4A_7C15);
+    let mut blocks = 0;
+    for rows in key_scan_row_counts() {
+        for _ in 0..8 {
+            let values: Vec<Option<String>> = (0..rows).map(|_| rng.value()).collect();
+            // Only a block whose values are long enough on average stores the keys at all.
+            if values.iter().flatten().map(String::len).sum::<usize>() < values.iter().flatten().count() * 24 {
+                continue;
+            }
+            blocks += 1;
+            let (column, block) = keyed_fsst_block(&values);
+            for _ in 0..24 {
+                let predicate = StringPredicate::Range {
+                    lower: rng.bound(&values),
+                    upper: rng.bound(&values),
+                };
+                let mask = filter_string_block(block.pipeline, &block.bytes, &predicate)
+                    .unwrap()
+                    .expect("a keyed FSST block answers a range");
+                assert_eq!(mask, predicate.filter_decoded(&column), "{rows} rows, {predicate:?}");
+            }
+        }
+    }
+    assert!(blocks > 40, "too few keyed blocks were exercised: {blocks}");
+}
+
+/// The chunked fingerprint scan finds exactly the rows a decoded search does, in both the mask and the count-only
+/// kernels, across chunk tails and needles that are common, rare, absent, or need several fingerprint bits.
+#[test]
+fn chunked_fingerprint_candidates_agree_with_the_decoded_search() {
+    let mut rng = KeyScanRng(0xD1B5_4A32_D192_ED03);
+    for rows in key_scan_row_counts() {
+        let mut values: Vec<Option<String>> = (0..rows)
+            .map(|_| {
+                let len = 30 + rng.below(30);
+                Some(rng.text(len))
+            })
+            .collect();
+        for value in values.iter_mut().step_by(5) {
+            *value = rng.value();
+        }
+        if let Some(Some(last)) = values.last_mut() {
+            last.push_str("-tail-marker");
+        }
+        let (column, block) = keyed_fsst_block(&values);
+        let mut predicates: Vec<StringPredicate> = ["a", "ab\0b", "aaaaaaaa", "z", "-tail-marker", ""]
+            .into_iter()
+            .map(contains)
+            .collect();
+        predicates.push(contains_all(&["A", "B"], true));
+        for predicate in &predicates {
+            let reference = predicate.filter_decoded(&column);
+            let mask = filter_string_block(block.pipeline, &block.bytes, predicate)
+                .unwrap()
+                .expect("a keyed FSST block answers a substring test");
+            assert_eq!(mask, reference, "{rows} rows, {predicate:?}");
+            let count = count_string_block_shared(block.pipeline, &block.bytes, predicate, None)
+                .unwrap()
+                .expect("a keyed FSST block counts a substring test");
+            assert_eq!(
+                count,
+                reference.iter().filter(|hit| **hit).count(),
+                "{rows} rows, {predicate:?}"
+            );
+        }
+    }
+}
+
+/// A stored prefix key whose length byte runs past the prefix width refuses the range scan, even when it sits in a
+/// later chunk's tail rather than the first chunk.
+#[test]
+fn a_forged_prefix_key_length_refuses_the_range_scan() {
+    let values: Vec<Option<String>> = (0..100).map(|i| Some(format!("{i:05}-a-long-enough-value"))).collect();
+    let (_, block) = keyed_fsst_block(&values);
+    let mut forged = block.bytes.clone();
+    let prefixes_start = forged.len() - values.len() * (PREFIX_KEY_BYTES + StringFingerprint::STORED_BYTES);
+    forged[prefixes_start + 70 * PREFIX_KEY_BYTES + PREFIX_KEY_PREFIX_LEN] = PREFIX_KEY_PREFIX_LEN as u8 + 1;
+    let predicate = StringPredicate::Range {
+        lower: Some(bound("00010", true)),
+        upper: None,
+    };
+    assert!(filter_string_block(block.pipeline, &block.bytes, &predicate).is_ok());
+    assert!(filter_string_block(block.pipeline, &forged, &predicate).is_err());
+}
+
 #[test]
 fn fsst_range_predicates_fall_back_to_decode() {
     // Short values, so the block stores no prefix keys and nothing in it orders the rows.

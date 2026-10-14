@@ -19,8 +19,8 @@
 //! for row. Requirements: "Compressed-data string predicates" and "Compressed-data numeric predicates".
 
 use super::constant::{
-    BRANCH_FREE_SET_NARROW, BRANCH_FREE_SET_WIDE, PARALLEL_SCAN_MIN_GRANULE_BYTES, PARALLEL_SCAN_MIN_GRANULES,
-    PREFIX_KEY_BYTES,
+    BRANCH_FREE_SET_NARROW, BRANCH_FREE_SET_WIDE, FSST_KEY_SCAN_CHUNK, PARALLEL_SCAN_MIN_GRANULE_BYTES,
+    PARALLEL_SCAN_MIN_GRANULES, PREFIX_KEY_BYTES, PREFIX_KEY_PREFIX_LEN,
 };
 use super::seekable_zstd::Window;
 use super::sidecar::{PrefixKey, StringFingerprint};
@@ -34,7 +34,6 @@ use crate::file::bytes::{Reader, slice};
 use aho_corasick::{AhoCorasick, MatchKind};
 use memchr::memmem::Finder;
 use multiversion::multiversion;
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 /// One end of a range filter: the value to compare against, and whether a row equal to that value is itself a match
@@ -696,31 +695,60 @@ struct FsstValueKeys<'a> {
 }
 
 impl FsstValueKeys<'_> {
-    /// The stored prefix key of every present value, in order. A key whose length byte runs past the prefix width is
-    /// a forged block, and refuses.
-    fn prefixes(&self) -> impl Iterator<Item = Result<PrefixKey, FormatError>> + '_ {
-        self.prefixes.chunks_exact(PREFIX_KEY_BYTES).map(|stored| {
-            <[u8; PREFIX_KEY_BYTES]>::try_from(stored)
-                .ok()
-                .and_then(PrefixKey::from_stored)
-                .ok_or(FormatError::Structural {
-                    rule: "fsst prefix key length byte runs past the prefix",
-                })
-        })
+    /// The positions of the values that could hold text summarised by `needles` - every value whose stored
+    /// fingerprint has all of the needles' bits, in stored order. Everything left out provably contains no needle.
+    fn contains_candidates(&self, needles: StringFingerprint) -> impl Iterator<Item = usize> + use<> {
+        let values = self.fingerprints.len() / StringFingerprint::STORED_BYTES;
+        let mut words = vec![0u64; values.div_ceil(FSST_KEY_SCAN_CHUNK)];
+        mark_fingerprint_candidates(self.fingerprints, needles, &mut words);
+        set_bit_positions(words)
     }
+}
 
-    /// The positions of the values that could hold text summarised by `needles` — every value whose stored
-    /// fingerprint has all of the needles' bits. Everything left out provably contains no needle.
-    fn contains_candidates(&self, needles: StringFingerprint) -> impl Iterator<Item = usize> + '_ {
-        self.fingerprints
-            .chunks_exact(StringFingerprint::STORED_BYTES)
-            .enumerate()
-            .filter(move |(_, stored)| {
-                let bits = u32::from_le_bytes((*stored).try_into().unwrap_or([0; 4]));
-                StringFingerprint::from_bits(bits).might_contain(needles)
-            })
-            .map(|(index, _)| index)
+/// Marks which stored fingerprints might hold `needles`, one bit per value: bit `i % 64` of word `i / 64` is set
+/// exactly when value `i` passes [`StringFingerprint::might_contain`]. `words` holds one word per started run of
+/// [`FSST_KEY_SCAN_CHUNK`] values.
+///
+/// Each run is tested as one branch-free stretch of `AND`-and-compare folded into its word, which the compiler spreads
+/// across vector lanes.
+#[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2", "aarch64+neon"))]
+fn mark_fingerprint_candidates(fingerprints: &[u8], needles: StringFingerprint, words: &mut [u64]) {
+    let (stored, _) = fingerprints.as_chunks::<{ StringFingerprint::STORED_BYTES }>();
+    let (full, tail) = stored.as_chunks::<FSST_KEY_SCAN_CHUNK>();
+    let mut words = words.iter_mut();
+    for (chunk, word) in full.iter().zip(&mut words) {
+        *word = fingerprint_candidate_word(chunk, needles);
     }
+    if let Some(word) = words.next() {
+        *word = fingerprint_candidate_word(tail, needles);
+    }
+}
+
+/// One word of [`mark_fingerprint_candidates`]: bit `i` set when the `i`th fingerprint of `chunk` might hold
+/// `needles`. Inlined so a full chunk's fixed length lets the compiler unroll the compares into vector lanes.
+#[inline(always)]
+fn fingerprint_candidate_word(chunk: &[[u8; StringFingerprint::STORED_BYTES]], needles: StringFingerprint) -> u64 {
+    chunk.iter().enumerate().fold(0, |bits, (bit, stored)| {
+        let fingerprint = StringFingerprint::from_bits(u32::from_le_bytes(*stored));
+        bits | u64::from(fingerprint.might_contain(needles)) << bit
+    })
+}
+
+/// The position of every set bit across `words`, lowest first, where bit `b` of word `w` stands for position
+/// `w * 64 + b`.
+fn set_bit_positions(words: Vec<u64>) -> impl Iterator<Item = usize> {
+    let mut words = words.into_iter();
+    let mut bits = 0u64;
+    let mut base = 0usize.wrapping_sub(FSST_KEY_SCAN_CHUNK);
+    std::iter::from_fn(move || {
+        while bits == 0 {
+            bits = words.next()?;
+            base = base.wrapping_add(FSST_KEY_SCAN_CHUNK);
+        }
+        let bit = bits.trailing_zeros() as usize;
+        bits &= bits.wrapping_sub(1);
+        Some(base + bit)
+    })
 }
 
 /// Reads the per-value key runs sitting after an FSST block's arena. The reader must already have consumed the arena.
@@ -968,24 +996,15 @@ fn filter_fsst_range(body: &[u8], predicate: &StringPredicate) -> Result<Vec<boo
     let data = reader.take(data_len, "fsst data")?;
     let keys = read_fsst_value_keys(&mut reader, present_count)?;
 
-    let lower_key = lower.as_ref().map(|bound| PrefixKey::of(&bound.value));
-    let upper_key = upper.as_ref().map(|bound| PrefixKey::of(&bound.value));
     let mut present = vec![false; present_count];
-    let mut ambiguous = Vec::new();
-    for (index, key) in keys.prefixes().enumerate() {
-        let key = key?;
-        let above = clears_bound(key, lower.as_ref(), lower_key, Ordering::Greater);
-        let below = clears_bound(key, upper.as_ref(), upper_key, Ordering::Less);
-        match (above, below) {
-            (Some(false), _) | (_, Some(false)) => {}
-            (Some(true), Some(true)) => {
-                if let Some(slot) = present.get_mut(index) {
-                    *slot = true;
-                }
-            }
-            _ => ambiguous.push(index),
-        }
+    let mut undecided = vec![0u64; present_count.div_ceil(FSST_KEY_SCAN_CHUNK)];
+    let range = PrefixKeyRange::new(lower.as_ref(), upper.as_ref());
+    if classify_prefix_keys(keys.prefixes, range, &mut present, &mut undecided) {
+        return Err(FormatError::Structural {
+            rule: "fsst prefix key length byte runs past the prefix",
+        });
     }
+    let ambiguous: Vec<usize> = set_bit_positions(undecided).collect();
     if !ambiguous.is_empty() {
         let verdicts = super::with_fsst_selected_bytes(
             &compressor,
@@ -1005,24 +1024,109 @@ fn filter_fsst_range(body: &[u8], predicate: &StringPredicate) -> Result<Vec<boo
     weave_present(&nulls, present)
 }
 
-/// Whether a value with prefix key `key` clears one end of a range: `Some(true)` when it satisfies the bound,
-/// `Some(false)` when it cannot, and `None` when the two prefixes tie and only the real text can say. `past` is the
-/// order a value must be in against the bound to satisfy it — `Greater` for a lower bound, `Less` for an upper one —
-/// and a value equal to the bound satisfies it exactly when the bound is inclusive. A missing bound is always
-/// cleared.
-fn clears_bound(
-    key: PrefixKey,
-    bound: Option<&StringBound>,
-    bound_key: Option<PrefixKey>,
-    past: Ordering,
-) -> Option<bool> {
-    let (Some(bound), Some(bound_key)) = (bound, bound_key) else {
-        return Some(true);
-    };
-    match key.compare(bound_key)? {
-        Ordering::Equal => Some(bound.inclusive),
-        ordering => Some(ordering == past),
+/// A range's two bounds turned into what a value's prefix key alone can prove about it.
+///
+/// A stored prefix key read as a big-endian integer orders exactly as [`PrefixKey::compare`] orders keys - prefix
+/// bytes first, then the length byte - so each bound becomes one integer compare. A key that ties a bound is settled
+/// by the bound's inclusivity when the bound's key holds its whole value, and is left to the real text when it does
+/// not; the two tie flags of each bound record which, and are both false for a tie the key cannot decide.
+///
+/// See: hef-encodings-and-compression/spec.md
+#[derive(Clone, Copy, Debug)]
+struct PrefixKeyRange {
+    /// The lower bound's key, or zero (the empty string's key, which nothing sorts below) when there is none.
+    lower: u64,
+    lower_tie_accepts: bool,
+    lower_tie_rejects: bool,
+    /// The upper bound's key, or `u64::MAX` (above every key a writer can store) when there is none.
+    upper: u64,
+    upper_tie_accepts: bool,
+    upper_tie_rejects: bool,
+}
+
+impl PrefixKeyRange {
+    /// The prefix-key form of a range with these bounds; a missing bound accepts every key.
+    fn new(lower: Option<&StringBound>, upper: Option<&StringBound>) -> Self {
+        let (lower, lower_tie_accepts, lower_tie_rejects) = Self::bound(lower, 0);
+        let (upper, upper_tie_accepts, upper_tie_rejects) = Self::bound(upper, u64::MAX);
+        Self {
+            lower,
+            lower_tie_accepts,
+            lower_tie_rejects,
+            upper,
+            upper_tie_accepts,
+            upper_tie_rejects,
+        }
     }
+
+    /// One bound's key and its two tie flags, or `missing` with a tie that accepts when there is no bound.
+    fn bound(bound: Option<&StringBound>, missing: u64) -> (u64, bool, bool) {
+        let Some(bound) = bound else {
+            return (missing, true, false);
+        };
+        let stored = PrefixKey::of(&bound.value).to_stored();
+        let whole = stored
+            .last()
+            .is_some_and(|&len| usize::from(len) < PREFIX_KEY_PREFIX_LEN);
+        (
+            u64::from_be_bytes(stored),
+            whole && bound.inclusive,
+            whole && !bound.inclusive,
+        )
+    }
+}
+
+/// Sorts each stored prefix key against `range` into one of three verdicts: proven inside the range (its slot in
+/// `accepted` set to `true`), proven outside (left `false`), or undecided, which sets bit `i % 64` of
+/// `undecided[i / 64]` so only those values are decompressed. Returns `true` when any key's length byte runs past the
+/// prefix width, a key no writer produces, so the caller refuses the block.
+///
+/// `accepted` holds one slot per key and `undecided` one word per started run of [`FSST_KEY_SCAN_CHUNK`] keys. Every
+/// key is decided by the same branch-free integer compares, which the compiler spreads across vector lanes.
+#[multiversion(targets("x86_64+avx512f+avx512bw+avx512dq+avx512vl", "x86_64+avx2", "aarch64+neon"))]
+fn classify_prefix_keys(prefixes: &[u8], range: PrefixKeyRange, accepted: &mut [bool], undecided: &mut [u64]) -> bool {
+    let (stored, _) = prefixes.as_chunks::<PREFIX_KEY_BYTES>();
+    let (full, tail) = stored.as_chunks::<FSST_KEY_SCAN_CHUNK>();
+    let (full_accepted, tail_accepted) = accepted.as_chunks_mut::<FSST_KEY_SCAN_CHUNK>();
+    let mut words = undecided.iter_mut();
+    let mut forged = false;
+    for ((chunk, accepted), word) in full.iter().zip(full_accepted.iter_mut()).zip(&mut words) {
+        let (bits, chunk_forged) = classify_prefix_key_chunk(chunk, range, accepted);
+        *word = bits;
+        forged |= chunk_forged;
+    }
+    if let Some(word) = words.next() {
+        let (bits, chunk_forged) = classify_prefix_key_chunk(tail, range, tail_accepted);
+        *word = bits;
+        forged |= chunk_forged;
+    }
+    forged
+}
+
+/// One word of [`classify_prefix_keys`]: fills `accepted` for the keys of `chunk` and returns their undecided bits
+/// and whether any of them is forged. Inlined so a full chunk's fixed length lets the compiler unroll the compares
+/// into vector lanes.
+#[inline(always)]
+fn classify_prefix_key_chunk(
+    chunk: &[[u8; PREFIX_KEY_BYTES]],
+    range: PrefixKeyRange,
+    accepted: &mut [bool],
+) -> (u64, bool) {
+    let mut bits = 0u64;
+    let mut forged = false;
+    for (bit, (stored, slot)) in chunk.iter().zip(accepted.iter_mut()).enumerate() {
+        let key = u64::from_be_bytes(*stored);
+        forged |= key & u64::from(u8::MAX) > PREFIX_KEY_PREFIX_LEN as u64;
+        let at_lower = key == range.lower;
+        let at_upper = key == range.upper;
+        let (above, below) = (key > range.lower, key < range.upper);
+        let (under, over) = (key < range.lower, key > range.upper);
+        let clears = (above | at_lower & range.lower_tie_accepts) & (below | at_upper & range.upper_tie_accepts);
+        let fails = under | at_lower & range.lower_tie_rejects | over | at_upper & range.upper_tie_rejects;
+        *slot = clears;
+        bits |= u64::from(!clears & !fails) << bit;
+    }
+    (bits, forged)
 }
 
 /// Applies `predicate` to values laid end to end in `text`, where value `i` spans `bounds[i]..bounds[i + 1]` — the
