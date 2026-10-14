@@ -105,6 +105,13 @@ impl TimeSeriesRollups {
     /// Serializes the rollups for the footer's time-series rollups section. Pairs with [`Self::decode`].
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Writer::new();
+        self.encode_into(&mut out);
+        out.into_bytes()
+    }
+
+    /// Appends the bytes [`Self::encode`] returns to `out`, so the footer can write the section straight into its
+    /// shared buffer without a temporary copy.
+    pub(crate) fn encode_into(&self, out: &mut Writer) {
         out.put_i64(self.bucket_nanos);
         out.put_u32(self.column_ids.len() as u32);
         for column_id in &self.column_ids {
@@ -122,7 +129,6 @@ impl TimeSeriesRollups {
                 out.put_u64(aggregate.max.to_bits());
             }
         }
-        out.into_bytes()
     }
 
     /// Rebuilds rollups from [`Self::encode`] output. Refuses a width that is not positive, columns that are not

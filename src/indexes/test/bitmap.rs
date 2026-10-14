@@ -526,3 +526,172 @@ fn value_first_recorded_with_no_rows_takes_later_rows() {
     assert_eq!(index.bitmap(4).unwrap().ranges(), &[RowRange { end: 7, start: 5 }]);
     assert_eq!(index.len(), 1);
 }
+
+/// How `intersect_values` worked before it reused buffers: clone the first value's bitmap, then replace it with a
+/// freshly allocated intersection for each later value.
+fn reference_intersect_values(index: &BitmapIndex, values: &[u64]) -> RoaringRangeBitmap {
+    let mut iter = values.iter();
+    let Some(first) = iter.next() else {
+        return RoaringRangeBitmap::default();
+    };
+    let Some(acc) = index.bitmap(*first) else {
+        return RoaringRangeBitmap::default();
+    };
+    let mut acc = acc.clone();
+    for value in iter {
+        match index.bitmap(*value) {
+            Some(next) => acc = acc.intersect(next),
+            None => return RoaringRangeBitmap::default(),
+        }
+        if acc.is_empty() {
+            break;
+        }
+    }
+    acc
+}
+
+/// Where each value's runs live in memory, to check a read left the index's storage in place.
+fn storage_of(index: &BitmapIndex) -> Vec<(u64, *const RowRange)> {
+    index
+        .entries
+        .iter()
+        .map(|(value, bitmap)| (*value, bitmap.ranges().as_ptr()))
+        .collect()
+}
+
+/// Checks `intersect_values` against the clone-and-intersect reference, its encoded bytes and a naive set oracle, and
+/// that the index itself is left untouched.
+fn assert_intersect_values_matches(index: &BitmapIndex, values: &[u64], context: &str) {
+    let bytes = index.encode();
+    let storage = storage_of(index);
+    let got = index.intersect_values(values);
+    let want = reference_intersect_values(index, values);
+    assert_eq!(got, want, "{context}: values {values:?}");
+    assert_eq!(got.encode(), want.encode(), "{context}: values {values:?}");
+    let mut oracle: Option<BTreeSet<u64>> = None;
+    for value in values {
+        let rows = index.bitmap(*value).map(rows_of).unwrap_or_default();
+        oracle = Some(match oracle {
+            Some(acc) => acc.intersection(&rows).copied().collect(),
+            None => rows,
+        });
+    }
+    assert_eq!(
+        rows_of(&got),
+        oracle.unwrap_or_default(),
+        "{context}: values {values:?}"
+    );
+    assert!(
+        got.ranges().iter().all(|r| r.start < r.end) && got.ranges().windows(2).all(|w| w[0].end < w[1].start),
+        "{context}: result not canonical: {got:?}"
+    );
+    assert_eq!(index.encode(), bytes, "{context}: index bytes changed");
+    assert_eq!(storage_of(index), storage, "{context}: index storage moved");
+}
+
+fn index_of(entries: &[(u64, Runs<'_>)]) -> BitmapIndex {
+    BitmapIndex {
+        entries: entries.iter().map(|&(value, runs)| (value, bitmap_of(runs))).collect(),
+    }
+}
+
+#[test]
+fn intersect_values_matches_the_reference_on_edge_cases() {
+    let fragments: Vec<(u64, u64)> = (0..64u64).map(|i| (i * 4, i * 4 + 2)).collect();
+    let entries: &[(u64, Runs<'_>)] = &[
+        // Empty bitmap.
+        (0, &[]),
+        // One wide run.
+        (1, &[(0, 1_000)]),
+        // Many disjoint runs that split the wide run.
+        (2, fragments.as_slice()),
+        // Shifted fragments, alternating against value 2.
+        (3, &[(1, 3), (5, 7), (9, 11), (13, 15), (100, 200)]),
+        // Runs touching the bounds of value 1.
+        (4, &[(0, 1), (999, 1_000), (1_000, 1_001)]),
+        // Runs ending at the top of the row-id space.
+        (5, &[(0, 10), (u64::MAX - 10, u64::MAX)]),
+        (6, &[(5, 6), (u64::MAX - 3, u64::MAX)]),
+        // Disjoint from value 1.
+        (7, &[(2_000, 3_000)]),
+        // A progressively shrinking chain.
+        (8, &[(0, 500)]),
+        (9, &[(100, 400)]),
+        (10, &[(200, 300)]),
+    ];
+    let index = index_of(entries);
+    // Value 11 is absent from the index.
+    let requests: &[&[u64]] = &[
+        &[],
+        &[1],
+        &[0],
+        &[11],
+        &[1, 1],
+        &[1, 1, 1, 1],
+        &[11, 1],
+        &[1, 11],
+        &[1, 2, 11],
+        &[1, 7, 11],
+        &[0, 1],
+        &[1, 0],
+        &[1, 2, 0],
+        &[0, 11],
+        &[1, 2],
+        &[2, 1],
+        &[1, 2, 3],
+        &[2, 3, 2, 3],
+        &[1, 4],
+        &[4, 1, 4],
+        &[5, 6],
+        &[5, 6, 5],
+        &[1, 7],
+        &[1, 7, 2],
+        &[1, 8, 9, 10],
+        &[10, 9, 8, 1],
+        &[1, 8, 9, 10, 2],
+    ];
+    for values in requests {
+        assert_intersect_values_matches(&index, values, "edge case");
+    }
+}
+
+#[test]
+fn intersect_values_matches_the_reference_on_random_indexes() {
+    // A fixed-seed linear congruential generator, so a failure reproduces.
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move |bound: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) % bound
+    };
+    for case in 0..500 {
+        let mut index = BitmapIndex::new();
+        for value in 0..6 {
+            // Leave some values absent and give the rest a mix of dense and fragmented rows.
+            if next(5) == 0 {
+                continue;
+            }
+            let density = next(4) + 1;
+            let rows: Vec<u64> = (0..96).filter(|_| next(density) == 0).collect();
+            index.insert(value, rows);
+        }
+        for _ in 0..8 {
+            let values: Vec<u64> = (0..next(7)).map(|_| next(7)).collect();
+            assert_intersect_values_matches(&index, &values, &format!("case {case}"));
+        }
+    }
+}
+
+#[test]
+fn intersect_runs_into_replaces_previous_contents() {
+    let mut out = vec![RowRange { end: 9, start: 8 }; 4];
+    intersect_runs_into(
+        bitmap_of(&[(0, 10)]).ranges(),
+        bitmap_of(&[(2, 3), (5, 7)]).ranges(),
+        &mut out,
+    );
+    assert_eq!(out, vec![RowRange { end: 3, start: 2 }, RowRange { end: 7, start: 5 }]);
+    intersect_runs_into(bitmap_of(&[(0, 10)]).ranges(), &[], &mut out);
+    assert!(out.is_empty());
+}
