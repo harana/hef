@@ -357,6 +357,82 @@ fn bitmap_builder_maps_values_to_their_granule_rows_exactly() {
     }
 }
 
+/// A granule holding only the negative value -5 contributes no range key, so a range probe for [-5, -5] must not prune
+/// it: clamping the bound to zero once probed [0, 0] and proved the granule absent.
+#[test]
+fn a_range_probe_below_zero_never_proves_a_granule_of_negative_values_absent() {
+    let keys = membership_keys(&crate::encoding::ColumnData::I64(vec![-5])).unwrap();
+    let artifact = IndexArtifact::new(
+        ArtifactCoverage {
+            deletion_vector_generation: 0,
+            file_id: 1,
+            granule_ranges: vec![(0, 0)],
+            schema_fingerprint: [0u8; 32],
+        },
+        ArtifactHeader {
+            column_id: 42,
+            exact: false,
+            false_positive_ppm: RANGE_FILTER_FALSE_POSITIVE_PPM,
+            kind: ArtifactKind::RangeFilter,
+            projection_id: 0,
+        },
+        vec![ArtifactPage {
+            bytes: RangeFilter::build(&keys).encode(),
+            first_granule: 0,
+            last_granule: 0,
+        }],
+    );
+    let clause = FilterClause {
+        column_id: 42,
+        predicate: PredicateKind::Range,
+        value_hi: -5,
+        value_lo: -5,
+    };
+    assert_ne!(
+        artifact.term_for(0, &clause).map(|term| term.verdict()),
+        Some(StatVerdict::ProvenAbsent),
+        "the granule holds -5, so a range covering it must keep the granule"
+    );
+}
+
+/// Dense values [-1, 7]: -1 has no key, but 7 still sits at row 1. Dropping -1 before pairing values with rows once
+/// mapped 7 to row 0 in an artifact marked exact.
+#[test]
+fn a_value_without_a_key_does_not_shift_the_rows_of_later_values() {
+    let read = ColumnRead {
+        data: crate::encoding::ColumnData::I64(vec![-1, 7]),
+        presence: Vec::new(),
+    };
+    let index = granule_bitmap(&read, 2).expect("i64 columns carry keys");
+    let rows = index.bitmap(7).expect("7 is mapped");
+    assert!(rows.contains(1), "7 sits at row 1");
+    assert!(!rows.contains(0), "row 0 holds -1, not 7");
+}
+
+/// Rows 0-99 are null and rows 100 and 101 hold 10 and 20: the learned model must name those file rows, not the dense
+/// positions 0 and 1 of the stored values.
+#[test]
+fn a_learned_position_model_over_a_sparse_column_names_file_rows() {
+    let mut presence = vec![0u8; 13];
+    presence[100 / 8] |= 1 << (100 % 8);
+    presence[101 / 8] |= 1 << (101 % 8);
+    let read = ColumnRead {
+        data: crate::encoding::ColumnData::I64(vec![10, 20]),
+        presence,
+    };
+    let rows = stored_rows(&read, 102);
+    assert_eq!(rows, vec![100, 101]);
+
+    let model = LearnedPositionIndex::build_at_rows(1, 0, &[10, 20], &rows, 102, 0);
+    let window = model.estimate_position(20);
+    assert!(
+        (window.search_from..=window.search_to).contains(&101),
+        "window [{}, {}] must contain row 101, where 20 sits",
+        window.search_from,
+        window.search_to
+    );
+}
+
 #[test]
 fn page_for_finds_the_covering_page_among_many_pages() {
     let pages: Vec<ArtifactPage> = (0..64u32)

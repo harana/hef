@@ -79,6 +79,28 @@ fn duplicate_run_straddling_a_segment_break_brackets_the_true_row() {
 }
 
 #[test]
+fn duplicate_run_starting_inside_a_segment_brackets_its_first_row() {
+    // Keys [0, 1, 1, 1, 1] with error_bound 1 once started a second segment at row 4 with key_lo 1, so seeking 1
+    // returned [2, 4] and missed the run's first row 1.
+    let keys = vec![0i64, 1, 1, 1, 1];
+    let index = LearnedPositionIndex::build(1, 0, &keys, 1);
+    let window = index.estimate_position(1);
+    assert!(
+        window.search_from <= 1 && 1 <= window.search_to,
+        "window [{}, {}] must contain row 1, the first row holding key 1",
+        window.search_from,
+        window.search_to,
+    );
+}
+
+#[test]
+fn a_long_duplicate_run_round_trips_through_encode_and_decode() {
+    // Ten 5s with error_bound 2 once fitted four segments all keyed 5, which decode refused as out of order.
+    let index = LearnedPositionIndex::build(1, 0, &[5i64; 10], 2);
+    assert_eq!(LearnedPositionIndex::decode(&index.encode()).unwrap(), index);
+}
+
+#[test]
 fn absent_key_between_fitted_keys_stays_inside_the_window() {
     // The ±error fit guarantee holds at the fitted keys; the insertion point of a key absent from them can sit one
     // row further out. Keys [0, 1, 1_000_000] fit one near-flat segment, so seeking 2 estimates row 0 while the true
