@@ -73,10 +73,9 @@ pub struct LogRecords<'a> {
 impl LogObjectWriter {
     /// Starts an empty log object.
     pub fn new() -> Self {
-        Self {
-            bytes: header(),
-            record_count: 0,
-        }
+        let mut bytes = Writer::new();
+        bytes.put_slice(&header());
+        Self { bytes, record_count: 0 }
     }
 
     /// Adds one record to the end of the object. Refuses, leaving the object unchanged, a payload of `u32::MAX` bytes
@@ -154,8 +153,7 @@ impl<'a> LogRecords<'a> {
             verified_len: 0,
         };
         records.verify_through(LOG_HEADER_LEN)?;
-        let expected = header();
-        if content.len() < LOG_HEADER_LEN && expected.bytes().starts_with(content) {
+        if content.len() < LOG_HEADER_LEN && header().starts_with(content) {
             return Err(LogReadError::TornTail {
                 intact_len: 0,
                 intact_records: 0,
@@ -285,13 +283,10 @@ impl<'a> Iterator for LogRecords<'a> {
     }
 }
 
-/// The six header bytes every log object starts with.
-fn header() -> Writer {
-    let mut header = Writer::new();
-    header.put_slice(&LOG_MAGIC);
-    header.put_u8(LOG_FORMAT_VERSION);
-    header.put_u8(Profile::Log.code());
-    header
+/// The six header bytes every log object starts with, built on the stack.
+fn header() -> [u8; LOG_HEADER_LEN] {
+    let [m0, m1, m2, m3] = LOG_MAGIC;
+    [m0, m1, m2, m3, LOG_FORMAT_VERSION, Profile::Log.code()]
 }
 
 #[cfg(test)]
