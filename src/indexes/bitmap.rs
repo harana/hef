@@ -223,24 +223,7 @@ impl RoaringRangeBitmap {
     /// set intersection, exactly.
     pub fn intersect(&self, other: &Self) -> Self {
         let mut runs: Vec<RowRange> = Vec::new();
-        let mut a = 0usize;
-        let mut b = 0usize;
-        while let (Some(left), Some(right)) = (self.runs.get(a), other.runs.get(b)) {
-            let start = left.start.max(right.start);
-            let end = left.end.min(right.end);
-            if start < end {
-                match runs.last_mut() {
-                    Some(last) if start <= last.end => last.end = last.end.max(end),
-                    _ => runs.push(RowRange { start, end }),
-                }
-            }
-            // Advance whichever run ends first; the other may still overlap a later run on the opposite side.
-            if left.end <= right.end {
-                a += 1;
-            } else {
-                b += 1;
-            }
-        }
+        intersect_runs_into(&self.runs, &other.runs, &mut runs);
         Self { runs }
     }
 
@@ -332,6 +315,30 @@ pub(crate) fn put_encoded_runs(out: &mut Writer, runs: &[RowRange]) {
     }
 }
 
+/// Replaces the contents of `out` with the intersection of two canonical run lists, keeping `out`'s capacity so a
+/// caller intersecting many lists can reuse the same buffer.
+fn intersect_runs_into(left: &[RowRange], right: &[RowRange], out: &mut Vec<RowRange>) {
+    out.clear();
+    let mut a = 0usize;
+    let mut b = 0usize;
+    while let (Some(l), Some(r)) = (left.get(a), right.get(b)) {
+        let start = l.start.max(r.start);
+        let end = l.end.min(r.end);
+        if start < end {
+            match out.last_mut() {
+                Some(last) if start <= last.end => last.end = last.end.max(end),
+                _ => out.push(RowRange { start, end }),
+            }
+        }
+        // Advance whichever run ends first; the other may still overlap a later run on the opposite side.
+        if l.end <= r.end {
+            a += 1;
+        } else {
+            b += 1;
+        }
+    }
+}
+
 /// A bitmap index for one low-cardinality column: a mapping from each distinct value (encoded as a `u64` code, e.g. a
 /// dictionary id or a `status` code) to the set of rows that hold it.
 ///
@@ -390,24 +397,34 @@ impl BitmapIndex {
     /// empty; with one it is that value's bitmap; otherwise the per-value bitmaps are intersected directly. A value
     /// absent from the index contributes no rows, so the whole intersection is empty.
     pub fn intersect_values(&self, values: &[u64]) -> RoaringRangeBitmap {
-        let mut iter = values.iter();
-        let Some(first) = iter.next() else {
+        let Some((first, rest)) = values.split_first() else {
             return RoaringRangeBitmap::default();
         };
-        let Some(acc) = self.bitmap(*first) else {
+        let Some(first) = self.bitmap(*first) else {
             return RoaringRangeBitmap::default();
         };
-        let mut acc = acc.clone();
-        for value in iter {
-            match self.bitmap(*value) {
-                Some(next) => acc = acc.intersect(next),
-                None => return RoaringRangeBitmap::default(),
-            }
-            if acc.is_empty() {
+        let Some((second, rest)) = rest.split_first() else {
+            return first.clone();
+        };
+        let Some(second) = self.bitmap(*second) else {
+            return RoaringRangeBitmap::default();
+        };
+        // Intersect the first two borrowed bitmaps straight into the result, then alternate between the result and
+        // one scratch buffer so later values reuse both allocations instead of building a fresh list each time.
+        let mut runs: Vec<RowRange> = Vec::new();
+        intersect_runs_into(&first.runs, &second.runs, &mut runs);
+        let mut scratch: Vec<RowRange> = Vec::new();
+        for value in rest {
+            if runs.is_empty() {
                 break;
             }
+            let Some(next) = self.bitmap(*value) else {
+                return RoaringRangeBitmap::default();
+            };
+            intersect_runs_into(&runs, &next.runs, &mut scratch);
+            std::mem::swap(&mut runs, &mut scratch);
         }
-        acc
+        RoaringRangeBitmap { runs }
     }
 
     /// Serializes the whole index: a value count, then each value followed by its encoded bitmap. Round-trips with
