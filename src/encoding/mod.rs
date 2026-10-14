@@ -1724,13 +1724,14 @@ fn decode_alp_rd(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
 /// Variants are in strict alphabetical order; the wire tags (`all_present` 0, `all_absent` 1, runs 2, raw 3) are
 /// written and read in [`NullStream::write`] / [`NullStream::read`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum NullStreamForm {
+enum NullStreamForm<'a> {
     /// No row carries a value — zero stored bytes beyond the header.
     AllAbsent,
     /// Every row carries a value — zero stored bytes beyond the header.
     AllPresent,
     /// The raw one-bit-per-row LSB-0 bitmap: the fallback and the equivalence reference for the compressed forms.
-    Raw(Vec<u8>),
+    /// Borrowed straight from the block body when read, owned when derived by the encoder.
+    Raw(Cow<'a, [u8]>),
     /// Sorted, disjoint, non-adjacent `[start, end)` runs of present rows — the roaring-style run form, smallest when
     /// nulls cluster (the usual case for event data).
     Runs(Vec<(u32, u32)>),
@@ -1742,8 +1743,8 @@ enum NullStreamForm {
 /// how many present rows precede it — are answered directly on the stored form, never by first materializing the raw
 /// bitmap. Requirement: "Presence and null bitmaps are encoded side streams".
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct NullStream {
-    form: NullStreamForm,
+struct NullStream<'a> {
+    form: NullStreamForm<'a>,
     row_count: usize,
 }
 
@@ -1765,7 +1766,7 @@ fn each_present_run(presence: &[bool], mut emit: impl FnMut(usize, usize)) {
     }
 }
 
-impl NullStream {
+impl<'a> NullStream<'a> {
     /// Derives the stream from a block's values, choosing the smallest form: `all_present` / `all_absent` at zero
     /// bytes, the run form when it undercuts the raw bitmap, the raw bitmap otherwise. Deterministic, so
     /// byte-identical encodes across nodes hold unchanged.
@@ -1798,7 +1799,7 @@ impl NullStream {
                     .enumerate()
                     .fold(0u8, |bits, (bit, &present)| bits | (u8::from(present) << bit));
             }
-            NullStreamForm::Raw(raw)
+            NullStreamForm::Raw(Cow::Owned(raw))
         };
         Self { form, row_count }
     }
@@ -1827,7 +1828,7 @@ impl NullStream {
     /// Reads a stream written by [`write`](Self::write), refusing malformed input: an unknown form tag, a zero-byte
     /// form whose row count is pure output amplification, or runs that are empty, out of bounds, or not sorted and
     /// non-adjacent.
-    fn read(reader: &mut Reader<'_>) -> Result<Self, FormatError> {
+    fn read(reader: &mut Reader<'a>) -> Result<Self, FormatError> {
         let row_count = reader.u32("string row count")? as usize;
         let form = match reader.u8("null stream form")? {
             0 | 1 if row_count > MAX_BLOCK_VALUES => {
@@ -1859,7 +1860,7 @@ impl NullStream {
                 }
                 NullStreamForm::Runs(runs)
             }
-            3 => NullStreamForm::Raw(reader.take(row_count.div_ceil(8), "null bitmap")?.to_vec()),
+            3 => NullStreamForm::Raw(Cow::Borrowed(reader.take(row_count.div_ceil(8), "null bitmap")?)),
             _ => {
                 return Err(FormatError::Structural {
                     rule: "unknown null stream form",
@@ -1867,6 +1868,20 @@ impl NullStream {
             }
         };
         Ok(Self { form, row_count })
+    }
+
+    /// The same stream, copying a borrowed raw bitmap so it no longer depends on the bytes it was read from.
+    fn into_owned(self) -> NullStream<'static> {
+        let form = match self.form {
+            NullStreamForm::AllAbsent => NullStreamForm::AllAbsent,
+            NullStreamForm::AllPresent => NullStreamForm::AllPresent,
+            NullStreamForm::Raw(bits) => NullStreamForm::Raw(Cow::Owned(bits.into_owned())),
+            NullStreamForm::Runs(runs) => NullStreamForm::Runs(runs),
+        };
+        NullStream {
+            form,
+            row_count: self.row_count,
+        }
     }
 
     fn row_count(&self) -> usize {
@@ -4368,14 +4383,14 @@ fn decode_dictionary_string_range(
 
 /// What every string block writes before its values: the presence stream, the FSST symbol table when the block
 /// carries one, how many present values follow, and where the offset table over them begins.
-struct StringHeader {
+struct StringHeader<'a> {
     fsst: Option<FsstDecodeTable>,
-    nulls: NullStream,
+    nulls: NullStream<'a>,
     offsets_start: usize,
     present_count: usize,
 }
 
-impl StringHeader {
+impl StringHeader<'_> {
     /// The block's FSST symbol table, which every FSST block carries and no other string block does.
     fn fsst(&self) -> Result<&FsstDecodeTable, FormatError> {
         self.fsst.as_ref().ok_or(FormatError::Structural {
@@ -4391,7 +4406,7 @@ impl StringHeader {
 }
 
 /// Reads the header of a string block stored under `transform`, leaving `reader` positioned at its offset table.
-fn read_string_header(transform: Transform, reader: &mut Reader<'_>) -> Result<StringHeader, FormatError> {
+fn read_string_header<'a>(transform: Transform, reader: &mut Reader<'a>) -> Result<StringHeader<'a>, FormatError> {
     let nulls = NullStream::read(reader)?;
     let fsst = match transform {
         Transform::FsstString => Some(FsstDecodeTable::read(reader)?),
@@ -4447,7 +4462,7 @@ fn merge_nulls_range<'a>(
 /// slice — read from a block body through the two offset entries that bound the run, never through the whole table.
 fn value_bytes_for_range<'a>(
     body: &'a [u8],
-    header: &StringHeader,
+    header: &StringHeader<'_>,
     present_start: usize,
     present_end: usize,
     what: &'static str,
@@ -4550,15 +4565,23 @@ fn raw_string_value<'a>(data: &'a [u8], offsets: &[usize], index: usize) -> Resu
 fn read_windowed_string_header(
     transform: Transform,
     window: &mut seekable_zstd::Window<'_>,
-) -> Result<StringHeader, FormatError> {
-    let mut probe = window.first_frame_len().min(window.plain_len());
+) -> Result<StringHeader<'static>, FormatError> {
+    let plain_len = window.plain_len();
+    let mut probe = window.first_frame_len().min(plain_len);
     loop {
         let head = window.read_forward(0, probe)?;
         match read_string_header(transform, &mut Reader::new(&head)) {
-            Err(FormatError::Truncated { .. }) if probe < window.plain_len() => {
-                probe = probe.saturating_mul(2).min(window.plain_len());
+            Err(FormatError::Truncated { .. }) if probe < plain_len => {
+                probe = probe.saturating_mul(2).min(plain_len);
             }
-            header => return header,
+            header => {
+                return header.map(|header| StringHeader {
+                    fsst: header.fsst,
+                    nulls: header.nulls.into_owned(),
+                    offsets_start: header.offsets_start,
+                    present_count: header.present_count,
+                });
+            }
         }
     }
 }

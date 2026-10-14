@@ -955,7 +955,7 @@ fn null_stream_picks_the_smallest_form() {
 
 /// The null-stream derivation as it stood before the counting first pass: build every present-row run, then pick the
 /// form from them. Kept here as the reference the current derivation must match byte for byte.
-fn reference_null_stream(values: &StringColumn) -> NullStream {
+fn reference_null_stream(values: &StringColumn) -> NullStream<'static> {
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for (index, value) in values.iter().enumerate() {
         if value.is_some() {
@@ -980,7 +980,7 @@ fn reference_null_stream(values: &StringColumn) -> NullStream {
                 raw[row / 8] |= 1 << (row % 8);
             }
         }
-        NullStreamForm::Raw(raw)
+        NullStreamForm::Raw(Cow::Owned(raw))
     };
     NullStream { form, row_count }
 }
@@ -1149,7 +1149,7 @@ fn string_transforms_round_trip_under_every_null_stream_form() {
 fn null_stream_refuses_malformed_input() {
     let read = |bytes: &[u8]| {
         let mut reader = Reader::new(bytes);
-        NullStream::read(&mut reader)
+        NullStream::read(&mut reader).map(NullStream::into_owned)
     };
     let stream = |row_count: u32, form: u8, rest: &[u8]| {
         let mut out = Writer::new();
@@ -1171,6 +1171,53 @@ fn null_stream_refuses_malformed_input() {
     let unsorted = [2u32.to_le_bytes().as_slice(), &run(4, 6), &run(0, 2)].concat();
     assert!(read(&stream(8, 2, &unsorted)).is_err(), "unsorted runs");
     assert!(read(&stream(64, 3, &[0xFF; 4])).is_err(), "truncated raw bitmap");
+}
+
+/// A raw-form null stream read from a block borrows its bitmap straight out of the input instead of copying it, the
+/// encoder's derived stream owns its bitmap, and both write the same bytes. Decodes of a raw-form block still return
+/// output that outlives the block bytes.
+#[test]
+fn raw_null_stream_borrows_the_input_bitmap_and_decodes_into_owned_output() {
+    let derived = NullStream::from_values(&string_values_with_nulls(300, |i| i % 2 == 0));
+    assert!(matches!(derived.form, NullStreamForm::Raw(Cow::Owned(_))));
+    let mut out = Writer::new();
+    derived.write(&mut out);
+    let bytes = out.into_bytes();
+    let read = NullStream::read(&mut Reader::new(&bytes)).unwrap();
+    match &read.form {
+        NullStreamForm::Raw(Cow::Borrowed(bits)) => {
+            assert_eq!(bits.as_ptr(), bytes[5..].as_ptr());
+            assert_eq!(bits.len(), 300usize.div_ceil(8));
+        }
+        other => panic!("expected a borrowed raw bitmap, got {other:?}"),
+    }
+    assert_eq!(read, derived);
+    let mut rewritten = Writer::new();
+    read.write(&mut rewritten);
+    assert_eq!(rewritten.into_bytes(), bytes);
+
+    let values: Vec<Option<String>> = (0..300).map(|i| (i % 2 == 0).then(|| format!("v{i}-\u{e9}"))).collect();
+    let data = ColumnData::Strings(values.clone().into());
+    for transform in [Transform::DictionaryString, Transform::FsstString, Transform::RawString] {
+        let block =
+            encode_block_forced_for_conformance(&data, false, CascadeStrategy::DecodeOptimized, transform).unwrap();
+        let mut bytes = block.bytes.clone();
+        let full = decode_block(block.pipeline, &bytes).unwrap();
+        let range = decode_block_range(block.pipeline, &bytes, 3, 10).unwrap();
+        let views = decode_string_block_views(block.pipeline, &bytes).unwrap().unwrap();
+        bytes.fill(0);
+        drop(bytes);
+        assert_eq!(full, data, "{transform:?}: full decode");
+        assert_eq!(
+            range,
+            ColumnData::Strings(values[3..10].to_vec().into()),
+            "{transform:?}: range decode"
+        );
+        let viewed: Vec<Option<String>> = (0..views.len())
+            .map(|row| views.is_valid(row).then(|| views.value(row).to_string()))
+            .collect();
+        assert_eq!(viewed, values, "{transform:?}: views");
+    }
 }
 
 /// A hand-built FSST string block: one present row whose compressed bytes are `data`, under a symbol table with the
