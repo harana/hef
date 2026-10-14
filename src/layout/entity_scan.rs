@@ -31,8 +31,9 @@ use std::ops::RangeInclusive;
 /// See: hef-deletes-and-corrections/spec.md
 pub trait DeletesAndCorrections {
     /// The rows deleted from the stored file `file_id`, in that file's own row ordinals, or `None` when none are.
-    /// The vector may also mark rows a correction superseded, as `latest_corrected_deletion_vector` computes them: a
-    /// scan reads the mark on a corrected row as its supersession and still serves the event's latest correction.
+    /// The vector may also mark rows a replacement superseded, as `latest_corrected_deletion_vector` computes them: a
+    /// scan reads the mark on a replaced row as its supersession and still serves the replacement. A mark on a row
+    /// whose payload would be served, including an amended original, always drops the event.
     fn deletion_vector(&self, tenant_id: TenantId, file_id: u128) -> Result<Option<DeletionVector>, EntityScanError>;
 
     /// True when the event at `point` was written as a correction of another event. A scan serves it in place of the
@@ -103,8 +104,8 @@ impl EntityScan {
     /// fresher rows. Deleted rows are left out and corrected events come back as their latest correction, both as
     /// recorded in `deletes`: a retraction drops the event, a replacement serves the correcting event, and an amendment
     /// serves the original with the amendment's payload fields laid over its own. Corrections of corrections are
-    /// followed to the end of the chain, applied in order; a retraction anywhere on the chain, or a deleted row at its
-    /// end, drops the event. A chain that loops back on itself is refused with `CorrectionCycle`.
+    /// followed to the end of the chain, applied in order; a retraction anywhere on the chain, or a deleted row whose
+    /// payload would be served, drops the event. A chain that loops back on itself is refused with `CorrectionCycle`.
     pub fn run(
         &self,
         files: &[&HefFile],
@@ -167,9 +168,9 @@ impl EntityScan {
     /// Follows `event`'s corrections hop by hop to its latest version, or `None` when that version is not served.
     ///
     /// A replacement swaps in the correcting event, an amendment lays its payload fields over the version before it,
-    /// in chain order, and a retraction anywhere on the chain drops the event. A row's deletion mark counts only at
-    /// the end of the chain: a corrected row's own mark reads as its supersession, as a latest-corrected deletion
-    /// vector records it, while a deleted last row drops the event rather than serving a superseded version.
+    /// in chain order, and a retraction anywhere on the chain drops the event. A deletion mark on any row whose
+    /// payload the served version is built from drops the event, so a deleted payload is never served; a mark on a
+    /// row a later replacement discarded reads as its supersession, as a latest-corrected deletion vector records it.
     fn latest_version(
         &self,
         source: RowSource,
@@ -183,19 +184,17 @@ impl EntityScan {
         let mut amendments = Vec::new();
         let mut current = envelope.event_id;
         let mut on_chain = vec![current];
-        let mut source = source;
+        let mut served_rows = vec![source];
         while let Some(correction) = deletes.latest_correction(self.tenant_id, current)? {
             let at = SequencePoint {
                 epoch: correction.correction_epoch,
                 sequence: correction.correction_sequence,
             };
-            let (correcting, changes) = match correction.correction_type {
-                CorrectionType::Amendment | CorrectionType::Replacement => {
-                    source = locate(at, files, segments)?;
-                    reader.read(source)?
-                }
-                CorrectionType::Retraction => return Ok(None),
-            };
+            if correction.correction_type == CorrectionType::Retraction {
+                return Ok(None);
+            }
+            let row = locate(at, files, segments)?;
+            let (correcting, changes) = reader.read(row)?;
             current = correcting.event_id;
             if on_chain.contains(&current) {
                 return Err(EntityScanError::CorrectionCycle {
@@ -208,12 +207,15 @@ impl EntityScan {
                 amendments.push(changes);
             } else if let Some(last) = amendments.last_mut() {
                 *last = changes;
+                served_rows.pop();
             } else {
                 envelope = correcting;
                 base = changes;
+                served_rows.clear();
             }
+            served_rows.push(row);
         }
-        if is_deleted(deletion_vectors, source) {
+        if served_rows.iter().any(|row| is_deleted(deletion_vectors, *row)) {
             return Ok(None);
         }
         Ok(Some((envelope, amendments.into_iter().fold(base, amend))))

@@ -529,3 +529,23 @@ fn a_latest_corrected_deletion_vector_still_serves_the_replacement_once() {
     assert_eq!(served[0].point.sequence, 6);
     assert!(events.iter().all(|event| event.envelope.event_id != event_id(6)));
 }
+
+/// An amended event whose original row was deleted is dropped, so the deleted payload is never served under the
+/// amendment.
+#[test]
+fn a_deleted_amended_original_drops_the_event() {
+    let older = file(1, 20, 1, payload);
+    let mut vector = DeletionVector::new();
+    // Sequences 1..=20 sit at row ordinals 0..=19, so sequence 4 is ordinal 3.
+    vector.mark_deleted(3);
+    let deletes = RecordedDeletes {
+        corrections: vec![correction(4, 8, CorrectionType::Amendment)],
+        deleted: [(older.header().file_id, vector)].into_iter().collect(),
+    };
+
+    let events = scan(SortDirection::Ascending, None)
+        .run(&[&older], &LiveOverlayStore::new(), &deletes)
+        .unwrap();
+
+    assert_eq!(sequences(&events), vec![2, 6, 10, 12, 14, 16, 18, 20]);
+}
