@@ -31,6 +31,58 @@ fn a_block_that_encodes_larger_than_plain_is_stored_plain() {
     }
 }
 
+/// Encoding borrowed u64 values gives exactly the block that encoding the same values as an owned column gives:
+/// pipeline, bytes, stats and decoded length, for empty, single, constant, monotonic, descending, wrapping, random and
+/// `u64::MAX` values, at sizes around the 1024-value vector and the trailing stage's full-trial limit, with and without
+/// random access. Some of the cases store their plain form after the acceptance gate, and some keep a transform.
+#[test]
+fn borrowed_u64_values_encode_exactly_as_an_owned_column() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut random = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut cases: Vec<Vec<u64>> = vec![
+        Vec::new(),
+        vec![0],
+        vec![u64::MAX],
+        vec![7, 9],
+        vec![1_000_000, 1_000_064, 1_000_128],
+        vec![u64::MAX, 3, 17, 9_000_000_000],
+    ];
+    for len in [2u64, 3, 64, 1023, 1024, 1025, 2048, 4095, 4096, 4097, 8192, 20_000] {
+        cases.push(vec![42; len as usize]);
+        cases.push((0..len).collect());
+        cases.push((0..len).map(|i| u64::MAX - i).collect());
+        cases.push((0..len).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect());
+        cases.push((0..len).map(|i| if i % 97 == 0 { u64::MAX } else { i % 5 }).collect());
+        cases.push((0..len).map(|_| random()).collect());
+        cases.push((0..len).map(|_| random() % 16).collect());
+    }
+    let (mut plain, mut transformed) = (0, 0);
+    for values in &cases {
+        let owned = ColumnData::U64(values.clone());
+        for random_access in [false, true] {
+            let expected = encode_block(&owned, random_access);
+            let borrowed = encode_u64_block(values, random_access);
+            let case = format!("{} values, random access {random_access}", values.len());
+            assert_eq!(borrowed.pipeline, expected.pipeline, "{case}");
+            assert_eq!(borrowed.bytes, expected.bytes, "{case}");
+            assert_eq!(borrowed.stats, expected.stats, "{case}");
+            assert_eq!(borrowed.uncompressed_len, expected.uncompressed_len, "{case}");
+            assert!(borrowed.fsst.is_none() && expected.fsst.is_none(), "{case}");
+            if borrowed.pipeline.transform().unwrap() == Transform::PlainU64 {
+                plain += 1;
+            } else {
+                transformed += 1;
+            }
+        }
+    }
+    assert!(plain > 0 && transformed > 0, "plain {plain}, transformed {transformed}");
+}
+
 /// The gate must not cost a block that genuinely earns its encoding: a long run-heavy column stays on the transform
 /// that shrinks it rather than being pushed onto the plain form.
 #[test]

@@ -43,7 +43,7 @@ use super::constant::{CHAIN_RANGE_BYTES, GRAPH_EDGE_KINDS, MAX_GRAPH_SUBJECT_BYT
 use super::footer::{GranuleEntry, StateRootEntry};
 use super::reader::HefFile;
 use crate::artifacts::state_chunk::StateRoot;
-use crate::encoding::{ColumnData, PipelineId, decode_block, encode_block};
+use crate::encoding::{ColumnData, EncodedBlock, PipelineId, decode_block, encode_block, encode_u64_block};
 use crate::error::FormatError;
 use crate::events::{RelationshipKind, RelationshipRef, TargetIdSpace};
 use crate::file::bytes::{Reader, Writer};
@@ -550,7 +550,10 @@ fn encode_csr(out: &mut Writer, first_sn: u64, rows: &[[&[u64]; GRAPH_EDGE_KINDS
 }
 
 fn put_block(out: &mut Writer, data: &ColumnData) {
-    let encoded = encode_block(data, false);
+    put_encoded(out, &encode_block(data, false));
+}
+
+fn put_encoded(out: &mut Writer, encoded: &EncodedBlock) {
     out.put_u32(encoded.pipeline.0);
     out.put_u32(encoded.bytes.len() as u32);
     out.put_slice(&encoded.bytes);
@@ -738,8 +741,8 @@ impl EventIdIndex {
     /// Writes footer section `GRAPH_EVENT_IDS`: the hashes, then the sequence numbers, each through the ordinary column
     /// block encoder as `pipeline u32 | byte length u32 | bytes`, then the filter as `length u32 | bytes`.
     pub(super) fn encode(&self, out: &mut Writer) {
-        put_block(out, &ColumnData::U64(self.hashes.clone()));
-        put_block(out, &ColumnData::U64(self.sns.clone()));
+        put_encoded(out, &encode_u64_block(&self.hashes, false));
+        put_encoded(out, &encode_u64_block(&self.sns, false));
         out.put_u32(self.filter.len() as u32);
         out.put_slice(&self.filter);
     }
