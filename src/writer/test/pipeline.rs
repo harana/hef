@@ -1091,6 +1091,106 @@ fn a_sync_failure_over_appended_bytes_leaves_an_indeterminate_receipt_to_guard_a
     );
 }
 
+#[test]
+fn a_retry_after_a_failed_sync_is_not_appended_a_second_time() {
+    use crate::invariants::JournalStorage;
+
+    // A failed sync leaves the first attempt's frame appended but of unknown durability. A retry of the same delivery
+    // used to be queued and appended again under a new sequence, so a later successful sync persisted both copies. The
+    // retry must be held as unresolved until replay finds the first frame durable, and then answered as a duplicate.
+    let clock = SimClock::new(61);
+    let mut storage = SimJournalStorage::new();
+    let mut allocator = SequenceAllocator::new(1);
+    let mut watermarks = WatermarkTracker::new();
+    let mut retry = SimSafeRetryStore::new();
+    let mut overlay = LiveOverlayStore::new();
+    let mut worker = pipeline();
+    worker.submit(event(0), 1, &mut retry, &clock).unwrap();
+    storage.inject(Fault::FailSync { shard: ShardId(0) });
+    assert!(matches!(
+        worker
+            .flush(
+                FlushReason::Target,
+                &mut allocator,
+                &mut storage,
+                &mut watermarks,
+                &mut retry,
+                &mut overlay,
+                &clock,
+            )
+            .unwrap_err(),
+        FlushError::Storage(_)
+    ));
+    let indeterminate = retry.lookup(worker.tenant_id, (5000, 1)).unwrap();
+    assert_eq!(indeterminate.status_class, StatusClass::Indeterminate);
+
+    assert_eq!(
+        worker.submit(event(0), 1, &mut retry, &clock).unwrap(),
+        Submission::Unresolved(indeterminate.clone()),
+        "a retry of a delivery of unknown durability is held, not queued"
+    );
+    assert_eq!(
+        worker
+            .submit_batch(vec![event(0), event(1)], 1, &mut retry, &clock)
+            .unwrap(),
+        vec![Submission::Unresolved(indeterminate), Submission::Ready],
+        "a batch retry holds only the unresolved delivery"
+    );
+    assert!(
+        worker.queue().pending_bytes() > 0,
+        "the new event in the batch is queued"
+    );
+    worker
+        .flush(
+            FlushReason::Target,
+            &mut allocator,
+            &mut storage,
+            &mut watermarks,
+            &mut retry,
+            &mut overlay,
+            &clock,
+        )
+        .unwrap();
+
+    // The first frame becomes durable; replay settles its receipt, and a further retry is answered as a duplicate.
+    storage.sync(ShardId(0)).unwrap();
+    let replay = replay_segment(&storage, ShardId(0), 1, 1).unwrap();
+    retry.reconstruct_from_replay(&replay.frames, ShardId(0), clock.now_nanos() + ACK_REPLAY_GUARD_NANOS);
+    let settled = retry.lookup(worker.tenant_id, (5000, 1)).unwrap();
+    assert_eq!(settled.status_class, StatusClass::Acknowledged);
+    assert_eq!(settled.commit.sequence, 1);
+    assert_eq!(
+        worker.submit(event(0), 1, &mut retry, &clock).unwrap(),
+        Submission::Duplicate(settled)
+    );
+
+    // At most once: the delivery appears in exactly one journal frame.
+    let copies: usize = replay
+        .frames
+        .iter()
+        .map(|frame| {
+            let (header, payload) = decode_frame(&frame.frame_bytes).unwrap();
+            decode_batch(payload, header.event_count)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| {
+                    (
+                        event.variable.connector_delivery_hash_low,
+                        event.variable.connector_delivery_hash_high,
+                    ) == (5000, 1)
+                })
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        replay.frames.len(),
+        2,
+        "the first attempt and the new event, nothing else"
+    );
+    assert_eq!(copies, 1, "the retried delivery is stored once");
+}
+
 /// Storage whose read-back returns a *different* frame — itself perfectly valid and the same size — modelling a stale or
 /// misdirected read.
 struct MisdirectedReadStorage {
