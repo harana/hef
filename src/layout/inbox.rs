@@ -17,7 +17,8 @@ use super::reader::{HefFile, granules_overlapping_rows};
 use crate::columns::column_ids;
 use crate::deletes::DeletionVector;
 use crate::error::{FormatError, InboxError};
-use crate::events::{SequencePoint, TenantId};
+use crate::events::{EventEnvelope, SequencePoint, TenantId};
+use std::vec::IntoIter;
 
 /// Who an inbox row is addressed to: the row's entity, by the two identity hashes every row stores beside its entity
 /// id.
@@ -151,14 +152,7 @@ fn read_rows(
             {
                 continue;
             }
-            if envelopes.is_none() {
-                envelopes = Some(file.granule_envelopes(granule.granule_id)?);
-            }
-            let envelope = envelopes
-                .as_ref()
-                .and_then(|envelopes| envelopes.get(row_in_granule))
-                .cloned()
-                .ok_or(FormatError::RefOutOfRange { what: "row in granule" })?;
+            let envelope = take_envelope(file, granule.granule_id, &mut envelopes, row_in_granule)?;
             out.push(EntityEvent {
                 envelope,
                 payload: file.payload(row_ordinal)?,
@@ -167,6 +161,29 @@ fn read_rows(
         }
     }
     Ok(())
+}
+
+/// Moves row `row_in_granule`'s envelope out of its granule, decoding the whole granule the first time a row of it is
+/// needed. Rows must come in increasing order: `envelopes` holds the granule's envelopes from the row after the last
+/// one taken, and the ones skipped over are dropped.
+#[inline(never)]
+fn take_envelope(
+    file: &HefFile,
+    granule_id: u32,
+    envelopes: &mut Option<(IntoIter<EventEnvelope>, usize)>,
+    row_in_granule: usize,
+) -> Result<EventEnvelope, FormatError> {
+    if envelopes.is_none() {
+        *envelopes = Some((file.granule_envelopes(granule_id)?.into_iter(), 0));
+    }
+    envelopes
+        .as_mut()
+        .and_then(|(envelopes, next)| {
+            let envelope = envelopes.nth(row_in_granule - *next);
+            *next = row_in_granule + 1;
+            envelope
+        })
+        .ok_or(FormatError::RefOutOfRange { what: "row in granule" })
 }
 
 fn recipient_of(entry: &InboxRecipientEntry) -> Recipient {
