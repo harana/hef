@@ -4079,3 +4079,44 @@ fn dictionary_string_encoding_matches_the_reference_encoder_byte_for_byte() {
         assert!(sides.contains(&side), "the cases must exercise {side:?}");
     }
 }
+
+/// FSST dictionary values written in place keep the reference bytes on both sides of the acceptance threshold: a
+/// sweep of shared-prefix lengths flips the trial between kept and rolled back under every strategy, and every
+/// trial lands in one writer after the ones before it, so a rollback must leave earlier bytes untouched and a kept
+/// stream must patch its offsets where they belong.
+#[test]
+fn fsst_dictionary_values_written_in_place_match_the_reference_across_the_threshold() {
+    let strategies = [
+        CascadeStrategy::DecodeOptimized,
+        CascadeStrategy::NoTrailing,
+        CascadeStrategy::SizeOptimized,
+    ];
+    let mut expected = Writer::new();
+    expected.put_slice(b"prefix");
+    let mut actual = Writer::new();
+    actual.put_slice(b"prefix");
+    let mut sides = Vec::new();
+    for prefix_len in 0..48 {
+        let prefix = "\u{e9}x".repeat(prefix_len / 2) + &"p".repeat(prefix_len % 2);
+        let owned: Vec<String> = (0..FSST_MIN_SAMPLE_COUNT + prefix_len)
+            .map(|i| format!("{prefix}{i:03}"))
+            .collect();
+        let mut dictionary: Vec<&str> = owned.iter().map(String::as_str).collect();
+        dictionary.sort_unstable();
+        let codes: Vec<u64> = (0..2000).map(|row| (row % dictionary.len()) as u64).collect();
+        for strategy in strategies {
+            let expected_side =
+                reference_encode_local_dictionary(&dictionary, &codes, strategy, &mut expected).unwrap();
+            let actual_side =
+                encode_local_dictionary(&dictionary, codes.len(), |row| codes[row], strategy, &mut actual).unwrap();
+            assert_eq!(actual_side, expected_side, "prefix {prefix_len}, {strategy:?}");
+            assert_eq!(actual.bytes(), expected.bytes(), "prefix {prefix_len}, {strategy:?}");
+            sides.push(actual_side);
+        }
+    }
+    assert!(
+        sides.contains(&SideStream::FsstDictionaryValues),
+        "the sweep must keep FSST"
+    );
+    assert!(sides.contains(&SideStream::None), "the sweep must roll FSST back");
+}

@@ -2067,43 +2067,69 @@ fn offset_window(table: &[u8], first: usize, count: usize) -> Result<Vec<usize>,
     )?))
 }
 
-/// Tries the FSST inner cascade level on a dictionary's distinct-value stream: trains a symbol table, compresses every
-/// entry (the scratch buffer budgets the FSST worst case of two output bytes per input byte), and keeps the level only
-/// when the compressed value stream — symbol table included — clears the strategy's size bar against the plain stream.
-/// Entries longer than [`DICTIONARY_FSST_MAX_VALUE_LEN`] keep the stream plain. Returns what the level emits, or
-/// `None` to keep the plain value stream.
-fn fsst_dictionary_values(
+/// Tries the FSST inner cascade level on a dictionary's distinct-value stream: trains a symbol table, then writes the
+/// table, the offset table and every compressed entry straight into `out` (the scratch buffer budgets the FSST worst
+/// case of two output bytes per input byte), and keeps the level only when that stream clears the strategy's size bar
+/// against the plain stream. Entries longer than [`DICTIONARY_FSST_MAX_VALUE_LEN`] keep the stream plain. Returns
+/// whether the level was kept; when it was not, `out` is rolled back to where it started, ready for the plain value
+/// stream.
+fn write_fsst_dictionary_values(
     dictionary: &[&str],
     strategy: CascadeStrategy,
-) -> Option<(fsst::Compressor, Vec<usize>, Vec<u8>)> {
+    out: &mut Writer,
+) -> Result<bool, FormatError> {
     if !cascade_level_fits(1) || dictionary.len() < FSST_MIN_SAMPLE_COUNT {
-        return None;
+        return Ok(false);
     }
     if dictionary
         .iter()
         .any(|value| value.len() > DICTIONARY_FSST_MAX_VALUE_LEN)
     {
-        return None;
+        return Ok(false);
     }
     let corpus: Vec<&[u8]> = dictionary.iter().map(|value| value.as_bytes()).collect();
     let compressor = fsst::Compressor::train(&corpus);
+    let start = out.len();
+    let symbols = compressor.symbol_table();
+    let lengths = compressor.symbol_lengths();
+    out.put_u16(symbols.len() as u16);
+    for (symbol, length) in symbols.iter().zip(lengths.iter()) {
+        out.put_u64(symbol.to_u64());
+        out.put_u8(*length);
+    }
+    // The offset table opens with a zero and is filled in entry by entry as each compressed entry lands after it.
+    let offsets_start = out.len();
+    out.reserve_bytes((dictionary.len() + 1) * 4);
+    let arena_start = out.len();
+    let mut offsets_overflow = false;
     let mut scratch = Vec::new();
-    let mut arena = Vec::new();
-    let mut compressed_lens = Vec::with_capacity(corpus.len());
-    for value in &corpus {
+    for (index, value) in corpus.iter().enumerate() {
         compress_fsst_value(&compressor, value, &mut scratch);
-        compressed_lens.push(scratch.len());
-        arena.extend_from_slice(&scratch);
+        out.put_slice(&scratch);
+        match u32::try_from(out.len() - arena_start) {
+            Ok(offset) => out.patch_u32(offsets_start + (index + 1) * 4, offset),
+            Err(_) => offsets_overflow = true,
+        }
     }
     let plain = (dictionary.len() + 1) * 4 + corpus.iter().map(|value| value.len()).sum::<usize>();
-    let compressed = 2 + 9 * compressor.symbol_table().len() + (dictionary.len() + 1) * 4 + arena.len();
+    let compressed = out.len() - start;
     let threshold = match strategy {
         CascadeStrategy::DecodeOptimized | CascadeStrategy::NoTrailing => {
             plain * DECODE_OPTIMIZED_THRESHOLD_NUM / DECODE_OPTIMIZED_THRESHOLD_DEN
         }
         CascadeStrategy::SizeOptimized => plain - plain / SIZE_OPTIMIZED_SAVINGS_DIVISOR,
     };
-    (compressed < threshold).then_some((compressor, compressed_lens, arena))
+    if compressed >= threshold {
+        out.truncate(start);
+        return Ok(false);
+    }
+    // Only a kept stream reports offsets past the u32 range, matching [`write_offsets`] on the stream it would write.
+    if offsets_overflow {
+        return Err(FormatError::Structural {
+            rule: "string arena offsets exceed the u32 range the format stores",
+        });
+    }
+    Ok(true)
 }
 
 /// Dictionary string block: null bitmap, sorted distinct values, then each present row's code bitpacked. When every
@@ -2111,7 +2137,7 @@ fn fsst_dictionary_values(
 /// alphabet (its sorted-order assignment) competes with the local dictionary form in an exact size trial, and the
 /// smaller stored form wins — a block covering only a corner of a wide alphabet pays wider codes at file scope than
 /// its own narrow dictionary would, so coverage alone cannot decide. The local dictionary's distinct-value stream
-/// may ride the FSST inner cascade level (see [`fsst_dictionary_values`]). Codes keep their ascending sorted-order
+/// may ride the FSST inner cascade level (see [`write_fsst_dictionary_values`]). Codes keep their ascending sorted-order
 /// assignment in every scope, so compressed-form predicates on codes never notice. Returns the side stream the block
 /// records.
 fn encode_dictionary_string(
@@ -2191,26 +2217,14 @@ fn encode_local_dictionary(
     out: &mut Writer,
 ) -> Result<SideStream, FormatError> {
     out.put_u32(dictionary.len() as u32);
-    let side = match fsst_dictionary_values(dictionary, strategy) {
-        Some((compressor, compressed_lens, arena)) => {
-            let symbols = compressor.symbol_table();
-            let lengths = compressor.symbol_lengths();
-            out.put_u16(symbols.len() as u16);
-            for (symbol, length) in symbols.iter().zip(lengths.iter()) {
-                out.put_u64(symbol.to_u64());
-                out.put_u8(*length);
-            }
-            write_offsets(compressed_lens.into_iter(), out)?;
-            out.put_slice(&arena);
-            SideStream::FsstDictionaryValues
+    let side = if write_fsst_dictionary_values(dictionary, strategy, out)? {
+        SideStream::FsstDictionaryValues
+    } else {
+        write_offsets(dictionary.iter().map(|value| value.len()), out)?;
+        for value in dictionary {
+            out.put_slice(value.as_bytes());
         }
-        None => {
-            write_offsets(dictionary.iter().map(|value| value.len()), out)?;
-            for value in dictionary {
-                out.put_slice(value.as_bytes());
-            }
-            SideStream::None
-        }
+        SideStream::None
     };
     let max = dictionary.len().saturating_sub(1) as u64;
     bitpack_with(count, bits_needed(max), out, code);
