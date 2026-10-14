@@ -2134,17 +2134,20 @@ fn encode_dictionary_string(
         .enumerate()
         .map(|(index, value)| (*value, index as u64))
         .collect();
-    let codes: Vec<u64> = present
-        .iter()
-        .map(|value| code_of.get(value).copied().unwrap_or(0))
-        .collect();
+    // Each present row's local code, looked up on demand rather than kept as one `u64` per row.
+    let local_code = |row: usize| {
+        present
+            .get(row)
+            .and_then(|value| code_of.get(value).copied())
+            .unwrap_or(0)
+    };
     if let Some(alphabet) = shared
         && dictionary
             .iter()
             .all(|value| alphabet.binary_search_by(|entry| entry.as_str().cmp(value)).is_ok())
     {
-        // Each distinct value's alphabet index is resolved once here, then every present row's already-computed
-        // local code is translated to it in O(1) instead of every row paying its own alphabet binary search.
+        // Each distinct value's alphabet index is resolved once here, then every present row's local code is
+        // translated to it in O(1) instead of every row paying its own alphabet binary search.
         let alphabet_index_of: Vec<u64> = dictionary
             .iter()
             .map(|value| {
@@ -2154,15 +2157,16 @@ fn encode_dictionary_string(
                     .unwrap_or(0)
             })
             .collect();
-        let shared_code = |code: u64| alphabet_index_of.get(code as usize).copied().unwrap_or(0);
-        let max = codes.iter().map(|&code| shared_code(code)).max().unwrap_or(0);
+        // Every dictionary entry is some present row's value, so the largest index any row uses is the largest
+        // index of any entry.
+        let max = alphabet_index_of.iter().copied().max().unwrap_or(0);
         let mut shared_out = Writer::new();
-        bitpack_with(codes.len(), bits_needed(max), &mut shared_out, |i| {
-            codes.get(i).map_or(0, |&code| shared_code(code))
+        bitpack_with(present.len(), bits_needed(max), &mut shared_out, |row| {
+            alphabet_index_of.get(local_code(row) as usize).copied().unwrap_or(0)
         });
         let shared_bytes = shared_out.into_bytes();
         let mut local_out = Writer::new();
-        let local_side = encode_local_dictionary(&dictionary, &codes, strategy, &mut local_out)?;
+        let local_side = encode_local_dictionary(&dictionary, present.len(), local_code, strategy, &mut local_out)?;
         let local_bytes = local_out.into_bytes();
         if shared_bytes.len() < local_bytes.len() {
             out.put_slice(&shared_bytes);
@@ -2171,16 +2175,18 @@ fn encode_dictionary_string(
         out.put_slice(&local_bytes);
         return Ok(local_side);
     }
-    encode_local_dictionary(&dictionary, &codes, strategy, out)
+    encode_local_dictionary(&dictionary, present.len(), local_code, strategy, out)
 }
 
-/// The block-local dictionary form: distinct values (plain or through the FSST inner cascade level), then each
-/// present row's already-resolved code ([`encode_dictionary_string`]'s `codes`, sorted-order assignment against
-/// `dictionary`) bitpacked. One candidate in [`encode_dictionary_string`]'s scope trial, and the only form for a
-/// block the column's shared alphabet does not cover.
+/// The block-local dictionary form: distinct values (plain or through the FSST inner cascade level), then the `count`
+/// present rows' codes bitpacked, row `i`'s code read from `code(i)` ([`encode_dictionary_string`]'s sorted-order
+/// assignment against `dictionary`). Every entry of `dictionary` must be some row's value, which fixes the largest
+/// code at `dictionary.len() - 1`. One candidate in [`encode_dictionary_string`]'s scope trial, and the only form for
+/// a block the column's shared alphabet does not cover.
 fn encode_local_dictionary(
     dictionary: &[&str],
-    codes: &[u64],
+    count: usize,
+    code: impl Fn(usize) -> u64,
     strategy: CascadeStrategy,
     out: &mut Writer,
 ) -> Result<SideStream, FormatError> {
@@ -2206,8 +2212,8 @@ fn encode_local_dictionary(
             SideStream::None
         }
     };
-    let max = codes.iter().copied().max().unwrap_or(0);
-    bitpack(codes, bits_needed(max), out);
+    let max = dictionary.len().saturating_sub(1) as u64;
+    bitpack_with(count, bits_needed(max), out, code);
     Ok(side)
 }
 
