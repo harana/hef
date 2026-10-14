@@ -1659,6 +1659,10 @@ fn alp_rd_split_chunk(
 /// ALP-RD block: right-part width, left-part dictionary, exact left-part exceptions, then bitpacked codes and right
 /// parts. The split and dictionary come from the block's sample; a value whose left part missed the dictionary stores
 /// code 0 and patches its real left part through the exception list.
+///
+/// The block is split one 1024-value vector at a time into fixed scratch, never into full-length code or right-part
+/// vectors: a first pass writes the exceptions and finds both streams' widths, a second re-splits each vector to pack
+/// its codes, and the right parts are packed straight from the input's bits.
 fn encode_alp_rd(values: &[f64], out: &mut Writer) {
     let sample = transform_sample(values);
     let sample: &[f64] = sample.as_deref().unwrap_or(values);
@@ -1667,43 +1671,82 @@ fn encode_alp_rd(values: &[f64], out: &mut Writer) {
     for (slot, entry) in padded_dict.iter_mut().zip(&dict) {
         *slot = *entry;
     }
-    // Right parts are split into one vector's worth of scratch at a time, only to find their maximum; they are packed
-    // later straight from the input's bits, so no full-length right-part vector is kept.
-    let mut codes = vec![0u64; values.len()];
-    let mut rights = [0u64; FASTLANES_VECTOR];
-    let mut max_right = 0u64;
-    for (value_chunk, code_chunk) in values.chunks(FASTLANES_VECTOR).zip(codes.chunks_mut(FASTLANES_VECTOR)) {
-        alp_rd_split_chunk(
-            value_chunk,
-            right_width,
-            &padded_dict,
-            dict.len(),
-            code_chunk,
-            &mut rights,
-        );
-        let chunk_max = rights.iter().take(value_chunk.len()).copied().max().unwrap_or(0);
-        max_right = max_right.max(chunk_max);
-    }
-    let exception_count = codes.iter().filter(|code| **code == ALP_RD_CODE_MISS).count();
     out.put_u8(right_width as u8);
     out.put_u8(dict.len() as u8);
     for left in &dict {
         out.put_u16(*left);
     }
-    out.put_u32(exception_count as u32);
-    for (index, (code, value)) in codes.iter_mut().zip(values).enumerate() {
-        if *code == ALP_RD_CODE_MISS {
-            *code = 0;
-            out.put_u32(index as u32);
-            out.put_u16((value.to_bits() >> right_width) as u16);
+    let exception_count_at = out.len();
+    out.put_u32(0);
+    let mut exception_count = 0u32;
+    let mut codes = [0u64; FASTLANES_VECTOR];
+    let mut rights = [0u64; FASTLANES_VECTOR];
+    let mut max_code = 0u64;
+    let mut max_right = 0u64;
+    for (vector_index, value_chunk) in values.chunks(FASTLANES_VECTOR).enumerate() {
+        alp_rd_split_chunk(
+            value_chunk,
+            right_width,
+            &padded_dict,
+            dict.len(),
+            &mut codes,
+            &mut rights,
+        );
+        for (offset, ((code, right), value)) in codes.iter().zip(&rights).zip(value_chunk).enumerate() {
+            if *code == ALP_RD_CODE_MISS {
+                exception_count += 1;
+                out.put_u32((vector_index * FASTLANES_VECTOR + offset) as u32);
+                out.put_u16((value.to_bits() >> right_width) as u16);
+            } else {
+                max_code = max_code.max(*code);
+            }
+            max_right = max_right.max(*right);
         }
     }
-    let max_code = codes.iter().copied().max().unwrap_or(0);
-    bitpack(&codes, bits_needed(max_code), out);
+    out.patch_u32(exception_count_at, exception_count);
+    alp_rd_bitpack_vectors(values.len(), bits_needed(max_code), out, |vector_index, buffer| {
+        let start = vector_index * FASTLANES_VECTOR;
+        let value_chunk = values
+            .get(start..values.len().min(start + FASTLANES_VECTOR))
+            .unwrap_or(&[]);
+        buffer.fill(0);
+        alp_rd_split_chunk(value_chunk, right_width, &padded_dict, dict.len(), buffer, &mut rights);
+        for code in buffer.iter_mut() {
+            if *code == ALP_RD_CODE_MISS {
+                *code = 0;
+            }
+        }
+    });
     let right_mask = mask(right_width);
     bitpack_with(values.len(), bits_needed(max_right), out, |i| {
         values.get(i).map_or(0, |value| value.to_bits() & right_mask)
     });
+}
+
+/// Byte-identical to [`bitpack`] over `len` values, but `fill(vector_index, buffer)` writes one whole 1024-value vector
+/// at a time into `buffer` (zeroing slots past `len`), so a caller can produce values with a vector-wide kernel instead
+/// of keeping a full-length `Vec<u64>` of them.
+fn alp_rd_bitpack_vectors(
+    len: usize,
+    width: u32,
+    out: &mut Writer,
+    mut fill: impl FnMut(usize, &mut [u64; FASTLANES_VECTOR]),
+) {
+    out.put_u32(len as u32);
+    out.put_u8(width as u8);
+    if width == 0 {
+        return;
+    }
+    let words_per_vector = FASTLANES_LANES * fastlanes_words_per_lane(width as usize);
+    let vectors = len.div_ceil(FASTLANES_VECTOR);
+    let value_mask = mask(width);
+    let packed = out.reserve_bytes(vectors * words_per_vector * 8);
+    let mut buffer = [0u64; FASTLANES_VECTOR];
+    let mut scratch = [0u64; FASTLANES_VECTOR];
+    for (vector_index, packed_vector) in packed.chunks_exact_mut(words_per_vector * 8).enumerate() {
+        fill(vector_index, &mut buffer);
+        pack_vector_into(&buffer, &mut scratch, packed_vector, width, value_mask);
+    }
 }
 
 fn decode_alp_rd(reader: &mut Reader<'_>) -> Result<Vec<f64>, FormatError> {
