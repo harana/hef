@@ -26,6 +26,7 @@ ed25519-dalek = "2"
 fsst-rs = "0.5.11"
 getrandom = "0.4.3"
 hardware-rust-crypto = { version = "1.0.1", features = ["hazmat-explicit-nonce"] }
+half = "2"
 hashbrown = "0.17"
 hex-simd = "0.8"
 hkdf = "0.13.0"
@@ -59,6 +60,10 @@ tempfile = "3"
 
 [[bench]]
 name = "encoding"
+harness = false
+
+[[bench]]
+name = "vector"
 harness = false
 
 [[bench]]

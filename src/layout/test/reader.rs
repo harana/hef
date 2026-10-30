@@ -100,6 +100,7 @@ fn minimal_footer(mark: ColumnMark) -> Footer {
         text_token_indexes: Vec::new(),
         text_token_offsets: Vec::new(),
         time_series_rollups: None,
+        vector_columns: Vec::new(),
     }
 }
 

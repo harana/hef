@@ -17,6 +17,7 @@ use crate::encoding::{ColumnData, PipelineId, decode_block, encode_block};
 use crate::error::FormatError;
 use crate::events::TimestampValue;
 use crate::file::bytes::{Reader, Writer, slice};
+use crate::vector::VectorColumnMeta;
 use hashbrown::HashMap;
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -118,6 +119,9 @@ pub mod sections {
     /// Optional: a time-series file's rollups (see [`super::TimeSeriesRollups`]). Absent in files that do not
     /// declare `TIME_SERIES_ROLLUPS`.
     pub const TIME_SERIES_ROLLUPS: u32 = 39;
+    /// Optional: one [`crate::vector::VectorColumnMeta`] per vector column. Present exactly when the file declares
+    /// the `VECTOR_COLUMNS` required feature.
+    pub const VECTOR_COLUMNS: u32 = 41;
 }
 
 /// Logical column kind codes (stored in the column directory).
@@ -129,6 +133,9 @@ pub enum ColumnKind {
     String = 5,
     U128 = 2,
     U64 = 0,
+    /// Fixed-width embedding rows; dimension, element type, metric and model live in the footer's vector column
+    /// metadata, never in this byte.
+    Vector = 6,
 }
 
 impl ColumnKind {
@@ -141,6 +148,7 @@ impl ColumnKind {
             3 => ColumnKind::F64,
             4 => ColumnKind::Decimal,
             5 => ColumnKind::String,
+            6 => ColumnKind::Vector,
             _ => {
                 return Err(FormatError::Structural {
                     rule: "unknown column kind",
@@ -722,6 +730,9 @@ pub struct Footer {
     /// A time-series file's rollups. `None` in every other file, and in a time-series file that does not declare
     /// `TIME_SERIES_ROLLUPS`.
     pub time_series_rollups: Option<TimeSeriesRollups>,
+    /// One entry per `Vector` column. Empty in every file that does not declare `VECTOR_COLUMNS`, so such a footer
+    /// stays byte-identical to one written before vector columns existed.
+    pub vector_columns: Vec<VectorColumnMeta>,
 }
 
 impl Footer {
@@ -1375,6 +1386,15 @@ fn encode_sections(footer: &Footer) -> SectionArea {
 
     if let Some(rollups) = &footer.time_series_rollups {
         sections.push(sections::TIME_SERIES_ROLLUPS, |out| rollups.encode_into(out));
+    }
+
+    if !footer.vector_columns.is_empty() {
+        sections.push(sections::VECTOR_COLUMNS, |out| {
+            out.put_u32(footer.vector_columns.len() as u32);
+            for meta in &footer.vector_columns {
+                meta.encode_into(out);
+            }
+        });
     }
 
     // The sparse shredded key set: optional, emitted only when the writer stored sparse columns.
@@ -2417,6 +2437,43 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         }
     }
 
+    let vector_columns = match decode_section(&directory, section_area, sections::VECTOR_COLUMNS)? {
+        Some(bytes) => {
+            let mut reader = Reader::new(bytes);
+            let count = reader.u32("vector column count")? as usize;
+            let count = bounded_count(count, 4, &reader, "vector column count exceeds section")?;
+            let mut metas = Vec::with_capacity(count);
+            for _ in 0..count {
+                metas.push(VectorColumnMeta::decode_from(&mut reader)?);
+            }
+            if reader.remaining() != 0 {
+                return Err(FormatError::Structural {
+                    rule: "vector column section has trailing bytes",
+                });
+            }
+            metas
+        }
+        None => Vec::new(),
+    };
+    // Every vector column has exactly one metadata entry, and every entry names a vector column.
+    let vector_column_count = columns
+        .iter()
+        .filter(|column| column.kind == ColumnKind::Vector)
+        .count();
+    let declared = required_feature_flags & required_features::VECTOR_COLUMNS != 0;
+    if vector_column_count != vector_columns.len()
+        || declared == vector_columns.is_empty()
+        || !vector_columns.iter().all(|meta| {
+            columns
+                .iter()
+                .any(|column| column.column_id == meta.column_id && column.kind == ColumnKind::Vector)
+        })
+    {
+        return Err(FormatError::Structural {
+            rule: "vector column metadata covers exactly the file's vector columns",
+        });
+    }
+
     Ok(Footer {
         audit,
         clustering,
@@ -2461,6 +2518,7 @@ pub fn decode_footer(blob: &[u8]) -> Result<Footer, FormatError> {
         text_token_indexes,
         text_token_offsets,
         time_series_rollups,
+        vector_columns,
     })
 }
 

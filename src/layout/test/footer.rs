@@ -2,6 +2,7 @@ use super::*;
 use crate::benchmarks::{ProfileOverheadMeasurement, profile_overhead_gate_passes};
 use crate::events::{RelationshipKind, RelationshipRef};
 use crate::layout::HEADER_BLOCK_LEN;
+use crate::vector::{EmbeddingModel, VectorElement, VectorMetric};
 use crate::writer::build::{BuiltHef, build_hef_file};
 use crate::writer::source_form::tests::{plain_row, source_form_config};
 
@@ -73,6 +74,7 @@ fn minimal_footer() -> Footer {
         text_token_indexes: Vec::new(),
         text_token_offsets: Vec::new(),
         time_series_rollups: None,
+        vector_columns: Vec::new(),
     }
 }
 
@@ -1528,4 +1530,65 @@ fn time_series_rollups_section_holds_exactly_the_standalone_encoding() {
         decode_footer(&bytes).unwrap().time_series_rollups,
         footer.time_series_rollups
     );
+}
+
+fn vector_footer(element: VectorElement, metric: VectorMetric) -> Footer {
+    let mut footer = minimal_footer();
+    footer.required_feature_flags |= crate::layout::required_features::VECTOR_COLUMNS;
+    footer.columns.push(ColumnDescriptor {
+        column_id: 5001,
+        internal_only: true,
+        kind: ColumnKind::Vector,
+        name: "embedding".to_owned(),
+        nullable: false,
+    });
+    footer.vector_columns = vec![VectorColumnMeta {
+        column_id: 5001,
+        element,
+        model: EmbeddingModel {
+            dimension: 384,
+            digest: [3u8; 32],
+            id: "minilm".to_owned(),
+            metric,
+        },
+        representation_of: 5000,
+    }];
+    footer
+}
+
+#[test]
+fn vector_column_metadata_round_trips_for_every_element_type_and_metric() {
+    for element in [
+        VectorElement::F16,
+        VectorElement::F32,
+        VectorElement::I8,
+        VectorElement::U1,
+    ] {
+        for metric in [VectorMetric::Cosine, VectorMetric::Dot, VectorMetric::L2] {
+            let footer = vector_footer(element, metric);
+            let decoded = decode_footer(&encode_footer(&footer)).unwrap();
+            assert_eq!(decoded.vector_columns, footer.vector_columns);
+            assert_eq!(decoded.columns, footer.columns);
+        }
+    }
+}
+
+#[test]
+fn a_footer_without_vector_columns_stays_byte_identical() {
+    let footer = minimal_footer();
+    let bytes = encode_footer(&footer);
+    let decoded = decode_footer(&bytes).unwrap();
+    assert!(decoded.vector_columns.is_empty());
+    assert_eq!(encode_footer(&decoded), bytes);
+}
+
+#[test]
+fn vector_metadata_must_cover_exactly_the_vector_columns() {
+    let mut footer = vector_footer(VectorElement::I8, VectorMetric::Cosine);
+    footer.vector_columns.clear();
+    footer.required_feature_flags &= !crate::layout::required_features::VECTOR_COLUMNS;
+    assert!(decode_footer(&encode_footer(&footer)).is_err());
+    let mut undeclared = vector_footer(VectorElement::I8, VectorMetric::Cosine);
+    undeclared.required_feature_flags &= !crate::layout::required_features::VECTOR_COLUMNS;
+    assert!(decode_footer(&encode_footer(&undeclared)).is_err());
 }

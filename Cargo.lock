@@ -956,6 +956,7 @@ dependencies = [
  "ed25519-dalek",
  "fsst-rs",
  "getrandom 0.4.3",
+ "half",
  "hardware-rust-crypto",
  "hashbrown 0.17.1",
  "hex-simd",

@@ -49,6 +49,7 @@ pub mod lifecycle;
 pub mod object_store;
 pub mod security;
 pub mod typed_id;
+pub mod vector;
 
 #[cfg(feature = "write")]
 pub mod writer;

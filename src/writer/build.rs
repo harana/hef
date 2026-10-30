@@ -1579,7 +1579,7 @@ impl TypedColumn {
             ColumnKind::F64 => TypedColumn::F64(Vec::new()),
             ColumnKind::I64 => TypedColumn::I64(Vec::new()),
             ColumnKind::String => TypedColumn::Strings(StringColumn::new()),
-            ColumnKind::U128 | ColumnKind::U64 => TypedColumn::Empty,
+            ColumnKind::U128 | ColumnKind::U64 | ColumnKind::Vector => TypedColumn::Empty,
         }
     }
 
@@ -5280,6 +5280,7 @@ fn build_hef_file_sealed_in_order(
         text_token_indexes: Vec::new(),
         text_token_offsets,
         time_series_rollups,
+        vector_columns: Vec::new(),
     };
 
     // The checksum/proof pass above produced the large-byte leaves shared by deterministic identity, the authoritative
