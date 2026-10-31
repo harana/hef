@@ -557,3 +557,167 @@ fn u1_estimate_tracks_the_true_dot_product() {
     }
     assert!(error / 198.0 < 0.1);
 }
+
+#[test]
+fn a_prefix_read_returns_the_leading_dimensions_and_refuses_quantized_columns() {
+    let model = model(32, VectorMetric::Dot);
+    let rows = input(5, 32);
+    let bytes = write_segment(
+        &spec(
+            model.clone(),
+            vec![VectorElement::I8, VectorElement::F16, VectorElement::F32],
+        ),
+        &rows,
+        &key(1),
+    )
+    .unwrap();
+    let reader = SegmentReader::open(bytes, &key(1)).unwrap();
+    let f32_prefix = reader
+        .vector_prefix(representation_column_id(VectorElement::F32), 3, 8, &model)
+        .unwrap();
+    assert_eq!(f32_prefix, rows.vectors[3][..8]);
+    let f16_prefix = reader
+        .vector_prefix(representation_column_id(VectorElement::F16), 3, 8, &model)
+        .unwrap();
+    assert_eq!(f16_prefix.len(), 8);
+    assert!(
+        f16_prefix
+            .iter()
+            .zip(&rows.vectors[3])
+            .all(|(read, wrote)| (read - wrote).abs() < 1e-3)
+    );
+    assert!(
+        reader
+            .vector_prefix(representation_column_id(VectorElement::I8), 3, 8, &model)
+            .is_err()
+    );
+    assert!(
+        reader
+            .vector_prefix(representation_column_id(VectorElement::F32), 3, 33, &model)
+            .is_err()
+    );
+}
+
+#[test]
+fn the_centroid_is_the_normalized_mean_and_ranks_segments_by_closeness() {
+    let model = model(16, VectorMetric::Cosine);
+    let segment = |seeds: std::ops::Range<u64>| {
+        let mut rows = input(seeds.clone().count(), 16);
+        rows.vectors = seeds.map(|seed| unit(seed, 16)).collect();
+        SegmentReader::open(
+            write_segment(
+                &spec(model.clone(), vec![VectorElement::U1, VectorElement::F32]),
+                &rows,
+                &key(1),
+            )
+            .unwrap(),
+            &key(1),
+        )
+        .unwrap()
+    };
+    let near = segment(100..101);
+    let far = segment(200..203);
+    let centroid = near.centroid().unwrap();
+    assert!(
+        centroid
+            .iter()
+            .zip(unit(100, 16))
+            .all(|(read, wrote)| (read - wrote).abs() < 1e-5)
+    );
+    let norm = far
+        .centroid()
+        .unwrap()
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    assert!((norm - 1.0).abs() < 1e-5);
+
+    let empty = SegmentReader::open(
+        write_segment(&spec(model.clone(), vec![VectorElement::F32]), &input(0, 16), &key(1)).unwrap(),
+        &key(1),
+    )
+    .unwrap();
+    assert_eq!(empty.centroid(), None);
+
+    let segments = [far, near, empty];
+    let ranked = nearest_segments(&segments, &unit(100, 16), &model, 3).unwrap();
+    assert_eq!(ranked, vec![2, 1, 0]);
+    assert_eq!(
+        nearest_segments(&segments, &unit(100, 16), &model, 2).unwrap(),
+        vec![2, 1]
+    );
+    assert!(nearest_segments(&segments, &unit(100, 16), &self::model(16, VectorMetric::Dot), 1).is_err());
+}
+
+#[test]
+fn merging_small_segments_keeps_every_row_in_order_and_searches_the_same() {
+    let model = model(24, VectorMetric::Cosine);
+    let representations = vec![VectorElement::U1, VectorElement::F32];
+    let first = input(GRANULE_ROWS + 3, 24);
+    let mut second = input(5, 24);
+    second.event_ids = (0..5).map(|row| format!("$late{row}")).collect();
+    second.vectors = (0..5).map(|row| unit(9_000 + row, 24)).collect();
+    let readers: Vec<_> = [&first, &second]
+        .into_iter()
+        .map(|rows| {
+            SegmentReader::open(
+                write_segment(&spec(model.clone(), representations.clone()), rows, &key(1)).unwrap(),
+                &key(1),
+            )
+            .unwrap()
+        })
+        .collect();
+    let merged = SegmentReader::open(
+        merge_segments(&readers, &spec(model.clone(), representations.clone()), &key(2)).unwrap(),
+        &key(2),
+    )
+    .unwrap();
+    assert_eq!(merged.row_count(), (GRANULE_ROWS + 8) as u64);
+    assert_eq!(merged.manifest().window.first_event, "$event0");
+    assert_eq!(merged.manifest().window.last_event, "$late4");
+    let all = merged.read_all().unwrap();
+    let expected: Vec<String> = first.event_ids.iter().chain(&second.event_ids).cloned().collect();
+    assert_eq!(all.event_ids, expected);
+    assert_eq!(all.vectors[GRANULE_ROWS + 4], second.vectors[1]);
+    assert_eq!(all.string_columns, {
+        let mut columns = first.string_columns.clone();
+        columns
+            .iter_mut()
+            .zip(&second.string_columns)
+            .for_each(|((_, into), (_, from))| into.extend(from.clone()));
+        columns
+    });
+
+    let query = unit(9_002, 24);
+    let search = VectorSearch {
+        filter: SearchFilter::default(),
+        k: 3,
+        model: &model,
+        oversample: DEFAULT_OVERSAMPLE,
+        query: &query,
+    };
+    let before: Vec<String> = search_segments(&readers, &search)
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.event_id)
+        .collect();
+    let after: Vec<String> = search_segments(std::slice::from_ref(&merged), &search)
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.event_id)
+        .collect();
+    assert_eq!(before, after);
+
+    let mut other = input(2, 24);
+    other.integer_columns.clear();
+    let mismatched = SegmentReader::open(
+        write_segment(&spec(model.clone(), representations.clone()), &other, &key(1)).unwrap(),
+        &key(1),
+    )
+    .unwrap();
+    let readers = [readers.into_iter().next().unwrap(), mismatched];
+    assert!(merge_segments(&readers, &spec(model.clone(), representations.clone()), &key(2)).is_err());
+    let dot = self::model(24, VectorMetric::Dot);
+    assert!(merge_segments(&readers, &spec(dot, representations), &key(2)).is_err());
+}

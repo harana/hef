@@ -13,8 +13,11 @@
 //! combination.
 
 use crate::events::TenantId;
+#[cfg(target_arch = "wasm32")]
+use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key as XChaChaKey, XChaCha20Poly1305, XNonce};
+#[cfg(not(target_arch = "wasm32"))]
 use hardware_rust_crypto::aes_gcm::HardwareAes256Gcm;
 use hashbrown::{HashMap, HashSet};
 use hkdf::Hkdf;
@@ -121,10 +124,20 @@ impl AeadScheme {
     /// the nonce-deriving helpers so the nonce construction stays pinned.
     pub(crate) fn seal(self, key: &[u8; KEY_LEN], nonce: &[u8], aad: &[u8], plaintext: &[u8]) -> Option<Vec<u8>> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             AeadScheme::AesGcm256 => HardwareAes256Gcm::new(key)
                 .ok()?
                 .encrypt_with_nonce(nonce, aad, plaintext)
                 .ok(),
+            // WebAssembly has no AES instructions, so the same AES-256-GCM runs in software there.
+            #[cfg(target_arch = "wasm32")]
+            AeadScheme::AesGcm256 => {
+                let nonce: [u8; 12] = nonce.try_into().ok()?;
+                let payload = Payload { msg: plaintext, aad };
+                Aes256Gcm::new(&(*key).into())
+                    .encrypt(&AesNonce::from(nonce), payload)
+                    .ok()
+            }
             AeadScheme::XChaCha20Poly1305 => {
                 let nonce: [u8; 24] = nonce.try_into().ok()?;
                 let key: XChaChaKey = (*key).into();
@@ -139,10 +152,19 @@ impl AeadScheme {
     /// rather than altered plaintext.
     pub(crate) fn open(self, key: &[u8; KEY_LEN], nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             AeadScheme::AesGcm256 => HardwareAes256Gcm::new(key)
                 .ok()?
                 .decrypt_with_nonce(nonce, aad, ciphertext)
                 .ok(),
+            #[cfg(target_arch = "wasm32")]
+            AeadScheme::AesGcm256 => {
+                let nonce: [u8; 12] = nonce.try_into().ok()?;
+                let payload = Payload { msg: ciphertext, aad };
+                Aes256Gcm::new(&(*key).into())
+                    .decrypt(&AesNonce::from(nonce), payload)
+                    .ok()
+            }
             AeadScheme::XChaCha20Poly1305 => {
                 let nonce: [u8; 24] = nonce.try_into().ok()?;
                 let key: XChaChaKey = (*key).into();

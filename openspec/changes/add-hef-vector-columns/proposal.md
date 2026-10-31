@@ -28,8 +28,14 @@ of the same vectors, no top-k kernel, and no whole-file encryption that still al
   copy and re-scores candidates with the finest copy. Reads and scans refuse a different model or metric. (H6, H12)
 - `segments_to_reembed` lists every file built with a model other than the current one. (H11)
 
-Deferred: prefix reads (H4), per-segment centroids (H9), small-segment merge (H13), the Wasm read path (H14), ANN
-indexes, vector compression codecs.
+- Prefix reads: the leading dimensions of one f16 or f32 row, for models whose prefix is itself an embedding. (H4)
+- A per-segment centroid in the sealed footer (mean vector, normalized for cosine) and `nearest_segments`, which ranks
+  segments by it so a search can scan the likeliest first. Footers written without one still open. (H9)
+- `merge_segments` replaces many small segments with one, re-encoding each file's finest stored vectors. (H13)
+- The read and write path builds and runs on WebAssembly: AES-256-GCM falls back to a software implementation there
+  (same ciphertext), and randomness comes from the host. (H14)
+
+Deferred: ANN indexes, vector compression codecs.
 
 ## Impact
 
