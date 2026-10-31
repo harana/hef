@@ -9,7 +9,7 @@ use super::constant::*;
 use super::error::VectorError;
 use super::kernel::{PreparedQuery, TopK, top_k};
 use super::model::*;
-use super::quantize::encode_row;
+use super::quantize::{decode_row, encode_row};
 use super::seal::{FileKeys, WrappingKey};
 use crate::file::bytes::{Reader, Writer};
 use crate::indexes::bitmap::RoaringRangeBitmap;
@@ -154,8 +154,10 @@ pub fn write_segment(spec: &SegmentSpec, input: &SegmentInput, wrapping: &Wrappi
     }
 
     file.resize(file.len().next_multiple_of(BLOCK_ALIGNMENT), 0);
+    let centroid = centroid(&spec.model, &input.vectors);
     let content_hash = *blake3::hash(file.get(HEADER_LEN..).unwrap_or_default()).as_bytes();
     let footer = SegmentFooter {
+        centroid,
         columns,
         granule_rows: granules.iter().map(|(start, end)| (end - start) as u32).collect(),
         manifest: SegmentManifest {
@@ -272,6 +274,8 @@ struct StoredColumn {
 
 #[derive(Debug, Clone)]
 struct SegmentFooter {
+    /// Empty when the segment has no rows or its vectors average to zero.
+    centroid: Vec<f32>,
     columns: Vec<StoredColumn>,
     granule_rows: Vec<u32>,
     manifest: SegmentManifest,
@@ -310,6 +314,10 @@ impl SegmentFooter {
         }
         out.put_u32(self.vector_columns.len() as u32);
         self.vector_columns.iter().for_each(|meta| meta.encode_into(&mut out));
+        out.put_u32(self.centroid.len() as u32);
+        self.centroid
+            .iter()
+            .for_each(|value| out.put_slice(&value.to_le_bytes()));
         out.into_bytes()
     }
 
@@ -361,12 +369,27 @@ impl SegmentFooter {
         for _ in 0..meta_count {
             vector_columns.push(VectorColumnMeta::decode_from(&mut reader)?);
         }
+        // Files written before centroids end here; they read as having none.
+        let mut centroid = Vec::new();
+        if reader.remaining() != 0 {
+            let len = reader.u32("centroid length")? as usize;
+            centroid.reserve(reader.capacity_hint(len, 4));
+            for _ in 0..len {
+                centroid.push(f32::from_le_bytes(array4(reader.take(4, "centroid value")?)));
+            }
+            if len != 0 && len != manifest.model.dimension as usize {
+                return Err(VectorError::Format(crate::error::FormatError::Structural {
+                    rule: "vector segment centroid has the model's dimension",
+                }));
+            }
+        }
         if reader.remaining() != 0 {
             return Err(VectorError::Format(crate::error::FormatError::Structural {
                 rule: "vector segment footer has trailing bytes",
             }));
         }
         let footer = SegmentFooter {
+            centroid,
             columns,
             granule_rows,
             manifest,
@@ -479,6 +502,12 @@ impl<S: SegmentSource> SegmentReader<S> {
             .take(granule)
             .map(|rows| u64::from(*rows))
             .sum()
+    }
+
+    /// The mean of the segment's vectors (normalized for cosine), read from the footer without decrypting any block.
+    /// `None` for an empty segment, one whose vectors average to zero, or one written before centroids existed.
+    pub fn centroid(&self) -> Option<&[f32]> {
+        (!self.footer.centroid.is_empty()).then_some(self.footer.centroid.as_slice())
     }
 
     /// The metadata of every vector column in the file.
@@ -597,6 +626,83 @@ impl<S: SegmentSource> SegmentReader<S> {
             .get(local * width..(local + 1) * width)
             .map(<[u8]>::to_vec)
             .ok_or_else(truncated)
+    }
+
+    /// The first `dimensions` elements of file row `row` of float column `column_id`, decoded to `f32`. For models
+    /// trained so a prefix is itself a usable embedding, this gives a shorter vector without decoding the whole row.
+    /// Fails for 1-bit and int8 columns, whose rows are not prefix-decodable, and when `dimensions` exceeds the model's.
+    pub fn vector_prefix(
+        &self,
+        column_id: u32,
+        row: u64,
+        dimensions: u32,
+        model: &EmbeddingModel,
+    ) -> Result<Vec<f32>, VectorError> {
+        let meta = self.vector_meta(column_id, model)?;
+        if dimensions > meta.model.dimension {
+            return Err(VectorError::InvalidInput {
+                rule: format!("prefix of {dimensions} past the model's {}", meta.model.dimension),
+            });
+        }
+        let element_bytes = match meta.element {
+            VectorElement::F16 => 2,
+            VectorElement::F32 => 4,
+            VectorElement::I8 | VectorElement::U1 => {
+                return Err(VectorError::InvalidInput {
+                    rule: format!("{:?} rows have no prefix read", meta.element),
+                });
+            }
+        };
+        let width = meta.row_width();
+        let (granule, local) = self.locate(row)?;
+        let plaintext = self.open_block(self.column_by_id(column_id)?, granule)?;
+        let start = local * width;
+        let prefix = plaintext
+            .get(start..start + dimensions as usize * element_bytes)
+            .ok_or_else(truncated)?;
+        Ok(decode_row(meta.element, dimensions, prefix))
+    }
+
+    /// Every row of the segment, decoded back to what [`write_segment`] takes: the event ids, every string and
+    /// integer column, and each vector decoded from the finest stored representation (renormalized for cosine). Used
+    /// to merge small segments; vectors stored only as int8 or 1-bit come back approximate.
+    pub fn read_all(&self) -> Result<SegmentInput, VectorError> {
+        let mut input = SegmentInput::default();
+        let fine = *self
+            .representations(EMBEDDING_COLUMN_ID)
+            .last()
+            .ok_or_else(|| VectorError::MissingColumn {
+                name: "embedding".to_owned(),
+            })?;
+        let width = fine.row_width();
+        let fine_column = self.column_by_id(fine.column_id)?;
+        for column in &self.footer.columns {
+            match column.kind {
+                ColumnKind::String if column.name != EVENT_ID_COLUMN => {
+                    input.string_columns.push((column.name.clone(), Vec::new()))
+                }
+                ColumnKind::I64 => input.integer_columns.push((column.name.clone(), Vec::new())),
+                _ => {}
+            }
+        }
+        for granule in 0..self.granule_count() {
+            input.event_ids.extend(self.strings(EVENT_ID_COLUMN, granule)?);
+            for (name, values) in &mut input.string_columns {
+                values.extend(self.strings(name, granule)?);
+            }
+            for (name, values) in &mut input.integer_columns {
+                values.extend(self.integers(name, granule)?);
+            }
+            let plaintext = self.open_block(fine_column, granule)?;
+            for row in plaintext.chunks_exact(width.max(1)) {
+                let mut vector = decode_row(fine.element, fine.model.dimension, row);
+                if fine.model.metric == VectorMetric::Cosine {
+                    normalize(&mut vector);
+                }
+                input.vectors.push(vector);
+            }
+        }
+        Ok(input)
     }
 
     /// The best `k` rows of vector column `column_id` for `query`, best first, scanning only the granules `granules`
@@ -772,6 +878,82 @@ impl<S> std::fmt::Debug for SegmentReader<S> {
             .field("rows", &self.footer.manifest.row_count)
             .finish_non_exhaustive()
     }
+}
+
+/// Writes one segment holding every row of `segments`, in order, so many small segments can be replaced by one.
+/// Every segment must hold the same columns and come from `spec.model`; vectors are re-encoded from each file's
+/// finest representation. The caller deletes the inputs once the merged file is stored.
+pub fn merge_segments<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    spec: &SegmentSpec,
+    wrapping: &WrappingKey,
+) -> Result<Vec<u8>, VectorError> {
+    let mut merged: Option<SegmentInput> = None;
+    for segment in segments {
+        segment.manifest().model.require_same(&spec.model)?;
+        let input = segment.read_all()?;
+        match &mut merged {
+            None => merged = Some(input),
+            Some(merged) => {
+                let names = |input: &SegmentInput| {
+                    (
+                        input
+                            .string_columns
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect::<Vec<_>>(),
+                        input
+                            .integer_columns
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                if names(merged) != names(&input) {
+                    return Err(VectorError::InvalidInput {
+                        rule: "merged segments hold the same columns".to_owned(),
+                    });
+                }
+                merged.event_ids.extend(input.event_ids);
+                merged.vectors.extend(input.vectors);
+                for ((_, into), (_, from)) in merged.string_columns.iter_mut().zip(input.string_columns) {
+                    into.extend(from);
+                }
+                for ((_, into), (_, from)) in merged.integer_columns.iter_mut().zip(input.integer_columns) {
+                    into.extend(from);
+                }
+            }
+        }
+    }
+    write_segment(spec, &merged.unwrap_or_default(), wrapping)
+}
+
+/// The mean of `vectors`, normalized for cosine; empty when there are none or they average to zero.
+fn centroid(model: &EmbeddingModel, vectors: &[Vec<f32>]) -> Vec<f32> {
+    let mut sum = vec![0f32; model.dimension as usize];
+    for vector in vectors {
+        sum.iter_mut().zip(vector).for_each(|(slot, value)| *slot += value);
+    }
+    let count = vectors.len() as f32;
+    sum.iter_mut().for_each(|value| *value /= count.max(1.0));
+    if model.metric == VectorMetric::Cosine {
+        normalize(&mut sum);
+    }
+    if sum.iter().all(|value| *value == 0.0) {
+        return Vec::new();
+    }
+    sum
+}
+
+fn normalize(vector: &mut [f32]) {
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        vector.iter_mut().for_each(|value| *value /= norm);
+    }
+}
+
+fn array4(bytes: &[u8]) -> [u8; 4] {
+    bytes.try_into().unwrap_or([0; 4])
 }
 
 fn encode_strings(values: &[String]) -> Vec<u8> {

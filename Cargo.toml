@@ -50,6 +50,14 @@ zeekstd = "0.6.2"
 zeroize = "1"
 zstd = "0.13.3"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+aes-gcm = "0.11.1"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+uuid = { version = "1", features = ["js"] }
+
 [dev-dependencies]
 criterion = "0.8.2"
 prost = "0.14"

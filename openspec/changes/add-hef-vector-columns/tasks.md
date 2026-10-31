@@ -11,6 +11,11 @@
 - [x] Event id row key and sealed manifest with content hash.
 - [x] Whole-file encryption with ranged reads; wrong key, tampered, swapped and truncated blocks fail.
 - [x] Model-id invalidation: `segments_to_reembed`.
+- [x] Prefix reads of f16 and f32 rows; quantized columns refuse them. (H4)
+- [x] Per-segment centroid in the footer and `nearest_segments`; older footers open with no centroid. (H9)
+- [x] `merge_segments`: rows kept in order, same search results, mismatched columns or model refused. (H13)
+- [x] Builds for `wasm32-unknown-unknown`; a `wasm32-wasip1` program run under Node opens a natively written segment,
+      merges and searches. (H14)
 - [x] Benchmark 1-bit and int8 scans over 100k × 384 with and without a room filter (`benches/vector.rs`).
 
 ## Benchmark (2026-10-30, 4-core 2.1 GHz Xeon, one core, `cargo bench --bench vector -- --quick`)

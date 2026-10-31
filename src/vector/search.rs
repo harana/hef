@@ -4,7 +4,7 @@
 
 use super::constant::*;
 use super::error::VectorError;
-use super::model::{EmbeddingModel, SegmentManifest};
+use super::model::{EmbeddingModel, SegmentManifest, VectorMetric};
 use super::segment::{ColumnStats, SegmentReader, SegmentSource};
 use crate::indexes::bitmap::{RoaringRangeBitmap, RowRange};
 
@@ -187,6 +187,31 @@ fn granule_may_match<S: SegmentSource>(segment: &SegmentReader<S>, granule: usiz
     strings_may_match(ROOM_ID_COLUMN, &filter.room_ids)
         && strings_may_match(SENDER_COLUMN, &filter.senders)
         && time_may_match
+}
+
+/// The indexes of the `n` segments whose centroid is closest to `query` under `model`'s metric, closest first, so a
+/// search over many segments can scan only the likeliest ones. Segments without a centroid can't be ruled out and
+/// come first. Fails if any segment was made by a different model.
+pub fn nearest_segments<S: SegmentSource>(
+    segments: &[SegmentReader<S>],
+    query: &[f32],
+    model: &EmbeddingModel,
+    n: usize,
+) -> Result<Vec<usize>, VectorError> {
+    let mut scored = Vec::with_capacity(segments.len());
+    for (index, segment) in segments.iter().enumerate() {
+        segment.manifest().model.require_same(model)?;
+        let score = segment.centroid().map_or(f32::INFINITY, |centroid| {
+            let pairs = centroid.iter().zip(query);
+            match model.metric {
+                VectorMetric::Cosine | VectorMetric::Dot => pairs.map(|(left, right)| left * right).sum(),
+                VectorMetric::L2 => -pairs.map(|(left, right)| (left - right) * (left - right)).sum::<f32>(),
+            }
+        });
+        scored.push((index, score));
+    }
+    scored.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
+    Ok(scored.into_iter().take(n).map(|(index, _)| index).collect())
 }
 
 /// The keys of every segment built with a model other than `current`, so the caller re-embeds them when the

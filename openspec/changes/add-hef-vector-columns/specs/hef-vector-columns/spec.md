@@ -86,3 +86,35 @@ any of their vector blocks, scan the coarsest copy, re-score candidates with the
 #### Scenario: Pruned segments are not read
 - **WHEN** a search filters to one room
 - **THEN** segments of other rooms decrypt no blocks
+
+### Requirement: Prefix reads
+A reader SHALL return the first `n` dimensions of one f16 or f32 row decoded to f32, and SHALL refuse a prefix read of
+an int8 or 1-bit column or a prefix longer than the model's dimension.
+
+#### Scenario: Leading dimensions
+- **WHEN** a reader asks for the first 8 dimensions of an f32 row
+- **THEN** it returns exactly the first 8 values written
+
+### Requirement: Segment centroids
+The sealed footer SHALL carry the mean of the segment's vectors, normalized for cosine, or none for an empty segment.
+`nearest_segments` SHALL rank segments by the query's score against their centroid, closest first, with segments that
+have no centroid ranked first. A footer written without a centroid SHALL still open.
+
+#### Scenario: Closest segment first
+- **WHEN** segments are ranked for a query equal to one segment's only vector
+- **THEN** that segment ranks ahead of the others, after any segment without a centroid
+
+### Requirement: Small-segment merge
+`merge_segments` SHALL write one segment holding every row of its inputs in order, with vectors re-encoded from each
+input's finest representation, and SHALL refuse inputs with different columns or a different model.
+
+#### Scenario: Same search results
+- **WHEN** two segments are merged
+- **THEN** a search over the merged file returns the same event ids as a search over the two inputs
+
+### Requirement: WebAssembly read path
+The vector segment reader and writer SHALL build for WebAssembly and read files written on any other platform.
+
+#### Scenario: Cross-platform file
+- **WHEN** a WebAssembly build opens a segment written natively
+- **THEN** it authenticates, verifies the content hash and returns the written event ids
